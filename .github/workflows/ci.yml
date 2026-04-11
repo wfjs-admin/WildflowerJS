@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+  bundle-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Report bundle sizes
+        run: |
+          echo "## Bundle Sizes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Variant | Raw | Gzip | Brotli |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|------|--------|" >> $GITHUB_STEP_SUMMARY
+          for f in dist/*.min.js; do
+            name=$(basename "$f")
+            raw=$(wc -c < "$f" | awk '{printf "%.1f KB", $1/1024}')
+            gz=$(gzip -c "$f" | wc -c | awk '{printf "%.1f KB", $1/1024}')
+            br=""
+            if [ -f "$f.br" ]; then
+              br=$(wc -c < "$f.br" | awk '{printf "%.1f KB", $1/1024}')
+            fi
+            echo "| $name | $raw | $gz | $br |" >> $GITHUB_STEP_SUMMARY
+          done

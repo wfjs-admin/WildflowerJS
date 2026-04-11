@@ -1,0 +1,46 @@
+{
+  "name": "@wildflowerjs/test-utils",
+  "version": "1.0.0",
+  "description": "Testing utilities for WildflowerJS applications",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./vitest": "./vitest.js"
+  },
+  "types": "types.d.ts",
+  "files": [
+    "index.js",
+    "vitest.js",
+    "types.d.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "wildflowerjs",
+    "testing",
+    "vitest",
+    "test-utils",
+    "component-testing"
+  ],
+  "author": "WildflowerJS",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wfjs-admin/WildflowerJS.git",
+    "directory": "packages/test-utils"
+  },
+  "bugs": {
+    "url": "https://github.com/wfjs-admin/WildflowerJS/issues"
+  },
+  "homepage": "https://wildflowerjs.com/docs/testing",
+  "peerDependencies": {
+    "vitest": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vitest": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "toast",
+  "version": "1.0.0",
+  "description": "Lightweight toast notification plugin for user feedback",
+  "author": "WildflowerJS",
+  "license": "MIT",
+  "global": "wfToast",
+  "variants": {
+    "universal": {
+      "type": "vanilla",
+      "source": "toast.js"
+    }
+  },
+  "default": "universal"
+}

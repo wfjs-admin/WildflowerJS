@@ -1,0 +1,1531 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://uam.dev/v7/schema.json",
+  "title": "Universal App Manifest (UAM) v7.0",
+  "description": "A universal, framework-agnostic standard for describing a reactive web application. UAM v7 adds: store parity with components (watch, destroy, subscribe, lifecycle), non-reactive instance refs, deep reactivity hints per target, integration timing hints (deferInit, scanAfterRender), and element-level CSS transitions. All v7 additions are optional — existing v2-v6 manifests remain valid.",
+  "type": "object",
+  "required": ["meta", "entry"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Schema reference for validation"
+    },
+    "meta": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "description": "Application or manifest name" },
+        "version": { "type": "string", "description": "Semantic version" },
+        "description": { "type": "string", "description": "Brief description of the application" }
+      }
+    },
+    "entry": {
+      "type": "string",
+      "description": "The root component name to render"
+    },
+    "scripts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "External script URLs or paths to include (e.g., Chart.js, plugins). Note: Scripts for declared integrations are auto-included."
+    },
+    "inlineScripts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Inline JavaScript code blocks to include. Prefer 'helpers' for pure functions and 'integrations' for library setup."
+    },
+    "styles": {
+      "type": "string",
+      "description": "Global CSS styles for the application"
+    },
+    "helpers": {
+      "$ref": "#/definitions/helpersDefinition",
+      "description": "Pure utility functions available in expressions and templates. These are framework-agnostic and compiled to appropriate patterns for each target."
+    },
+    "integrations": {
+      "$ref": "#/definitions/integrationsDefinition",
+      "description": "Third-party library configurations. Compilers generate framework-appropriate initialization, data binding, and cleanup code."
+    },
+    "plugins": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/pluginReference" },
+      "description": "UAM plugins to include. Plugins are resolved from /www/js/uam/plugins/"
+    },
+    "stores": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/storeDefinition" },
+      "description": "Global reactive stores (like Pinia, Redux, or WF stores)"
+    },
+    "components": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/componentDefinition" },
+      "description": "Reusable component definitions"
+    },
+    "routing": {
+      "$ref": "#/definitions/routingConfig",
+      "description": "URL-based routing configuration"
+    },
+    "variables": {
+      "type": "object",
+      "description": "Documentation of compile-time variables used in this manifest. Use {{variableName|\"defaultValue\"}} syntax anywhere in the manifest.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": { "type": "string", "description": "What this variable controls" },
+          "default": { "type": "string", "description": "Default value (should match the default in placeholders)" },
+          "examples": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Example values this variable might take"
+          }
+        }
+      }
+    },
+    "targets": {
+      "type": "object",
+      "description": "Per-target framework configuration for AI-assisted code generation. Links idiom guides, external references, and generation hints for each compilation target.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "idioms": {
+            "type": "string",
+            "description": "Relative path to the framework idiom guide (e.g., './idioms/react.idioms.md')"
+          },
+          "references": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "URLs to framework documentation, llms.txt files, or other references for AI assistants"
+          },
+          "hints": {
+            "type": "object",
+            "description": "Optional hints for AI code generation for this target.",
+            "properties": {
+              "deepReactivity": {
+                "type": "boolean",
+                "description": "Whether the target supports deep reactive proxies. true: direct nested mutations auto-propagate. false: use immutable patterns (spread, produce)."
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "definitions": {
+    "helpersDefinition": {
+      "type": "object",
+      "description": "Pure utility functions that can be called from expressions and templates. Functions must be pure (no side effects) and framework-agnostic.",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "Function body as code string. Parameters are inferred or use arrow function syntax: '(hex) => { return hex.slice(1); }'"
+          },
+          {
+            "type": "object",
+            "required": ["code"],
+            "properties": {
+              "params": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Parameter names for the function"
+              },
+              "code": {
+                "type": "string",
+                "description": "Function body (return statement or expression)"
+              },
+              "description": {
+                "type": "string",
+                "description": "Documentation for this helper function"
+              },
+              "pure": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether this function is pure (no side effects). Non-pure helpers may not be optimizable."
+              }
+            }
+          }
+        ]
+      },
+      "examples": [
+        {
+          "getLuminance": "(hex) => { const r = parseInt(hex.slice(1,3), 16) / 255; const g = parseInt(hex.slice(3,5), 16) / 255; const b = parseInt(hex.slice(5,7), 16) / 255; return 0.2126 * r + 0.7152 * g + 0.0722 * b; }",
+          "getTextColor": {
+            "params": ["bgColor"],
+            "code": "return helpers.getLuminance(bgColor) > 0.5 ? '#172b4d' : '#ffffff';",
+            "description": "Returns appropriate text color (dark or light) for a given background color"
+          }
+        }
+      ]
+    },
+
+    "integrationsDefinition": {
+      "type": "object",
+      "description": "Third-party library configurations. Each integration type has its own schema. Compilers auto-generate init, update, and destroy code appropriate for each target framework.",
+      "properties": {
+        "sortable": {
+          "$ref": "#/definitions/sortableIntegration",
+          "description": "SortableJS drag-and-drop configuration"
+        },
+        "driverjs": {
+          "$ref": "#/definitions/driverjsIntegration",
+          "description": "Driver.js guided tour configuration"
+        },
+        "chartjs": {
+          "$ref": "#/definitions/chartjsIntegration",
+          "description": "Chart.js visualization configuration (v5 enhanced)"
+        },
+        "datatables": {
+          "$ref": "#/definitions/datatablesIntegration",
+          "description": "DataTables table configuration (v5 new)"
+        },
+        "flatpickr": {
+          "$ref": "#/definitions/flatpickrIntegration",
+          "description": "Flatpickr date picker configuration (v5 new)"
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/genericIntegration",
+        "description": "Generic third-party library integration"
+      }
+    },
+
+    "chartjsIntegration": {
+      "type": "object",
+      "description": "Chart.js visualization configuration. Compilers generate framework-appropriate canvas access, chart initialization, reactive updates, and cleanup.",
+      "properties": {
+        "cdn": {
+          "type": "string",
+          "default": "https://cdn.jsdelivr.net/npm/chart.js",
+          "description": "CDN URL for Chart.js (auto-included if not in scripts)"
+        },
+        "instances": {
+          "type": "object",
+          "description": "Named chart instances within components",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["type", "target"],
+            "properties": {
+              "component": {
+                "type": "string",
+                "description": "Component name where this chart lives. If omitted, applies to any component with matching target."
+              },
+              "target": {
+                "type": "string",
+                "description": "CSS selector for the canvas element within the component (e.g., 'canvas', '.chart-canvas', '#myChart')"
+              },
+              "type": {
+                "type": "string",
+                "enum": ["bar", "line", "pie", "doughnut", "radar", "scatter", "bubble", "polarArea"],
+                "description": "Chart type"
+              },
+              "data": {
+                "type": "string",
+                "description": "State path for chart data array (e.g., 'state.revenueHistory', 'store:sales.revenueHistory')"
+              },
+              "labels": {
+                "type": "string",
+                "description": "State path for labels array (e.g., 'state.labels', 'store:sales.labels')"
+              },
+              "datasetLabel": {
+                "type": "string",
+                "description": "Label for the dataset (shown in legend)"
+              },
+              "colors": {
+                "type": "object",
+                "properties": {
+                  "borderColor": { "type": "string" },
+                  "backgroundColor": { "type": "string" },
+                  "fill": { "type": "boolean", "default": true }
+                },
+                "description": "Chart colors configuration"
+              },
+              "options": {
+                "type": "object",
+                "description": "Chart.js options object (passed directly to Chart constructor)"
+              },
+              "reactive": {
+                "type": "boolean",
+                "default": true,
+                "description": "Auto-update chart when data/labels change"
+              },
+              "updateMode": {
+                "type": "string",
+                "enum": ["none", "resize", "reset", "active", "show", "hide"],
+                "default": "none",
+                "description": "Chart.js update mode for reactive updates"
+              },
+              "deferInit": {
+                "type": "string",
+                "enum": ["immediate", "afterPaint", "afterMount"],
+                "default": "immediate",
+                "description": "Initialization timing. 'afterPaint': defer to requestAnimationFrame (library needs rendered dimensions). 'afterMount': defer to next microtask (DOM must settle). 'immediate': init synchronously."
+              },
+              "scanAfterRender": {
+                "type": "boolean",
+                "default": false,
+                "description": "This integration creates DOM that may contain framework components. Frameworks requiring explicit scanning (WildflowerJS) should scan after render."
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "datatablesIntegration": {
+      "type": "object",
+      "description": "DataTables table configuration. Compilers generate framework-appropriate table initialization, reactive data binding, and cleanup. For WildflowerJS, auto-generates wildflower.scan() on draw events when columns contain components.",
+      "properties": {
+        "cdn": {
+          "type": "object",
+          "properties": {
+            "js": {
+              "type": "string",
+              "default": "https://cdn.datatables.net/2.1.8/js/dataTables.min.js",
+              "description": "CDN URL for DataTables JS"
+            },
+            "css": {
+              "type": "string",
+              "default": "https://cdn.datatables.net/2.1.8/css/dataTables.dataTables.min.css",
+              "description": "CDN URL for DataTables CSS"
+            },
+            "jquery": {
+              "type": "string",
+              "default": "https://code.jquery.com/jquery-3.7.1.min.js",
+              "description": "CDN URL for jQuery (required by DataTables)"
+            }
+          }
+        },
+        "instances": {
+          "type": "object",
+          "description": "Named DataTables instances within components",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["target", "data", "columns"],
+            "properties": {
+              "component": {
+                "type": "string",
+                "description": "Component name where this table lives"
+              },
+              "target": {
+                "type": "string",
+                "description": "CSS selector for the table element (e.g., '#employees', '.data-table')"
+              },
+              "data": {
+                "type": "string",
+                "description": "State path for table data array (e.g., 'state.employees', 'store:users.list')"
+              },
+              "columns": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "string",
+                      "description": "Property name in data objects (e.g., 'name', 'salary')"
+                    },
+                    "title": {
+                      "type": "string",
+                      "description": "Column header text (optional, uses 'data' if omitted)"
+                    },
+                    "orderable": {
+                      "type": "boolean",
+                      "default": true,
+                      "description": "Whether column is sortable"
+                    },
+                    "searchable": {
+                      "type": "boolean",
+                      "default": true,
+                      "description": "Whether column is searchable"
+                    },
+                    "render": {
+                      "type": "string",
+                      "description": "Custom render function as code string. Receives (data, type, row, meta). Return HTML string."
+                    },
+                    "component": {
+                      "type": "object",
+                      "description": "Render a UAM component in this column (alternative to render function)",
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "description": "Component name to render"
+                        },
+                        "props": {
+                          "type": "object",
+                          "description": "Props mapping. Values are property paths from row data (e.g., { 'itemName': 'name' })"
+                        }
+                      }
+                    },
+                    "className": {
+                      "type": "string",
+                      "description": "CSS class for column cells"
+                    },
+                    "width": {
+                      "type": "string",
+                      "description": "Column width (e.g., '100px', '20%')"
+                    }
+                  }
+                },
+                "description": "Column definitions"
+              },
+              "options": {
+                "type": "object",
+                "description": "DataTables options (pageLength, lengthMenu, order, etc.)",
+                "properties": {
+                  "pageLength": { "type": "number", "default": 10 },
+                  "lengthMenu": {
+                    "type": "array",
+                    "items": { "type": "number" },
+                    "default": [5, 10, 25, 50]
+                  },
+                  "ordering": { "type": "boolean", "default": true },
+                  "searching": { "type": "boolean", "default": true },
+                  "paging": { "type": "boolean", "default": true },
+                  "info": { "type": "boolean", "default": true }
+                },
+                "additionalProperties": true
+              },
+              "reactive": {
+                "type": "boolean",
+                "default": true,
+                "description": "Auto-update table when data changes (preserves sort/page state)"
+              },
+              "preserveState": {
+                "type": "object",
+                "properties": {
+                  "order": { "type": "boolean", "default": true, "description": "Preserve sort order on data update" },
+                  "page": { "type": "boolean", "default": true, "description": "Preserve current page on data update" },
+                  "search": { "type": "boolean", "default": false, "description": "Preserve search filter on data update" }
+                },
+                "description": "What table state to preserve during reactive updates"
+              },
+              "stateProperty": {
+                "type": "string",
+                "default": "datatable",
+                "description": "Component state property to store DataTable instance (for method access)"
+              },
+              "deferInit": {
+                "type": "string",
+                "enum": ["immediate", "afterPaint", "afterMount"],
+                "default": "immediate",
+                "description": "Initialization timing. 'afterPaint': defer to requestAnimationFrame (library needs rendered dimensions). 'afterMount': defer to next microtask (DOM must settle). 'immediate': init synchronously."
+              },
+              "scanAfterRender": {
+                "type": "boolean",
+                "default": false,
+                "description": "This integration creates DOM that may contain framework components. Frameworks requiring explicit scanning (WildflowerJS) should scan after render."
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "flatpickrIntegration": {
+      "type": "object",
+      "description": "Flatpickr date/time picker configuration. Compilers generate framework-appropriate input binding, picker initialization, value synchronization, and cleanup.",
+      "properties": {
+        "cdn": {
+          "type": "object",
+          "properties": {
+            "js": {
+              "type": "string",
+              "default": "https://cdn.jsdelivr.net/npm/flatpickr",
+              "description": "CDN URL for Flatpickr JS"
+            },
+            "css": {
+              "type": "string",
+              "default": "https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css",
+              "description": "CDN URL for Flatpickr CSS"
+            }
+          }
+        },
+        "instances": {
+          "type": "object",
+          "description": "Named Flatpickr instances within components",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["target", "value"],
+            "properties": {
+              "component": {
+                "type": "string",
+                "description": "Component name where this picker lives"
+              },
+              "target": {
+                "type": "string",
+                "description": "CSS selector for the input element (e.g., '.date-input', '#startDate')"
+              },
+              "value": {
+                "type": "string",
+                "description": "State path for the selected date value (e.g., 'state.selectedDate'). Two-way bound."
+              },
+              "options": {
+                "type": "object",
+                "description": "Flatpickr options",
+                "properties": {
+                  "dateFormat": {
+                    "type": "string",
+                    "default": "Y-m-d",
+                    "description": "Date format string"
+                  },
+                  "enableTime": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable time selection"
+                  },
+                  "noCalendar": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Time picker only (no calendar)"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": ["single", "multiple", "range"],
+                    "default": "single",
+                    "description": "Selection mode"
+                  },
+                  "minDate": {
+                    "type": "string",
+                    "description": "Minimum selectable date (ISO string or 'today')"
+                  },
+                  "maxDate": {
+                    "type": "string",
+                    "description": "Maximum selectable date (ISO string or 'today')"
+                  },
+                  "defaultDate": {
+                    "type": "string",
+                    "description": "Default selected date"
+                  },
+                  "inline": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Show calendar inline (always visible)"
+                  }
+                },
+                "additionalProperties": true
+              },
+              "stateProperty": {
+                "type": "string",
+                "default": "picker",
+                "description": "Component state property to store Flatpickr instance (for method access)"
+              },
+              "deferInit": {
+                "type": "string",
+                "enum": ["immediate", "afterPaint", "afterMount"],
+                "default": "immediate",
+                "description": "Initialization timing. 'afterPaint': defer to requestAnimationFrame (library needs rendered dimensions). 'afterMount': defer to next microtask (DOM must settle). 'immediate': init synchronously."
+              },
+              "scanAfterRender": {
+                "type": "boolean",
+                "default": false,
+                "description": "This integration creates DOM that may contain framework components. Frameworks requiring explicit scanning (WildflowerJS) should scan after render."
+              }
+            }
+          }
+        }
+      }
+    },
+
+    "sortableIntegration": {
+      "type": "object",
+      "description": "SortableJS drag-and-drop list configuration",
+      "required": ["lists"],
+      "properties": {
+        "lists": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["selector"],
+            "properties": {
+              "selector": {
+                "type": "string",
+                "description": "CSS selector for the sortable container(s)"
+              },
+              "group": {
+                "type": "string",
+                "description": "Group name for cross-list dragging"
+              },
+              "handle": {
+                "type": "string",
+                "description": "CSS selector for drag handle within items"
+              },
+              "animation": {
+                "type": "number",
+                "default": 150,
+                "description": "Animation duration in ms"
+              },
+              "classes": {
+                "type": "object",
+                "properties": {
+                  "ghost": { "type": "string", "description": "Class for drop placeholder" },
+                  "chosen": { "type": "string", "description": "Class for selected item" },
+                  "drag": { "type": "string", "description": "Class while dragging" }
+                }
+              },
+              "itemKey": {
+                "type": "string",
+                "description": "Data attribute name for item identifier (e.g., 'card-id' for data-card-id)"
+              },
+              "containerKey": {
+                "type": "string",
+                "description": "Data attribute name for container identifier (e.g., 'col-id' for data-col-id)"
+              },
+              "onSort": {
+                "$ref": "#/definitions/sortableEventHandler",
+                "description": "Called when item is sorted within same list"
+              },
+              "onMove": {
+                "$ref": "#/definitions/sortableEventHandler",
+                "description": "Called when item is moved to different list"
+              },
+              "onEnd": {
+                "$ref": "#/definitions/sortableEventHandler",
+                "description": "Called when drag ends (sort or move)"
+              },
+              "deferInit": {
+                "type": "string",
+                "enum": ["immediate", "afterPaint", "afterMount"],
+                "default": "immediate",
+                "description": "Initialization timing. 'afterPaint': defer to requestAnimationFrame (library needs rendered dimensions). 'afterMount': defer to next microtask (DOM must settle). 'immediate': init synchronously."
+              },
+              "scanAfterRender": {
+                "type": "boolean",
+                "default": false,
+                "description": "This integration creates DOM that may contain framework components. Frameworks requiring explicit scanning (WildflowerJS) should scan after render."
+              }
+            }
+          }
+        },
+        "cdn": {
+          "type": "string",
+          "description": "CDN URL for SortableJS (auto-included if not in scripts)"
+        }
+      }
+    },
+
+    "sortableEventHandler": {
+      "type": "object",
+      "description": "Handler for sortable events",
+      "properties": {
+        "store": {
+          "type": "string",
+          "description": "Store name to call method on"
+        },
+        "method": {
+          "type": "string",
+          "description": "Store method to call"
+        },
+        "params": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["itemId", "fromContainerId", "toContainerId", "oldIndex", "newIndex", "item", "from", "to"]
+          },
+          "description": "Parameters to extract from event and pass to method"
+        }
+      }
+    },
+
+    "driverjsIntegration": {
+      "type": "object",
+      "description": "Driver.js guided tour configuration",
+      "properties": {
+        "tours": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["steps"],
+            "properties": {
+              "showProgress": { "type": "boolean", "default": true },
+              "showButtons": {
+                "type": "array",
+                "items": { "type": "string", "enum": ["next", "previous", "close"] }
+              },
+              "steps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["element"],
+                  "properties": {
+                    "element": { "type": "string", "description": "CSS selector for highlighted element" },
+                    "title": { "type": "string" },
+                    "description": { "type": "string" },
+                    "side": { "type": "string", "enum": ["top", "right", "bottom", "left"] }
+                  }
+                }
+              }
+            }
+          },
+          "description": "Named tours (e.g., 'welcome', 'featureTour')"
+        },
+        "cdn": {
+          "type": "string",
+          "description": "CDN URL for Driver.js"
+        },
+        "cssUrl": {
+          "type": "string",
+          "description": "CDN URL for Driver.js CSS"
+        }
+      }
+    },
+
+    "genericIntegration": {
+      "type": "object",
+      "description": "Generic third-party library integration for libraries not explicitly supported",
+      "properties": {
+        "cdn": {
+          "type": "string",
+          "description": "CDN URL to load the library"
+        },
+        "cssUrl": {
+          "type": "string",
+          "description": "Optional CSS URL to load"
+        },
+        "global": {
+          "type": "string",
+          "description": "Global variable name the library exposes (e.g., 'Sortable', 'Chart')"
+        },
+        "init": {
+          "type": "string",
+          "description": "Initialization code to run after library loads. Has access to the global variable."
+        },
+        "mountHook": {
+          "type": "string",
+          "description": "Code to run when component mounts. Useful for per-component library setup."
+        },
+        "unmountHook": {
+          "type": "string",
+          "description": "Code to run when component unmounts. Useful for cleanup."
+        },
+        "instances": {
+          "type": "object",
+          "description": "Named instances of this integration within components",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "deferInit": {
+                "type": "string",
+                "enum": ["immediate", "afterPaint", "afterMount"],
+                "default": "immediate",
+                "description": "Initialization timing. 'afterPaint': defer to requestAnimationFrame (library needs rendered dimensions). 'afterMount': defer to next microtask (DOM must settle). 'immediate': init synchronously."
+              },
+              "scanAfterRender": {
+                "type": "boolean",
+                "default": false,
+                "description": "This integration creates DOM that may contain framework components. Frameworks requiring explicit scanning (WildflowerJS) should scan after render."
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+
+    "pluginReference": {
+      "description": "Reference to a UAM plugin from /www/js/uam/plugins/",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Plugin name (shorthand, uses default variant resolution)"
+        },
+        {
+          "type": "object",
+          "required": ["name"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Plugin name (folder name in /www/js/uam/plugins/)"
+            },
+            "variant": {
+              "type": "string",
+              "description": "Force a specific variant (e.g., 'universal', 'wildflower', 'vue'). Default: auto-resolve based on target framework."
+            },
+            "config": {
+              "type": "object",
+              "description": "Configuration options passed to the plugin at initialization"
+            },
+            "global": {
+              "type": "string",
+              "description": "Override the global variable name for this plugin"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+
+    "routingConfig": {
+      "type": "object",
+      "description": "Application routing configuration",
+      "required": ["mode", "routes"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["hash", "history"],
+          "description": "hash: Uses URL hash (/#/path) - works with static hosting. history: Uses History API (/path) - requires server-side routing fallback."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["view", "component"],
+          "default": "view",
+          "description": "view: Routes map to view state values. component: Routes render different components."
+        },
+        "stateBinding": {
+          "type": "string",
+          "description": "For view-based routing: store.property path that controls the view (e.g., 'ui.view')"
+        },
+        "routes": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/routeDefinition" },
+          "description": "Route definitions"
+        },
+        "viewTransitions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable View Transitions API for smooth page transitions"
+        },
+        "transitionClass": {
+          "type": "string",
+          "description": "CSS class applied during view transitions"
+        },
+        "transitionDuration": {
+          "type": "number",
+          "description": "Transition duration in milliseconds"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "routeDefinition": {
+      "type": "object",
+      "description": "Individual route configuration",
+      "required": ["path", "name"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "URL path pattern. Use :param for dynamic segments (e.g., '/product/:id')"
+        },
+        "name": {
+          "type": "string",
+          "description": "Unique route name for programmatic navigation"
+        },
+        "view": {
+          "type": "string",
+          "description": "For view-based routing: the view state value this route represents"
+        },
+        "component": {
+          "type": "string",
+          "description": "For component-based routing: component name to render"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Map URL params to state paths (e.g., { 'id': 'ui.selectedProductId' })"
+        },
+        "queryParams": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Query parameters to sync with store state (e.g., ['category', 'search'])"
+        },
+        "queryParamBindings": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Map query params to specific state paths (e.g., { 'category': 'ui.categoryFilter' })"
+        },
+        "transition": {
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "string" }
+          ],
+          "description": "Per-route transition control: false to disable, true to use default, or string for custom transition name"
+        },
+        "guards": {
+          "type": "object",
+          "properties": {
+            "before": {
+              "type": "string",
+              "description": "Guard code run before entering route. Return false to cancel, or a path string to redirect. Has access to: from, to, params, query."
+            },
+            "after": {
+              "type": "string",
+              "description": "Code run after route loads successfully. Has access to: from, to, params, query."
+            }
+          },
+          "additionalProperties": false,
+          "description": "Route guards for authentication, authorization, or data loading"
+        }
+      },
+      "additionalProperties": false
+    },
+
+
+    "bindingSource": {
+      "description": "Explicit binding source - eliminates ambiguity about data origin",
+      "oneOf": [
+        {
+          "type": "object",
+          "description": "Standard source types: state, props, computed, item, index",
+          "required": ["source", "path"],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["state", "props", "computed", "item", "index"],
+              "description": "state: Component state. props: Component props. computed: Computed property. item: Current loop item. index: Current loop index (0-based)."
+            },
+            "path": {
+              "type": "string",
+              "description": "Property path (e.g., 'count', 'user.name', 'items.length'). For 'index' source, path is optional."
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Store binding - access global store data",
+          "required": ["source", "store", "path"],
+          "properties": {
+            "source": { "const": "store" },
+            "store": { "type": "string", "description": "Store name" },
+            "path": { "type": "string", "description": "Path within store (e.g., 'state.items', 'computed.total')" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Expression binding - for complex JavaScript expressions",
+          "required": ["source", "expression"],
+          "properties": {
+            "source": { "const": "expression" },
+            "expression": { "type": "string", "description": "JavaScript expression to evaluate. Has access to: state, props, computed, item, index, helpers, stores." }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Helper call binding - call a helper function with arguments",
+          "required": ["source", "helper"],
+          "properties": {
+            "source": { "const": "helper" },
+            "helper": { "type": "string", "description": "Helper function name from the helpers section" },
+            "args": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/bindingSource" },
+              "description": "Arguments to pass to the helper, each can be any binding source"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+
+    "styleBinding": {
+      "description": "Style binding supporting both static and computed styles",
+      "oneOf": [
+        {
+          "$ref": "#/definitions/bindingSource",
+          "description": "Single binding source that returns a style string or object"
+        },
+        {
+          "type": "object",
+          "description": "Object with individual style properties, each can be static or bound",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "description": "Static CSS value" },
+              { "$ref": "#/definitions/bindingSource", "description": "Dynamic value from binding" }
+            ]
+          }
+        }
+      ]
+    },
+
+    "conditionalBinding": {
+      "type": "object",
+      "description": "Conditional rendering with explicit strategy",
+      "required": ["when", "strategy"],
+      "properties": {
+        "when": {
+          "$ref": "#/definitions/bindingSource",
+          "description": "Condition to evaluate (truthy = show/render)"
+        },
+        "strategy": {
+          "type": "string",
+          "enum": ["visibility", "presence"],
+          "description": "visibility: CSS display toggle (element stays in DOM, preserves state). presence: DOM insertion/removal (element removed, state lost)."
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "modelBinding": {
+      "type": "object",
+      "description": "Two-way data binding for form elements",
+      "required": ["path", "type"],
+      "properties": {
+        "path": {
+          "$ref": "#/definitions/bindingSource",
+          "description": "State path to bind (must be writable - typically state source)"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["text", "checkbox", "radio", "select", "textarea", "color", "number", "range"],
+          "description": "Element type - determines event (input vs change) and value extraction (value vs checked)"
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "eventBinding": {
+      "description": "Event handler configuration",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Simple handler name (shorthand for { handler: 'name' })"
+        },
+        {
+          "type": "object",
+          "required": ["handler"],
+          "properties": {
+            "handler": {
+              "type": "string",
+              "description": "Method name to call"
+            },
+            "provides": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["event", "item", "index", "element", "value"]
+              },
+              "description": "Context to pass to handler. 'value' extracts event.target.value automatically."
+            },
+            "args": {
+              "type": "object",
+              "additionalProperties": { "$ref": "#/definitions/bindingSource" },
+              "description": "Additional arguments to pass, each resolved from a binding source"
+            },
+            "modifiers": {
+              "type": "object",
+              "properties": {
+                "prevent": { "type": "boolean", "description": "Call event.preventDefault()" },
+                "stop": { "type": "boolean", "description": "Call event.stopPropagation()" },
+                "once": { "type": "boolean", "description": "Remove listener after first trigger" },
+                "capture": { "type": "boolean", "description": "Use capture phase" },
+                "debounce": { "type": "number", "description": "Debounce handler by N milliseconds" },
+                "throttle": { "type": "number", "description": "Throttle handler by N milliseconds" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+
+    "bindings": {
+      "type": "object",
+      "description": "Element data bindings",
+      "properties": {
+        "text": { "$ref": "#/definitions/bindingSource", "description": "Text content binding" },
+        "html": { "$ref": "#/definitions/bindingSource", "description": "HTML content binding (XSS caution)" },
+        "class": { "$ref": "#/definitions/bindingSource", "description": "CSS class binding - should return class string" },
+        "style": { "$ref": "#/definitions/styleBinding", "description": "Inline style binding - can be binding source, or object with per-property bindings" },
+        "attrs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/bindingSource" },
+          "description": "Dynamic attribute bindings (e.g., { 'data-id': { source: 'item', path: 'id' } })"
+        },
+        "conditional": { "$ref": "#/definitions/conditionalBinding", "description": "Conditional visibility/presence" },
+        "model": { "$ref": "#/definitions/modelBinding", "description": "Two-way form binding" },
+        "portal": { "type": "boolean", "description": "Render at document.body (modals, dropdowns)" },
+        "transition": {
+          "type": "object",
+          "description": "CSS transition for element enter/leave. Applied when element is conditionally shown/hidden.",
+          "properties": {
+            "enter": { "type": "string", "description": "CSS class for enter animation" },
+            "leave": { "type": "string", "description": "CSS class for leave animation" },
+            "duration": { "type": "number", "description": "Transition duration in milliseconds" }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "loopNode": {
+      "type": "object",
+      "description": "List rendering. Provides context: item (aliased by 'as'), index (0-based number), count (total), first (boolean), last (boolean). Supports nested loops - inner loops can access outer loop context via their 'as' aliases.",
+      "required": ["source", "as", "template"],
+      "properties": {
+        "source": { "$ref": "#/definitions/bindingSource", "description": "Array to iterate" },
+        "as": { "type": "string", "description": "Item variable name for template access" },
+        "indexAs": { "type": "string", "description": "Optional alias for index (default: 'index')" },
+        "key": { "type": "string", "description": "Unique key path for efficient reconciliation (e.g., 'id' resolves to item.id)" },
+        "template": { "$ref": "#/definitions/templateNode", "description": "Template for each item - can contain nested loops" },
+        "empty": { "$ref": "#/definitions/templateNode", "description": "Template to render when array is empty" },
+        "filter": {
+          "type": "string",
+          "description": "Optional filter expression. Has access to item and index. Return true to include."
+        },
+        "trackBy": {
+          "type": "string",
+          "description": "Property path for identity tracking during updates (alternative to key)"
+        },
+        "transition": {
+          "type": "object",
+          "description": "Transition for list item add/remove animations.",
+          "properties": {
+            "enter": { "type": "string", "description": "CSS class for item enter animation" },
+            "leave": { "type": "string", "description": "CSS class for item leave animation" },
+            "duration": { "type": "number", "description": "Transition duration in milliseconds" }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "codeDefinition": {
+      "description": "Code definition for computed properties and methods with optional dependency and generation hints",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Code string (shorthand, no hints)"
+        },
+        {
+          "type": "object",
+          "required": ["code"],
+          "properties": {
+            "uses": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Store names this code accesses. Compilers inject store references via getStore()."
+            },
+            "usesPlugins": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Plugin names this code accesses."
+            },
+            "usesComponents": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Component names this code accesses."
+            },
+            "usesHelpers": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Helper function names this code accesses. Compilers make helpers available."
+            },
+            "code": {
+              "type": "string",
+              "description": "JavaScript code body"
+            },
+            "expensive": {
+              "type": "boolean",
+              "description": "Hint for computed properties: whether this derivation is expensive (array filter/reduce/sort). When true, AI generators should use memoization (useMemo, createMemo, Pinia getter). When false, inline access is fine."
+            },
+            "depends": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Explicit dependency list for memoization (e.g., ['products.all', 'ui.categoryFilter']). Helps AI generators produce correct dependency arrays."
+            },
+            "params": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Named parameters for methods (e.g., ['product']). AI generators should use these instead of generic 'args' objects."
+            },
+            "modifiesState": {
+              "type": "boolean",
+              "description": "Hint for methods: whether this method mutates store state. Helps AI generators decide whether to wrap in set() (Zustand) or use produce() (Solid)."
+            },
+            "navigates": {
+              "type": "boolean",
+              "description": "Hint for methods: whether this method involves route navigation. Helps AI generators inject router/navigate dependencies."
+            }
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+
+    "methodDefinition": {
+      "$ref": "#/definitions/codeDefinition",
+      "description": "Component/store method definition"
+    },
+
+    "validationRule": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["required", "minLength", "maxLength", "min", "max", "pattern", "match", "custom"],
+          "description": "Validation rule type"
+        },
+        "value": {
+          "description": "Rule parameter: number for min/max/length, string/preset for pattern, field name for match, code for custom"
+        },
+        "message": {
+          "type": "string",
+          "description": "Error message when validation fails"
+        }
+      }
+    },
+
+    "validationConfig": {
+      "type": "object",
+      "description": "Field validation configuration",
+      "required": ["rules"],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/validationRule" },
+          "description": "Validation rules (checked in order, first failure stops)"
+        },
+        "validateOn": {
+          "type": "string",
+          "enum": ["change", "blur", "submit"],
+          "default": "change",
+          "description": "When to trigger validation"
+        },
+        "trim": {
+          "type": "boolean",
+          "default": false,
+          "description": "Trim whitespace before validating"
+        }
+      }
+    },
+
+    "stateProperty": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["string", "number", "boolean", "array", "object"],
+          "description": "Property data type"
+        },
+        "default": { "description": "Default value (type should match)" },
+        "validation": {
+          "$ref": "#/definitions/validationConfig",
+          "description": "Validation rules for this field."
+        }
+      }
+    },
+
+    "propDefinition": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["string", "number", "boolean", "array", "object"] },
+        "required": { "type": "boolean", "description": "Is this prop required?" },
+        "default": { "description": "Default value if not provided" }
+      }
+    },
+
+    "storeDefinition": {
+      "type": "object",
+      "description": "Global reactive store definition",
+      "properties": {
+        "static": {
+          "type": "boolean",
+          "default": false,
+          "description": "Hint: data never changes at runtime. AI generators should use a plain const instead of a reactive store."
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/stateProperty" },
+          "description": "Reactive state properties"
+        },
+        "computed": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/codeDefinition" },
+          "description": "Computed properties."
+        },
+        "methods": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/methodDefinition" },
+          "description": "Store methods"
+        },
+        "init": {
+          "$ref": "#/definitions/codeDefinition",
+          "description": "Initialization code (runs when store is created)"
+        },
+        "persistence": {
+          "type": "object",
+          "description": "Persistence configuration for automatic state saving/loading",
+          "properties": {
+            "storageKey": {
+              "type": "string",
+              "description": "Key name for localStorage/sessionStorage (e.g., 'my-app-data')"
+            },
+            "storage": {
+              "type": "string",
+              "enum": ["local", "session"],
+              "default": "local",
+              "description": "Storage type: 'local' for localStorage, 'session' for sessionStorage"
+            },
+            "autoSave": {
+              "type": "boolean",
+              "default": true,
+              "description": "Automatically save state on every change"
+            },
+            "debounce": {
+              "type": "number",
+              "description": "Debounce save operations by N milliseconds"
+            },
+            "include": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Only persist these state paths (whitelist)"
+            },
+            "exclude": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Don't persist these state paths (blacklist)"
+            }
+          }
+        },
+        "watch": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/codeDefinition" },
+          "description": "Watch handlers for reactive state changes. Equivalent: React useEffect with deps, Vue watch, Solid createEffect, WF watch block."
+        },
+        "destroy": {
+          "$ref": "#/definitions/codeDefinition",
+          "description": "Cleanup code when store is torn down. For clearing intervals, closing connections, unsubscribing."
+        },
+        "subscribe": {
+          "type": "object",
+          "description": "Declarative subscriptions to other stores. Enables cross-store reactivity. Note: subscribe schema may be refined in v8.",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Array of state paths to observe (e.g., ['cpuLoad', 'items'])"
+          }
+        },
+        "lifecycle": {
+          "type": "object",
+          "properties": {
+            "onStoreUpdate": {
+              "$ref": "#/definitions/codeDefinition",
+              "description": "Called when a subscribed store path changes. Receives (storeName, path, newValue, oldValue)."
+            }
+          }
+        },
+        "refs": {
+          "type": "object",
+          "description": "Non-reactive instance references. For third-party library instances (charts, maps, sortable), DOM references, and values that persist without triggering reactivity.",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "description": "Type hint (e.g., 'Chart', 'L.Map', 'Sortable')" },
+              {
+                "type": "object",
+                "properties": {
+                  "type": { "type": "string" },
+                  "description": { "type": "string" },
+                  "cleanupOnDestroy": { "type": "boolean", "default": true }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+
+    "componentDefinition": {
+      "type": "object",
+      "required": ["template"],
+      "properties": {
+        "props": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/propDefinition" },
+          "description": "Component props schema"
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/stateProperty" },
+          "description": "Component local state"
+        },
+        "computed": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/codeDefinition" },
+          "description": "Computed properties."
+        },
+        "methods": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/methodDefinition" },
+          "description": "Component methods"
+        },
+        "subscribe": {
+          "type": "object",
+          "description": "Store subscriptions - auto-injects stores via this.stores and triggers onStoreUpdate lifecycle hook",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Array of state paths to subscribe to (e.g., ['items', 'selectedId'])"
+          }
+        },
+        "integrations": {
+          "type": "object",
+          "description": "Component-level integration instances. References integration types defined at manifest level.",
+          "additionalProperties": {
+            "type": "string",
+            "description": "Integration instance name (must match an instance defined in manifest integrations)"
+          }
+        },
+        "init": {
+          "$ref": "#/definitions/codeDefinition",
+          "description": "Initialization code (legacy, prefer lifecycle.mount)"
+        },
+        "destroy": {
+          "$ref": "#/definitions/codeDefinition",
+          "description": "Cleanup code (legacy, prefer lifecycle.unmount)"
+        },
+        "lifecycle": {
+          "type": "object",
+          "properties": {
+            "beforeInit": { "$ref": "#/definitions/codeDefinition", "description": "Called before DOM bindings. Use to access this.listItem for components in lists." },
+            "mount": { "$ref": "#/definitions/codeDefinition", "description": "Called after component mounts to DOM" },
+            "unmount": { "$ref": "#/definitions/codeDefinition", "description": "Called before component unmounts" },
+            "update": { "$ref": "#/definitions/codeDefinition", "description": "Called after reactive updates" },
+            "onStoreUpdate": { "$ref": "#/definitions/codeDefinition", "description": "Called when subscribed store paths change. Receives (storeName, changes) arguments." }
+          }
+        },
+        "watch": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/codeDefinition" },
+          "description": "Watch handlers for reactive property changes."
+        },
+        "refs": {
+          "type": "object",
+          "description": "Non-reactive instance references. For third-party library instances (charts, maps, sortable), DOM references, and values that persist without triggering reactivity.",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "description": "Type hint (e.g., 'Chart', 'L.Map', 'Sortable')" },
+              {
+                "type": "object",
+                "properties": {
+                  "type": { "type": "string" },
+                  "description": { "type": "string" },
+                  "cleanupOnDestroy": { "type": "boolean", "default": true }
+                }
+              }
+            ]
+          }
+        },
+        "errorBoundary": {
+          "type": "object",
+          "properties": {
+            "onError": {
+              "type": "string",
+              "description": "Error handler code. Receives (error, errorInfo). Return false to stop propagation."
+            },
+            "fallback": {
+              "$ref": "#/definitions/templateNode",
+              "description": "Template to render when an error occurs."
+            }
+          },
+          "additionalProperties": false,
+          "description": "Error boundary configuration"
+        },
+        "template": { "$ref": "#/definitions/templateNode" }
+      }
+    },
+
+    "templateNode": {
+      "description": "A node in the component template tree",
+      "oneOf": [
+        { "$ref": "#/definitions/elementNode" },
+        { "$ref": "#/definitions/textNode" },
+        { "$ref": "#/definitions/bindingNode" },
+        { "$ref": "#/definitions/componentNode" },
+        { "$ref": "#/definitions/conditionalNode" },
+        { "$ref": "#/definitions/loopTemplateNode" }
+      ]
+    },
+
+    "elementNode": {
+      "type": "object",
+      "required": ["type", "tag"],
+      "properties": {
+        "type": { "const": "element" },
+        "tag": { "type": "string", "description": "HTML tag name" },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Static HTML attributes"
+        },
+        "bindings": { "$ref": "#/definitions/bindings" },
+        "events": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/eventBinding" },
+          "description": "Event handlers (key is event name: click, input, etc.)"
+        },
+        "loop": { "$ref": "#/definitions/loopNode", "description": "List rendering for this element" },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/templateNode" },
+          "description": "Child nodes"
+        }
+      }
+    },
+
+    "loopTemplateNode": {
+      "type": "object",
+      "description": "Standalone loop node (alternative to element.loop for cleaner nested loops)",
+      "required": ["type", "loop"],
+      "properties": {
+        "type": { "const": "loop" },
+        "loop": { "$ref": "#/definitions/loopNode" }
+      }
+    },
+
+    "textNode": {
+      "type": "object",
+      "required": ["type", "value"],
+      "properties": {
+        "type": { "const": "text" },
+        "value": { "type": "string", "description": "Static text content" }
+      }
+    },
+
+    "bindingNode": {
+      "type": "object",
+      "description": "Inline text binding (for mixed static + dynamic text)",
+      "required": ["type", "source"],
+      "properties": {
+        "type": { "const": "binding" },
+        "source": { "$ref": "#/definitions/bindingSource" }
+      }
+    },
+
+    "componentNode": {
+      "type": "object",
+      "required": ["type", "name"],
+      "properties": {
+        "type": { "const": "component" },
+        "name": { "type": "string", "description": "Component name to render" },
+        "props": {
+          "type": "object",
+          "description": "Props to pass - values can be literals or binding sources"
+        },
+        "slot": {
+          "$ref": "#/definitions/templateNode",
+          "description": "Default slot content to render inside component"
+        },
+        "slots": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/templateNode" },
+          "description": "Named slots content"
+        }
+      }
+    },
+
+    "conditionalNode": {
+      "type": "object",
+      "description": "If/else conditional rendering",
+      "required": ["type", "condition", "then"],
+      "properties": {
+        "type": { "const": "conditional" },
+        "condition": { "$ref": "#/definitions/bindingSource" },
+        "then": { "$ref": "#/definitions/templateNode", "description": "Render if condition is truthy" },
+        "else": { "$ref": "#/definitions/templateNode", "description": "Render if condition is falsy (optional)" }
+      }
+    }
+  }
+}
