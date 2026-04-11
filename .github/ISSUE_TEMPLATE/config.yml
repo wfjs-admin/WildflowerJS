@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://wildflowerjs.com
+    about: Check the docs for guides, API reference, and examples.
+  - name: Questions & Discussions
+    url: https://github.com/wfjs-admin/WildflowerJS/discussions
+    about: Ask questions and discuss ideas with the community.

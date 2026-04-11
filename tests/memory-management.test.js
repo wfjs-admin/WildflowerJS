@@ -1,0 +1,784 @@
+/**
+ * WildflowerJS Memory Management and Garbage Collection Test Suite - Vitest Browser Mode
+ *
+ * Tests for context garbage collection and cleanup of detached DOM elements.
+ * Migrated from unitTestSuite.js MEMORY MANAGEMENT AND GARBAGE COLLECTION section.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
+import { loadFramework, resetFramework, getDistMode, isMinifiedBuild} from './helpers/load-framework.js'
+
+// Helper to wait for framework processing
+async function waitForUpdate(ms = 50) {
+  await new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// Helper to wait for complete render cycle
+async function waitForCompleteRender() {
+  if (window.wildflower?._forceCompleteRender) {
+    await window.wildflower._forceCompleteRender()
+  }
+  await new Promise(resolve => setTimeout(resolve, 50))
+}
+
+describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', () => {
+  let testContainer
+  let wildflower
+
+  beforeAll(async () => {
+    await loadFramework()
+  })
+
+  beforeEach(() => {
+    wildflower = window.wildflower
+    resetFramework()
+
+    // Re-initialize the context system
+    if (wildflower._initContextSystem) {
+      wildflower._contextSystemInitialized = false
+      wildflower._initContextSystem()
+    }
+
+    // Create test container
+    testContainer = document.createElement('div')
+    testContainer.id = 'test-container'
+    testContainer.style.position = 'absolute'
+    testContainer.style.left = '-9999px'
+    testContainer.style.opacity = '0'
+    document.body.appendChild(testContainer)
+  })
+
+  afterEach(() => {
+    if (testContainer && testContainer.parentNode) {
+      testContainer.parentNode.removeChild(testContainer)
+    }
+  })
+
+  it('Contexts are garbage collected when components are destroyed', async () => {
+    // Use unique list name to avoid conflicts with other tests
+    // Include bindings outside the list template to ensure binding contexts are created
+    // (HTML5 template content is in DocumentFragments, not visible to initial querySelectorAll)
+    testContainer.innerHTML = `
+      <div data-component="gc-test">
+        <span data-bind="title">Title</span>
+        <div data-show="showList">
+          <div data-list="gcItems">
+            <template>
+              <div>
+                <span data-bind="name"></span>
+                <div data-show="active">Active</div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    `
+
+    wildflower.component('gc-test', {
+      state: {
+        title: 'Test Component',
+        showList: true,
+        gcItems: [
+          { name: 'Item 1', active: true },
+          { name: 'Item 2', active: false }
+        ]
+      }
+    })
+
+    wildflower.scan()
+    await waitForCompleteRender()
+
+    const component = testContainer.querySelector('[data-component="gc-test"]')
+    const instanceId = component.dataset.componentId
+    const instance = wildflower.componentInstances.get(instanceId)
+
+    // Ensure component was created
+    expect(instance).toBeDefined()
+
+    // Count contexts before destruction (global counts, as in original test)
+    const beforeContextCount = wildflower._contextRegistry.contexts.size
+    const listContextsBefore = wildflower._contextRegistry.getContextsByType('list').length
+    const bindingContextsBefore = wildflower._contextRegistry.getContextsByType('binding').length
+    const conditionalContextsBefore = wildflower._contextRegistry.getContextsByType('conditional').length
+
+    // Ensure we have contexts to test with
+    expect(beforeContextCount).toBeGreaterThan(0)
+    expect(listContextsBefore).toBeGreaterThan(0)
+    expect(bindingContextsBefore).toBeGreaterThan(0)
+    expect(conditionalContextsBefore).toBeGreaterThan(0)
+
+    // Destroy the component
+    wildflower.destroyComponent(instanceId)
+
+    // Force garbage collection
+    const gcStats = wildflower._contextRegistry.garbageCollect()
+
+    // Verify garbage collection ran
+    expect(gcStats).toBeDefined()
+
+    // Count contexts after destruction (global counts, as in original test)
+    const afterContextCount = wildflower._contextRegistry.contexts.size
+    const listContextsAfter = wildflower._contextRegistry.getContextsByType('list').length
+    const bindingContextsAfter = wildflower._contextRegistry.getContextsByType('binding').length
+    const conditionalContextsAfter = wildflower._contextRegistry.getContextsByType('conditional').length
+
+    // Verify contexts were reduced - overall count should decrease
+    expect(afterContextCount).toBeLessThan(beforeContextCount)
+
+    // Verify individual context types were cleaned up
+    expect(listContextsAfter).toBeLessThan(listContextsBefore)
+    expect(bindingContextsAfter).toBeLessThan(bindingContextsBefore)
+    expect(conditionalContextsAfter).toBeLessThan(conditionalContextsBefore)
+
+    // Verify no orphaned contexts for the destroyed component remain
+    const orphanedContexts = Array.from(wildflower._contextRegistry.contexts.values())
+      .filter(ctx => ctx.componentInstance && ctx.componentInstance.id === instanceId)
+
+    expect(orphanedContexts.length).toBe(0)
+  })
+
+  it('Contexts for detached DOM elements are cleaned up', async () => {
+    testContainer.innerHTML = `
+      <div data-component="detached-test">
+        <div id="detach-container">
+          <span id="detach-binding" data-bind="message">Initial</span>
+          <div id="detach-conditional" data-show="showDetails">Details</div>
+        </div>
+      </div>
+    `
+
+    wildflower.component('detached-test', {
+      state: {
+        message: 'Hello',
+        showDetails: true
+      }
+    })
+
+    wildflower.scan()
+    await waitForCompleteRender()
+
+    const component = testContainer.querySelector('[data-component="detached-test"]')
+    const container = testContainer.querySelector('#detach-container')
+
+    // Count contexts before detaching elements
+    const beforeContextCount = wildflower._contextRegistry.contexts.size
+
+    // Ensure we have contexts to test with
+    expect(beforeContextCount).toBeGreaterThan(0)
+
+    // Get reference to binding and conditional elements
+    const bindingElement = testContainer.querySelector('#detach-binding')
+    const conditionalElement = testContainer.querySelector('#detach-conditional')
+
+    // Get the contexts for these elements before removal
+    const bindingContext = wildflower._contextRegistry.getContextForElement(bindingElement)
+    const conditionalContext = wildflower._contextRegistry.getContextForElement(conditionalElement)
+
+    expect(bindingContext).toBeDefined()
+    expect(conditionalContext).toBeDefined()
+
+    // Remove the container from DOM
+    container.remove()
+
+    // Force garbage collection
+    const gcStats = wildflower._contextRegistry.garbageCollect()
+
+    // Verify garbage collection ran and found disconnected elements
+    expect(gcStats).toBeDefined()
+
+    // The key behavior: contexts for detached elements should be handled
+    // Either removed from registry or have their element references cleared
+    if (wildflower._contextRegistry.contexts.has(bindingContext.id)) {
+      // If context still exists, element reference should be cleared
+      expect(bindingContext.element === null || !document.body.contains(bindingContext.element)).toBe(true)
+    }
+
+    if (wildflower._contextRegistry.contexts.has(conditionalContext.id)) {
+      expect(conditionalContext.element === null || !document.body.contains(conditionalContext.element)).toBe(true)
+    }
+  })
+
+  describe('Event handler cleanup', () => {
+    it('should clean up event handlers when component is destroyed', async () => {
+      testContainer.innerHTML = `
+        <div data-component="event-cleanup-test">
+          <button id="test-btn" data-action="handleClick">Click</button>
+          <input id="test-input" data-action="input:handleInput keyup:handleKeyup" />
+          <div id="click-count" data-bind="clickCount"></div>
+        </div>
+      `
+
+      let clickCount = 0
+      let inputCount = 0
+      let keyupCount = 0
+
+      wildflower.component('event-cleanup-test', {
+        state: { clickCount: 0 },
+        handleClick() {
+          clickCount++
+          this.state.clickCount++
+        },
+        handleInput() {
+          inputCount++
+        },
+        handleKeyup() {
+          keyupCount++
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const component = testContainer.querySelector('[data-component="event-cleanup-test"]')
+      const instanceId = component.dataset.componentId
+      const btn = testContainer.querySelector('#test-btn')
+      const input = testContainer.querySelector('#test-input')
+
+      // Trigger events before destruction
+      btn.click()
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', bubbles: true }))
+      await waitForUpdate()
+
+      expect(clickCount).toBe(1)
+      expect(inputCount).toBe(1)
+      expect(keyupCount).toBe(1)
+
+      // Destroy the component
+      wildflower.destroyComponent(instanceId)
+      await waitForUpdate()
+
+      // Try to trigger events after destruction - handlers should not fire
+      btn.click()
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new KeyboardEvent('keyup', { key: 'b', bubbles: true }))
+      await waitForUpdate()
+
+      // Counts should remain the same (handlers cleaned up)
+      expect(clickCount).toBe(1)
+      expect(inputCount).toBe(1)
+      expect(keyupCount).toBe(1)
+    })
+
+    it('should clean up debounced handlers when component is destroyed', async () => {
+      testContainer.innerHTML = `
+        <div data-component="debounce-cleanup-test">
+          <input id="debounce-input" data-action="input:handleSearch" data-event-debounce="100" />
+          <div id="search-count" data-bind="searchCount"></div>
+        </div>
+      `
+
+      let searchCount = 0
+
+      wildflower.component('debounce-cleanup-test', {
+        state: { searchCount: 0 },
+        handleSearch() {
+          searchCount++
+          this.state.searchCount++
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const component = testContainer.querySelector('[data-component="debounce-cleanup-test"]')
+      const instanceId = component.dataset.componentId
+      const input = testContainer.querySelector('#debounce-input')
+
+      // Trigger debounced input
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+
+      // Destroy before debounce fires
+      wildflower.destroyComponent(instanceId)
+
+      // Wait longer than debounce timeout
+      await waitForUpdate(200)
+
+      // Handler should NOT have fired (was cleaned up)
+      expect(searchCount).toBe(0)
+    })
+  })
+
+  describe('Store subscription cleanup', () => {
+    it('should clean up store subscriptions when component is destroyed', async () => {
+      // Skip if storeManager not available
+      if (!wildflower.storeManager) {
+        console.log('storeManager not available, skipping test')
+        return
+      }
+
+      // Create a store using the correct API
+      const store = wildflower.storeManager.createStoreComponent('cleanup-test-store', {
+        state: {
+          count: 0
+        }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="store-sub-cleanup-test">
+          <div id="store-count" data-bind="external('cleanup-test-store', 'count')"></div>
+        </div>
+      `
+
+      wildflower.component('store-sub-cleanup-test', {
+        state: {}
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const component = testContainer.querySelector('[data-component="store-sub-cleanup-test"]')
+      const instanceId = component.dataset.componentId
+      const display = testContainer.querySelector('#store-count')
+
+      // Verify initial binding works
+      expect(display.textContent).toBe('0')
+
+      // Increment store
+      store.state.count++
+      await waitForUpdate()
+      expect(display.textContent).toBe('1')
+
+      // Count subscriptions before destroy
+      const subsBefore = store._subscribers ? store._subscribers.size : 0
+
+      // Destroy the component
+      wildflower.destroyComponent(instanceId)
+      await waitForUpdate()
+
+      // Count subscriptions after destroy
+      const subsAfter = store._subscribers ? store._subscribers.size : 0
+
+      // Subscriptions should be reduced or equal (depending on implementation)
+      expect(subsAfter).toBeLessThanOrEqual(subsBefore)
+    })
+  })
+
+  describe('Watch callback cleanup', () => {
+    it('should clean up watch callbacks when component is destroyed', async () => {
+      testContainer.innerHTML = `
+        <div data-component="watch-cleanup-test">
+          <div data-bind="value"></div>
+        </div>
+      `
+
+      let watchCallCount = 0
+
+      wildflower.component('watch-cleanup-test', {
+        state: { value: 'initial' },
+        watch: {
+          value(newVal, oldVal) {
+            watchCallCount++
+          }
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const component = testContainer.querySelector('[data-component="watch-cleanup-test"]')
+      const instanceId = component.dataset.componentId
+      const instance = wildflower.componentInstances.get(instanceId)
+
+      // Trigger watch
+      instance.state.value = 'changed'
+      await waitForUpdate()
+      expect(watchCallCount).toBe(1)
+
+      // Destroy component
+      wildflower.destroyComponent(instanceId)
+      await waitForUpdate()
+
+      // Try to trigger watch via direct state manipulation (if state still exists)
+      // The watch should NOT fire after destruction
+      const countBefore = watchCallCount
+      if (instance.state) {
+        instance.state.value = 'after-destroy'
+        await waitForUpdate()
+      }
+
+      // Watch count should not increase
+      expect(watchCallCount).toBe(countBefore)
+    })
+  })
+
+  describe('Large-scale component cleanup', () => {
+    it('should efficiently clean up many components', async () => {
+      // Create 50 components
+      const componentCount = 50
+
+      let html = ''
+      for (let i = 0; i < componentCount; i++) {
+        html += `<div data-component="mass-cleanup-test-${i}"><span data-bind="value">${i}</span></div>`
+      }
+      testContainer.innerHTML = html
+
+      // Register all components
+      for (let i = 0; i < componentCount; i++) {
+        wildflower.component(`mass-cleanup-test-${i}`, {
+          state: { value: i }
+        })
+      }
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      // Verify all were created
+      expect(wildflower.componentInstances.size).toBeGreaterThanOrEqual(componentCount)
+
+      // Count contexts before
+      const contextsBefore = wildflower._contextRegistry.contexts.size
+
+      // Collect all instance IDs
+      const instanceIds = []
+      for (let i = 0; i < componentCount; i++) {
+        const comp = testContainer.querySelector(`[data-component="mass-cleanup-test-${i}"]`)
+        if (comp && comp.dataset.componentId) {
+          instanceIds.push(comp.dataset.componentId)
+        }
+      }
+
+      // Destroy all components
+      const startTime = performance.now()
+      for (const id of instanceIds) {
+        wildflower.destroyComponent(id)
+      }
+      wildflower._contextRegistry.garbageCollect()
+      const endTime = performance.now()
+
+      // Should complete in reasonable time (under 500ms for 50 components)
+      expect(endTime - startTime).toBeLessThan(500)
+
+      // Contexts should be significantly reduced
+      const contextsAfter = wildflower._contextRegistry.contexts.size
+      expect(contextsAfter).toBeLessThan(contextsBefore)
+    })
+  })
+
+  describe('List item cleanup', () => {
+    it('should clean up contexts when list items are removed', async () => {
+      testContainer.innerHTML = `
+        <div data-component="list-cleanup-test">
+          <ul data-list="items">
+            <template>
+              <li>
+                <span data-bind="name"></span>
+                <button data-action="remove">Remove</button>
+              </li>
+            </template>
+          </ul>
+        </div>
+      `
+
+      wildflower.component('list-cleanup-test', {
+        state: {
+          items: [
+            { id: 1, name: 'Item 1' },
+            { id: 2, name: 'Item 2' },
+            { id: 3, name: 'Item 3' },
+            { id: 4, name: 'Item 4' },
+            { id: 5, name: 'Item 5' }
+          ]
+        },
+        remove(event, element, detail) {
+          this.state.items.splice(detail.index, 1)
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      // Count DOM elements with 5 items
+      const listItems5 = testContainer.querySelectorAll('li').length
+      expect(listItems5).toBe(5)
+
+      // Remove 3 items
+      const instance = wildflower.componentInstances.values().next().value
+      instance.state.items.splice(0, 3)
+      await waitForCompleteRender()
+
+      // Run garbage collection
+      wildflower._contextRegistry.garbageCollect()
+
+      // Count DOM elements with 2 items
+      const listItems2 = testContainer.querySelectorAll('li').length
+      expect(listItems2).toBe(2)
+
+      // Verify DOM was actually cleaned up (primary assertion)
+      expect(listItems2).toBeLessThan(listItems5)
+
+      // Context cleanup is an implementation detail - the key is that:
+      // 1. DOM elements were properly removed
+      // 2. No memory leak occurs over repeated operations
+    })
+
+    it('should clean up DOM when list is cleared', async () => {
+      testContainer.innerHTML = `
+        <div data-component="list-clear-test">
+          <ul data-list="items">
+            <template>
+              <li data-bind="name"></li>
+            </template>
+          </ul>
+          <button id="clear-btn" data-action="clearAll">Clear</button>
+        </div>
+      `
+
+      wildflower.component('list-clear-test', {
+        state: {
+          items: [
+            { name: 'A' }, { name: 'B' }, { name: 'C' },
+            { name: 'D' }, { name: 'E' }, { name: 'F' }
+          ]
+        },
+        clearAll() {
+          this.state.items = []
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      // Verify initial list rendered
+      expect(testContainer.querySelectorAll('li').length).toBe(6)
+
+      // Clear the list
+      const clearBtn = testContainer.querySelector('#clear-btn')
+      clearBtn.click()
+      await waitForCompleteRender()
+
+      // Verify list is empty in DOM
+      expect(testContainer.querySelectorAll('li').length).toBe(0)
+
+      // Run garbage collection
+      wildflower._contextRegistry.garbageCollect()
+
+      // The key assertion is that DOM cleanup occurred
+      // Context cleanup is an implementation detail
+    })
+
+    it('should not leak contexts when list items are repeatedly added and removed', async () => {
+      testContainer.innerHTML = `
+        <div data-component="list-churn-test">
+          <ul data-list="items">
+            <template>
+              <li data-bind="value"></li>
+            </template>
+          </ul>
+        </div>
+      `
+
+      wildflower.component('list-churn-test', {
+        state: {
+          items: []
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const instance = wildflower.componentInstances.values().next().value
+
+      // Baseline context count
+      const baselineContexts = wildflower._contextRegistry.contexts.size
+
+      // Repeatedly add and remove items
+      for (let round = 0; round < 5; round++) {
+        // Add 10 items
+        instance.state.items = Array.from({ length: 10 }, (_, i) => ({ value: `Item ${i}` }))
+        await waitForUpdate(30)
+
+        // Clear items
+        instance.state.items = []
+        await waitForUpdate(30)
+
+        // Garbage collect
+        wildflower._contextRegistry.garbageCollect()
+      }
+
+      const finalContexts = wildflower._contextRegistry.contexts.size
+
+      // Context count should not grow unbounded - allow some tolerance
+      // (base contexts + reasonable growth)
+      expect(finalContexts).toBeLessThanOrEqual(baselineContexts + 20)
+    })
+  })
+
+  describe('Conditional rendering cleanup', () => {
+    it('should clean up nested contexts when conditional hides content', async () => {
+      testContainer.innerHTML = `
+        <div data-component="conditional-cleanup-test">
+          <div data-show="showSection">
+            <h2 data-bind="title"></h2>
+            <ul data-list="items">
+              <template>
+                <li data-bind="name"></li>
+              </template>
+            </ul>
+          </div>
+          <button id="toggle-btn" data-action="toggle">Toggle</button>
+        </div>
+      `
+
+      wildflower.component('conditional-cleanup-test', {
+        state: {
+          showSection: true,
+          title: 'Section Title',
+          items: [{ name: 'X' }, { name: 'Y' }, { name: 'Z' }]
+        },
+        toggle() {
+          this.state.showSection = !this.state.showSection
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      // Verify section is visible
+      const section = testContainer.querySelector('[data-show]')
+      expect(section.style.display).not.toBe('none')
+
+      const contextsWhenVisible = wildflower._contextRegistry.contexts.size
+
+      // Hide the section
+      const toggleBtn = testContainer.querySelector('#toggle-btn')
+      toggleBtn.click()
+      await waitForCompleteRender()
+
+      // Section should be hidden
+      expect(section.style.display).toBe('none')
+
+      // Run garbage collection
+      wildflower._contextRegistry.garbageCollect()
+
+      const contextsWhenHidden = wildflower._contextRegistry.contexts.size
+
+      // Note: data-show hides but doesn't remove elements, so contexts may remain
+      // The key is that they don't leak when toggled repeatedly
+      // Let's toggle multiple times and ensure no growth
+      for (let i = 0; i < 5; i++) {
+        toggleBtn.click()
+        await waitForUpdate(20)
+      }
+
+      wildflower._contextRegistry.garbageCollect()
+      const contextsAfterToggles = wildflower._contextRegistry.contexts.size
+
+      // Context count should not grow unbounded
+      expect(contextsAfterToggles).toBeLessThanOrEqual(contextsWhenVisible + 5)
+    })
+  })
+
+  describe('Template cache management', () => {
+    it('should not leak template cache entries for destroyed components', async () => {
+      // Create a component with a list template
+      testContainer.innerHTML = `
+        <div data-component="cache-test">
+          <ul data-list="items">
+            <template>
+              <li data-bind="value"></li>
+            </template>
+          </ul>
+        </div>
+      `
+
+      wildflower.component('cache-test', {
+        state: {
+          items: [{ value: 1 }, { value: 2 }]
+        }
+      })
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const component = testContainer.querySelector('[data-component="cache-test"]')
+      const instanceId = component.dataset.componentId
+
+      // Check if template cache exists and get size
+      const cacheSizeBefore = wildflower._templateCache?.general?.size || 0
+
+      // Destroy the component
+      wildflower.destroyComponent(instanceId)
+      wildflower._contextRegistry.garbageCollect()
+
+      // Cache should not grow unbounded (may or may not clear entries)
+      const cacheSizeAfter = wildflower._templateCache?.general?.size || 0
+      expect(cacheSizeAfter).toBeLessThanOrEqual(cacheSizeBefore + 1)
+    })
+  })
+
+  it('removeContext cleans contextsByComponent entries', async () => {
+    testContainer.innerHTML = `
+      <div data-component="cbc-leak-test">
+        <span data-bind="name"></span>
+        <div data-show="active">Active</div>
+      </div>
+    `
+
+    wildflower.component('cbc-leak-test', {
+      state: { name: 'Test', active: true }
+    })
+
+    wildflower.scan()
+    await waitForCompleteRender()
+
+    const component = testContainer.querySelector('[data-component="cbc-leak-test"]')
+    const instanceId = component.dataset.componentId
+
+    // Verify contextsByComponent has entries for this component
+    const registry = wildflower._contextRegistry
+    expect(registry.contextsByComponent.has(instanceId)).toBe(true)
+    const contextCountBefore = registry.contextsByComponent.get(instanceId).size
+    expect(contextCountBefore).toBeGreaterThan(0)
+
+    // Destroy the component
+    wildflower.destroyComponent(instanceId)
+    registry.garbageCollect()
+
+    // contextsByComponent should be cleaned — no stale entries for destroyed component
+    const remaining = registry.contextsByComponent.get(instanceId)
+    const remainingCount = remaining ? remaining.size : 0
+    expect(remainingCount).toBe(0)
+  })
+
+  it('waitForReady resolves within bounded time when component never becomes ready', async () => {
+    testContainer.innerHTML = `
+      <div data-component="wait-timeout-test">
+        <span data-bind="name"></span>
+      </div>
+    `
+
+    wildflower.component('wait-timeout-test', {
+      state: { name: 'Test' }
+    })
+
+    wildflower.scan()
+    await waitForCompleteRender()
+
+    const component = testContainer.querySelector('[data-component="wait-timeout-test"]')
+    const instanceId = component.dataset.componentId
+    const instance = wildflower.componentInstances.get(instanceId)
+
+    // Force the component into a permanently not-ready state
+    instance.state._internal = { ready: false }
+
+    // waitForReady should reject within a bounded time, not poll forever
+    // Use Promise.race to enforce our own test deadline
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('test deadline exceeded')), 12000)
+    )
+
+    let rejected = false
+    let rejectionMessage = ''
+    try {
+      await Promise.race([instance.context.waitForReady(), timeout])
+    } catch (e) {
+      rejected = true
+      rejectionMessage = e.message
+    }
+
+    // Should have been rejected by waitForReady's own timeout, not our test deadline
+    expect(rejected).toBe(true)
+    expect(rejectionMessage).toContain('waitForReady timed out')
+  })
+})

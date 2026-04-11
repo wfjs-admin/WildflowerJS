@@ -1,0 +1,13 @@
+{
+  "name": "tutorial",
+  "version": "1.0.0",
+  "description": "Framework-agnostic tutorial/onboarding system for UAM applications",
+  "global": "UAMTutorial",
+  "variants": {
+    "universal": {
+      "type": "vanilla",
+      "source": "universal/tutorial.js"
+    }
+  },
+  "default": "universal"
+}
