@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test artifacts
+test-results/
+playwright-report/
+tests/__screenshots__/
+test-output*.txt
+build-output.txt
+
+# Environment
+.env
+.env.local
+
+# Build output (regenerate with: npm run build)
+dist/
+
+# Build caches
+.cache/
+
+# Claude Code
+.claude/

@@ -1,0 +1,53 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting a feature! Please describe the problem you're trying to solve and your proposed solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this feature solve? What's the use case?
+      placeholder: I'm trying to... but currently...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How would you like this to work? Include API examples if possible.
+      placeholder: |
+        It would be great if WildflowerJS supported...
+
+        ```html
+        <div data-component="example">
+          ...
+        </div>
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds you've considered.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Which area of the framework does this affect?
+      options:
+        - Core (reactivity, binding, state)
+        - Components (lifecycle, props, templates)
+        - Lists (rendering, operations)
+        - Stores (state management)
+        - Router
+        - Plugins
+        - Other

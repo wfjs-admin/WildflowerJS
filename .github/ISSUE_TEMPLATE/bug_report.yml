@@ -1,0 +1,64 @@
+name: Bug Report
+description: Report a bug in WildflowerJS
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! Please fill out the sections below so we can reproduce and fix the issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+      placeholder: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Steps to reproduce the behavior, or a minimal code example.
+      placeholder: |
+        1. Create a component with...
+        2. Click on...
+        3. See error...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Which version of WildflowerJS are you using?
+      placeholder: e.g. 1.0.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package variant
+      options:
+        - Core (wildflower.min.js)
+        - Lite (wildflower.lite.min.js)
+        - SPA (wildflower.spa.min.js)
+        - Full (wildflower.full.min.js)
+        - ESM (wildflower.esm.js)
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser
+      description: Which browser(s) does this occur in?
+      placeholder: e.g. Chrome 120, Firefox 121, Safari 17
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Any other context, screenshots, or error messages.
