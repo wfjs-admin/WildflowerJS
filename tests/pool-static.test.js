@@ -8,7 +8,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, hasFeature } from './helpers/load-framework.js'
+
+const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
 async function waitForUpdate(ms = 50) {
   await new Promise(resolve => setTimeout(resolve, ms))
@@ -40,7 +42,7 @@ function getInstance(wildflower, el) {
   return wildflower.componentInstances.get(target.dataset.componentId)
 }
 
-describe('Static Pool (data-pool-static)', () => {
+describeIfPools('Static Pool (data-pool-static)', () => {
   let testContainer
   let wildflower
 

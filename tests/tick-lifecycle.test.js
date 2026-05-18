@@ -6,13 +6,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, isMinifiedBuild } from './helpers/load-framework.js'
+import { loadFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
+
+const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
 async function waitForFrames(ms = 200) {
   await new Promise(resolve => setTimeout(resolve, ms))
 }
 
-describe('tick(dt) Lifecycle Hook', () => {
+describeIfPools('tick(dt) Lifecycle Hook', () => {
   let testContainer
   let wildflower
 

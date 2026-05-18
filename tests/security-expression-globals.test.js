@@ -101,4 +101,29 @@ describe('Security: expression evaluation global access', () => {
         const el = document.getElementById('target')
         expect(el.style.display).toBe('none')
     })
+
+    // H6 regression guards — verify the extraction-and-shadow mechanism
+    // continues to shadow these browser globals to undefined. These are
+    // the globals the `_UNSAFE_EXPR_RE` blocklist does NOT explicitly cover
+    // (the CSP evaluator's BLOCKED_GLOBALS does). They are safe because
+    // unreserved identifiers get extracted by `_extractExpressionVars` and
+    // injected as parameters to the compiled function, shadowing any globals.
+
+    for (const globalName of ['location', 'navigator', 'localStorage', 'sessionStorage', 'setTimeout', 'setInterval', 'alert', 'XMLHttpRequest', 'WebSocket', 'open']) {
+        it(`H6 regression — ${globalName} is shadowed to undefined in expressions`, async () => {
+            wildflower.component(`global-h6-${globalName}`, {
+                state: {}
+            })
+
+            await setupComponent(wildflower, testContainer, `
+                <div data-component="global-h6-${globalName}">
+                    <span id="target" data-show="typeof ${globalName} !== 'undefined'">LEAKED ACCESS TO ${globalName}</span>
+                </div>
+            `)
+
+            await waitForUpdate(300)
+            const el = document.getElementById('target')
+            expect(el.style.display).toBe('none')
+        })
+    }
 })

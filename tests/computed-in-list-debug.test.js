@@ -33,8 +33,8 @@ describe('computed in list debug', () => {
                 ]
             },
             computed: {
-                formattedPrice() {
-                    return this.price !== undefined ? '$' + this.price.toFixed(2) : '';
+                formattedPrice(item) {
+                    return item && item.price !== undefined ? '$' + item.price.toFixed(2) : '';
                 }
             }
         })
@@ -70,8 +70,8 @@ describe('computed in list debug', () => {
                 ]
             },
             computed: {
-                formattedPrice() {
-                    return this.price !== undefined ? '$' + this.price.toFixed(2) : '';
+                formattedPrice(item) {
+                    return item && item.price !== undefined ? '$' + item.price.toFixed(2) : '';
                 }
             }
         })
@@ -138,8 +138,8 @@ describe('computed in list debug', () => {
                 ]
             },
             computed: {
-                isPremium() {
-                    return this.price > 20;
+                isPremium(item) {
+                    return item && item.price > 20;
                 }
             }
         })

@@ -1263,6 +1263,80 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(testContainer.querySelector('.name').textContent).toBe('Computed Alice')
     })
 
+    // Skipped: Requires feature implementation (Implicit Context)
+    it.skip('should bind to component root state when data-with is omitted (Implicit Context)', async () => {
+      testContainer.innerHTML = `
+        <div data-component="parent-comp">
+          <template data-item-template="root-card">
+            <div class="root-card">
+              <span class="app-name" data-bind="appName"></span>
+            </div>
+          </template>
+
+          <div data-component="child-comp">
+            <!-- No data-with, should bind to child-comp state -->
+            <template data-use-template="root-card"></template>
+          </div>
+        </div>
+      `
+
+      wildflower.component('parent-comp', { state: {} })
+
+      wildflower.component('child-comp', {
+        state: {
+          appName: 'My App'
+        }
+      })
+
+      await waitForCompleteRender()
+
+      const card = testContainer.querySelector('.root-card')
+      expect(card).toBeDefined()
+      expect(card.querySelector('.app-name').textContent).toBe('My App')
+    })
+
+    // Skipped: Requires feature implementation (Nested Templates)
+    it.skip('should support nested templates (Slot using another Slot)', async () => {
+      testContainer.innerHTML = `
+        <div data-component="parent-comp">
+          <!-- Inner Template -->
+          <template data-item-template="badge">
+            <span class="badge" data-bind="text"></span>
+          </template>
+
+          <!-- Outer Template uses Inner Template -->
+          <template data-item-template="user-card">
+            <div class="card">
+              <span class="name" data-bind="name"></span>
+              <template data-use-template="badge" data-with="badgeData"></template>
+            </div>
+          </template>
+
+          <div data-component="child-comp">
+            <template data-use-template="user-card" data-with="user"></template>
+          </div>
+        </div>
+      `
+
+      wildflower.component('parent-comp', { state: {} })
+
+      wildflower.component('child-comp', {
+        state: {
+          user: {
+            name: 'Alice',
+            badgeData: { text: 'VIP' }
+          }
+        }
+      })
+
+      await waitForCompleteRender()
+
+      const card = testContainer.querySelector('.card')
+      expect(card).toBeDefined()
+      expect(card.querySelector('.name').textContent).toBe('Alice')
+      expect(card.querySelector('.badge').textContent).toBe('VIP')
+    })
+
   })
 
 })

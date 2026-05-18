@@ -554,11 +554,11 @@ describe('inline expression store reactivity', () => {
                         var s = wildflower.getStore('metric')
                         return s ? Math.round(s.state.cpu) : 50
                     },
-                    rowClass() {
+                    rowClass(item) {
                         var s = wildflower.getStore('metric')
                         var thresh = s ? Math.round(s.state.cpu) : 50
-                        if (this.value === undefined) return 'badge badge-normal'
-                        return 'badge ' + (this.value > thresh ? 'badge-danger' : 'badge-normal')
+                        if (!item || item.value === undefined) return 'badge badge-normal'
+                        return 'badge ' + (item.value > thresh ? 'badge-danger' : 'badge-normal')
                     }
                 }
             })

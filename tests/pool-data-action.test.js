@@ -7,7 +7,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, isMinifiedBuild } from './helpers/load-framework.js'
+import { loadFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
+
+const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
 async function waitForUpdate(ms = 50) {
   await new Promise(resolve => setTimeout(resolve, ms))
@@ -24,7 +26,7 @@ function getInstance(wildflower, el) {
   return wildflower.componentInstances.get(id)
 }
 
-describe('data-action in Pool Templates', () => {
+describeIfPools('data-action in Pool Templates', () => {
   let testContainer
   let wildflower
 
@@ -450,7 +452,7 @@ describe('data-action in Pool Templates', () => {
   })
 })
 
-describe('pool.swap()', () => {
+describeIfPools('pool.swap()', () => {
   let testContainer
   let wildflower
 

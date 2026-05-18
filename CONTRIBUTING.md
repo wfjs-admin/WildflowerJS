@@ -32,9 +32,9 @@ npm test
 
 Pull requests are reviewed with the help of AI-assisted code analysis against the full internal test suite (~3,400 tests across 8 build variants). This means:
 
-- **Reviews may take a few days** — your PR is evaluated against the complete codebase for correctness, performance impact, and pattern consistency, not just a quick skim.
-- **Integration goes through an internal pipeline** — accepted changes are merged into the development tree, tested, and published through our build process. Your PR will be closed with a reference to the integrating commit rather than merged directly on GitHub.
-- **We may ask questions or suggest adjustments** — this is normal and not a sign your contribution isn't valued. The codebase has specific patterns and performance constraints that aren't always obvious from the public API.
+- **Reviews may take a few days.** Your PR is evaluated against the complete codebase for correctness, performance impact, and pattern consistency, not just a quick skim.
+- **Integration goes through an internal pipeline.** Accepted changes are merged into the development tree, tested, and published through our build process. Your PR will be closed with a reference to the integrating commit rather than merged directly on GitHub.
+- **We may ask questions or suggest adjustments.** This is normal and not a sign your contribution isn't valued. The codebase has specific patterns and performance constraints that aren't always obvious from the public API.
 
 The best way to get a PR accepted quickly: open an issue first, wait for feedback on the approach, then submit focused changes with tests.
 

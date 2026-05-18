@@ -13,6 +13,18 @@ const LARGE_ARRAY_THRESHOLD = 500;     // Arrays above this size use synchronous
 const READY_POLL_INTERVAL_MS = 10;     // Polling interval for waitForReady()
 const READY_POLL_MAX_ATTEMPTS = 1000;  // Max polls before timeout (10s at 10ms)
 
+// Methods the framework drives directly via instance.context.X(). These bypass
+// the action-before-init queue in _wrapMethod — queueing init() itself would
+// deadlock _initReady, and other lifecycle hooks must fire at framework-known
+// points regardless of init state.
+const LIFECYCLE_HOOK_NAMES = new Set([
+    'init', 'beforeInit',
+    'destroy', 'beforeDestroy',
+    'onUpdate', 'beforeUpdate',
+    'onError',
+    'tick'
+]);
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
@@ -98,14 +110,20 @@ export const ComponentLifecycleMethods = {
         // Inject store references early so they're available in computed properties and beforeInit
         this._injectStoreReferences(instance);
 
+        // Declarative store subscriptions MUST run before computed setup.
+        // addComputed enqueues initial evals via microtask; if subscribePath
+        // ran after that, store mutations between the two could miss the
+        // component as a cascade target. The async scanner has the same
+        // ordering invariant (see ComponentScanning.js pre-pass). The
+        // idempotency guard inside _setupStoreSubscriptions makes any
+        // later call from the same init flow a no-op.
+        this._setupStoreSubscriptions(instance);
+
         // Setup computed properties with error handling
         this._setupComputedProperties(definition, context, stateManager, componentName, instanceId);
 
         // Call beforeInit hook (after methods bound, before bindings processed)
         this._callBeforeInitHook(instance, componentName);
-
-        // Setup declarative store subscriptions (subscribe: {} in definition)
-        this._setupStoreSubscriptions(instance);
 
         // Setup watchers, slots, bindings, actions
         this._setupWatchers(instance);
@@ -168,6 +186,23 @@ export const ComponentLifecycleMethods = {
 
         // Finalize initialization
         this._finishComponentInitialization(instanceId);
+
+        // Strip data-cloak from the just-initialized subtree. By this point the
+        // render effect's first synchronous run has written display:none for any
+        // false data-show binding, so removing the cloak attribute is safe. This
+        // is the late-registration counterpart to the framework-init and SPA-scan
+        // cloak-strip rAFs: when a defer-loaded script registers a component
+        // after framework init, those passes saw the element with no
+        // data-component-id and deferred. We pick up the deferred work here, plus
+        // the element itself in case it was registered as the cloak host.
+        if (this._stripCloakWithVerdict) {
+            if (element.hasAttribute('data-cloak')) {
+                this._stripCloakWithVerdict(element);
+            }
+            element.querySelectorAll('[data-cloak]').forEach(el => {
+                this._stripCloakWithVerdict(el);
+            });
+        }
 
         return instance;
     },
@@ -572,6 +607,34 @@ export const ComponentLifecycleMethods = {
             this._triggerHook('component:beforeInit', instance);
         }
         this._callInitHook(instance, componentName);
+
+        // Mark init complete and replay any queued action calls. Actions
+        // bound at the synchronous mount step (ComponentLifecycle.js:127)
+        // can fire before the deferred init() runs — for example, a click
+        // dispatched in the same task as mount, or while waiting for a
+        // subscribed store. _wrapMethod queues those calls; we replay them
+        // here so they observe the post-init state the user expected.
+        instance._initReady = true;
+        if (instance._pendingActions && instance._pendingActions.length > 0) {
+            const queued = instance._pendingActions;
+            instance._pendingActions = null;
+            for (let i = 0; i < queued.length; i++) {
+                try {
+                    queued[i]();
+                } catch (e) {
+                    // Route through _handleError so the component's onError
+                    // hook can intercept (matching the contract for any other
+                    // method invocation). Without this, replayed actions that
+                    // throw would be silently swallowed in production.
+                    this._handleError(
+                        `Error replaying queued action for component ${instance.name}`,
+                        e,
+                        instance,
+                        { lifecycle: 'replay-pending-action' }
+                    );
+                }
+            }
+        }
 
         // Register tick lifecycle hook if defined
         if (typeof instance.definition.tick === 'function') {
@@ -1845,6 +1908,16 @@ export const ComponentLifecycleMethods = {
             return;
         }
 
+        // Idempotency guard. The async scanner hoists this call to a
+        // pre-pass that runs before computed setup (so subscribePath
+        // registers entity-deps before the first computed-eval microtask
+        // flush, avoiding a race where store mutations between scanner
+        // batches miss the component as a cascade target). The original
+        // post-features call site still runs in some lifecycle paths, so
+        // skip it here when the pre-pass already ran.
+        if (instance._subscriptionsSetup) return;
+        instance._subscriptionsSetup = true;
+
         // Parse the subscribe declaration (supports array and object syntax)
         const parsed = this._parseSubscribeDeclaration(definition.subscribe);
 
@@ -2001,8 +2074,29 @@ export const ComponentLifecycleMethods = {
         const originalContext = instance.context;
         const originalFn = fn;
 
+        // Lifecycle hooks bypass the init-ready queue: the framework drives
+        // them at known points and queueing them would deadlock (init() being
+        // queued before _initReady is set creates infinite wait).
+        const isLifecycle = LIFECYCLE_HOOK_NAMES.has(methodName);
+
         // Create a non-arrow function to allow 'this' manipulation
         function wrappedMethod(...args) {
+            // Action-before-init guard. If the user's init() hook hasn't run
+            // yet (instance._initReady !== true), queue external calls and
+            // replay them after init completes. Re-entrant calls (a method
+            // invoking another method during execution) bypass the queue —
+            // we're already inside a known execution frame.
+            if (!isLifecycle && !instance._initReady && !instance._inMethodExecution) {
+                if (!instance._pendingActions) instance._pendingActions = [];
+                // Capture a replay closure that re-enters this wrapper. Once
+                // _initReady is true, replay loops and each call falls through
+                // to the immediate-execution branch below.
+                instance._pendingActions.push(() => wrappedMethod.apply(originalContext, args));
+                return undefined;
+            }
+
+            const wasExecuting = instance._inMethodExecution;
+            instance._inMethodExecution = true;
             try {
                 // Force context to always be the original context
                 // This is the key line that ensures context consistency
@@ -2014,6 +2108,8 @@ export const ComponentLifecycleMethods = {
                     instance,
                     {methodName, arguments: args}
                 );
+            } finally {
+                instance._inMethodExecution = wasExecuting;
             }
         }
 
@@ -2099,9 +2195,15 @@ export const ComponentLifecycleMethods = {
             return false; // Exit early, rendering will occur when batch completes
         }
 
-        // Update portal visibility if conditionally rendered
-        // Only if portal system is included (not in lite build)
-        if (this._updatePortalVisibility) {
+        // Update portal visibility if conditionally rendered.
+        // Only if portal system is included (not in lite build) AND this
+        // instance actually has portals. _hasPortals is set by _processPortals
+        // (and _processPortalsInListItems for late-discovered list-item
+        // portals). Without this gate, _updatePortalVisibility runs a
+        // descendant querySelectorAll for every component on every entity
+        // state change, dominating the main thread on portal-free apps
+        // (PM demo: 38% of total scripting time before this gate).
+        if (this._updatePortalVisibility && instance._hasPortals) {
             this._updatePortalVisibility(instance);
         }
 

@@ -206,10 +206,14 @@ _setupDynamicComponentDetection()
 
         // Remove data-cloak from newly scanned scope (SPA navigation, dynamic content)
         // Deferred via RAF so data-show/data-render conditionals evaluate first
-        // (see FrameworkInit._completeInitialization for detailed explanation)
+        // (see FrameworkInit._completeInitialization for detailed explanation).
+        // Commits a data-show visibility verdict before stripping the attribute
+        // to close the race; see _evaluateCloakShowVerdict for rationale.
         if (initializedCount > 0) {
             requestAnimationFrame(() => {
-                searchRoot.querySelectorAll('[data-cloak]').forEach(el => el.removeAttribute('data-cloak'));
+                searchRoot.querySelectorAll('[data-cloak]').forEach(el => {
+                    this._stripCloakWithVerdict(el);
+                });
             });
         }
 
@@ -466,6 +470,51 @@ _setupDynamicComponentDetection()
      * @param {Object} instance - Component instance
      * @private
      */
+    /**
+     * Walk the entire root DOM once and populate _listRelationships
+     * from every template before any component renders.
+     *
+     * Background: per-component _setupListContexts runs after
+     * _setupSingleInstanceFeatures, but features creates the render effect,
+     * which fires synchronously. If a list renders before the relationships
+     * are registered, _renderListWithMapArray sees hasChildLists=false and
+     * never wires up nested-list integration. The result is outer-list items
+     * with their inner data-list elements left as bare templates — section
+     * headers without rows. Walking from the root once up front ensures
+     * relationships are known before any render fires.
+     *
+     * @private
+     */
+    _prepopulateListRelationships() {
+        if (!this._contextRegistry || !this._contextRegistry.detectTemplateRelationships) {
+            this._ensureContextSystem?.();
+            if (!this._contextRegistry?.detectTemplateRelationships) return;
+        }
+        if (!this._listRelationships) {
+            this._listRelationships = new Map();
+        }
+        // detectTemplateRelationships calls element.getAttribute(), so we need an
+        // Element. this.root may be the Document node when Wildflower auto-init
+        // runs against the page; fall back to documentElement in that case.
+        const walkRoot = (this.root && typeof this.root.getAttribute === 'function')
+            ? this.root
+            : (this.root?.documentElement || document.documentElement);
+        if (!walkRoot) return;
+        let relationships = [];
+        try {
+            relationships = this._contextRegistry.detectTemplateRelationships(walkRoot);
+        } catch (e) {
+            if (__DEV__) console.warn('[WF] _prepopulateListRelationships failed:', e?.message);
+            return;
+        }
+        for (const { parentPath, childPath } of relationships) {
+            if (!this._listRelationships.has(parentPath)) {
+                this._listRelationships.set(parentPath, new Set());
+            }
+            this._listRelationships.get(parentPath).add(childPath);
+        }
+    },
+
     _setupSingleInstanceFeatures(instance) {
         // Setup declarative store subscriptions (subscribe: {} in definition)
         // This must be called before watchers/bindings to ensure onStoreUpdate works
@@ -506,6 +555,12 @@ _setupDynamicComponentDetection()
         // Queue init() for deferred execution (will run in separate macrotask)
         if (typeof instance.context.init === 'function') {
             ctx.pendingInits.push(instance);
+        } else {
+            // No user init() defined — nothing to wait for. Mark ready
+            // synchronously so action handlers bound at scan time can run
+            // immediately rather than being queued indefinitely by
+            // _wrapMethod's action-before-init guard.
+            instance._initReady = true;
         }
 
         // Dispatch component init event for optional module integration (e.g., RouteManager)
@@ -545,7 +600,34 @@ _setupDynamicComponentDetection()
                     if (this._triggerHook) {
                         this._triggerHook('component:beforeInit', instance);
                     }
-                    instance.context.init();
+                    if (typeof instance.context.init === 'function') {
+                        instance.context.init();
+                    }
+                    // Mark init complete and replay any queued action calls.
+                    // Must run regardless of whether init() was defined: methods
+                    // wrapped by _wrapMethod queue against !instance._initReady,
+                    // and the page-load path here is the only place that sets
+                    // it for components mounted via _scanForComponents.
+                    instance._initReady = true;
+                    if (instance._pendingActions && instance._pendingActions.length > 0) {
+                        const queued = instance._pendingActions;
+                        instance._pendingActions = null;
+                        for (let i = 0; i < queued.length; i++) {
+                            try {
+                                queued[i]();
+                            } catch (e) {
+                                // Route through _handleError so the component's
+                                // onError hook can intercept. See the matching
+                                // block in ComponentLifecycle.js for context.
+                                this._handleError(
+                                    `Error replaying queued action for component ${instance.name}`,
+                                    e,
+                                    instance,
+                                    { lifecycle: 'replay-pending-action' }
+                                );
+                            }
+                        }
+                    }
                     // Register tick lifecycle hook if defined
                     if (typeof instance.definition.tick === 'function') {
                         instance._tickFn = instance.definition.tick.bind(instance.context);
@@ -594,6 +676,19 @@ _setupDynamicComponentDetection()
             // Create all component instances
             for (const element of ctx.componentElements) {
                 this._createSingleInstance(element, ctx);
+            }
+
+            // Pre-pass: declare store subscriptions BEFORE computed setup.
+            // The async path may yield between phases (requestIdleCallback);
+            // the sync path doesn't yield, but we mirror the same order here
+            // so the behavior is identical regardless of which orchestrator
+            // ran. Without this pre-pass, the first computed-eval microtask
+            // flush can run before subscribePath registers the component as
+            // an entity-dep of its declared stores — and any store mutation
+            // between the two won't dirty the component's computeds, leaving
+            // stale cached values that no subsequent cascade re-evaluates.
+            for (const instance of ctx.instances) {
+                this._setupStoreSubscriptions(instance);
             }
 
             // Setup computed properties
@@ -719,6 +814,25 @@ _setupDynamicComponentDetection()
                 this._createSingleInstance(element, ctx);
             });
 
+            // Pre-pass: declare store subscriptions BEFORE computed setup.
+            // processWithIdleYield can yield between the computed-setup loop
+            // and the features loop. During those yields, the computed-eval
+            // microtask flush runs initial body evaluations — but if
+            // subscribePath hasn't registered entity-deps yet, store
+            // mutations that fire between yields don't dirty the
+            // component's computeds. The cached null result from that first
+            // eval then persists indefinitely. Running subscribePath as its
+            // own pre-pass ensures all entity-deps exist BEFORE any computed
+            // body runs.
+            //
+            // Synchronous loop — no yielding — so an async store init
+            // (e.g. `await PMStorage.open()` resolving while the scanner
+            // is mid-pass) can't slip a mutation through with only some
+            // components subscribed.
+            for (const instance of ctx.instances) {
+                this._setupStoreSubscriptions(instance);
+            }
+
             // Setup computed properties (uses shared unit-of-work method)
             await processWithIdleYield(ctx.instances, (instance) => {
                 this._setupSingleInstanceComputed(instance);
@@ -731,6 +845,16 @@ _setupDynamicComponentDetection()
             await processWithIdleYield(ctx.instances, (instance) => {
                 this._callSingleBeforeInitHook(instance);
             });
+
+            // Pre-populate _listRelationships from all templates BEFORE features.
+            // _setupSingleInstanceFeatures creates the render effect, which fires
+            // synchronously and may trigger _renderList. _renderList queries
+            // _listRelationships to decide whether nested-list integration runs.
+            // If we wait for per-component _setupListContexts (which runs in the
+            // next phase), the first batch of renders sees an empty map and
+            // nested lists never bind. Walking the root once up-front ensures
+            // every render — early or late — sees the relationships it needs.
+            this._prepopulateListRelationships();
 
             // Setup component features (uses shared unit-of-work method)
             await processWithIdleYield(ctx.instances, (instance) => {

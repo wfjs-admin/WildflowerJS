@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework, getDistMode } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, getDistMode, isMinifiedBuild } from './helpers/load-framework.js'
 
 // Helper to wait for framework processing
 async function waitForUpdate(ms = 50) {
@@ -106,6 +106,121 @@ describe('Batch Update Processing', () => {
     expect(listItems.length).toBe(2)
     expect(listItems[0].textContent).toBe('Item 1')
     expect(listItems[1].textContent).toBe('Item 2')
+  })
+
+  it('cancelBatch keeps mutations in state but skips render and clears bookkeeping', async () => {
+    testContainer.innerHTML = `
+      <div data-component="cancel-persist">
+        <span id="cancel-bind" data-bind="count"></span>
+      </div>
+    `
+
+    wildflower.component('cancel-persist', {
+      state: { count: 0 }
+    })
+
+    wildflower.scan()
+    await waitForCompleteRender()
+
+    const component = testContainer.querySelector('[data-component="cancel-persist"]')
+    const componentId = component.dataset.componentId
+    const instance = wildflower.componentInstances.get(componentId)
+    const bindingElement = component.querySelector('#cancel-bind')
+
+    // Initial render baseline.
+    expect(bindingElement.textContent).toBe('0')
+
+    // Track DOM updates so we can confirm cancel skipped scheduling.
+    let textContentSetCount = 0
+    const originalDescriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent')
+    Object.defineProperty(bindingElement, 'textContent', {
+      set(value) {
+        textContentSetCount++
+        return originalDescriptor.set.call(this, value)
+      },
+      get() {
+        return originalDescriptor.get.call(this)
+      }
+    })
+
+    // Cancelled batch: mutations persist in state but no render runs.
+    const batch = wildflower.startBatch()
+    instance.state.count = 5
+    batch.cancel()
+
+    await waitForUpdate()
+
+    expect(instance.state.count, 'cancelBatch must not roll back mutations').toBe(5)
+    expect(textContentSetCount, 'cancelBatch must skip render scheduling').toBe(0)
+    expect(originalDescriptor.get.call(bindingElement),
+      'DOM should reflect pre-batch value because no render fired'
+    ).toBe('0')
+
+    // Internal-state probe: bookkeeping cleared. Skipped on minified
+    // builds because terser mangles `_batchChanges` per mangle-properties.json.
+    if (!isMinifiedBuild()) {
+      expect(instance.stateManager._batchChanges?.size || 0,
+        '_batchChanges must be cleared on cancel'
+      ).toBe(0)
+    }
+  })
+
+  // Skipped on minified builds: the assertions probe `_batchChanges`
+  // entries directly to detect bookkeeping leaks. That property gets
+  // mangled in production. The observable DOM end-state would not
+  // distinguish a leak (both batches' mutations land in `instance.state`
+  // regardless of bookkeeping correctness), so there's no min-safe
+  // version of this test.
+  it.skipIf(isMinifiedBuild())('a fresh batch after cancel sees only its own mutations', async () => {
+    testContainer.innerHTML = `
+      <div data-component="cancel-leak">
+        <span id="leak-name" data-bind="name"></span>
+        <span id="leak-tag" data-bind="tag"></span>
+      </div>
+    `
+
+    wildflower.component('cancel-leak', {
+      state: { name: 'a', tag: 'x' }
+    })
+
+    wildflower.scan()
+    await waitForCompleteRender()
+
+    const component = testContainer.querySelector('[data-component="cancel-leak"]')
+    const componentId = component.dataset.componentId
+    const instance = wildflower.componentInstances.get(componentId)
+
+    // Cancelled batch touches `name`.
+    const cancelledBatch = wildflower.startBatch()
+    instance.state.name = 'b'
+    cancelledBatch.cancel()
+
+    // Stale entries from the cancelled batch must not leak into the
+    // next batch's _batchChanges. Verify the post-cancel Map is empty
+    // BEFORE we start the second batch.
+    expect(instance.stateManager._batchChanges?.size || 0,
+      'leftover _batchChanges entries from cancelled batch leak into next batch'
+    ).toBe(0)
+
+    // Fresh batch touches `tag` only.
+    const realBatch = wildflower.startBatch()
+    instance.state.tag = 'y'
+
+    // At this point _batchChanges should hold only `tag`, not `name`
+    // (name was cancelled). If the cancel didn't clear, we'd see both.
+    const recordedPaths = new Set(instance.stateManager._batchChanges.keys())
+    expect(recordedPaths.has('tag')).toBe(true)
+    expect(recordedPaths.has('name'),
+      'cancelled-batch path "name" must not appear in fresh batch _batchChanges'
+    ).toBe(false)
+
+    await realBatch.apply()
+    await waitForCompleteRender()
+
+    // Both mutations are in state (cancel does not roll back), but
+    // only the fresh batch should have driven a render.
+    expect(component.querySelector('#leak-name').textContent).toBe('b')
+    expect(component.querySelector('#leak-tag').textContent).toBe('y')
   })
 
   it('Batch updates minimize DOM operations', async () => {

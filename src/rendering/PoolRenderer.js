@@ -19,9 +19,10 @@ const _POOL_BLOCKED_ATTRS = new Set([
     'data-wf-portal', 'data-wf-model', 'data-wf-bind-html', 'data-wf-bind-class',
     'data-wf-bind-style', 'data-wf-bind-attr', 'data-wf-key'
 ]);
-const _POOL_URL_ATTRS = new Set(['href', 'src', 'formaction', 'action', 'poster']);
+const _POOL_URL_ATTRS = new Set(['href', 'src', 'formaction', 'action', 'poster', 'xlink:href']);
 
-// Attributes to strip from pool template content after compilation (same as TemplateSystem Phase 3.5)
+// Attributes to strip from pool template content after compilation,
+// matching the same set TemplateSystem strips from list templates.
 const _POOL_ATTRS_TO_STRIP = [
     'data-bind', 'data-wf-bind',
     'data-action', 'data-wf-action',
@@ -35,13 +36,61 @@ const _POOL_ATTRS_TO_STRIP = [
     'data-key', 'data-wf-key'
 ];
 const _POOL_STRIP_SELECTOR = _POOL_ATTRS_TO_STRIP.map(a => `[${a}]`).join(',');
-const _POOL_DANGEROUS_PROTO_RE = /^(javascript|vbscript):|^data:(?!image\/)/i;
+// data:image/svg+xml / data:image/xml can execute inline scripts via
+// <object>/<iframe>/<embed> — narrow the allowlist to raster formats only.
+const _POOL_DANGEROUS_PROTO_RE = /^(javascript|vbscript):|^data:(?!image\/(png|jpe?g|gif|webp|avif|bmp|ico|tiff?|x-icon)[,;])/i;
+
+// Boolean DOM properties whose attribute and JS-property desync after user
+// interaction. data-bind-attr writes both so toggling them stays correct
+// across interaction and DOM-element recycling.
+const _POOL_BOOLEAN_PROPS = new Set([
+    'checked', 'disabled', 'selected', 'readonly', 'multiple',
+    'required', 'open', 'hidden', 'autofocus', 'autoplay',
+    'controls', 'loop', 'muted', 'default', 'reversed'
+]);
+// Attribute name (lowercase) → JS property name (camelCase) mapping for
+// the few boolean attributes whose DOM property name differs.
+const _POOL_BOOLEAN_PROP_NAMES = { readonly: 'readOnly' };
+
+/**
+ * Resolve a dotted path against a context object. Used by data-bind and
+ * data-show fallback paths where the compile-time `isExpression` check
+ * didn't flag the path as an expression (no operators), but it still
+ * contains a dot (e.g. "props.visible"). Walks segments left to right,
+ * returning undefined on any null/undefined along the way.
+ * @private
+ */
+function _readPath(ctx, path) {
+    if (!path.includes('.')) return ctx[path];
+    const parts = path.split('.');
+    let v = ctx;
+    for (let i = 0; i < parts.length; i++) {
+        if (v == null) return undefined;
+        v = v[parts[i]];
+    }
+    return v;
+}
 
 /**
  * Pool handle — returned by component.pool(name).
  * Manages a collection of plain objects and their DOM representations.
  */
 class PoolHandle {
+    /**
+     * Best-effort detection of arrow functions. Concise methods (`foo() {}`) and
+     * arrows (`() => {}`) both lack `prototype`, so source inspection is the
+     * reliable distinguisher: an arrow has `=>` before its body opener.
+     * @private
+     */
+    static _isArrowFunction(fn) {
+        if (typeof fn !== 'function') return false;
+        if (fn.prototype !== undefined) return false;
+        const src = Function.prototype.toString.call(fn);
+        const arrowIdx = src.indexOf('=>');
+        const braceIdx = src.indexOf('{');
+        return arrowIdx !== -1 && (braceIdx === -1 || arrowIdx < braceIdx);
+    }
+
     constructor(name, container, keyProp, templateContent, compiledMetadata, framework, options) {
         this.name = name;
         this._container = container;
@@ -116,6 +165,104 @@ class PoolHandle {
         /** @type {Function|null} Lifecycle hook — called once before bulk clear */
         this._onClear = options.onClear || null;
 
+        /**
+         * Entity computed property descriptors.
+         * Object mapping computed name → property descriptor with getter.
+         * Pre-built once at pool registration; applied to each entity at add().
+         * When null, no computed work is done per-entity (zero overhead).
+         * @type {Object|null}
+         */
+        this._entityComputedDescriptors = null;
+        /** @type {string[]|null} Array of computed property names for fast iteration */
+        this._entityComputedNames = null;
+
+        if (options.entityComputed && typeof options.entityComputed === 'object') {
+            const descriptors = {};
+            const names = [];
+            for (const key of Object.keys(options.entityComputed)) {
+                const fn = options.entityComputed[key];
+                if (typeof fn !== 'function') continue;
+                // Arrow functions ignore the `this` the getter rebinds, so the
+                // computed either throws on first read or silently resolves
+                // against module-scope `this`. Fail loudly at registration.
+                if (PoolHandle._isArrowFunction(fn)) {
+                    throw new Error('[WildflowerJS Pool] entity.computed "' + key + '" is an arrow function. ' +
+                        'Arrow functions do not bind `this` to the entity. Use shorthand method syntax: ' +
+                        'computed: { ' + key + '() { /* this === entity */ } }');
+                }
+                names.push(key);
+                descriptors[key] = {
+                    configurable: true,
+                    // Enumerable so that Object.assign() into the ctx-buffer
+                    // (used when a pool has props, see _applyBindings) invokes
+                    // the getter and carries its value into the binding context.
+                    enumerable: true,
+                    // Intentionally uncached: recompute on every access. See
+                    // test-new/pool-entity-methods.test.js ("no cache" contract)
+                    // before adding memoization; a naive cache introduces
+                    // invalidation bugs when entity methods mutate state.
+                    get() { return fn.call(this); }
+                };
+            }
+            if (names.length > 0) {
+                this._entityComputedDescriptors = descriptors;
+                this._entityComputedNames = names;
+            }
+        }
+
+        /**
+         * Entity state template. Plain object whose own keys are
+         * shallow-merged into every new entity at add() time. Spawn-provided
+         * values win; template only fills in keys the spawn omitted. Brings
+         * pool entity state declaration into line with store/component state.
+         * @type {Object|null}
+         */
+        this._entityStateTemplate = null;
+        this._entityStateTemplateKeys = null;
+        if (options.entityStateTemplate && typeof options.entityStateTemplate === 'object') {
+            const keys = Object.keys(options.entityStateTemplate);
+            if (keys.length > 0) {
+                this._entityStateTemplate = options.entityStateTemplate;
+                this._entityStateTemplateKeys = keys;
+            }
+        }
+
+        /**
+         * Entity methods. Functions installed on every entity at add()
+         * time, with `this` bound to the entity at call time. Routed by data-action
+         * dispatch in preference to component methods.
+         * @type {Object|null}
+         */
+        this._entityMethodDescriptors = null;
+        this._entityMethodNames = null;
+        if (options.entityMethods && typeof options.entityMethods === 'object') {
+            const mDescriptors = {};
+            const mNames = [];
+            for (const key of Object.keys(options.entityMethods)) {
+                const fn = options.entityMethods[key];
+                if (typeof fn !== 'function') continue;
+                // Arrow functions don't bind `this` to the entity at call time,
+                // so the method would silently fail to mutate. Fail loudly at
+                // registration — there is no legitimate use case for an arrow
+                // as an entity method, so throw rather than warn.
+                if (PoolHandle._isArrowFunction(fn)) {
+                    throw new Error('[WildflowerJS Pool] entity method "' + key + '" is an arrow function. ' +
+                        'Arrow functions do not bind `this` to the entity. Use shorthand method syntax: ' +
+                        'entity: { ' + key + '() { /* this === entity */ } }');
+                }
+                mNames.push(key);
+                // Non-enumerable: methods don't need to flow into ctx-buffer
+                // (binding evaluators read values, never invoke methods),
+                // and keeping them off enumeration matches the intuition that
+                // serializing an entity should give plain data.
+                mDescriptors[key] = { configurable: true, enumerable: false, writable: false, value: fn };
+            }
+            if (mNames.length > 0) {
+                this._entityMethodDescriptors = mDescriptors;
+                this._entityMethodNames = mNames;
+            }
+        }
+
         /** @type {Array<{el: Element, elementsArray: Array}>} Recycled DOM nodes for reuse */
         this._freeList = [];
         /** @type {number} Maximum recycled nodes to retain */
@@ -172,6 +319,11 @@ class PoolHandle {
             return obj;
         }
 
+        // Apply defaults before installing computed/methods so that
+        // template-provided fields count as own properties (they should).
+        this._applyEntityStateTemplate(obj);
+        this._installEntityComputed(obj);
+        this._installEntityMethods(obj);
         this.items.push(obj);
 
         let el, elementsArray;
@@ -202,14 +354,17 @@ class PoolHandle {
         }
 
         const isStatic = this._staticProp && obj[this._staticProp];
-        const entry = { el, elementsArray, item: obj, itemsIdx: this.items.length - 1, entitiesIdx: this._entitiesArray.length, _isStatic: isStatic };
+        const subArr = isStatic ? this._staticArray : this._dynamicArray;
+        const entry = {
+            el, elementsArray, item: obj,
+            itemsIdx: this.items.length - 1,
+            entitiesIdx: this._entitiesArray.length,
+            subIdx: subArr.length,
+            _isStatic: isStatic
+        };
         this._entities.set(key, entry);
         this._entitiesArray.push(entry);
-        if (isStatic) {
-            this._staticArray.push(entry);
-        } else {
-            this._dynamicArray.push(entry);
-        }
+        subArr.push(entry);
 
         // Apply initial bindings
         this._applyBindings(el, obj);
@@ -253,6 +408,9 @@ class PoolHandle {
                 continue;
             }
 
+            this._applyEntityStateTemplate(obj);
+            this._installEntityComputed(obj);
+            this._installEntityMethods(obj);
             this.items.push(obj);
 
             let el, elementsArray;
@@ -276,14 +434,17 @@ class PoolHandle {
             }
 
             const isStatic = this._staticProp && obj[this._staticProp];
-            const entry = { el, elementsArray, item: obj, itemsIdx: this.items.length - 1, entitiesIdx: this._entitiesArray.length, _isStatic: isStatic };
+            const subArr = isStatic ? this._staticArray : this._dynamicArray;
+            const entry = {
+                el, elementsArray, item: obj,
+                itemsIdx: this.items.length - 1,
+                entitiesIdx: this._entitiesArray.length,
+                subIdx: subArr.length,
+                _isStatic: isStatic
+            };
             this._entities.set(key, entry);
             this._entitiesArray.push(entry);
-            if (isStatic) {
-                this._staticArray.push(entry);
-            } else {
-                this._dynamicArray.push(entry);
-            }
+            subArr.push(entry);
 
             this._applyBindings(el, obj);
             fragment.appendChild(el);
@@ -345,13 +506,16 @@ class PoolHandle {
         }
         this._entitiesArray.pop();
 
-        // Remove from static/dynamic sub-array
+        // O(1) swap-with-last removal from static/dynamic sub-array via stored subIdx
         const subArr = entry._isStatic ? this._staticArray : this._dynamicArray;
-        const subIdx = subArr.indexOf(entry);
-        if (subIdx !== -1) {
-            subArr[subIdx] = subArr[subArr.length - 1];
-            subArr.pop();
+        const subIdx = entry.subIdx;
+        const lastSub = subArr.length - 1;
+        if (subIdx < lastSub) {
+            const swapped = subArr[lastSub];
+            subArr[subIdx] = swapped;
+            swapped.subIdx = subIdx;
         }
+        subArr.pop();
 
         // Remove from map
         this._entities.delete(key);
@@ -544,6 +708,119 @@ class PoolHandle {
     }
 
     /**
+     * Array-like alias for `size`. Enables pool.length to read naturally
+     * alongside JavaScript array idioms (length, push, pop, filter, etc.).
+     * @returns {number}
+     */
+    get length() {
+        return this._entities.size;
+    }
+
+    // ========================================================================
+    // Array-like API
+    // These methods make PoolHandle feel like a JavaScript array for
+    // ergonomic symmetry with developers' existing mental models.
+    // All array mutators delegate to add/remove to preserve identity semantics.
+    // ========================================================================
+
+    /**
+     * Array-native alias for add(). Accepts a single entity or an array.
+     * @param {Object|Object[]} objOrArray
+     * @returns {number} The new length of the pool (matches Array.prototype.push).
+     */
+    push(objOrArray) {
+        this.add(objOrArray);
+        return this._entities.size;
+    }
+
+    /**
+     * Remove and return the last entity in the pool.
+     * Uses swap-with-last semantics from the underlying items array.
+     * @returns {Object|undefined} The removed entity, or undefined if empty.
+     */
+    // ---- Array readers -- pure delegates to the underlying items array ----
+    //
+    // Index-dependent methods (splice, pop, indexOf, slice) are intentionally
+    // omitted. Pools use swap-with-last removal, so an entity's position in
+    // items[] is reshuffled by any remove() elsewhere in the pool — any
+    // "remove at index i" operation silently refers to a different entity
+    // than the caller likely intended. Use remove(key) to delete, and at(i)
+    // when you need positional access in DOM order (stable).
+
+    find(fn)    { return this.items.find(fn); }
+    filter(fn)  { return this.items.filter(fn); }
+    map(fn)     { return this.items.map(fn); }
+    forEach(fn) { return this.items.forEach(fn); }
+    some(fn)    { return this.items.some(fn); }
+    every(fn)   { return this.items.every(fn); }
+    reduce(fn, init) {
+        return arguments.length > 1
+            ? this.items.reduce(fn, init)
+            : this.items.reduce(fn);
+    }
+
+    [Symbol.iterator]() {
+        return this.items[Symbol.iterator]();
+    }
+
+    /**
+     * Apply the entity state template to a new entity.
+     * Shallow merge: template fills in keys the spawn omitted. Spawn values
+     * always win. Nested objects are shared by reference — documented behavior.
+     * @private
+     */
+    _applyEntityStateTemplate(obj) {
+        if (!this._entityStateTemplate) return;
+        const keys = this._entityStateTemplateKeys;
+        const template = this._entityStateTemplate;
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+                obj[key] = template[key];
+            }
+        }
+    }
+
+    /**
+     * Install computed property getters on an entity.
+     * Defines each computed as an accessor on the entity object. When the
+     * entity already has an own property with the same name, the literal
+     * value wins (getter is not installed for that name).
+     * No-op when the pool has no entity computed definitions.
+     * @private
+     */
+    _installEntityComputed(obj) {
+        if (!this._entityComputedDescriptors) return;
+        const names = this._entityComputedNames;
+        const descriptors = this._entityComputedDescriptors;
+        for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            // If the entity has its own data property with this name, skip —
+            // literal values always win to prevent surprising override.
+            if (Object.prototype.hasOwnProperty.call(obj, name)) continue;
+            Object.defineProperty(obj, name, descriptors[name]);
+        }
+    }
+
+    /**
+     * Install entity methods on an entity.
+     * Methods are non-enumerable function values; calling entity[name](...)
+     * invokes the original function with `this === entity`. Same own-property
+     * shadow rule as computed: a literal of the same name wins.
+     * @private
+     */
+    _installEntityMethods(obj) {
+        if (!this._entityMethodDescriptors) return;
+        const names = this._entityMethodNames;
+        const descriptors = this._entityMethodDescriptors;
+        for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            if (Object.prototype.hasOwnProperty.call(obj, name)) continue;
+            Object.defineProperty(obj, name, descriptors[name]);
+        }
+    }
+
+    /**
      * Apply all compiled bindings to a single entity's DOM element.
      * Restore a recycled element to its template-original state.
      * Resets className, inline styles, and visibility to match a freshly-cloned template.
@@ -614,17 +891,23 @@ class PoolHandle {
 
         const elements = el._cachedElementsArray;
 
-        // ── data-bind (text content) — direct property read ──
+        // ── data-bind (text content, or input value for form controls) ──
         const bindings = meta.bindings;
         for (let i = 0; i < bindings.length; i++) {
             const binding = bindings[i];
             const target = elements[binding.index];
             if (!target) continue;
-            const value = binding.isExpression ? this._evalExpr(binding, ctx) : ctx[binding.path];
+            const value = binding.isExpression ? this._evalExpr(binding, ctx) : _readPath(ctx, binding.path);
             // Skip String() conversion + DOM comparison when raw value unchanged
             if (value === target._poolPrevRaw) continue;
             target._poolPrevRaw = value;
-            target.textContent = value == null ? '' : String(value);
+            const strValue = value == null ? '' : String(value);
+            if (binding.isInput) {
+                // INPUT/TEXTAREA/SELECT: write .value, not textContent
+                if (target.value !== strValue) target.value = strValue;
+            } else {
+                target.textContent = strValue;
+            }
         }
 
         // ── data-show — direct property read ──
@@ -633,7 +916,7 @@ class PoolHandle {
             const show = shows[i];
             const target = elements[show.index];
             if (!target) continue;
-            const raw = show.isExpression ? this._evalExpr(show, ctx) : ctx[show.path];
+            const raw = show.isExpression ? this._evalExpr(show, ctx) : _readPath(ctx, show.path);
             const visible = show.negate ? !raw : Boolean(raw);
             const display = visible ? '' : 'none';
             if (target.style.display !== display) target.style.display = display;
@@ -734,6 +1017,21 @@ class PoolHandle {
                         if (_POOL_BLOCKED_ATTRS.has(lower)) continue;
 
                         const val = result[attr];
+                        // Boolean DOM properties: also write the JS property,
+                        // not just the attribute. Once a user interacts with
+                        // a checkbox, the attribute and the .checked property
+                        // desync — removeAttribute alone won't uncheck it.
+                        if (_POOL_BOOLEAN_PROPS.has(lower)) {
+                            const boolVal = !!val && val !== 'false';
+                            const propName = _POOL_BOOLEAN_PROP_NAMES[lower] || lower;
+                            if (target[propName] !== boolVal) target[propName] = boolVal;
+                            if (boolVal) {
+                                if (prev[attr] !== '') { prev[attr] = ''; target.setAttribute(attr, ''); }
+                            } else {
+                                if (prev[attr] !== null) { prev[attr] = null; target.removeAttribute(attr); }
+                            }
+                            continue;
+                        }
                         if (val === null || val === undefined || val === false) {
                             if (prev[attr] !== null) {
                                 prev[attr] = null;
@@ -1064,7 +1362,7 @@ export const PoolRendererMethods = {
 
             // Resolve lifecycle hooks and props from declarative pools block
             const poolDef = instance._poolDefinitions?.get(path);
-            let onAdd = null, onRemove = null, onClear = null, poolProps = null;
+            let onAdd = null, onRemove = null, onClear = null, poolProps = null, entityComputed = null, entityMethods = null, entityStateTemplate = null;
             if (poolDef) {
                 const ctx = instance.context;
                 const resolve = (hook) => typeof hook === 'string' ? ctx[hook]?.bind(ctx) :
@@ -1075,11 +1373,35 @@ export const PoolRendererMethods = {
                 if (poolDef.props && typeof poolDef.props === 'object') {
                     poolProps = poolDef.props;
                 }
+                // entity.computed — per-entity derived values
+                if (poolDef.entity && poolDef.entity.computed && typeof poolDef.entity.computed === 'object') {
+                    entityComputed = poolDef.entity.computed;
+                }
+                // entity.state — default-state template merged into new entities
+                if (poolDef.entity && poolDef.entity.state && typeof poolDef.entity.state === 'object') {
+                    entityStateTemplate = poolDef.entity.state;
+                }
+                // Entity methods live at the top level of the entity block
+                // (matching component/store shape, where methods are also top-level).
+                // Any function property on the entity block that isn't a reserved
+                // key — state, computed — becomes an entity method.
+                if (poolDef.entity && typeof poolDef.entity === 'object') {
+                    const collected = {};
+                    let hasAny = false;
+                    for (const key of Object.keys(poolDef.entity)) {
+                        if (key === 'state' || key === 'computed') continue;
+                        const v = poolDef.entity[key];
+                        if (typeof v !== 'function') continue;
+                        collected[key] = v;
+                        hasAny = true;
+                    }
+                    if (hasAny) entityMethods = collected;
+                }
             }
 
             const handle = new PoolHandle(path, element, keyProp, templateContent, compiledMetadata, this, {
                 targetFps, cullPadding, sortProp, sortDesc, cullProps, defaultEntityWidth, defaultEntityHeight, staticProp, isPassive,
-                props: poolProps, onAdd, onRemove, onClear
+                props: poolProps, onAdd, onRemove, onClear, entityComputed, entityMethods, entityStateTemplate
             });
             instance._pools.set(path, handle);
 
@@ -1132,7 +1454,11 @@ export const PoolRendererMethods = {
                             const idx = cachedElements.indexOf(el);
                             if (idx !== -1 && indexMap.has(idx)) {
                                 const method = indexMap.get(idx);
-                                if (typeof ctx[method] === 'function') {
+                                // Entity method wins over component method when both exist
+                                const entityFn = item[method];
+                                if (typeof entityFn === 'function') {
+                                    entityFn.call(item, event);
+                                } else if (typeof ctx[method] === 'function') {
                                     ctx[method](item, event);
                                 }
                                 return; // First match wins — don't continue walking

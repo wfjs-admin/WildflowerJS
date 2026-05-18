@@ -675,4 +675,58 @@ describe('Async Lifecycle Hooks', () => {
       expect(initCalled).toBe(false)
     })
   })
+
+  describe('Pre-init action queue and replay', () => {
+    it('queues actions invoked before init() runs and replays them after init', async () => {
+      // Regression: a method invoked on a component before its deferred
+      // init() ran (e.g. user code calling instance.context.foo() right
+      // after wildflower.scan()) used to land on a partially-initialized
+      // component, throw, or be silently dropped. Now external method
+      // calls are queued via _wrapMethod when instance._initReady is
+      // false, then replayed in order after init() completes.
+      const order = []
+
+      wildflower.component('preinit-queue-test', {
+        state: { initRan: false, log: [] },
+        init() {
+          // Sync init that flips a marker.
+          this.state.initRan = true
+          order.push('init')
+        },
+        record(label) {
+          // Handler depends on init-set state. If queued+replayed,
+          // initRan must already be true here.
+          this.state.log = this.state.log.concat([label + ':' + this.state.initRan])
+          order.push('rec:' + label)
+        }
+      })
+
+      testContainer.innerHTML = `<div data-component="preinit-queue-test"></div>`
+
+      // Kick scan. Init is deferred (setTimeout(0)) — synchronously after
+      // this call, the wrapper exists but _initReady is still false.
+      wildflower.scan(testContainer)
+
+      const compEl = testContainer.querySelector('[data-component-id]')
+      const inst = wildflower.componentInstances.get(compEl.dataset.componentId)
+      expect(inst).toBeDefined()
+      expect(inst._initReady).toBeFalsy()
+
+      // Invoke the method BEFORE init runs. _wrapMethod sees
+      // _initReady === false and queues into _pendingActions.
+      inst.context.record('a')
+      inst.context.record('b')
+
+      // Nothing should have actually run yet.
+      expect(order.length).toBe(0)
+      expect(Array.from(inst.state.log).length).toBe(0)
+
+      // Yield so deferred init fires. After init: _initReady = true,
+      // queued actions replay in order.
+      await waitForUpdate(20)
+
+      expect(order).toEqual(['init', 'rec:a', 'rec:b'])
+      expect(Array.from(inst.state.log)).toEqual(['a:true', 'b:true'])
+    })
+  })
 })

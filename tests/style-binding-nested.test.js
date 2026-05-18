@@ -325,10 +325,9 @@ describe('Style Binding Nested Properties', () => {
                     ]
                 },
                 computed: {
-                    // This computed will be evaluated for each item in list context
-                    itemStyle() {
-                        // In list context, this.id comes from the item
-                        const isSelected = this.id === this.state?.selectedId
+                    // Parameterised: receives the current item.
+                    itemStyle(item) {
+                        const isSelected = item && item.id === this.state?.selectedId
                         return {
                             backgroundColor: isSelected ? 'lightblue' : 'white',
                             fontWeight: isSelected ? 'bold' : 'normal'
@@ -382,8 +381,8 @@ describe('Style Binding Nested Properties', () => {
                     visibleTasks() {
                         return this.state.tasks.filter(t => t.visible)
                     },
-                    taskStyle() {
-                        const isHighlighted = this.category === this.state?.highlightedCategory
+                    taskStyle(task) {
+                        const isHighlighted = task && task.category === this.state?.highlightedCategory
                         return {
                             borderLeft: isHighlighted ? '4px solid red' : '4px solid transparent',
                             paddingLeft: '8px'
@@ -430,8 +429,8 @@ describe('Style Binding Nested Properties', () => {
                     ]
                 },
                 computed: {
-                    dynamicStyle() {
-                        const isActive = this.id === this.state?.activeItemId
+                    dynamicStyle(item) {
+                        const isActive = item && item.id === this.state?.activeItemId
                         return {
                             opacity: isActive ? '1' : '0.5'
                         }

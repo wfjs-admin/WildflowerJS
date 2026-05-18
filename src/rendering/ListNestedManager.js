@@ -32,7 +32,31 @@ export const ListNestedMethods = {
         const parentItem = parentData[parentIndex];
         if (!parentItem || typeof parentItem !== 'object') return null;
 
-        const childData = parentItem[childPath] || [];
+        let childData = parentItem[childPath];
+
+        // Fallback: when the child path isn't a raw field on the item but
+        // IS a defined item-level computed property on the component, evaluate
+        // it in the item's context. This mirrors data-bind's implicit computed
+        // resolution and lets nested data-list paths use item-level computeds.
+        if (childData === undefined &&
+            !childPath.includes('.') &&
+            parentContext.componentInstance?.stateManager?.computed?.[childPath]) {
+            try {
+                childData = this._evaluateComputedInListContext(
+                    parentContext.componentInstance,
+                    childPath,
+                    parentItem,
+                    parentIndex,
+                    parentContext
+                );
+            } catch (e) {
+                if (typeof __DEV__ !== 'undefined' && __DEV__) {
+                    console.error(`Error evaluating nested list computed "${childPath}":`, e);
+                }
+            }
+        }
+
+        if (childData === undefined || childData === null) childData = [];
 
         // Create child context with proper parent relationship
         const context = this._createListContext(
@@ -208,7 +232,25 @@ export const ListNestedMethods = {
             const nestedListElements = itemEl.querySelectorAll(`[data-list="${escapedPath}"]`);
 
             nestedListElements.forEach(nestedListEl => {
-                const nestedData = item[childPath];
+                let nestedData = item[childPath];
+
+                // Fallback: implicit item-level computed evaluation when the
+                // path isn't a raw field on the item. Mirrors data-bind's
+                // resolution so item-level computeds work as nested-list
+                // sources, not just as data-bind values.
+                if (nestedData === undefined &&
+                    !childPath.includes('.') &&
+                    instance?.stateManager?.computed?.[childPath]) {
+                    try {
+                        nestedData = this._evaluateComputedInListContext(
+                            instance, childPath, item, index, context
+                        );
+                    } catch (e) {
+                        if (typeof __DEV__ !== 'undefined' && __DEV__) {
+                            console.error(`Error evaluating nested list computed "${childPath}":`, e);
+                        }
+                    }
+                }
 
                 if (Array.isArray(nestedData)) {
                     // CRITICAL: Check if nested list already has a context and update its _parentIndex
@@ -221,6 +263,23 @@ export const ListNestedMethods = {
                         childContext._parentIndex = index;
                     } else if (context.createChildContext) {
                         childContext = context.createChildContext(index, childPath);
+                        // Parent context.data may be stale if mapArray's reactive effect
+                        // updated the array without going through _renderList (which is
+                        // the only path that refreshes context.data). When that happens,
+                        // getItemData returns null and createChildContext yields null.
+                        // Fall back to constructing the context directly from nestedData.
+                        if (!childContext) {
+                            childContext = this._createListContext(
+                                childPath,
+                                nestedData,
+                                instance,
+                                context,
+                                index
+                            );
+                            if (childContext) {
+                                childContext._parentIndex = index;
+                            }
+                        }
                     } else {
                         childContext = this._createListContext(
                             childPath,

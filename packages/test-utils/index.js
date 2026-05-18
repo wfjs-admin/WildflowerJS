@@ -230,50 +230,70 @@ export function getDistMode() {
  */
 export function getFrameworkScripts(mode) {
   const distMode = mode || getDistMode()
+  // Allow tests to be pointed at an alternate dist directory (e.g. /dist-esbuild)
+  // via __WILDFLOWER_DIST_DIR__ injected by the vitest config.
+  const dir = (typeof __WILDFLOWER_DIST_DIR__ !== 'undefined') ? __WILDFLOWER_DIST_DIR__ : '/dist'
 
   switch (distMode) {
     // Minified production builds
     case 'core':
-      return ['/dist/wildflower.min.js']
+      return [`${dir}/wildflower.min.js`]
+    case 'mini':
+      return [`${dir}/wildflower.mini.min.js`]
     case 'lite':
-      return ['/dist/wildflower.lite.min.js']
+      return [`${dir}/wildflower.lite.min.js`]
     case 'spa':
-      return ['/dist/wildflower.spa.min.js']
+      return [`${dir}/wildflower.spa.min.js`]
     case 'full':
-      return ['/dist/wildflower.full.min.js']
+      return [`${dir}/wildflower.full.min.js`]
     // Explicit minified builds (same as short names, for clarity)
     case 'core-min':
-      return ['/dist/wildflower.min.js']
+      return [`${dir}/wildflower.min.js`]
+    case 'mini-min':
+      return [`${dir}/wildflower.mini.min.js`]
     case 'lite-min':
-      return ['/dist/wildflower.lite.min.js']
+      return [`${dir}/wildflower.lite.min.js`]
     case 'spa-min':
-      return ['/dist/wildflower.spa.min.js']
+      return [`${dir}/wildflower.spa.min.js`]
     case 'full-min':
-      return ['/dist/wildflower.full.min.js']
+      return [`${dir}/wildflower.full.min.js`]
     case 'experimental-min':
-      return ['/dist/wildflower.experimental.js']
+      return [`${dir}/wildflower.experimental.js`]
     // Development builds (console warnings preserved)
     case 'core-dev':
-      return ['/dist/wildflower.dev.js']
+      return [`${dir}/wildflower.dev.js`]
+    case 'mini-dev':
+      return [`${dir}/wildflower.mini.dev.js`]
     case 'lite-dev':
-      return ['/dist/wildflower.lite.dev.js']
+      return [`${dir}/wildflower.lite.dev.js`]
     case 'spa-dev':
-      return ['/dist/wildflower.spa.dev.js']
+      return [`${dir}/wildflower.spa.dev.js`]
     case 'full-dev':
-      return ['/dist/wildflower.full.dev.js']
+      return [`${dir}/wildflower.full.dev.js`]
+    // Uncompressed builds (plain .js — unminified, __DEV__=true, full source readable)
+    case 'core-raw':
+      return [`${dir}/wildflower.js`]
+    case 'mini-raw':
+      return [`${dir}/wildflower.mini.js`]
+    case 'lite-raw':
+      return [`${dir}/wildflower.lite.js`]
+    case 'spa-raw':
+      return [`${dir}/wildflower.spa.js`]
+    case 'full-raw':
+      return [`${dir}/wildflower.full.js`]
     // EXPERIMENTAL: Schema-based ListRenderer v2
     case 'experimental':
-      return ['/dist/wildflower.experimental.js']
+      return [`${dir}/wildflower.experimental.js`]
     case 'experimental-dev':
-      return ['/dist/wildflower.experimental.dev.js']
+      return [`${dir}/wildflower.experimental.dev.js`]
     case 'source':
       // DEPRECATED: The old monolithic files in /src/ are obsolete after ES6 migration.
       // Source is now in /src/ and must be built to /dist/.
       // Fall through to full-dev as the default.
       console.warn('[WF Test] "source" mode is deprecated. Using "full-dev" instead. See /src/ for ES6 modules.')
-      return ['/dist/wildflower.full.dev.js']
+      return [`${dir}/wildflower.full.dev.js`]
     default:
-      return ['/dist/wildflower.full.dev.js']
+      return [`${dir}/wildflower.full.dev.js`]
   }
 }
 
@@ -284,7 +304,7 @@ export function getFrameworkScripts(mode) {
  * @returns {string} Base mode without -dev suffix
  */
 function getBaseMode(mode) {
-  return mode.replace(/-(dev|min)$/, '')
+  return mode.replace(/-(dev|min|raw)$/, '')
 }
 
 /**
@@ -295,6 +315,27 @@ function getBaseMode(mode) {
  */
 function isDevBuild(mode) {
   return mode.endsWith('-dev')
+}
+
+/**
+ * Check if a mode is an uncompressed (plain .js) build — unminified, __DEV__=true.
+ * Raw builds preserve all debug features (like dev builds) but are NOT minified or mangled.
+ * @private
+ * @param {string} mode - Distribution mode
+ * @returns {boolean} Whether this is a raw/uncompressed build
+ */
+function isRawBuild(mode) {
+  return mode.endsWith('-raw')
+}
+
+/**
+ * Check if a mode is any unminified build (dev or raw).
+ * Used to decide whether console warnings / __DEV__ features are available.
+ * @private
+ * @param {string} mode - Distribution mode
+ */
+function isUnminifiedBuild(mode) {
+  return isDevBuild(mode) || isRawBuild(mode)
 }
 
 /**
@@ -315,15 +356,19 @@ export function hasFeature(feature) {
   // Features stripped from lite build only
   const liteStrippedFeatures = ['portals', 'transitions', 'modals', 'configurable-templates', 'plugins']
 
-  if (baseMode === 'lite' && liteStrippedFeatures.includes(feature)) {
+  if ((baseMode === 'lite' || baseMode === 'mini') && liteStrippedFeatures.includes(feature)) {
     return false
   }
 
-  // Binding validation is only in source and dev builds
-  // Minified builds strip FEATURE_BINDING_VALIDATION, but dev builds keep it
+  // Mini build also excludes pools (data-pool renderer)
+  if (baseMode === 'mini' && (feature === 'pools' || feature === 'data-pool')) {
+    return false
+  }
+
+  // Binding validation is only in source, dev, and raw (uncompressed) builds
+  // Minified builds strip FEATURE_BINDING_VALIDATION; dev and raw keep it
   if ((feature === 'validation' || feature === 'binding-validation')) {
-    // Available in source and all dev builds
-    if (mode === 'source' || isDevBuild(mode)) {
+    if (mode === 'source' || isUnminifiedBuild(mode)) {
       return true
     }
     return false
@@ -331,13 +376,13 @@ export function hasFeature(feature) {
 
   // SSR is only in full builds (and source)
   // Experimental build is based on core, so no SSR
-  if (feature === 'ssr' && (baseMode === 'core' || baseMode === 'lite' || baseMode === 'spa' || baseMode === 'experimental')) {
+  if (feature === 'ssr' && (baseMode === 'core' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'spa' || baseMode === 'experimental')) {
     return false
   }
 
   // Router is only in spa and full builds (and source)
   // Experimental build is based on core, so no router
-  if (feature === 'router' && (baseMode === 'core' || baseMode === 'lite' || baseMode === 'experimental')) {
+  if (feature === 'router' && (baseMode === 'core' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'experimental')) {
     return false
   }
 
@@ -352,8 +397,8 @@ export function hasFeature(feature) {
  */
 export function isMinifiedBuild() {
   const mode = getDistMode()
-  // Source and dev builds are not minified
-  return mode !== 'source' && !isDevBuild(mode)
+  // Source, dev, and raw (uncompressed) builds are not minified
+  return mode !== 'source' && !isUnminifiedBuild(mode)
 }
 
 /**

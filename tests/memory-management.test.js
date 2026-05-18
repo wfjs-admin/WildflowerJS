@@ -762,10 +762,15 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
     // Force the component into a permanently not-ready state
     instance.state._internal = { ready: false }
 
-    // waitForReady should reject within a bounded time, not poll forever
-    // Use Promise.race to enforce our own test deadline
+    // waitForReady should reject within a bounded time, not poll forever.
+    // The framework's nominal timeout is 10s (1000 polls × 10ms). Under
+    // full-suite browser-mode load, setTimeout scheduling is bursty:
+    // 1000 sequential 10ms timers can stretch well past 10s wall-clock
+    // while individual tests run normally. Test deadline at 30s leaves
+    // 3x cushion before our outer race fires; the assertion still
+    // verifies rejection came from waitForReady, not from this guard.
     const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('test deadline exceeded')), 12000)
+      setTimeout(() => reject(new Error('test deadline exceeded')), 30000)
     )
 
     let rejected = false

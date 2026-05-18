@@ -410,6 +410,41 @@ export class ReactiveStateManager {
 
 
     /**
+     * __DEV__-only warning when a reactive object is reachable via two paths
+     * with different roots — i.e., aliased across state subtrees, e.g.:
+     *
+     *   state.a = state.b = sharedObj;
+     *
+     * The framework supports this by re-stamping PATH_SYMBOL on each access,
+     * but the latest-access-wins semantics mean writes through the "losing"
+     * path may notify the wrong subscribers depending on access order, and
+     * normalised data store patterns (the same record reachable via id-keyed
+     * map and a "selected" pointer) silently enter trap territory.
+     *
+     * Heuristic: warn only when the path's FIRST segment differs. That filters
+     * out the legitimate splice/reindex case (`items.0` → `items.1`, same root
+     * "items") while catching cross-subtree aliasing (`a` ↔ `b`, `users.0` ↔
+     * `selected`). Conservative: misses within-subtree aliasing like
+     * `a.shared` ↔ `a.other`, but those are the less-common pattern and the
+     * cost of a false-negative warn is just a missed nudge.
+     *
+     * @private
+     */
+    _maybeWarnPathAlias(oldPath, newPath) {
+        const oldDot = oldPath.indexOf('.');
+        const newDot = newPath.indexOf('.');
+        const oldRoot = oldDot === -1 ? oldPath : oldPath.slice(0, oldDot);
+        const newRoot = newDot === -1 ? newPath : newPath.slice(0, newDot);
+        if (oldRoot !== newRoot) {
+            console.warn(
+                `[WF] Reactive object aliased across state subtrees: same target reachable via "${oldPath}" and "${newPath}". ` +
+                `Writes will route to whichever path was accessed most recently; bindings on the other path may miss updates. ` +
+                `Hold the data in one place and use a derived computed for cross-references.`
+            );
+        }
+    }
+
+    /**
      * Create a reactive proxy that detects property access and changes
      * @param {Object|Array} target - The object or array to make reactive
      * @param {string} path - The current property path
@@ -433,6 +468,7 @@ export class ReactiveStateManager {
             if (path) {
                 const rawTarget = this._proxyTargets.get(target);
                 if (rawTarget && rawTarget[PATH_SYMBOL] !== undefined && rawTarget[PATH_SYMBOL] !== path) {
+                    if (__DEV__) this._maybeWarnPathAlias(rawTarget[PATH_SYMBOL], path);
                     rawTarget[PATH_SYMBOL] = path;
                     rawTarget[ARRAY_PATH_SYMBOL] = undefined;
                 }
@@ -449,6 +485,7 @@ export class ReactiveStateManager {
             if (path) {
                 const currentPath = target[PATH_SYMBOL];
                 if (currentPath !== undefined && currentPath !== path) {
+                    if (__DEV__) this._maybeWarnPathAlias(currentPath, path);
                     target[PATH_SYMBOL] = path;
                     target[ARRAY_PATH_SYMBOL] = undefined;
                 }
@@ -514,7 +551,7 @@ export class ReactiveStateManager {
     }
 
     // ===================================================================
-    // PHASE 2.5: PATHLESS PROXY INFRASTRUCTURE FOR mapArray
+    // Pathless proxy infrastructure for mapArray.
     // These methods enable fine-grained list reactivity by creating
     // isolated proxies for list items that don't depend on the parent array.
     // ===================================================================
@@ -721,15 +758,18 @@ export class ReactiveStateManager {
 
                 if (removedKey !== null && removedIdx >= 0) {
                     // SINGLE REMOVE FAST PATH - skip full key map build
-                    self._arrayIndexMutations.isSpliceInProgress = true;
 
                     const removedItem = currentItems[removedIdx];
 
-                    // Dispose effect
+                    // Dispose effect + run user onRemove BEFORE setting the splice flag.
+                    // `isSpliceInProgress` gates the index-shifting phase (lines below);
+                    // setting it earlier incorrectly suppresses reactive-state writes
+                    // that user cleanup callbacks may perform (e.g. a nested component's
+                    // onDestroy writing to the same component's non-array state).
                     if (removedItem.disposeEffect) removedItem.disposeEffect();
-
-                    // Call onRemove
                     onRemove(removedItem.element, removedItem.key);
+
+                    self._arrayIndexMutations.isSpliceInProgress = true;
 
                     // Remove from currentItems
                     currentItems.splice(removedIdx, 1);
@@ -1072,15 +1112,16 @@ export class ReactiveStateManager {
                     // SINGLE REMOVE - O(n) index updates only (no reordering needed)
                     // PERF: Set flag to skip proxy set trap processing during index shifts
                     // This prevents ~9500 _handleArrayIndexMutation calls from firing
-                    self._arrayIndexMutations.isSpliceInProgress = true;
-
                     const removedItem = currentItems[removedIdx];
 
-                    // Dispose effect
+                    // Dispose effect + run user onRemove BEFORE setting the splice flag.
+                    // `isSpliceInProgress` gates the index-shifting phase (lines below);
+                    // setting it earlier would suppress reactive-state writes that user
+                    // cleanup callbacks may perform (e.g. nested-component onDestroy hooks).
                     if (removedItem.disposeEffect) removedItem.disposeEffect();
-
-                    // Call onRemove
                     onRemove(removedItem.element, removedItem.key);
+
+                    self._arrayIndexMutations.isSpliceInProgress = true;
 
                     // Remove from currentItems
                     currentItems.splice(removedIdx, 1);
@@ -2520,6 +2561,22 @@ export class ReactiveStateManager {
         
         // If all properties are processed and initial setup is complete, clear the queue
         // Note: Use .clear() instead of = null to maintain stable V8 hidden class
+        //
+        // INVARIANT: the !_isInitialSetup branch could in principle drop
+        // un-ready entries — values queued for
+        // a data-bind-html element that hasn't registered yet. The reason this
+        // doesn't manifest as silent data loss in practice: drains are triggered
+        // by binding-context registration (RenderingCore.js / PortalSystem.js),
+        // and a hidden subtree's data-bind-html context registers the moment
+        // the subtree becomes visible (data-render flip, portal activation).
+        // That registration calls back into _processHtmlInitialQueue, which
+        // finds the entry as ready and processes it BEFORE this clear runs.
+        // The drop branch only fires when a non-hidden binding registers
+        // post-init while a still-hidden one's entry is also queued — a narrow
+        // interleaving that requires specific topology to trigger. If you're
+        // refactoring init ordering or portal activation, preserve the
+        // "drain-before-clear" sequencing: a drain caller must process ready
+        // entries before this conditional fires.
         if (this._htmlInitialQueue.size === 0 || !this.component?._isInitialSetup) {
             this._htmlInitialQueue.clear();
         }
@@ -2748,6 +2805,29 @@ export class ReactiveStateManager {
      * @param {string} path - The dependency path (e.g., 'computed:selectedId')
      * @private
      */
+    /**
+     * Force every per-item effect on this RSM to re-run on the next flush.
+     * Used when an external entity (cross-store/plugin) this component depends
+     * on mutates: per-item effects don't subscribe to external entities, so
+     * they would otherwise miss values read through item-level computeds.
+     * Binding diff drops no-op DOM writes; cost is one expression eval per row.
+     * @private
+     */
+    _dirtyAllItemEffects() {
+        const set = this._listItemEffects;
+        if (!set || set.size === 0) return;
+        for (const effect of set) {
+            if (!effect || effect.disposed || effect.dirty) continue;
+            effect.dirty = true;
+            effect._changedProp = undefined;
+            if (effect.sync) {
+                this._runEffect(effect);
+            } else {
+                effectScheduler.queue(effect);
+            }
+        }
+    }
+
     _registerComponentDep(path) {
         if (!activeEffect) return;
         if (!activeEffect._componentDeps) activeEffect._componentDeps = new Set();
@@ -2810,6 +2890,7 @@ export class ReactiveStateManager {
 
         // Remove from RSM tracking
         this._effects.delete(effect);
+        if (this._listItemEffects) this._listItemEffects.delete(effect);
         this._hasAnyEffects = this._effects.size > 0;
 
         // Remove from scope
@@ -2833,12 +2914,12 @@ export class ReactiveStateManager {
     _bulkDisposeEffects(effects) {
         if (!effects || effects.length === 0) return;
 
-        // Phase 1: Mark all as disposed upfront
+        // Step 1: Mark all as disposed upfront.
         for (let i = 0; i < effects.length; i++) {
             effects[i].disposed = true;
         }
 
-        // Phase 2: Clean deps from _effectDependents and _effectPatternEffects
+        // Step 2: Clean deps from _effectDependents and _effectPatternEffects.
         for (let i = 0; i < effects.length; i++) {
             const effect = effects[i];
             for (const dep of effect.deps) {
@@ -2871,13 +2952,14 @@ export class ReactiveStateManager {
             }
         }
 
-        // Phase 3: Batch remove from this._effects
+        // Step 3: Batch remove from this._effects.
         for (let i = 0; i < effects.length; i++) {
             this._effects.delete(effects[i]);
+            if (this._listItemEffects) this._listItemEffects.delete(effects[i]);
         }
         this._hasAnyEffects = this._effects.size > 0;
 
-        // Phase 4: Group by scope — use clear() when removing ALL effects from a scope
+        // Step 4: Group by scope — use clear() when removing ALL effects from a scope.
         const scopeCounts = new Map();
         for (let i = 0; i < effects.length; i++) {
             const scope = effects[i].scope;
@@ -2899,7 +2981,7 @@ export class ReactiveStateManager {
             }
         }
 
-        // Phase 5: Batch scheduler cleanup
+        // Step 5: Batch scheduler cleanup.
         for (let i = 0; i < effects.length; i++) {
             effectScheduler.remove(effects[i]);
         }
@@ -3114,14 +3196,36 @@ export class ReactiveStateManager {
         // PERF: Fast exit when no effects exist in the system
         if (this._effectDependents.size === 0 && !this._effectPatternTrie && this._itemEffectsByIndex.size === 0) return;
 
-        // PERF: Skip ITEM effect notifications during splice operations
-        // When items shift indices (501→500), their paths change but the data is the same
-        // mapArray handles these updates directly - no need to re-run item effects
-        // This prevents ~9499 item effects from re-running on a single remove
-        // BUT: Allow .length notifications through - the structural effect depends on these!
+        // PERF: Skip ITEM effect notifications during splice operations.
+        // When items shift indices (501→500), their paths change but the data
+        // is the same. mapArray handles these updates directly, so per-item
+        // effects don't need to re-run during the splice (prevents ~9499
+        // item-effect re-runs on a single remove).
+        //
+        // Two notifications must still get through:
+        //   1. .length paths — the structural (mapArray) effect depends on
+        //      these to reconcile the row set.
+        //   2. computed:* paths — _markComputedsDirtyTransitively notifies
+        //      DOM bindings of length-reading computeds (taskCount, etc.)
+        //      via these paths. Component-level computeds aren't per-item
+        //      effects, so the optimization here was filtering them out as
+        //      collateral damage. Without this allow-through, length-reading
+        //      computeds stay dirty-but-stale after a splice when bindings
+        //      were registered via computed:NAME (which happens whenever an
+        //      item-level binding effect on the same row has previously
+        //      re-run, rewiring the dep graph).
+        // Pattern subscriptions (`pattern:foo.*` via the trie matcher) are
+        // also intentionally NOT notified during splice: the trie match
+        // happens after this guard, so a non-.length, non-computed path
+        // that would otherwise hit a registered pattern returns early
+        // before the matcher runs. mapArray (the only internal pattern
+        // subscriber) compensates by ALSO subscribing to `arrayPath.length`
+        // via subscribePathLength — see `mapArray` registration below. User
+        // code that registers a pattern via `_registerEffectPatternDependency`
+        // and wants splice-aware behavior must do the same: pair the pattern
+        // with an explicit .length read inside the effect body.
         if (this._arrayIndexMutations.isSpliceInProgress) {
-            // Allow length change notifications - needed for structural effect
-            if (!path.endsWith('.length')) {
+            if (!path.endsWith('.length') && !path.startsWith('computed:')) {
                 return;
             }
         }
@@ -3223,7 +3327,12 @@ export class ReactiveStateManager {
 
         if (effectsToNotify.size === 0) return;
 
-        for (const effect of effectsToNotify) {
+        // Snapshot into a local array before iterating. A sync effect in this
+        // batch may write to another pattern-matched path, re-entering this
+        // function's slow path which would `.clear()` the shared reusable Set
+        // mid-iteration — dropping every effect after the current one.
+        const snapshot = Array.from(effectsToNotify);
+        for (const effect of snapshot) {
             if (effect.disposed) continue;
 
             if (!effect.dirty) {

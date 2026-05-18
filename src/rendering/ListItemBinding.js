@@ -91,8 +91,8 @@ export const ListItemBindingMethods = {
             itemEl._bindingElements = allElements;
         }
 
-        // PHASE 3.5: Store compiled metadata for post-render updates
-        // This enables metadata-based updates even for cloneNode path
+        // Store compiled metadata for post-render updates so the
+        // cloneNode path can use metadata-based updates too.
         if (compiledMetadata && !itemEl._compiledMetadata) {
             itemEl._compiledMetadata = compiledMetadata;
         }
@@ -272,14 +272,31 @@ export const ListItemBindingMethods = {
      */
     _executeBindings(elementsArray, bindings, item, ctx) {
         const targetedProp = this._targetedProp;
+        // Fast-path: skip computed-name bypass entirely when the component
+        // declares no computeds — every `computeds[name]` lookup would miss.
+        const componentInstance = ctx?.componentInstance;
+        const hasComputeds = this._instanceHasComputeds(componentInstance);
+        const computeds = hasComputeds ? componentInstance.stateManager.computed : null;
         for (let i = 0; i < bindings.length; i++) {
             const binding = bindings[i];
 
-            // Targeted rebind: skip DOM write for bindings not matching changed prop
+            // Targeted rebind: skip DOM write for bindings not matching changed prop.
+            // Computed-name bindings are an exception — the computed body may read
+            // the changed prop transitively, so the path-equality filter would
+            // skip them incorrectly.
             if (targetedProp) {
-                const matches = binding.isExpression
+                let matches = binding.isExpression
                     ? (binding.expressionVars && binding.expressionVars.indexOf(targetedProp) !== -1)
                     : (binding.path === targetedProp);
+                if (!matches && hasComputeds) {
+                    if (binding.isExpression && binding.expressionVars) {
+                        for (let v = 0; v < binding.expressionVars.length; v++) {
+                            if (computeds[binding.expressionVars[v]]) { matches = true; break; }
+                        }
+                    } else if (binding.path && computeds[binding.path]) {
+                        matches = true;
+                    }
+                }
                 if (!matches) continue;
             }
 
@@ -322,8 +339,6 @@ export const ListItemBindingMethods = {
             // PERF: Skip DOM write if value unchanged
             const strValue = value == null ? '' : String(value);
             if (binding.isInput) {
-                // Skip writeback if a debounce is pending on this input
-                if (el._debounceTimeout) continue;
                 if (el.value !== strValue) {
                     el.value = strValue;
                 }
@@ -341,6 +356,9 @@ export const ListItemBindingMethods = {
      */
     _executeHtmlBindings(elementsArray, htmlBindings, item, ctx) {
         const targetedProp = this._targetedProp;
+        const componentInstance = ctx?.componentInstance;
+        const hasComputeds = this._instanceHasComputeds(componentInstance);
+        const computeds = hasComputeds ? componentInstance.stateManager.computed : null;
         for (let i = 0; i < htmlBindings.length; i++) {
             const binding = htmlBindings[i];
             const el = elementsArray[binding.index];
@@ -348,8 +366,11 @@ export const ListItemBindingMethods = {
 
             const value = this._resolveCompiledBinding(binding, item, ctx);
 
-            // Targeted rebind: skip DOM write for non-matching bindings
-            if (targetedProp && binding.path !== targetedProp) continue;
+            // Targeted rebind: skip DOM write for non-matching bindings.
+            // Bypass when binding.path is a registered computed — the computed
+            // body may read the changed prop transitively.
+            if (targetedProp && binding.path !== targetedProp
+                && !(hasComputeds && binding.path && computeds[binding.path])) continue;
 
             const htmlStr = value == null ? '' : value;
             el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
@@ -365,11 +386,6 @@ export const ListItemBindingMethods = {
             const modelBinding = models[i];
             const el = elementsArray[modelBinding.index];
             if (!el) continue;
-
-            // Skip writeback if a debounce is pending — the user is still typing
-            // and the state hasn't been synced yet. Writing the stale state value
-            // back would overwrite the user's in-progress input.
-            if (el._debounceTimeout) continue;
 
             const value = this._getValueFromItem(item, modelBinding.path);
 
@@ -395,6 +411,10 @@ export const ListItemBindingMethods = {
      */
     _executeShows(elementsArray, shows, item, ctx) {
         const targetedProp = this._targetedProp;
+        // Fast-path: skip computed-name bypass when component declares no computeds
+        const componentInstance = ctx?.componentInstance;
+        const hasComputeds = this._instanceHasComputeds(componentInstance);
+        const computeds = hasComputeds ? componentInstance.stateManager.computed : null;
         for (let i = 0; i < shows.length; i++) {
             const binding = shows[i];
             const el = elementsArray[binding.index];
@@ -403,11 +423,26 @@ export const ListItemBindingMethods = {
             // Resolve value using consolidated helper
             const rawValue = this._resolveCompiledBinding(binding, item, ctx);
 
-            // Targeted rebind: skip DOM write for non-matching bindings
+            // Targeted rebind: skip DOM write for non-matching bindings.
+            // Computed-name bindings are an exception — the computed body may
+            // read the changed prop transitively, so the path-equality filter
+            // would skip them incorrectly. Same pattern as _executeBindings;
+            // omitting it caused per-row data-show on item-level computeds to
+            // freeze visually when component-own state mutated (the popover
+            // open/close case in the PM tracker).
             if (targetedProp) {
-                const matches = binding.isExpression
+                let matches = binding.isExpression
                     ? (binding.expressionVars && binding.expressionVars.indexOf(targetedProp) !== -1)
                     : (binding.path === targetedProp);
+                if (!matches && hasComputeds) {
+                    if (binding.isExpression && binding.expressionVars) {
+                        for (let v = 0; v < binding.expressionVars.length; v++) {
+                            if (computeds[binding.expressionVars[v]]) { matches = true; break; }
+                        }
+                    } else if (binding.path && computeds[binding.path]) {
+                        matches = true;
+                    }
+                }
                 if (!matches) continue;
             }
 
@@ -457,6 +492,8 @@ export const ListItemBindingMethods = {
         const itemIndex = ctx.itemIndex;
         const listContext = ctx.listContext;
         const targetedProp = this._targetedProp;
+        // Fast-path: skip computed-name bypass when component has no computeds
+        const hasComputeds = this._instanceHasComputeds(componentInstance);
 
         for (let i = 0; i < classBindings.length; i++) {
             const classBinding = classBindings[i];
@@ -467,19 +504,26 @@ export const ListItemBindingMethods = {
             if (classBinding.isSimpleProperty !== undefined) {
                 // Fast path: use pre-computed metadata
                 if (classBinding.isSimpleProperty) {
-                    // Simple property binding - check for implicit computed first
+                    // Simple property binding - check for implicit computed first.
+                    // Skip the computed lookup entirely when the component declares
+                    // no computeds (fast path for templates with only data props).
                     const expression = classBinding.expression;
+                    const isComputedName = hasComputeds
+                        ? !!(expression && componentInstance.stateManager.computed[expression])
+                        : false;
 
                     let value;
-                    if (componentInstance?.stateManager?.computed?.[expression]) {
+                    if (isComputedName) {
                         value = this._evaluateComputedInListContext(
                             componentInstance, expression, item, itemIndex, listContext
                         );
                     } else {
                         value = this._getValueFromItem(item, expression);
                     }
-                    // Targeted rebind: skip DOM write if this prop didn't change
-                    if (targetedProp && expression !== targetedProp) continue;
+                    // Targeted rebind: skip DOM write if this prop didn't change.
+                    // Bypass when binding's expression is a registered computed —
+                    // the computed body may read the changed prop transitively.
+                    if (targetedProp && expression !== targetedProp && !isComputedName) continue;
                     this._toggleBoundClass(el, value ? String(value) : '');
                 } else if (classBinding.isComputed) {
                     // Computed property with list item context
@@ -498,14 +542,24 @@ export const ListItemBindingMethods = {
                     // PERF: Reuse args array — cached on the binding to avoid allocation per call
                     const vars = classBinding.expressionVars;
                     const args = classBinding._args || (classBinding._args = new Array(vars.length));
-                    for (let v = 0; v < vars.length; v++) {
-                        args[v] = item[vars[v]];
+                    this._resolveListExprArgs(args, vars, item, componentInstance);
+                    // Targeted rebind: skip DOM write if changed prop not in expression vars.
+                    // Bypass when any var is a registered computed name — the computed
+                    // body may read the changed prop transitively. Skip the var-lookup
+                    // entirely when component has no computeds.
+                    if (targetedProp && vars.indexOf(targetedProp) === -1) {
+                        let refsComputed = false;
+                        if (hasComputeds) {
+                            const computedMap = componentInstance.stateManager.computed;
+                            for (let v = 0; v < vars.length; v++) {
+                                if (computedMap[vars[v]]) { refsComputed = true; break; }
+                            }
+                        }
+                        if (!refsComputed) continue;
                     }
-                    // Targeted rebind: skip DOM write if changed prop not in expression vars
-                    if (targetedProp && vars.indexOf(targetedProp) === -1) continue;
                     try {
-                        const className = classBinding.compiledFn(...args);
-                        this._toggleBoundClass(el, className ? String(className) : '');
+                        const result = classBinding.compiledFn(...args);
+                        this._toggleBoundClass(el, this._classResultToString(result));
                     } catch (e) {
                         this._toggleBoundClass(el, '');
                     }
@@ -885,11 +939,10 @@ export const ListItemBindingMethods = {
         // in mapArray's onCreate callback
         let verifiedListContext = listContext;
 
-        // ============================================================
-        // PHASE 3.5: Metadata-based context creation (for stripped templates)
-        // ============================================================
-        // If compiled metadata is available, use it instead of reading attributes.
-        // This enables attribute stripping for innerHTML-path templates.
+        // Metadata-based context creation for stripped templates.
+        // If compiled metadata is available, use it instead of reading
+        // attributes — this enables attribute stripping on the
+        // innerHTML-path templates.
         const compiledMetadata = itemEl._compiledMetadata;
         if (compiledMetadata && allElements) {
             this._ensureItemContextsFromMetadata(itemEl, allElements, compiledMetadata, verifiedListContext, componentInstance, itemIndex);
@@ -904,7 +957,7 @@ export const ListItemBindingMethods = {
         // This helps with establishing proper hierarchical relationships
         const sortedElements = this._sortElementsForContextCreation(allElements);
 
-        // --- PHASE 1: Create all non-action contexts first ---
+        // First pass — create all non-action contexts.
         const createdContexts = new Map(); // Track contexts by element
 
         for (let i = 0; i < sortedElements.length; i++) {
@@ -980,7 +1033,7 @@ export const ListItemBindingMethods = {
             }
         }
 
-        // --- PHASE 2: Create action contexts (after other contexts) ---
+        // Second pass — create action contexts after the others.
         // PERF: Filter out undefined/null elements that may exist in sparse arrays
         const actionElements = Array.from(allElements).filter(el =>
             el != null && this._hasAttr(el, 'action')
@@ -1003,6 +1056,27 @@ export const ListItemBindingMethods = {
             const closestComponent = actionEl.closest('[data-component]');
             if (closestComponent && closestComponent !== componentInstance.element) {
                 // Skip actions that belong to a nested component
+                continue;
+            }
+
+            // data-event-outside on row-template action elements: register
+            // the document-level outside-click handler and skip the regular
+            // per-event action context. See _ensureItemContextsFromMetadata
+            // for the rationale — same path, different template-compilation
+            // mode (this one runs for templates that don't get the innerHTML
+            // fast path).
+            if (this._hasAttr(actionEl, 'event-outside')) {
+                const outsideDefs = this._parseActions(actionAttr);
+                const rowCtx = {
+                    item: itemEl._bindItemData,
+                    index: itemIndex,
+                    listContext: verifiedListContext
+                };
+                for (const def of outsideDefs) {
+                    if (!def.methodName) continue;
+                    if (typeof componentInstance.context[def.methodName] !== 'function') continue;
+                    this._setupOutsideClickHandler(actionEl, componentInstance, def.methodName, rowCtx);
+                }
                 continue;
             }
 
@@ -1108,7 +1182,32 @@ export const ListItemBindingMethods = {
                     continue; // Skip - belongs to nested component
                 }
 
-                // Parse actions (handle multiple actions like "click:save|blur:validate")
+                // data-event-outside: register the document-level outside-click
+                // handler instead of a per-event action context. Mirrors the
+                // non-list path in EventSystem._bindComponentActions, which
+                // calls _setupOutsideClickHandler and returns early without
+                // adding a regular event listener. Direct clicks on the
+                // element must NOT fire the handler (popovers stay open when
+                // their own trigger is clicked), so we deliberately skip
+                // action-context creation. The registry in PropsSystem is
+                // idempotent — repeat registrations of the same (element,
+                // methodName) pair collapse onto a single entry.
+                if (action.hasEventOutside) {
+                    const outsideDefs = this._parseActions(action.actionName);
+                    const rowCtx = {
+                        item: itemEl._bindItemData,
+                        index: itemIndex,
+                        listContext: verifiedListContext
+                    };
+                    for (const def of outsideDefs) {
+                        if (!def.methodName) continue;
+                        if (typeof componentInstance.context[def.methodName] !== 'function') continue;
+                        this._setupOutsideClickHandler(actionEl, componentInstance, def.methodName, rowCtx);
+                    }
+                    continue;
+                }
+
+                // Parse actions (handle multiple actions like "click:save blur:validate")
                 const actionDefs = this._parseActions(action.actionName);
 
                 for (const { methodName, eventType, args: actionArgs } of actionDefs) {
@@ -1116,8 +1215,31 @@ export const ListItemBindingMethods = {
                         continue;
                     }
 
-                    // Check if element already has an action context
-                    if (this._contextRegistry.contextsByElement.get(actionEl)?.type === 'action') {
+                    // contextsByElement is single-valued per element; if an
+                    // action context already exists for this element, an
+                    // additional createActionContext call would overwrite
+                    // it. Instead, store the extra (eventType → handler)
+                    // pair on the existing context's data.eventHandlers
+                    // map so the dispatcher can route by event type at
+                    // fire time. Without this, a list-row element with
+                    // multiple actions (e.g. `data-action="click:open
+                    // mouseenter:hover"`) would only wire up the first one.
+                    const existing = this._contextRegistry.contextsByElement.get(actionEl);
+                    if (existing?.type === 'action') {
+                        if (!existing.data.eventHandlers) {
+                            existing.data.eventHandlers = new Map();
+                            // Seed the map with the primary handler so
+                            // dispatcher lookups for ANY declared event
+                            // type land in one place.
+                            existing.data.eventHandlers.set(existing.data.event, {
+                                methodName: existing.path,
+                                args: existing.data.actionArgs || []
+                            });
+                        }
+                        existing.data.eventHandlers.set(eventType, {
+                            methodName: methodName,
+                            args: actionArgs || []
+                        });
                         continue;
                     }
 

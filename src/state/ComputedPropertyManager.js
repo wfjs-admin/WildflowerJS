@@ -255,10 +255,23 @@ const HAS_DEPENDENTS = 4;
 const DYNAMIC = 8;
 const STATIC = 16;
 
-// Regex to detect conditional constructs in computed function bodies.
-// If a function has no conditionals, its deps are deterministic (same on every call),
-// so we can skip dep tracking entirely and bypass the proxy for raw state access.
-const CONDITIONAL_PATTERN = /\b(if|else|switch|case)\b|\?|&&|\|\||\?\?/;
+// Regex to detect non-deterministic constructs in computed function bodies.
+// If a function has none of these, its deps are deterministic (same on every
+// call) and we can skip dep tracking entirely, bypassing the proxy for raw
+// state access (STATIC mode in _updateNode).
+//
+// Two categories trigger rejection:
+//   1. Conditional control flow: if/else/switch/case/ternary/&&/||/??.
+//      A computed with branching may read different state on different runs.
+//   2. Function calls (identifier followed by paren).
+//      A delegated helper may contain its own conditional that selects which
+//      state to read — the regex can't see inside it. STATIC mode would skip
+//      tracking those reads, leaving the helper's branch deps unregistered
+//      and producing silent stale reads when the unread branch's state later
+//      mutates. False positives here (computeds calling pure helpers like
+//      Math.max) just drop to STABLE mode, which still tracks correctly —
+//      safe direction.
+const CONDITIONAL_PATTERN = /\b(if|else|switch|case)\b|\?|&&|\|\||\?\?|\w\(/;
 
 export { DIRTY, HAS_DEPENDENTS };
 
@@ -288,6 +301,7 @@ function createComputedNode(name, fn) {
         deps: null,                    // Array<string> — dep paths (replaces _computedDepsArray entry)
         depVersions: null,             // Array<number> — parallel to deps (replaces _computedDepVersions Map)
         depNodes: null,                // Array<Node|null> — direct refs for computed deps
+        externalSources: null,         // Array<{rsm, epoch}> — cross-RSM source tracking for staleness short-circuit
     };
 }
 
@@ -464,6 +478,46 @@ export const ComputedPropertyMethods = {
         // Single node lookup — this one Map.get replaces 3+ Map/Set lookups
         // that the fallback path would need (_stableComputeds.has, computedCache.has, etc.)
         const node = this._computedNodes && this._computedNodes.get(name);
+
+        // ─── CROSS-RSM CACHE-HIT FAST PATH ──────────────────────────────
+        // For computeds that depend on state in other RSMs (cross-store),
+        // the default behaviour forces re-evaluation on every read because
+        // the per-RSM _stateVersions staleness check can't see upstream
+        // changes. That's correct but expensive — every read re-runs fn()
+        // + traverses cross-store getters, ~500ns per read on a 3-prop
+        // chain even when the upstream values haven't changed.
+        //
+        // Short-circuit when each captured source RSM's _globalEpoch is
+        // unchanged since our last eval. externalSources is populated
+        // during the first full evaluation by EntitySystem's tracking
+        // proxy (each cross-RSM access registers its source RSM on the
+        // evaluating computed's node). Each successful eval refreshes
+        // the captured epoch to the current value.
+        //
+        // Skip this path when DIRTY is set — DIRTY means an explicit
+        // invalidation signal fired (path-subscriber cascade, manual
+        // _invalidateCachedComputed, etc.) and should be respected.
+        if (node && node.externalSources &&
+            node.externalSources.length > 0 &&
+            !(node.flags & DIRTY) &&
+            this.computedCache && this.computedCache.has(name)) {
+            const sources = node.externalSources;
+            let sourceMatches = true;
+            for (let i = 0; i < sources.length; i++) {
+                if (sources[i].rsm._globalEpoch !== sources[i].epoch) {
+                    sourceMatches = false;
+                    break;
+                }
+            }
+            if (sourceMatches) {
+                // Still register the effect dep — a subsequent effect read
+                // of this computed needs the dep graph intact.
+                this._registerEffectDependency(node.computedPath);
+                // Read from authoritative cache; node.value may not be
+                // populated yet on first-eval for unstable computeds.
+                return this.computedCache.get(name);
+            }
+        }
 
         // ─── NODE FAST PATH ─────────────────────────────────────────────
         // Entry conditions: node exists, is STABLE.
@@ -667,22 +721,43 @@ export const ComputedPropertyMethods = {
                 // populates with just the dep path (no Map/Set writes to
                 // computedDependencies or _computedDependsOn). After fn() returns,
                 // we compare the collected paths against node.deps.
-                if (!this._reusableTrackingSet) {
-                    this._reusableTrackingSet = new Set();
+                //
+                // REENTRANCY: Composed STABLE chains (a STABLE computed reading
+                // another STABLE computed) recurse here. The nested call would
+                // otherwise clobber the singleton _reusableTrackingSet and clear
+                // _nodeTrackingSet on its way out, leaving the outer caller with
+                // an empty tracking set and triggering spurious demotion to
+                // DYNAMIC. Save the prior _nodeTrackingSet, allocate a fresh Set
+                // when we're nested (the singleton is already in use by the
+                // parent), and restore in the finally block.
+                const prevTrackingSet = this._nodeTrackingSet;
+                let trackingSet;
+                if (prevTrackingSet) {
+                    // Nested call — don't touch the parent's singleton.
+                    trackingSet = new Set();
                 } else {
-                    this._reusableTrackingSet.clear();
+                    // Top-level call — reuse the singleton.
+                    if (!this._reusableTrackingSet) {
+                        this._reusableTrackingSet = new Set();
+                    } else {
+                        this._reusableTrackingSet.clear();
+                    }
+                    trackingSet = this._reusableTrackingSet;
                 }
-                this._nodeTrackingSet = this._reusableTrackingSet;
+                this._nodeTrackingSet = trackingSet;
                 try {
                     result = node.fn();
                 } finally {
-                    this._nodeTrackingSet = null;
+                    this._nodeTrackingSet = prevTrackingSet;
                 }
 
                 // Check if tracked deps differ from baked deps — if so, demote
                 // so next eval goes through full path with proper dep re-tracking.
                 // PERF: Use for-loop instead of .some() to avoid closure allocation.
-                const trackedDeps = this._reusableTrackingSet;
+                // Use the local trackingSet, not _reusableTrackingSet directly:
+                // when we're nested, _reusableTrackingSet still holds the parent's
+                // deps and reading from it here would compare the wrong set.
+                const trackedDeps = trackingSet;
                 if (node.deps) {
                     let depsChanged = trackedDeps.size !== node.deps.length;
                     if (!depsChanged) {
@@ -722,6 +797,14 @@ export const ComputedPropertyMethods = {
                 : oldResult !== result;
 
             node.value = result;
+            // Keep computedCache in sync with node.value. The node fast path
+            // returns node.value directly, but if the computed later demotes
+            // (STABLE → DYNAMIC, e.g., conditional dep identity change), the
+            // FULL PATH at evaluateComputed:641 reads from computedCache.
+            // Without this update, that path would return the stale value
+            // from the most recent full-path eval, missing every change made
+            // through _updateNode.
+            this.computedCache.set(name, result);
 
             if (changed) {
                 node.lastResult = result;
@@ -847,17 +930,64 @@ export const ComputedPropertyMethods = {
             if (this._hasAnyEffects) this._registerEffectDependency(node.computedPath);
 
             // LEAN RE-EVALUATION: Skip the 12 steps of _evaluateComputedFull
-            // overhead (dep clearing, tracking context, circular detection,
-            // evaluation stack, etc.) and just call fn() directly.
-            // The fn() call naturally cascades through the dependency chain,
-            // so correctness is maintained for arbitrary-depth store chains.
+            // overhead (dep clearing, circular detection, evaluation stack,
+            // etc.) and just call fn() directly. The fn() call naturally
+            // cascades through the dependency chain, so correctness is
+            // maintained for arbitrary-depth store chains.
+            //
+            // CROSS-STORE TRACKING: We DO need to set _computedTrackingContext
+            // around fn() so that cross-store getStore() calls return the
+            // tracking proxy and any new state reads register their deps. The
+            // original lean path skipped this on the assumption that "external
+            // deps are stable after first eval" — but that assumption breaks
+            // when the first eval early-returned BEFORE reaching a cross-store
+            // read (e.g. `if (!id) return null;` before reading another store's
+            // state). In that case the cross-store dep was never registered,
+            // and without setting tracking context here, subsequent lean evals
+            // would never register it either. The proxy's per-call dedup makes
+            // re-registration cheap for the common case where deps are stable.
+            const prevTrackingContext = this._wf ? this._wf._computedTrackingContext : null;
+            const prevIsEvaluatingComputed = this._wf ? this._wf._isEvaluatingComputed : false;
+            if (this._wf) {
+                this._wf._isEvaluatingComputed = true;
+                this._wf._computedTrackingContext = {
+                    componentId: this.component?.id || null,
+                    computedName: name,
+                    stateManager: this,
+                    listElement: prevTrackingContext?.listElement || null,
+                    isItemLevelComputed: false,
+                    itemIndex: -1
+                };
+            }
             let result;
             try {
-                result = node.fn();
-            } catch (error) {
-                // On error, fall through to full path for proper error handling
-                node.flags &= ~DIRTY;
-                return this._evaluateComputedFull(name);
+                try {
+                    result = node.fn();
+                } catch (error) {
+                    // On error, fall through to full path for proper error handling.
+                    // Restore tracking context first so _evaluateComputedFull sets up
+                    // its own context cleanly.
+                    if (this._wf) {
+                        this._wf._computedTrackingContext = prevTrackingContext;
+                        this._wf._isEvaluatingComputed = prevIsEvaluatingComputed;
+                    }
+                    node.flags &= ~DIRTY;
+                    return this._evaluateComputedFull(name);
+                }
+            } finally {
+                // Restores the tracking context the caller had active before
+                // this LEAN eval started. Idempotent in two ways:
+                //   - Top-level call: prevTrackingContext is null, so this writes
+                //     null over null (or over the value the inner catch + nested
+                //     _evaluateComputedFull left, which is also null).
+                //   - Nested call (this LEAN eval was triggered from inside
+                //     another eval): prevTrackingContext is the outer context;
+                //     restoring it here is exactly what we want, even after the
+                //     inner catch's _evaluateComputedFull cleared it to null.
+                if (this._wf) {
+                    this._wf._computedTrackingContext = prevTrackingContext;
+                    this._wf._isEvaluatingComputed = prevIsEvaluatingComputed;
+                }
             }
 
             const oldValue = node.value;
@@ -870,6 +1000,17 @@ export const ComputedPropertyMethods = {
             node.lastEpoch = this._globalEpoch;
             node.cacheGen = this._cacheGeneration;
             this.computedCache.set(name, result);
+
+            // Refresh captured cross-RSM source epochs so the cache-hit
+            // fast path in evaluateComputed can short-circuit subsequent
+            // reads. externalSources was populated during the first full
+            // evaluation; this lean path reuses the same source list.
+            if (node.externalSources) {
+                const srcs = node.externalSources;
+                for (let i = 0; i < srcs.length; i++) {
+                    srcs[i].epoch = srcs[i].rsm._globalEpoch || 0;
+                }
+            }
 
             if (node.flags & DIRTY) {
                 if (this._dirtyComputeds) this._dirtyComputeds.delete(name);
@@ -982,6 +1123,18 @@ export const ComputedPropertyMethods = {
             if (this._circularDependencies && this._circularDependencies.has(name)) {
                 // Circular dependency was detected during evaluation, return undefined and skip state change
                 return undefined;
+            }
+
+            // Refresh captured epochs on the computed's external sources
+            // so the cache-hit fast path in evaluateComputed correctly
+            // compares against current upstream state. Populated lazily
+            // during the first full eval by EntitySystem's tracking proxy.
+            const freshNode = this._computedNodes && this._computedNodes.get(name);
+            if (freshNode && freshNode.externalSources) {
+                const srcs = freshNode.externalSources;
+                for (let i = 0; i < srcs.length; i++) {
+                    srcs[i].epoch = srcs[i].rsm._globalEpoch || 0;
+                }
             }
 
             const oldResult = this._lastEvalResult ? this._lastEvalResult.get(name) : undefined;

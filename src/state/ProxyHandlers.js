@@ -91,6 +91,56 @@ import { createArrayOperation } from './ArrayOperationDetection.js';
  */
 export const ProxyHandlerMethods = {
     /**
+     * Ultra-fast inline write for root-level primitive properties. Shared
+     * implementation between the array and object set traps — both handlers
+     * gate on the same conditions (no nested path, primitive value, primitive
+     * old value, no batching, microtask batching not eligible) and then run
+     * an identical sequence of operations. Extracting here keeps the two
+     * gate sites in lockstep so future changes to the version-bump / effect-
+     * notify / onStateChange / auto-save sequence don't have to be applied
+     * twice.
+     *
+     * Only called when `!useMicrotaskBatching` (sync mode, component opt-out,
+     * or global disable). With microtask batching as default, this path is
+     * dead code for most production components, so the call-overhead cost of
+     * extraction is negligible in practice.
+     *
+     * @returns {boolean} The result of the underlying Reflect.set
+     * @private
+     */
+    _inlinePrimitiveSet(targetObj, prop, value, oldValue, receiver) {
+        const result = Reflect.set(targetObj, prop, value, receiver);
+        if (result) {
+            // Inline the essential _handleStateChange work
+            this._stateVersions.set(prop, (this._stateVersions.get(prop) || 0) + 1);
+            this._globalEpoch++;
+            if (this.component && this.component.isVirtual && !this._hasDOMDependents) {
+                // Virtual-entity specialization (store / plugin / pool entity
+                // with no DOM bindings): skip updatedPaths, effects, dirty
+                // propagation, and onStateChange — there is nothing downstream
+                // to notify, so a version bump is sufficient. Lean eval will
+                // re-evaluate dependents lazily on next read.
+            } else {
+                // Standard sync-mode path: notify effects, propagate to
+                // dependent computeds, fire onStateChange for component
+                // re-render scheduling.
+                this._updatedPaths.add(prop);
+                this._notifyEffectDependents(prop);
+                const dependentComputeds = this.computedDependencies.get(prop);
+                if (dependentComputeds && dependentComputeds.size > 0) {
+                    this._markComputedsDirtyTransitively(dependentComputeds);
+                }
+                this.onStateChange(prop, value, oldValue);
+            }
+            // Auto-save to localStorage if enabled
+            if (this.autoSave && this.storageKey) {
+                this._saveToStorage();
+            }
+        }
+        return result;
+    },
+
+    /**
      * V8 OPTIMIZATION: Creates a shared handler for Array proxies.
      * This handler is created ONCE per RSM instance and reused for all array proxies.
      * Path and RSM reference are stored on targets via symbols, not in closures.
@@ -127,7 +177,17 @@ export const ProxyHandlerMethods = {
                     const fullPath = path ? `${path}.${prop}` : prop;
 
                     // EFFECT SYSTEM: Register effect dependency
-                    // PERF: Skip during splice operations - dependencies already established
+                    // PERF: Skip during splice operations — index shifts move
+                    // existing item paths around (501→500, etc.) but the
+                    // underlying data is the same; effects already have those
+                    // paths in their dep set from the pre-splice render and
+                    // mapArray reconciles the row set directly. Re-registering
+                    // every shifted index would be O(n) per splice with no
+                    // benefit. Anti-pattern footgun: an effect that mutates an
+                    // array via splice and continues reading entries in the
+                    // same evaluation will NOT register the post-mutation
+                    // reads as deps. Don't write effects that splice + read
+                    // mid-execution.
                     if (!self._arrayIndexMutations.isSpliceInProgress) {
                         self._registerEffectDependency(fullPath);
                     }
@@ -162,7 +222,10 @@ export const ProxyHandlerMethods = {
                 const fullPath = path ? `${path}.${prop}` : prop;
 
                 // EFFECT SYSTEM: Register effect dependency
-                // PERF: Skip during splice operations - dependencies already established
+                // PERF: Skip during splice operations — see the matching skip
+                // in the primitive branch above for rationale and the
+                // splice-mid-read anti-pattern that this optimization
+                // intentionally does not protect against.
                 if (!self._arrayIndexMutations.isSpliceInProgress) {
                     self._registerEffectDependency(fullPath);
                 }
@@ -231,43 +294,17 @@ export const ProxyHandlerMethods = {
                     self._handleArrayLengthChange(targetObj, value, path);
                 }
 
-                // PERF: ULTRA-FAST PATH for simple root PRIMITIVE property updates
-                // Skip all array detection, batching, and complex state change handling
-                // when updating a scalar property at the root level
-                // CRITICAL: Only for primitives (string, number, boolean, null, undefined)
-                // Objects need full processing for nested property tracking
-                // NOTE: Skip fast path when batching is active - must defer updates
+                // PERF: ULTRA-FAST PATH for simple root PRIMITIVE property updates.
+                // Shared with the object handler — see _inlinePrimitiveSet.
+                // CRITICAL: Only for primitives. Objects need full processing
+                // for nested property tracking. Skip when batching is active.
                 const valueType = typeof value;
                 const isPrimitive = value === null || (valueType !== 'object' && valueType !== 'function');
                 const oldIsPrimitive = oldValue === null || (typeof oldValue !== 'object' && typeof oldValue !== 'function');
                 const batchModeActive = self._wf && self._wf._batchMode;
                 const useMicrotaskBatching = self._microtaskBatchingEligible && !(self._wf && self._wf._batchMode);
                 if (!path && typeof prop === 'string' && isPrimitive && oldIsPrimitive && !batchModeActive && !useMicrotaskBatching) {
-                    const result = Reflect.set(targetObj, prop, value, receiver);
-                    if (result) {
-                        // Inline the essential _handleStateChange work
-                        self._stateVersions.set(prop, (self._stateVersions.get(prop) || 0) + 1);
-                        self._globalEpoch++;
-                        // Virtual store fast path: skip updatedPaths, effects,
-                        // dirty propagation, and onStateChange — lean eval
-                        // re-evaluates lazily on next read.
-                        if (self.component && self.component.isVirtual && !self._hasDOMDependents) {
-                            // Only version bump needed
-                        } else {
-                            self._updatedPaths.add(prop);
-                            self._notifyEffectDependents(prop);
-                            const dependentComputeds = self.computedDependencies.get(prop);
-                            if (dependentComputeds && dependentComputeds.size > 0) {
-                                self._markComputedsDirtyTransitively(dependentComputeds);
-                            }
-                            self.onStateChange(prop, value, oldValue);
-                        }
-                        // Auto-save to localStorage if enabled
-                        if (self.autoSave && self.storageKey) {
-                            self._saveToStorage();
-                        }
-                    }
-                    return result;
+                    return self._inlinePrimitiveSet(targetObj, prop, value, oldValue, receiver);
                 }
 
                 const fullPath = path ? `${path}.${prop}` : prop;
@@ -300,6 +337,23 @@ export const ProxyHandlerMethods = {
                 const isArrayIndexMutation = self._regex.isNumeric.test(prop);
                 if (isArrayIndexMutation) {
                     self._handleArrayIndexMutation(targetObj, prop, oldValue, value, path);
+
+                    // BATCH: record the per-index write so applyBatch's proxy
+                    // change-tracking path can flag the array correctly. Without
+                    // this, push() and direct index assignments are invisible
+                    // to batch tracking — they only register the .length write
+                    // that follows, missing the per-index paths the JSON-diff
+                    // path expanded.
+                    if (self._wf && self._wf._batchMode) {
+                        const fullPath = path ? `${path}.${prop}` : prop;
+                        self._batchChanges.set(fullPath, {
+                            newValue: value,
+                            oldValue: self._batchChanges.has(fullPath)
+                                ? self._batchChanges.get(fullPath).oldValue
+                                : oldValue
+                        });
+                    }
+
                     return Reflect.set(targetObj, prop, value, receiver);
                 }
 
@@ -319,9 +373,41 @@ export const ProxyHandlerMethods = {
                     self._globalEpoch++;
                     self._updatedPaths.add(lengthPath);
 
-                    // Notify effects (mapArray depends on this)
+                    // BATCH: record the array-level change so applyBatch's
+                    // proxy path can flag it for path expansion. Without
+                    // this, splice operations are invisible to batch
+                    // tracking — the index shifts go through the early
+                    // return at the index-mutation branch above (which
+                    // now records them), but the splice signal itself
+                    // (length truncation) only registers if we record
+                    // the array path here.
+                    if (self._wf && self._wf._batchMode) {
+                        if (path) {
+                            self._batchChanges.set(path, {
+                                newValue: targetObj,
+                                oldValue: self._batchChanges.has(path)
+                                    ? self._batchChanges.get(path).oldValue
+                                    : null
+                            });
+                        }
+                        self._batchChanges.set(lengthPath, {
+                            newValue: value,
+                            oldValue: self._batchChanges.has(lengthPath)
+                                ? self._batchChanges.get(lengthPath).oldValue
+                                : oldValue
+                        });
+                    }
+
+                    // Notify effects (mapArray depends on this).
+                    // Only the .length notification reaches subscribers — the
+                    // splice guard in _notifyEffectDependents short-circuits
+                    // any non-.length / non-computed:* path while
+                    // isSpliceInProgress is set, which is exactly when this
+                    // branch runs. The bare-array-path notification is left
+                    // implicit: every effect that reads `this.tasks` also
+                    // reads `.length` or an indexed entry, so it's already
+                    // dirtied by the .length path above.
                     self._notifyEffectDependents(lengthPath);
-                    self._notifyEffectDependents(arrayPath);
 
                     // Mark dependent computeds as dirty (transitively)
                     for (const checkPath of [lengthPath, arrayPath]) {
@@ -708,41 +794,18 @@ export const ProxyHandlerMethods = {
                     }
                 }
 
-                // PERF: ULTRA-FAST PATH for simple root PRIMITIVE property updates
-                // Skip array detection, arrayPath computation, and pattern trie processing
-                // when updating a scalar property at the root level
-                // CRITICAL: Only for primitives (string, number, boolean, null, undefined)
-                // Objects/arrays need full processing for nested property tracking
-                // NOTE: Skip fast path when batching is active - must defer updates
+                // PERF: ULTRA-FAST PATH for simple root PRIMITIVE property updates.
+                // Shared with the array handler — see _inlinePrimitiveSet.
+                // CRITICAL: Only for primitives. Objects/arrays need full
+                // processing for nested property tracking. Skip when batching
+                // is active.
                 const valueType = typeof value;
                 const isPrimitive = value === null || (valueType !== 'object' && valueType !== 'function');
                 const oldIsPrimitive = oldValue === null || (typeof oldValue !== 'object' && typeof oldValue !== 'function');
                 const batchModeActive = self._wf && self._wf._batchMode;
                 const useMicrotaskBatching = self._microtaskBatchingEligible && !(self._wf && self._wf._batchMode);
                 if (!path && typeof prop === 'string' && isPrimitive && oldIsPrimitive && !batchModeActive && !useMicrotaskBatching) {
-                    const result = Reflect.set(targetObj, prop, value, receiver);
-                    if (result) {
-                        // Inline the essential _handleStateChange work
-                        self._stateVersions.set(prop, (self._stateVersions.get(prop) || 0) + 1);
-                        self._globalEpoch++;
-                        // Virtual store fast path
-                        if (self.component && self.component.isVirtual && !self._hasDOMDependents) {
-                            // Only version bump needed
-                        } else {
-                            self._updatedPaths.add(prop);
-                            self._notifyEffectDependents(prop);
-                            const dependentComputeds = self.computedDependencies.get(prop);
-                            if (dependentComputeds && dependentComputeds.size > 0) {
-                                self._markComputedsDirtyTransitively(dependentComputeds);
-                            }
-                            self.onStateChange(prop, value, oldValue);
-                        }
-                        // Auto-save to localStorage if enabled
-                        if (self.autoSave && self.storageKey) {
-                            self._saveToStorage();
-                        }
-                    }
-                    return result;
+                    return self._inlinePrimitiveSet(targetObj, prop, value, oldValue, receiver);
                 }
 
                 // LAZY arrayPath: Only compute when needed for batching

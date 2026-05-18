@@ -13,6 +13,7 @@
  */
 
 import { listBoundElements } from '../core/DomMetadata.js';
+import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -345,9 +346,11 @@ export const DomAbstractionMethods = {
             {
                 // WF-501: Warn if using $store.path in data-model (store paths are read-only)
                 if (elPath && elPath.includes('$')) {
-                    if (__DEV__) console.warn(`[WF-501] Store shorthand ($store.path) cannot be used in data-model. ` +
-                        `Store paths are read-only. Use component state with an action to mediate writes. ` +
-                        `Found: data-model="${elPath}"`);
+                    if (__DEV__) wfError(WF_ERRORS.MODEL_STORE_SHORTHAND, {
+                        context: `data-model="${elPath}"`,
+                        suggestion: 'Use component state and an action that mediates writes back to the store.',
+                        warn: true
+                    });
                     // Don't set up the model binding - it's invalid
                     return false;
                 }

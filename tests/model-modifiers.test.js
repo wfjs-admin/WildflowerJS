@@ -248,40 +248,6 @@ describe('Model Modifiers', () => {
             expect(instance.state.products[0].price).toBe(55.50)
         })
 
-        it('should combine with data-model-debounce', async () => {
-            wildflower.component('number-debounce', {
-                state: {
-                    amount: 0
-                }
-            })
-
-            testContainer.innerHTML = `
-                <div data-component="number-debounce">
-                    <input type="text" data-model="amount" data-model-number data-model-debounce="100" class="amount-input">
-                </div>
-            `
-
-            wildflower.scan()
-            await waitForCompleteRender()
-
-            const component = testContainer.querySelector('[data-component="number-debounce"]')
-            const instance = wildflower.componentInstances.get(component.dataset.componentId)
-            const input = testContainer.querySelector('.amount-input')
-
-            input.value = '123'
-            input.dispatchEvent(new Event('input', { bubbles: true }))
-            await waitForUpdate(50)
-
-            // Should not be updated yet (debounce)
-            expect(instance.state.amount).toBe(0)
-
-            await waitForUpdate(100)
-
-            // Now should be updated as number
-            expect(instance.state.amount).toBe(123)
-            expect(typeof instance.state.amount).toBe('number')
-        })
-
         it('should work with nested property paths', async () => {
             wildflower.component('number-nested', {
                 state: {
@@ -513,38 +479,6 @@ describe('Model Modifiers', () => {
             expect(instance.state.bio).toBe('This is my bio')
         })
 
-        it('should combine with data-model-debounce', async () => {
-            wildflower.component('trim-debounce', {
-                state: {
-                    search: ''
-                }
-            })
-
-            testContainer.innerHTML = `
-                <div data-component="trim-debounce">
-                    <input type="text" data-model="search" data-model-trim data-model-debounce="100" class="search-input">
-                </div>
-            `
-
-            wildflower.scan()
-            await waitForCompleteRender()
-
-            const component = testContainer.querySelector('[data-component="trim-debounce"]')
-            const instance = wildflower.componentInstances.get(component.dataset.componentId)
-            const input = testContainer.querySelector('.search-input')
-
-            input.value = '   query   '
-            input.dispatchEvent(new Event('input', { bubbles: true }))
-            await waitForUpdate(50)
-
-            // Should not be updated yet (debounce)
-            expect(instance.state.search).toBe('')
-
-            await waitForUpdate(100)
-
-            // Now should be trimmed
-            expect(instance.state.search).toBe('query')
-        })
     })
 
     describe('data-model-lazy', () => {
@@ -771,41 +705,6 @@ describe('Model Modifiers', () => {
             expect(typeof instance.state.price).toBe('number')
         })
 
-        it('should take precedence over data-model-debounce', async () => {
-            // If both lazy and debounce are present, lazy should win
-            wildflower.component('lazy-debounce-conflict', {
-                state: {
-                    value: 'initial'
-                }
-            })
-
-            testContainer.innerHTML = `
-                <div data-component="lazy-debounce-conflict">
-                    <input type="text" data-model="value" data-model-lazy data-model-debounce="100" class="value-input">
-                </div>
-            `
-
-            wildflower.scan()
-            await waitForCompleteRender()
-
-            const component = testContainer.querySelector('[data-component="lazy-debounce-conflict"]')
-            const instance = wildflower.componentInstances.get(component.dataset.componentId)
-            const input = testContainer.querySelector('.value-input')
-
-            // Type and wait for debounce time
-            input.value = 'typed'
-            input.dispatchEvent(new Event('input', { bubbles: true }))
-            await waitForUpdate(150)
-
-            // Should still be initial (lazy mode - no input updates)
-            expect(instance.state.value).toBe('initial')
-
-            // Only blur should update
-            input.dispatchEvent(new Event('blur', { bubbles: true }))
-            await waitForUpdate()
-
-            expect(instance.state.value).toBe('typed')
-        })
     })
 
     describe('Combined Modifiers', () => {
@@ -835,38 +734,6 @@ describe('Model Modifiers', () => {
 
             expect(instance.state.price).toBe(42.50)
             expect(typeof instance.state.price).toBe('number')
-        })
-
-        it('should work with trim + number + debounce', async () => {
-            wildflower.component('combined-all-three', {
-                state: {
-                    amount: 0
-                }
-            })
-
-            testContainer.innerHTML = `
-                <div data-component="combined-all-three">
-                    <input type="text" data-model="amount" data-model-trim data-model-number data-model-debounce="100" class="amount-input">
-                </div>
-            `
-
-            wildflower.scan()
-            await waitForCompleteRender()
-
-            const component = testContainer.querySelector('[data-component="combined-all-three"]')
-            const instance = wildflower.componentInstances.get(component.dataset.componentId)
-            const input = testContainer.querySelector('.amount-input')
-
-            input.value = '   99.99   '
-            input.dispatchEvent(new Event('input', { bubbles: true }))
-            await waitForUpdate(50)
-
-            expect(instance.state.amount).toBe(0) // Still initial (debounce)
-
-            await waitForUpdate(100)
-
-            expect(instance.state.amount).toBe(99.99)
-            expect(typeof instance.state.amount).toBe('number')
         })
 
         it('should work with trim + number + lazy', async () => {

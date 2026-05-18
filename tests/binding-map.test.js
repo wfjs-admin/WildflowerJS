@@ -38,6 +38,76 @@ describe('Binding Map Optimization', () => {
 
   // === PHASE 0: Prove the problem ===
 
+  describe('Phase 0: Monolithic Effect Problem', () => {
+    // TARGET TEST: This will pass once per-binding evaluation is implemented
+    // (binding map optimization). Currently all bindings re-evaluate (4 not 1).
+    it.skip('should demonstrate that changing one property re-evaluates all bindings', async () => {
+      // A component with bindings to 3 different properties
+      testContainer.innerHTML = `
+        <div data-component="bm-mono-test">
+          <span id="bm-count" data-bind="count"></span>
+          <span id="bm-name" data-bind="name"></span>
+          <span id="bm-status" data-bind="status"></span>
+          <div id="bm-show" data-show="isVisible">visible</div>
+          <div id="bm-class" data-bind-class="{ active: isActive }">classed</div>
+        </div>
+      `
+
+      wildflower.component('bm-mono-test', {
+        state: {
+          count: 0,
+          name: 'Alice',
+          status: 'online',
+          isVisible: true,
+          isActive: false
+        }
+      })
+
+      ensureComponentScanning(wildflower)
+      await waitForUpdate(150)
+
+      // Verify initial render
+      expect(testContainer.querySelector('#bm-count').textContent).toBe('0')
+      expect(testContainer.querySelector('#bm-name').textContent).toBe('Alice')
+      expect(testContainer.querySelector('#bm-status').textContent).toBe('online')
+
+      // Instrument _executeComponentBindingsForEffect to count evaluations
+      let evalCount = 0
+      const origExecute = wildflower._executeComponentBindingsForEffect.bind(wildflower)
+      wildflower._executeComponentBindingsForEffect = function(instance, bindingMeta, ...rest) {
+        // Count how many bindings are iterated
+        const origGetValue = instance.stateManager.getValue.bind(instance.stateManager)
+        let callsThisRun = 0
+        instance.stateManager.getValue = function(path) {
+          callsThisRun++
+          return origGetValue(path)
+        }
+        origExecute(instance, bindingMeta, ...rest)
+        instance.stateManager.getValue = origGetValue
+        evalCount = callsThisRun
+      }
+
+      // Change ONLY count — how many bindings get evaluated?
+      const el = testContainer.querySelector('[data-component-id]')
+      const instance = wildflower.componentInstances.get(el.dataset.componentId)
+      instance.state.count = 42
+      await waitForUpdate(100)
+
+      // Restore
+      wildflower._executeComponentBindingsForEffect = origExecute
+
+      // The binding for 'count' updated correctly
+      expect(testContainer.querySelector('#bm-count').textContent).toBe('42')
+
+      // After Phase 1: Only the changed property's bindings are evaluated.
+      // evalCount should be exactly 1 (only 'count' binding resolved via getValue;
+      // expression bindings like data-show and data-bind-class use resolveEffectExpression)
+      expect(evalCount).toBe(1)
+    })
+  })
+
+  // === PHASE 1: Changed-path filtering ===
+
   describe('Phase 1: Changed-Path Filtering', () => {
     it('should only evaluate bindings for the changed property', async () => {
       testContainer.innerHTML = `
