@@ -377,6 +377,26 @@ export class Context
                     if (parentItem && typeof parentItem === 'object') {
                         const nestedData = parentItem[path];
                         if (Array.isArray(nestedData)) return nestedData;
+
+                        // Otherwise evaluate the path as an item-level computed
+                        // on the parent item's shape, so nested lists whose
+                        // source is a computed (not a stored field) resolve
+                        // here the same way rendering does.
+                        if (nestedData === undefined) {
+                            const wf = this._wf;
+                            if (wf && wf._resolveRawBinding) {
+                                const scope = {
+                                    componentState: this.componentInstance?.state || {},
+                                    componentInstance: this.componentInstance,
+                                    itemIndex: this._parentIndex,
+                                    listLength: parentData.length,
+                                    listContext: this.parent,
+                                    propsData: this.componentInstance?._propsData
+                                };
+                                const computed = wf._resolveRawBinding(path, parentItem, scope);
+                                if (Array.isArray(computed)) return computed;
+                            }
+                        }
                     }
                 }
             } catch (error) {
@@ -899,6 +919,38 @@ export class Context
     _updateClassBindingElement(newValue)
     {
         if (!this.element || !this.isElementAttached()) return;
+
+        // Friendly dev-mode shape check — historically, returning an object
+        // from a data-bind-class computed threw `TypeError: t.split is not a
+        // function` deep in the framework, with no actionable hint. The
+        // Effect-based class path (RenderingCore._executeClassBindForEffect)
+        // accepts both strings and `{className: bool}` objects, but this
+        // path only handles strings. Coerce objects rather than throw so
+        // the page keeps rendering, and warn once per binding context.
+        if (newValue && typeof newValue === 'object') {
+            if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._classBindingShapeWarned) {
+                this._classBindingShapeWarned = true;
+                wfError(WF_ERRORS.CLASS_BINDING_SHAPE, {
+                    context: 'computed returned an object; coercing truthy keys to a class string',
+                    suggestion: 'A computed should return a string. For inline expressions, write `data-bind-class="{\'is-active\': cond}"`.',
+                    warn: true
+                });
+            }
+            // Coerce {className: truthy} → "className" space-separated
+            newValue = Object.keys(newValue)
+                .filter(k => newValue[k])
+                .join(' ');
+        } else if (newValue != null && typeof newValue !== 'string') {
+            // Numbers, booleans, etc — coerce to string and warn once.
+            if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._classBindingShapeWarned) {
+                this._classBindingShapeWarned = true;
+                wfError(WF_ERRORS.CLASS_BINDING_SHAPE, {
+                    context: `expected string, got ${typeof newValue}; coercing`,
+                    warn: true
+                });
+            }
+            newValue = String(newValue);
+        }
 
         // On first call, capture static classes and clean up any stale dynamic classes
         if (this._staticClasses === undefined)
@@ -1834,21 +1886,9 @@ export class ContextRegistry
     }
 }
 
-// Backward-compatible aliases — all context types are now handled by the unified Context class
-export const ActionContext = Context;
-export const BindingContext = Context;
-export const ConditionalContext = Context;
-export const ListContext = Context;
-export const ComponentContext = Context;
-
-// Browser global exports for backward compatibility
+// Browser global exports for introspection tests (context-registry-internals.test.js)
 if (typeof window !== 'undefined') {
     window.Context = Context;
     window.ContextRegistry = ContextRegistry;
-    window.ActionContext = Context;
-    window.BindingContext = Context;
-    window.ConditionalContext = Context;
-    window.ListContext = Context;
-    window.ComponentContext = Context;
 }
 

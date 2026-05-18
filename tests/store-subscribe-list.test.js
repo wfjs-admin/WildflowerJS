@@ -1322,6 +1322,121 @@ describe('Store-Backed List Patterns', () => {
             expect(actionCalled).toBe(true)
         })
 
+        it.skip('KANBAN BUG: store update without array reassign does NOT trigger subscription (OUTDATED - framework now detects nested mutations)', async () => {
+            // This tests the actual bug in kanban: setColumnColor mutates col.color
+            // but does NOT reassign this.state.columns, so subscription doesn't fire
+            wildflower.store('no-reassign-store', {
+                state: {
+                    columns: [
+                        { id: 'col-1', name: 'Column 1', color: '#ff0000' }
+                    ]
+                },
+                setColorBroken(args) {
+                    // This is the BROKEN pattern from kanban
+                    const { colId, color } = args
+                    const col = this.state.columns.find(c => c.id === colId)
+                    if (col) {
+                        col.color = color
+                        // BUG: Not reassigning columns array!
+                        // this.state.columns = [...this.state.columns]
+                    }
+                },
+                setColorFixed(args) {
+                    // This is the FIXED pattern
+                    const { colId, color } = args
+                    const col = this.state.columns.find(c => c.id === colId)
+                    if (col) {
+                        col.color = color
+                        this.state.columns = [...this.state.columns]
+                    }
+                }
+            })
+
+            let subscriptionCalled = 0
+
+            wildflower.component('no-reassign-host', {
+                state: {}
+            })
+
+            let componentRef = null
+
+            wildflower.component('no-reassign-col', {
+                state: {
+                    _colId: null,
+                    currentColor: '#ff0000'
+                },
+                computed: {
+                    bgStyle() {
+                        return { backgroundColor: this.state.currentColor }
+                    }
+                },
+                beforeInit() {
+                    const itemData = this.element._itemData
+                    if (itemData) {
+                        this.state._colId = itemData.id
+                        this.state.currentColor = itemData.color || '#ff0000'
+                    }
+                },
+                init() {
+                    componentRef = this
+                    const store = wildflower.getStore('no-reassign-store')
+                    const colId = this.state._colId
+                    store.subscribe('columns', (newColumns) => {
+                        subscriptionCalled++
+                        const col = newColumns.find(c => c.id === colId)
+                        if (col) {
+                            this.state.currentColor = col.color
+                        }
+                    })
+                }
+            })
+
+            testContainer.innerHTML = `
+                <div data-component="no-reassign-host">
+                    <div data-list="external('no-reassign-store', 'columns')" data-key="id">
+                        <template>
+                            <div data-component="no-reassign-col">
+                                <div class="styled-box" data-bind-style="computed:bgStyle">Content</div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            `
+
+            await waitForUpdate(100)
+
+            const box = testContainer.querySelector('.styled-box')
+            expect(box.style.backgroundColor).toBe('rgb(255, 0, 0)')
+
+            // Reset subscription counter
+            subscriptionCalled = 0
+
+            // Use broken pattern - should NOT trigger subscription
+            const store = wildflower.getStore('no-reassign-store')
+            store.setColorBroken({ colId: 'col-1', color: '#00ff00' })
+            await waitForUpdate(50)
+
+            // Subscription should NOT be called because columns array wasn't reassigned
+            expect(subscriptionCalled).toBe(0)
+
+            // Store DOES have the new color (mutation worked)
+            expect(store.state.columns[0].color).toBe('#00ff00')
+
+            // But component state wasn't updated via subscription
+            // So it still shows old color
+            expect(box.style.backgroundColor).toBe('rgb(255, 0, 0)')
+
+            // Now use fixed pattern
+            store.setColorFixed({ colId: 'col-1', color: '#0000ff' })
+            await waitForUpdate(50)
+
+            // Subscription SHOULD be called
+            expect(subscriptionCalled).toBe(1)
+
+            // Component state should be updated
+            expect(box.style.backgroundColor).toBe('rgb(0, 0, 255)')
+        })
+
         it('internal bindings inside component should NOT use list item context', async () => {
             wildflower.store('boundary-store', {
                 state: {

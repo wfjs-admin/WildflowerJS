@@ -249,7 +249,7 @@ export class RouteManager {
      * @returns {boolean} - True if browser supports View Transitions
      */
     get viewTransitionsAvailable() {
-        return typeof document.startViewTransition === 'function';
+        return typeof document !== 'undefined' && typeof document.startViewTransition === 'function';
     }
 
     /**
@@ -764,7 +764,8 @@ export class RouteManager {
             // Pass visited paths to track redirect chains and transition options
             await this._matchAndExecute(location, !options.replace, visitedPaths, {
                 skipTransition: options.skipTransition,
-                _state: options.state
+                _state: options.state,
+                _replace: options.replace
             });
         } finally {
             this.isNavigating = false;
@@ -1220,6 +1221,24 @@ export class RouteManager {
             } else {
                 // In history mode, use pushState
                 window.history.pushState(historyState, '', url);
+            }
+        } else if (transitionOptions._replace) {
+            // navigate(path, { replace: true }) — update the address bar in
+            // place, without adding a history entry. pushState === false also
+            // covers initial load and popstate, where the URL is already
+            // correct and must be left untouched — hence the explicit
+            // _replace flag rather than an unconditional else branch.
+            const url = this.urlParser.buildUrl(location);
+            const historyState = {
+                path: location.pathname,
+                ...(transitionOptions._state || {})
+            };
+            if (this.options.mode === 'hash') {
+                const hashValue = url.startsWith('#') ? url.slice(1) : url;
+                window.location.hash = hashValue;
+                window.history.replaceState(historyState, '');
+            } else {
+                window.history.replaceState(historyState, '', url);
             }
         }
 
@@ -2050,24 +2069,41 @@ RouteManager._frameworkIntegration.init();
 // ==================== WILDFLOWER.CREATEROUTER() FACTORY ====================
 
 /**
- * Factory function to create and initialize a router instance
+ * Factory function to create a router instance.
+ *
+ * Auto-initializes only when `routes:` is provided (declarative form). When
+ * called without `routes:`, the staged form is assumed — register routes via
+ * `.onRoute(...)` and then call `router.init()` yourself. Auto-initializing
+ * an empty route tree would emit "No route matched" warnings on every page
+ * load.
+ *
  * @param {object} options - Router configuration options
- * @returns {RouteManager} - Initialized router instance
+ * @returns {RouteManager} - Router instance (initialized iff `routes:` was provided)
  *
  * @example
+ * // Declarative — auto-initialized
  * const router = wildflower.createRouter({
  *     mode: 'history',
- *     viewTransitions: true,
  *     routes: [
- *         { path: '/', handler: () => '<div>Home</div>' },
+ *         { path: '/',      handler: () => '<div>Home</div>' },
  *         { path: '/about', handler: () => '<div>About</div>' }
- *     ],
- *     outlet: '#app'
+ *     ]
  * });
+ *
+ * @example
+ * // Staged — caller controls init timing
+ * const router = wildflower.createRouter({ mode: 'history' });
+ * router.onRoute('/', { handler: ... });
+ * router.onRoute('/users/:id', { handler: ... });
+ * router.init();
  */
 RouteManager.create = function(options = {}) {
     const router = new RouteManager(options);
-    router.init();
+    if (options.routes && Array.isArray(options.routes) && options.routes.length > 0) {
+        router.init();
+    }
+    // Store reference for DevTools introspection
+    RouteManager._activeRouter = router;
     return router;
 };
 

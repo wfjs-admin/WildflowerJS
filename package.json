@@ -1,7 +1,7 @@
 {
   "name": "wildflowerjs",
-  "version": "1.0.0",
-  "description": "Lightweight reactive JavaScript framework — no build step, no virtual DOM",
+  "version": "1.1.0",
+  "description": "Lightweight reactive JavaScript framework with no build step and no virtual DOM",
   "type": "module",
   "main": "dist/wildflower.min.js",
   "browser": "dist/wildflower.min.js",
@@ -11,12 +11,16 @@
     "dist/*.min.js",
     "dist/*.dev.js",
     "adapters/",
-    "types/"
+    "types/",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "PROVENANCE.md"
   ],
   "exports": {
     ".": {
       "default": "./dist/wildflower.min.js"
     },
+    "./mini": "./dist/wildflower.mini.min.js",
     "./lite": "./dist/wildflower.lite.min.js",
     "./spa": "./dist/wildflower.spa.min.js",
     "./full": "./dist/wildflower.full.min.js",
@@ -24,10 +28,7 @@
   },
   "types": "types/wildflowerJS.d.ts",
   "scripts": {
-    "prepublishOnly": "npm run build && npm test",
-    "build": "rollup -c && node scripts/compress.cjs",
-    "build:watch": "rollup -c --watch",
-    "compress": "node scripts/compress.cjs",
+    "build": "echo 'Bundles ship pre-built; rebuild from source via the main repo (rollup + terser).' && exit 0",
     "test": "vitest run --config tests/vitest.browser.config.js",
     "test:watch": "vitest --config tests/vitest.browser.config.js",
     "test:setup": "npx playwright install chromium"
@@ -54,18 +55,10 @@
   },
   "homepage": "https://wildflowerjs.com",
   "devDependencies": {
-    "@playwright/test": "^1.56.1",
-    "@rollup/plugin-commonjs": "^29.0.0",
-    "@rollup/plugin-node-resolve": "^16.0.3",
-    "@rollup/plugin-replace": "^6.0.3",
-    "@rollup/plugin-terser": "^0.4.4",
     "@vitest/browser": "^4.0.14",
     "@vitest/browser-playwright": "^4.0.14",
-    "brotli": "^1.3.3",
     "cross-env": "^7.0.3",
-    "rollup": "^4.54.0",
-    "rollup-plugin-filesize": "^10.0.0",
-    "terser": "^5.44.0",
+    "playwright": "^1.56.1",
     "vitest": "^4.0.14"
   }
 }

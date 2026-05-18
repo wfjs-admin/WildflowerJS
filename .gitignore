@@ -31,6 +31,10 @@ build-output.txt
 # Build output (regenerate with: npm run build)
 dist/
 
+# Vendored build tools (downloaded + SHA-512 verified by scripts/fetch-*.cjs)
+tools/esbuild/
+tools/terser/
+
 # Build caches
 .cache/
 

@@ -347,6 +347,433 @@ describe('Action Context', () => {
     expect(instance.state.items[0].active).toBe(!firstItemActive)
   })
 
+  // Hover events (mouseover / mouseout / mouseenter / mouseleave) on
+  // data-list row children were originally a gap: only the
+  // ALL_GENERIC_EVENTS whitelist (keydown/keyup/keypress/input/change
+  // plus click/submit/focus) got delegated listeners, so
+  // data-action="mouseenter:..." on a list-row template silently did
+  // nothing. The four tests below pin that fixed contract — both the
+  // bubbling pair (mouseover/mouseout) and the synthesized enter/leave
+  // semantics need to fire from list rows.
+  it.skipIf(isMinifiedBuild())('mouseover on list-item element fires data-action', async () => {
+    testContainer.innerHTML = `
+      <div data-component="list-mouseover-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li class="row" data-action="mouseover:onEnter">
+              <span data-bind="name"></span>
+            </li>
+          </template>
+        </ul>
+      </div>
+    `
+    wildflower.component('list-mouseover-test', {
+      state: { rows: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], lastSeen: null },
+      onEnter(event, element, details) { this.state.lastSeen = details && details.item ? details.item.id : null }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="list-mouseover-test"]')
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const rows = component.querySelectorAll('.row')
+    expect(rows.length).toBe(2)
+
+    rows[1].dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+    await waitForUpdate(50)
+    expect(instance.state.lastSeen).toBe('b')
+  })
+
+  it.skipIf(isMinifiedBuild())('mouseout on list-item element fires data-action', async () => {
+    testContainer.innerHTML = `
+      <div data-component="list-mouseout-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li class="row" data-action="mouseout:onLeave">
+              <span data-bind="name"></span>
+            </li>
+          </template>
+        </ul>
+      </div>
+    `
+    wildflower.component('list-mouseout-test', {
+      state: { rows: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], leftId: null },
+      onLeave(event, element, details) { this.state.leftId = details && details.item ? details.item.id : null }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="list-mouseout-test"]')
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const rows = component.querySelectorAll('.row')
+
+    rows[0].dispatchEvent(new MouseEvent('mouseout', { bubbles: true }))
+    await waitForUpdate(50)
+    expect(instance.state.leftId).toBe('a')
+  })
+
+  it.skipIf(isMinifiedBuild())('mouseenter on list-item element fires data-action (synthesized from mouseover)', async () => {
+    testContainer.innerHTML = `
+      <div data-component="list-mouseenter-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li class="row" data-action="mouseenter:onEnter">
+              <span class="inner" data-bind="name"></span>
+            </li>
+          </template>
+        </ul>
+      </div>
+    `
+    wildflower.component('list-mouseenter-test', {
+      state: { rows: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], entered: [] },
+      onEnter(event, element, details) {
+        if (details && details.item) this.state.entered = this.state.entered.concat(details.item.id)
+      }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="list-mouseenter-test"]')
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const rows = component.querySelectorAll('.row')
+
+    // Enter row A from outside (relatedTarget is the document body).
+    rows[0].dispatchEvent(new MouseEvent('mouseover', {
+      bubbles: true, relatedTarget: document.body
+    }))
+    await waitForUpdate(50)
+    expect(Array.from(instance.state.entered)).toEqual(['a'])
+
+    // Move from row A's outer to row A's inner span — still inside the
+    // row, mouseenter must NOT fire again.
+    const innerOfA = rows[0].querySelector('.inner')
+    innerOfA.dispatchEvent(new MouseEvent('mouseover', {
+      bubbles: true, relatedTarget: rows[0]
+    }))
+    await waitForUpdate(50)
+    expect(Array.from(instance.state.entered)).toEqual(['a'])  // still just one entry
+
+    // Enter row B from outside — fires once.
+    rows[1].dispatchEvent(new MouseEvent('mouseover', {
+      bubbles: true, relatedTarget: document.body
+    }))
+    await waitForUpdate(50)
+    expect(Array.from(instance.state.entered)).toEqual(['a', 'b'])
+  })
+
+  it.skipIf(isMinifiedBuild())('data-event-outside fires once per element, not once per re-registration', async () => {
+    // _setupOutsideClickHandler used to add a fresh document-level
+    // click listener every time it was invoked. If the same element
+    // and methodName got re-registered (e.g., a component re-scan or
+    // any path that calls it twice), each prior listener stayed alive
+    // and the user's handler ran N times per click. After the fix the
+    // registry is keyed by (element, methodName) so duplicate
+    // registrations are idempotent.
+    testContainer.innerHTML = `
+      <div data-component="outside-dedupe-test">
+        <span class="watcher" data-action="onOutside" data-event-outside>watcher</span>
+        <div id="outside-target">outside</div>
+      </div>
+    `
+    wildflower.component('outside-dedupe-test', {
+      state: { fires: 0 },
+      onOutside() { this.state.fires += 1 }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="outside-dedupe-test"]')
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const watcher = component.querySelector('.watcher')
+    const outsideTarget = component.querySelector('#outside-target')
+
+    expect(watcher).toBeTruthy()
+
+    // Re-register the same outside-click handler several times.
+    // Pre-fix each call added another document listener; post-fix
+    // they collapse to the same registry entry.
+    for (let i = 0; i < 4; i++) {
+      wildflower._setupOutsideClickHandler(watcher, instance, 'onOutside')
+    }
+
+    outsideTarget.click()
+    await waitForUpdate(50)
+
+    // Exactly one fire, not five.
+    expect(instance.state.fires).toBe(1)
+  })
+
+  it.skipIf(isMinifiedBuild())('data-event-outside on a data-list row child fires when clicking outside the row', async () => {
+    // The PM demo's inline-edit cells live inside a data-list and need
+    // outside-click to close their popovers. Without framework support,
+    // the click delegation never wires _setupOutsideClickHandler for
+    // row-template children, so data-event-outside there is a silent
+    // no-op and demos resort to a manual document.addEventListener.
+    //
+    // This test reproduces the bug: two rows, each with a span that
+    // declares data-action + data-event-outside. A click on an element
+    // outside any row must invoke the handler once per visible row.
+    testContainer.innerHTML = `
+      <div data-component="list-outside-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li class="row">
+              <span class="watcher" data-action="onOutside" data-event-outside data-bind="label"></span>
+            </li>
+          </template>
+        </ul>
+        <div id="elsewhere">outside the rows</div>
+      </div>
+    `
+    wildflower.component('list-outside-test', {
+      state: {
+        rows: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }],
+        fires: []
+      },
+      onOutside(event, element) {
+        this.state.fires = this.state.fires.concat(element.textContent)
+      }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="list-outside-test"]')
+    const watchers = component.querySelectorAll('.watcher')
+    const elsewhere = component.querySelector('#elsewhere')
+
+    expect(watchers.length).toBe(2)
+    expect(watchers[0].textContent).toBe('A')
+
+    elsewhere.click()
+    await waitForUpdate(50)
+
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    expect(Array.from(instance.state.fires).sort()).toEqual(['A', 'B'])
+  })
+
+  it.skipIf(isMinifiedBuild())('data-event-outside on a data-list row child receives details.item', async () => {
+    // T1.2: an outside-click handler on a row-template child must receive
+    // (event, el, details) with details.item populated — matching regular
+    // row action handlers. Before the fix it got only (event, el), forcing
+    // demos to walk the DOM for the framework-private _itemData property.
+    testContainer.innerHTML = `
+      <div data-component="list-outside-details-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li class="row">
+              <span class="watcher" data-action="onOutside" data-event-outside data-bind="label"></span>
+            </li>
+          </template>
+        </ul>
+        <div id="elsewhere">outside the rows</div>
+      </div>
+    `
+    wildflower.component('list-outside-details-test', {
+      state: {
+        rows: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }],
+        seen: []
+      },
+      onOutside(event, element, details) {
+        this.state.seen = this.state.seen.concat({
+          hasDetails: !!details,
+          id: details && details.item ? details.item.id : null,
+          index: details ? details.index : null,
+          length: details ? details.length : null
+        })
+      }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="list-outside-details-test"]')
+    const elsewhere = component.querySelector('#elsewhere')
+    elsewhere.click()
+    await waitForUpdate(50)
+
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const seen = Array.from(instance.state.seen)
+    expect(seen.length).toBe(2)
+    const byId = {}
+    seen.forEach(s => { byId[s.id] = s })
+    expect(byId['a']).toBeTruthy()
+    expect(byId['b']).toBeTruthy()
+    expect(byId['a'].hasDetails).toBe(true)
+    expect(byId['a'].index).toBe(0)
+    expect(byId['b'].index).toBe(1)
+    expect(byId['a'].length).toBe(2)
+  })
+
+  it.skipIf(isMinifiedBuild())('data-event-outside on a non-list element still works after the row-details change', async () => {
+    // Backward-compat guard for T1.2: a plain (non-list) data-event-outside
+    // handler must keep working. It receives (event, el) — the new third
+    // `details` arg is undefined for non-list handlers, harmlessly ignored.
+    testContainer.innerHTML = `
+      <div data-component="non-list-outside-test">
+        <span class="watcher" data-action="onOutside" data-event-outside>watcher</span>
+        <div id="outside-target">outside</div>
+      </div>
+    `
+    wildflower.component('non-list-outside-test', {
+      state: { fires: 0, sawDetails: 'unset' },
+      onOutside(event, element, details) {
+        this.state.fires += 1
+        this.state.sawDetails = details === undefined ? 'undefined' : 'defined'
+      }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="non-list-outside-test"]')
+    const outsideTarget = component.querySelector('#outside-target')
+    outsideTarget.click()
+    await waitForUpdate(50)
+
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    expect(instance.state.fires).toBe(1)
+    expect(instance.state.sawDetails).toBe('undefined')
+  })
+
+  it.skipIf(isMinifiedBuild())('multi-action input+change on a list-item input element (kanban color-picker pattern)', async () => {
+    // Mirrors the kanban-wf demo's column color picker:
+    //   <input data-model="settingsColor"
+    //          data-action="input:onPreview change:onCommit">
+    // inside a data-list. Both events are in the framework's
+    // delegated event whitelist (input/change/keydown/keyup/keypress).
+    // Probes whether the single-context-per-element limit silently
+    // drops one of the two handlers.
+    testContainer.innerHTML = `
+      <div data-component="list-input-change-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li>
+              <input class="picker" data-model="value" data-action="input:onPreview change:onCommit">
+            </li>
+          </template>
+        </ul>
+      </div>
+    `
+    wildflower.component('list-input-change-test', {
+      state: {
+        rows: [{ id: 'a', value: 'A' }],
+        previewLog: [],
+        commitLog: []
+      },
+      onPreview(event, element, details) {
+        this.state.previewLog = this.state.previewLog.concat(event.target.value)
+      },
+      onCommit(event, element, details) {
+        this.state.commitLog = this.state.commitLog.concat(event.target.value)
+      }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="list-input-change-test"]')
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const picker = component.querySelector('.picker')
+
+    picker.value = 'preview1'
+    picker.dispatchEvent(new Event('input', { bubbles: true }))
+    await waitForUpdate(50)
+    picker.value = 'committed'
+    picker.dispatchEvent(new Event('change', { bubbles: true }))
+    await waitForUpdate(50)
+
+    expect(Array.from(instance.state.previewLog)).toEqual(['preview1'])
+    expect(Array.from(instance.state.commitLog)).toEqual(['committed'])
+  })
+
+  it.skipIf(isMinifiedBuild())('multiple actions on a list-item element (click + mouseenter) all fire', async () => {
+    // Reproduces the gap exposed by the PM demo's favorites rows:
+    // an `<a>` inside a data-list template carries
+    //   data-action="gotoX mouseenter:hoverX mouseleave:unhoverX"
+    // For non-list elements this works (direct per-eventType listeners).
+    // For list-row elements, the framework's per-row context creation
+    // only registers ONE action per element — subsequent defs are
+    // skipped. So the click handler fires but the hover handlers go
+    // silently nowhere.
+    testContainer.innerHTML = `
+      <div data-component="multi-list-action-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li class="row" data-action="click:onClick mouseenter:onEnter mouseleave:onLeave">
+              <span data-bind="name"></span>
+            </li>
+          </template>
+        </ul>
+      </div>
+    `
+    wildflower.component('multi-list-action-test', {
+      state: {
+        rows: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }],
+        clicked: null, entered: null, left: null
+      },
+      onClick(event, element, details) { this.state.clicked = details && details.item ? details.item.id : null },
+      onEnter(event, element, details) { this.state.entered = details && details.item ? details.item.id : null },
+      onLeave(event, element, details) { this.state.left    = details && details.item ? details.item.id : null }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="multi-list-action-test"]')
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const rows = component.querySelectorAll('.row')
+
+    rows[1].click()
+    await waitForUpdate(50)
+    expect(instance.state.clicked).toBe('b')
+
+    rows[0].dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: document.body }))
+    await waitForUpdate(50)
+    expect(instance.state.entered).toBe('a')
+
+    rows[0].dispatchEvent(new MouseEvent('mouseout', { bubbles: true, relatedTarget: document.body }))
+    await waitForUpdate(50)
+    expect(instance.state.left).toBe('a')
+  })
+
+  it.skipIf(isMinifiedBuild())('mouseleave on list-item element fires data-action (synthesized from mouseout)', async () => {
+    testContainer.innerHTML = `
+      <div data-component="list-mouseleave-test">
+        <ul data-list="rows" data-key="id">
+          <template>
+            <li class="row" data-action="mouseleave:onLeave">
+              <span class="inner" data-bind="name"></span>
+            </li>
+          </template>
+        </ul>
+      </div>
+    `
+    wildflower.component('list-mouseleave-test', {
+      state: { rows: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }], left: [] },
+      onLeave(event, element, details) {
+        if (details && details.item) this.state.left = this.state.left.concat(details.item.id)
+      }
+    })
+    await waitForCompleteRender()
+    await waitForUpdate(50)
+
+    const component = testContainer.querySelector('[data-component="list-mouseleave-test"]')
+    const instance = wildflower.componentInstances.get(component.dataset.componentId)
+    const rows = component.querySelectorAll('.row')
+
+    // Move from row A's inner span to row A itself — still inside the
+    // row, mouseleave must NOT fire.
+    const innerOfA = rows[0].querySelector('.inner')
+    innerOfA.dispatchEvent(new MouseEvent('mouseout', {
+      bubbles: true, relatedTarget: rows[0]
+    }))
+    await waitForUpdate(50)
+    expect(Array.from(instance.state.left)).toEqual([])
+
+    // Leave row A entirely (relatedTarget outside the row) — fires once.
+    rows[0].dispatchEvent(new MouseEvent('mouseout', {
+      bubbles: true, relatedTarget: document.body
+    }))
+    await waitForUpdate(50)
+    expect(Array.from(instance.state.left)).toEqual(['a'])
+  })
+
   it.skipIf(isMinifiedBuild())('Action context cleanup on component destruction', async () => {
     testContainer.innerHTML = `
       <div data-component="cleanup-action-test">

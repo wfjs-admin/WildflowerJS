@@ -852,14 +852,24 @@ _updateLists(listElements, instance = null)
         };
 
         let fingerprint;
-        if (len > 100) {
-            // Sample first, middle, last — O(1) regardless of array size
+        if (len > 1000) {
+            // For very large arrays, accept sampling with 7 positions
+            // (first, q1, q2-1, q2, q2+1, q3, last) to catch interior-only
+            // changes far more often than 3 samples. O(1) regardless of size.
+            const q1 = len >> 2;
+            const q2 = len >> 1;
+            const q3 = len - (len >> 2);
             const s1 = _id(data[0]);
-            const s2 = _id(data[len >> 1]);
-            const s3 = _id(data[len - 1]);
-            fingerprint = `length:${len}|s:${s1}-${s2}-${s3}`;
+            const s2 = _id(data[q1]);
+            const s3 = _id(data[q2 - 1]);
+            const s4 = _id(data[q2]);
+            const s5 = _id(data[q2 + 1]);
+            const s6 = _id(data[q3]);
+            const s7 = _id(data[len - 1]);
+            fingerprint = `length:${len}|s:${s1}-${s2}-${s3}-${s4}-${s5}-${s6}-${s7}`;
         } else {
-            // For smaller arrays, hash all item identities (still no stringify)
+            // Hash all item identities for arrays up to 1000 items.
+            // Catches interior-only mutations that the 3-sample heuristic missed.
             let hash = `length:${len}|`;
             for (let i = 0; i < len; i++) {
                 hash += _id(data[i]);
@@ -1035,7 +1045,7 @@ _updateLists(listElements, instance = null)
         // Quick check: if no directives and no contexts needing cleanup, skip expensive element collection
         // Binding contexts don't need cleanup - they're in WeakMap and auto-GC when elements are removed
         if (!hasCustomDirectives && !itemsHaveContextsNeedingCleanup) {
-            // PHASE 2.2: Dispose ItemEffects for removed items (fast path)
+            // Dispose ItemEffects for removed items (fast path).
             for (const item of items) {
                 if (item._wfDisposeEffect) {
                     this._disposeItemEffect(item);
@@ -1106,7 +1116,7 @@ _updateLists(listElements, instance = null)
         // PERF: Skip _listContext cleanup - elements are being removed from DOM anyway
         // GC will handle orphaned references when elements are collected
 
-        // PHASE 2.2: Dispose ItemEffects for removed items (full path)
+        // Dispose ItemEffects for removed items (full path).
         for (const item of items) {
             if (item._wfDisposeEffect) {
                 this._disposeItemEffect(item);
@@ -1568,7 +1578,23 @@ _updateLists(listElements, instance = null)
                 // Use _parentItemProxy to access nested data reactively
                 // This creates a dependency so mapArray re-runs when nested data changes
                 if (context._parentItemProxy && context._childPath) {
-                    return context._parentItemProxy[context._childPath];
+                    let v = context._parentItemProxy[context._childPath];
+                    // Fallback: implicit item-level computed evaluation when the
+                    // child path isn't a raw field on the parent item but IS a
+                    // defined computed on the component. Mirrors data-bind's
+                    // resolution for symmetry across binding types.
+                    if (v === undefined &&
+                        !context._childPath.includes('.') &&
+                        sm?.computed?.[context._childPath]) {
+                        const parentIndex = context._parentIndex ?? -1;
+                        try {
+                            v = self._evaluateComputedInListContext(
+                                instance, context._childPath,
+                                context._parentItemProxy, parentIndex, context
+                            );
+                        } catch (e) { /* return undefined below */ }
+                    }
+                    return v;
                 }
                 // Fallback to context.data for non-mapArray nested lists
                 return context.data || data;
@@ -1649,7 +1675,7 @@ _updateLists(listElements, instance = null)
         // Extracted so it can be called immediately or deferred via requestIdleCallback
         const createItemEffect = (itemEl, itemProxy, precomputedItemProps, precomputedComponentDeps) => {
             let isFirstRun = !precomputedItemProps;
-            return sm.createEffect(() => {
+            const dispose = sm.createEffect(() => {
                 // For polymorphic lists, use per-item compiled metadata
                 const effectMeta = isPolymorphic ? (itemEl._compiledMetadata || compiledMetadata) : compiledMetadata;
                 if (effectMeta) {
@@ -1717,15 +1743,53 @@ _updateLists(listElements, instance = null)
                             }
                         };
 
+                        // For item-level computeds (fn(item) with fn.length > 0) referenced in
+                        // expressions, evaluate the computed so its internal state reads register
+                        // dependencies on THIS row's effect. Plain `touchExpressionVars` only reads
+                        // the names off the proxy; it never invokes the computed body.
+                        const originalComputeds = instance?.stateManager?._originalComputedFunctions;
+                        const evalItemLevelComputedsForExprVars = (expressionVars) => {
+                            if (!originalComputeds || !expressionVars) return;
+                            for (const v of expressionVars) {
+                                const fn = originalComputeds.get(v);
+                                // Both forms need invocation here so the computed's
+                                // internal state reads register as per-row deps.
+                                // Bare-form `fn()` reading `this.X` is resolved by
+                                // _evaluateComputedInListContext, whose `{...item}`
+                                // spread registers item-property reads.
+                                if (typeof fn === 'function') {
+                                    try {
+                                        self._evaluateComputedInListContext(instance, v, itemProxy, currentIndex, context);
+                                    } catch (e) { /* ignore */ }
+                                }
+                            }
+                        };
+                        const evalItemLevelComputedByName = (name) => {
+                            if (!originalComputeds || !name) return;
+                            const fn = originalComputeds.get(name);
+                            // Both forms need invocation under the active per-item
+                            // effect tracker so the computed's internal state reads
+                            // register as deps. Bare-form (fn.length === 0) reads
+                            // `this.X` which the list-context evaluator resolves to
+                            // the current item's fields.
+                            if (typeof fn === 'function') {
+                                try {
+                                    self._evaluateComputedInListContext(instance, name, itemProxy, currentIndex, context);
+                                } catch (e) { /* ignore */ }
+                            }
+                        };
+
                         // Touch text binding properties
                         for (const binding of (effectMeta.bindings || [])) {
                             if (binding.isExpression && binding.expressionVars) {
                                 // Expression with pre-extracted vars - just touch those
                                 touchExpressionVars(null, binding.expressionVars);
+                                evalItemLevelComputedsForExprVars(binding.expressionVars);
                             } else if (!binding.isExpression && !binding.isListContextVar && !binding.isPropsPath && !binding.isComputed) {
                                 // Simple property path - touch it
                                 touchPath(binding.path);
                                 touchComponentLevel(binding.path);
+                                evalItemLevelComputedByName(binding.path);
                             }
                             // Skip computed:, props:, and _index/_first etc - they don't need item deps
                         }
@@ -1744,29 +1808,67 @@ _updateLists(listElements, instance = null)
                             } else if (classBinding.isSimpleProperty && classBinding.expression) {
                                 touchPath(classBinding.expression);
                                 touchComponentLevel(classBinding.expression);
+                                // If the simple property name matches an item-level computed,
+                                // evaluate it to register the computed's transitive deps.
+                                // Both bare-form `fn()` reading `this.X` and parameterised
+                                // `fn(item)` need invocation so their internal state reads
+                                // register on this row's effect.
+                                if (originalComputeds && originalComputeds.has(classBinding.expression)) {
+                                    const fn = originalComputeds.get(classBinding.expression);
+                                    if (typeof fn === 'function') {
+                                        try {
+                                            self._evaluateComputedInListContext(instance, classBinding.expression, itemProxy, currentIndex, context);
+                                        } catch (e) { /* ignore */ }
+                                    }
+                                }
                             } else if (classBinding.expression) {
-                                touchExpressionVars(classBinding.expression, null);
+                                // For object/ternary expressions, identifiers may include item-level
+                                // computed names. Evaluate any such computeds so their internal state
+                                // reads register dependencies for THIS row's class effect.
+                                touchExpressionVars(classBinding.expression, classBinding.expressionVars);
+                                if (originalComputeds && classBinding.expressionVars) {
+                                    for (const v of classBinding.expressionVars) {
+                                        const fn = originalComputeds.get(v);
+                                        if (typeof fn === 'function') {
+                                            try {
+                                                self._evaluateComputedInListContext(instance, v, itemProxy, currentIndex, context);
+                                            } catch (e) { /* ignore */ }
+                                        }
+                                    }
+                                }
                             }
                         }
 
                         // Touch style binding variables
                         for (const styleBinding of (effectMeta.styleBindings || [])) {
                             if (styleBinding.expression) {
-                                touchExpressionVars(styleBinding.expression, null);
+                                touchExpressionVars(styleBinding.expression, styleBinding.expressionVars);
+                                evalItemLevelComputedsForExprVars(
+                                    styleBinding.expressionVars
+                                    || (styleBinding.expression?.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g))
+                                );
                             }
                         }
                         if (effectMeta.rootBindings?.bindStyleExpr) {
-                            touchExpressionVars(effectMeta.rootBindings.bindStyleExpr, null);
+                            const rootExpr = effectMeta.rootBindings.bindStyleExpr;
+                            touchExpressionVars(rootExpr, null);
+                            evalItemLevelComputedsForExprVars(rootExpr.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g));
                         }
 
                         // Touch attr binding variables
                         for (const attrBinding of (effectMeta.attrBindings || [])) {
                             if (attrBinding.expression) {
-                                touchExpressionVars(attrBinding.expression, null);
+                                touchExpressionVars(attrBinding.expression, attrBinding.expressionVars);
+                                evalItemLevelComputedsForExprVars(
+                                    attrBinding.expressionVars
+                                    || (attrBinding.expression?.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g))
+                                );
                             }
                         }
                         if (effectMeta.rootBindings?.bindAttrExpr) {
-                            touchExpressionVars(effectMeta.rootBindings.bindAttrExpr, null);
+                            const rootExpr = effectMeta.rootBindings.bindAttrExpr;
+                            touchExpressionVars(rootExpr, null);
+                            evalItemLevelComputedsForExprVars(rootExpr.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g));
                         }
 
                         // Touch model binding properties
@@ -1776,23 +1878,32 @@ _updateLists(listElements, instance = null)
 
                         // Touch show binding properties
                         for (const showBinding of (effectMeta.shows || [])) {
-                            touchPath(showBinding.path);
-                            touchComponentLevel(showBinding.path);
+                            if (showBinding.isExpression && showBinding.expressionVars) {
+                                touchExpressionVars(null, showBinding.expressionVars);
+                                evalItemLevelComputedsForExprVars(showBinding.expressionVars);
+                            } else {
+                                touchPath(showBinding.path);
+                                touchComponentLevel(showBinding.path);
+                                evalItemLevelComputedByName(showBinding.path);
+                            }
                         }
 
                         // Touch HTML binding properties
                         for (const htmlBinding of (effectMeta.htmlBindings || [])) {
                             touchPath(htmlBinding.path);
                             touchComponentLevel(htmlBinding.path);
+                            evalItemLevelComputedByName(htmlBinding.path);
                         }
 
                         // Touch render binding properties
                         for (const renderBinding of (effectMeta.renders || [])) {
                             if (renderBinding.isExpression && renderBinding.expressionVars) {
                                 touchExpressionVars(null, renderBinding.expressionVars);
+                                evalItemLevelComputedsForExprVars(renderBinding.expressionVars);
                             } else {
                                 touchPath(renderBinding.path);
                                 touchComponentLevel(renderBinding.path);
+                                evalItemLevelComputedByName(renderBinding.path);
                             }
                         }
 
@@ -1903,6 +2014,17 @@ _updateLists(listElements, instance = null)
             }, precomputedItemProps
                 ? { skipFirstRun: true, precomputedItemProps, componentDeps: precomputedComponentDeps }
                 : undefined);
+            // Tag and register every list item effect (including cross-store
+            // lists where _itemEffectContext is null) so EntitySystem can wake
+            // them on external entity mutations. Same-RSM list effects are
+            // also in _itemEffectsByIndex; this is the union set.
+            const eff = dispose._effect;
+            if (eff) {
+                eff._isListItemEffect = true;
+                if (!sm._listItemEffects) sm._listItemEffects = new Set();
+                sm._listItemEffects.add(eff);
+            }
+            return dispose;
         };
 
         // Compute which component-level vars are used ONLY in class bindings.
@@ -1994,6 +2116,22 @@ _updateLists(listElements, instance = null)
             // Only clear display:none (from hidden templates), preserve intentional values like flex/grid
             if (itemEl.style.display === 'none') itemEl.style.display = '';
             itemEl.classList.remove('hidden');
+
+            // Strip data-cloak from the freshly cloned item (root + descendants).
+            // The cached template (innerHTMLParts in TemplateSystem) already
+            // strips data-cloak, but the cloneNode fallback path may use
+            // template sources that bypassed that strip. Belt-and-suspenders
+            // so no list-item creation path ever leaves data-cloak alive on
+            // a row added after the initial scan.
+            if (itemEl.hasAttribute && itemEl.hasAttribute('data-cloak')) {
+                itemEl.removeAttribute('data-cloak');
+            }
+            if (itemEl.querySelectorAll) {
+                const cloakedDescendants = itemEl.querySelectorAll('[data-cloak]');
+                for (let ci = 0; ci < cloakedDescendants.length; ci++) {
+                    cloakedDescendants[ci].removeAttribute('data-cloak');
+                }
+            }
 
             // Store context references (same as context rendering)
             itemEl._listContext = context;
@@ -2100,12 +2238,33 @@ _updateLists(listElements, instance = null)
             const itemKey = itemProxy && itemProxy[keyProp] !== undefined ? itemProxy[keyProp] : index;
             itemElements.set(itemKey, itemEl);
 
+            // For ROOT-level data-render with conditionValue=false, the conditional
+            // setup wanted to swap the element for a placeholder, but at that point
+            // the element is still detached (in a DocumentFragment) and the swap
+            // wouldn't survive bulk insertion. Substitute the placeholder here so
+            // the actual list parent receives the placeholder, not the element.
+            // Nested data-render handles itself fine because its parent IS attached.
+            let insertEl = itemEl;
+            if (itemEl._renderContexts) {
+                for (const rc of itemEl._renderContexts) {
+                    // Only root-level renders need substitution: binding.elementPath
+                    // is the empty array for the root element of a list item template.
+                    const isRootRender = rc?.binding?.elementPath
+                        && Array.isArray(rc.binding.elementPath)
+                        && rc.binding.elementPath.length === 0;
+                    if (isRootRender && rc.context?.placeholder && rc.context.isRendered === false) {
+                        insertEl = rc.context.placeholder;
+                        break;
+                    }
+                }
+            }
+
             // OPTIMIZATION: During bulk creation, defer effect creation to after DOM insertion
             // This moves effect creation outside the critical rendering path
             if (isBulkCreation) {
                 // Return element + data for deferred effect creation
                 return {
-                    element: itemEl,
+                    element: insertEl,
                     key: itemKey,
                     disposeEffect: null,
                     itemProxy
@@ -2116,7 +2275,7 @@ _updateLists(listElements, instance = null)
             const disposeEffect = createItemEffect(itemEl, itemProxy);
             // Set on element for API consistency with _createItemEffect
             itemEl._wfDisposeEffect = disposeEffect;
-            return { element: itemEl, disposeEffect };
+            return { element: insertEl, disposeEffect };
         };
 
         // Set up mapArray with callbacks
@@ -2208,6 +2367,33 @@ _updateLists(listElements, instance = null)
                     // Avoids N function calls + metadata lookups when template doesn't use them
                     const hasRootModelOrShow = compiledMetadata.rootBindings?.modelPath || compiledMetadata.rootBindings?.showPath;
 
+                    // Pre-resolve outside-click actions on row-template children.
+                    // Lazy context creation in this bulk path means
+                    // _ensureItemContextsFromMetadata isn't reached until the
+                    // user clicks INSIDE a row. data-event-outside fires on
+                    // clicks OUTSIDE the row, so it must be wired now or it
+                    // silently no-ops. Each entry is {actionIndex, methodNames[]}
+                    // pre-parsed once per template, not per row.
+                    let outsideClickActions = compiledMetadata._outsideClickActions;
+                    if (outsideClickActions === undefined) {
+                        outsideClickActions = null;
+                        if (compiledMetadata.actions) {
+                            for (const action of compiledMetadata.actions) {
+                                if (!action.hasEventOutside) continue;
+                                if (action.isInNestedList || action.isInNestedComponent) continue;
+                                const defs = self._parseActions(action.actionName);
+                                const methodNames = [];
+                                for (const def of defs) {
+                                    if (def.methodName) methodNames.push(def.methodName);
+                                }
+                                if (methodNames.length === 0) continue;
+                                if (!outsideClickActions) outsideClickActions = [];
+                                outsideClickActions.push({ index: action.index, methodNames });
+                            }
+                        }
+                        compiledMetadata._outsideClickActions = outsideClickActions;
+                    }
+
                     // For append, start from rowStartIndex to skip existing rows
                     for (let i = rowStartIndex; i < rows.length; i++) {
                         const row = rows[i];
@@ -2283,6 +2469,31 @@ _updateLists(listElements, instance = null)
                         row._needsContexts = true;
                         row._bindItemData = itemProxy;
                         row._bindItemIndex = i;
+
+                        // Wire data-event-outside on row-template children.
+                        // Must happen eagerly: clicks land outside the row, so
+                        // the lazy context-creation path won't trigger. The
+                        // PropsSystem registry is idempotent so repeat row
+                        // mounts (template re-renders, key reuse) are safe.
+                        if (outsideClickActions) {
+                            const rowElements = row._bindingElements;
+                            for (let oi = 0; oi < outsideClickActions.length; oi++) {
+                                const entry = outsideClickActions[oi];
+                                const actionEl = rowElements[entry.index];
+                                if (!actionEl) continue;
+                                const methodNames = entry.methodNames;
+                                const rowCtx = {
+                                    item: itemProxy,
+                                    index: i,
+                                    listContext: context
+                                };
+                                for (let mi = 0; mi < methodNames.length; mi++) {
+                                    const methodName = methodNames[mi];
+                                    if (typeof instance.context[methodName] !== 'function') continue;
+                                    self._setupOutsideClickHandler(actionEl, instance, methodName, rowCtx);
+                                }
+                            }
+                        }
 
                         // PERF: Skip eager context creation in bulk path - contexts created lazily on interaction
                         // This was the main performance bottleneck (O(n) context creation during initial render)
@@ -2450,7 +2661,7 @@ _updateLists(listElements, instance = null)
                     // PERF: Extract and cache static item props once per template
                     // This allows skipping the first-run proxy reads (touchPath) for bulk-created items
                     if (compiledMetadata && compiledMetadata._staticItemProps === undefined) {
-                        compiledMetadata._staticItemProps = self._extractStaticItemProps(compiledMetadata);
+                        compiledMetadata._staticItemProps = self._extractStaticItemProps(compiledMetadata, instance);
                     }
                     const precomputedProps = compiledMetadata?._staticItemProps || null;
 
@@ -2680,9 +2891,13 @@ _updateLists(listElements, instance = null)
             compiledMetadata._componentDeps = self._extractComponentDeps(compiledMetadata, sampleItem, instance, sm);
         }
         const compDeps = compiledMetadata?._componentDeps;
+        // Hoisted so wrappedDispose below can clean it up when the list is
+        // disposed mid-life (not just on component destroy). Otherwise each
+        // re-render leaks the previous refresh effect.
+        let disposeRefreshEffect = null;
         if (compDeps && compDeps.size > 0 && sm && instance) {
             let isFirstRefresh = true;
-            const disposeRefreshEffect = sm.createEffect(() => {
+            disposeRefreshEffect = sm.createEffect(() => {
                 // Read component-level deps to register as dependencies of THIS effect
                 for (const dep of compDeps) {
                     if (dep.startsWith('computed:')) {
@@ -2830,13 +3045,45 @@ _updateLists(listElements, instance = null)
                 }
             });
 
-            // Register cleanup
-            if (instance._mapArrayCleanups) {
-                instance._mapArrayCleanups.push(() => {
-                    if (disposeRefreshEffect) disposeRefreshEffect();
-                });
-            }
         }
+
+        // Wrap element._disposeMapArray so it ALSO disposes:
+        //   - any nested data-list mapArrays inside this list's subtree
+        //     (popover lists, sub-lists, etc.), so they don't leak when a
+        //     parent row is removed or a parent list is re-rendered;
+        //   - this list's refresh effect (the component-level dep watcher
+        //     created above), which previously was only cleaned up on
+        //     component destroy.
+        //
+        // Without these, onItemUpdate's nested-list re-render path
+        // (`_disposeMapArray()` + `_renderList()`) would dispose only the
+        // structural + per-row item effects of the re-rendered list, leaving
+        // every nested popover list's structural + refresh + item effects
+        // alive. PM-demo measurement showed ~900 leaked effects per priority
+        // change, ballooning subsequent select/deselect latency.
+        const baseDisposeMapArray = disposeMapArray;
+        const wrappedDispose = () => {
+            // Walk descendants for nested mapArrays. querySelectorAll returns
+            // document order; each nested dispose nulls its own _disposeMapArray
+            // when done, so later iterations that re-encounter an already-
+            // disposed inner list skip cleanly.
+            if (element.querySelectorAll) {
+                const nestedListEls = element.querySelectorAll('[data-list], [data-wf-list]');
+                for (let i = 0; i < nestedListEls.length; i++) {
+                    const nested = nestedListEls[i];
+                    if (nested !== element && nested._disposeMapArray) {
+                        try { nested._disposeMapArray(); } catch (e) { /* ignore */ }
+                        nested._mapArrayInitialized = false;
+                        nested._disposeMapArray = null;
+                    }
+                }
+            }
+            if (disposeRefreshEffect) {
+                try { disposeRefreshEffect(); } catch (e) { /* ignore */ }
+            }
+            baseDisposeMapArray();
+        };
+        element._disposeMapArray = wrappedDispose;
 
         // Set up event delegation on the container element
         // This allows events to bubble from items to the container
@@ -2846,13 +3093,15 @@ _updateLists(listElements, instance = null)
         element._previousData = data;
         element._previousDataLength = data?.length || 0;
 
-        // Register cleanup on component destroy
+        // Register cleanup on component destroy. Use the wrapped dispose so
+        // component teardown also tears down nested data-lists + refresh
+        // effects, not just the top-level mapArray.
         if (instance && !instance._mapArrayCleanups) {
             instance._mapArrayCleanups = [];
         }
         if (instance) {
             instance._mapArrayCleanups.push(() => {
-                if (disposeMapArray) disposeMapArray();
+                wrappedDispose();
                 element._mapArrayInitialized = false;
                 element._disposeMapArray = null;
                 element._mapArrayItemElements = null;
@@ -3168,7 +3417,9 @@ _updateLists(listElements, instance = null)
         const state = instance?.state || {};
         const computed = instance?.stateManager?.computed || {};
         const stateManager = instance?.stateManager;
+        const originalComputeds = stateManager?._originalComputedFunctions;
         const hasListContext = typeof itemIndex === 'number';
+        const self = this;
 
         return new Proxy({}, {
             get(target, prop) {
@@ -3198,6 +3449,18 @@ _updateLists(listElements, instance = null)
                 // 4. Lazy computed evaluation (only evaluate when accessed)
                 if (prop in computed && stateManager) {
                     try {
+                        // Item-level computeds (fn(item) with fn.length > 0) need
+                        // the current item passed in. evaluateComputed without an
+                        // item arg returns undefined for these, so route through
+                        // _evaluateComputedInListContext when in list scope.
+                        if (item != null && typeof item === 'object' && originalComputeds) {
+                            const fn = originalComputeds.get(prop);
+                            if (fn && typeof fn === 'function' && fn.length > 0) {
+                                return self._evaluateComputedInListContext(
+                                    instance, prop, item, itemIndex, null
+                                );
+                            }
+                        }
                         return stateManager.evaluateComputed(prop);
                     } catch (e) {
                         return undefined;
@@ -3258,6 +3521,71 @@ _updateLists(listElements, instance = null)
     _applyClassBindingsToRow(row, item, index, dataLen, classEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
         const elements = row._bindingElements || row._cachedElementsArray;
         let mergedCtx = prebuiltMergedCtx || null;
+
+        // Item-level computeds (fn(item) with fn.length > 0) must be evaluated
+        // per item, so they can't be in any cached/prebuilt mergedCtx. They go
+        // into mergedCtx so expressions like `{ shared: isShared }` and
+        // `isShared ? 'on' : ''` resolve correctly.
+        //
+        // Skip the eager evaluation entirely when no evaluator on this row
+        // needs the merged context — every simple-property class binding
+        // (`data-bind-class="rowClass"`) resolves the computed directly via
+        // _evaluateComputedInListContext inside the per-evaluator loop below.
+        // Eagerly evaluating ALL item-level computeds in that case allocates
+        // two Proxies per computed per row per update with the result never
+        // read, which was 18% / 28% of main-thread time on the PM-demo
+        // profile (2026-05-16). Gate the loop on actual need.
+        //
+        // CRITICAL: use _evaluateComputedInListContext (not a direct fn.call) so
+        // dependency tracking sees the state reads inside the computed. Direct
+        // calls bypass the tracking context, breaking reactive updates when the
+        // accessed state mutates.
+        let needsMergedCtx = !!prebuiltMergedCtx;
+        if (!needsMergedCtx) {
+            for (let i = 0; i < classEvaluators.length; i++) {
+                const ev = classEvaluators[i];
+                if (ev.evaluator && ev.evaluator._usesMergedContext) {
+                    needsMergedCtx = true;
+                    break;
+                }
+                // Fallback path (no .evaluator, has .expression) also builds mergedCtx
+                if (!ev.evaluator && ev.expression) {
+                    needsMergedCtx = true;
+                    break;
+                }
+            }
+        }
+        const originalComputeds = needsMergedCtx ? instance?.stateManager?._originalComputedFunctions : null;
+        let itemComputedValues = null;
+        if (originalComputeds) {
+            for (const [key, fn] of originalComputeds) {
+                if (typeof fn === 'function' && fn.length > 0) {
+                    if (!itemComputedValues) itemComputedValues = {};
+                    try {
+                        itemComputedValues[key] = this._evaluateComputedInListContext(
+                            instance, key, item, index, listContext
+                        );
+                    } catch (e) {
+                        itemComputedValues[key] = undefined;
+                    }
+                }
+            }
+        }
+        if (itemComputedValues) {
+            if (!mergedCtx) {
+                // Build mergedCtx from item + componentState + list-context vars,
+                // then add the item-level computed values we already computed above.
+                mergedCtx = {
+                    ...item,
+                    ...componentState,
+                    _index: index,
+                    _length: dataLen,
+                    _first: index === 0,
+                    _last: index === dataLen - 1
+                };
+            }
+            Object.assign(mergedCtx, itemComputedValues);
+        }
         for (const evaluator of classEvaluators) {
             let targetEl;
 
@@ -3288,14 +3616,7 @@ _updateLists(listElements, instance = null)
                         }
                     } else if (evaluator.evaluator._usesMergedContext) {
                         if (!mergedCtx) {
-                            mergedCtx = {
-                                ...item,
-                                ...componentState,
-                                _index: index,
-                                _length: dataLen,
-                                _first: index === 0,
-                                _last: index === dataLen - 1
-                            };
+                            mergedCtx = this._buildClassMergedCtx(item, componentState, instance, index, dataLen);
                         }
                         classValue = evaluator.evaluator(mergedCtx);
                     } else {
@@ -3304,14 +3625,7 @@ _updateLists(listElements, instance = null)
                 } else if (evaluator.expression) {
                     // Fallback: evaluate expression with item context
                     if (!mergedCtx) {
-                        mergedCtx = {
-                            ...item,
-                            ...componentState,
-                            _index: index,
-                            _length: dataLen,
-                            _first: index === 0,
-                            _last: index === dataLen - 1
-                        };
+                        mergedCtx = this._buildClassMergedCtx(item, componentState, instance, index, dataLen);
                     }
                     try {
                         if (this._useCSPSafeEvaluation) {
@@ -3343,13 +3657,21 @@ _updateLists(listElements, instance = null)
                 classValue = '';
             }
 
-            // Targeted rebind: skip DOM class manipulation for non-matching evaluators
+            // Targeted rebind: skip DOM class manipulation for non-matching evaluators.
+            // Bypass when the evaluator references a registered computed by name —
+            // the computed body may read the changed prop transitively.
             if (this._targetedProp) {
                 const expr = evaluator.expression || evaluator.property || '';
-                if (expr && !expr.includes(this._targetedProp)) continue;
+                if (expr && !expr.includes(this._targetedProp)
+                    && !this._evaluatorRefsComputed(evaluator, instance)) continue;
             }
 
-            // Apply class (add to existing static classes, don't replace them)
+            // Apply class (add to existing static classes, don't replace them).
+            // NOTE: this path is intentionally additive — a "diff and remove
+            // dropped keys" version was attempted and broke 14 tests because
+            // _executeClassBindings also writes to _prevBoundClasses for the
+            // same element. Class drop-out semantics are owned by
+            // _executeClassBindings, which uses _toggleBoundClass correctly.
             if (classValue) {
                 let classNames;
                 if (Array.isArray(classValue)) {
@@ -3373,6 +3695,52 @@ _updateLists(listElements, instance = null)
     },
 
     /**
+     * Build the merged context object for class-binding expression evaluation.
+     *
+     * Includes: item properties, component state, list-context vars, AND
+     * item-level computed VALUES (computeds defined as `fn(item) { ... }` with
+     * fn.length > 0 — called once per row with the current item).
+     *
+     * Without item-level computeds in the merged context, expressions like
+     * `{ shared: isShared }` and `isShared ? 'on' : ''` see `isShared` as
+     * undefined because component-level state spread doesn't include them
+     * (they require an item argument).
+     *
+     * @private
+     */
+    _buildClassMergedCtx(item, componentState, instance, index, dataLen) {
+        const ctx = {
+            ...item,
+            ...componentState,
+            _index: index,
+            _length: dataLen,
+            _first: index === 0,
+            _last: index === dataLen - 1
+        };
+        // Item-level computeds (both parameterised fn(item) and bare-form fn()
+        // reading `this.X`): use _evaluateComputedInListContext so dependency
+        // tracking sees the state reads (direct fn.call bypasses tracking and
+        // breaks reactive updates). Override the stale value the componentState
+        // spread placed in ctx for bare-form computeds (component-level eval
+        // produces wrong value when the body reads item state via `this.X`).
+        // Item own-properties win — if item has a key matching a computed name,
+        // keep the item value.
+        const originals = instance?.stateManager?._originalComputedFunctions;
+        if (originals) {
+            for (const [key, fn] of originals) {
+                if (typeof fn === 'function' && !(key in item)) {
+                    try {
+                        ctx[key] = this._evaluateComputedInListContext(instance, key, item, index, null);
+                    } catch (e) {
+                        ctx[key] = undefined;
+                    }
+                }
+            }
+        }
+        return ctx;
+    },
+
+    /**
      * Fast-path style binding using pre-compiled evaluators.
      * Bypasses evaluateExpression → _processObjectBinding → _applyObjectBinding chain.
      */
@@ -3384,6 +3752,14 @@ _updateLists(listElements, instance = null)
         let lazyCtx = prebuiltMergedCtx || null;
         if (!lazyCtx) {
             const _idx = index, _len = dataLen;
+            // Item-level computeds (both parameterized fn(item) and bare-form fn()
+            // using `this.X`) need per-item evaluation. componentState resolves
+            // bare-form at the component level, which produces a stale (often
+            // wrong) value because `this.X` reads off the component context.
+            // Always route through _evaluateComputedInListContext when the name
+            // is a registered computed.
+            const origComputeds = instance?.stateManager?._originalComputedFunctions;
+            const self = this;
             lazyCtx = new Proxy(item, {
                 get(target, prop) {
                     if (prop === '_index') return _idx;
@@ -3392,6 +3768,14 @@ _updateLists(listElements, instance = null)
                     if (prop === '_last') return _idx === _len - 1;
                     const val = target[prop];
                     if (val !== undefined) return val;
+                    if (origComputeds) {
+                        const fn = origComputeds.get(prop);
+                        if (fn && typeof fn === 'function') {
+                            try {
+                                return self._evaluateComputedInListContext(instance, prop, item, _idx, listContext);
+                            } catch (e) { return undefined; }
+                        }
+                    }
                     if (componentState && prop in componentState) return componentState[prop];
                     return undefined;
                 }
@@ -3420,17 +3804,88 @@ _updateLists(listElements, instance = null)
                     continue;
                 }
             } catch (e) { continue; }
-            // Targeted rebind: skip DOM style manipulation for non-matching evaluators
-            if (this._targetedProp && evaluator.expression && !evaluator.expression.includes(this._targetedProp)) continue;
+            // Targeted rebind: skip DOM style manipulation for non-matching evaluators.
+            // Bypass when the evaluator references a registered computed by name —
+            // the computed body may read the changed prop transitively.
+            if (this._targetedProp && evaluator.expression
+                && !evaluator.expression.includes(this._targetedProp)
+                && !this._evaluatorRefsComputed(evaluator, instance)) continue;
 
             if (resultObject && typeof resultObject === 'object') {
                 const style = targetEl.style;
+                // Clear previously-bound keys that aren't in the new object
+                // (otherwise an `assigneeStyle` returning `{}` after unassign
+                // leaves the prior background:color on the element).
+                const prev = targetEl._boundStyleProps;
+                if (prev && prev.size > 0) {
+                    for (const prevProp of prev) {
+                        if (Object.prototype.hasOwnProperty.call(resultObject, prevProp)) continue;
+                        if (prevProp.startsWith('--')) style.removeProperty(prevProp);
+                        else style[prevProp] = '';
+                        prev.delete(prevProp);
+                    }
+                }
                 for (const prop in resultObject) {
                     const val = resultObject[prop];
                     style[prop] = (val === null || val === undefined) ? '' : val;
                 }
+                if (!targetEl._boundStyleProps) targetEl._boundStyleProps = new Set();
+                for (const k in resultObject) targetEl._boundStyleProps.add(k);
             }
         }
+    },
+
+    /**
+     * Whether the component instance has ANY registered computed properties.
+     * Used to fast-path past the binding-reactivity bypass logic for
+     * components that declare no computeds — every per-binding
+     * `computeds[name]` lookup would miss, so the bypass can be skipped
+     * entirely.
+     *
+     * Checked live (no cache) because caching breaks if a computed is
+     * registered AFTER the first list-binding evaluation queries the
+     * cache — the stale `false` would make all subsequent bypass checks
+     * silently skip computed-name bindings, producing partial updates
+     * (style updates but class/text don't).
+     * @private
+     */
+    _instanceHasComputeds(instance) {
+        const c = instance?.stateManager?.computed;
+        if (!c) return false;
+        for (const _k in c) return true;
+        return false;
+    },
+
+    /**
+     * Decide whether a list-binding evaluator's expression depends on any
+     * registered computed by name. Cached per-evaluator. Used to bypass the
+     * targeted-rebind path-equality filter for bindings whose value comes
+     * from a computed — the computed's body may read the changed prop
+     * transitively.
+     * @private
+     */
+    _evaluatorRefsComputed(evaluator, instance) {
+        if (evaluator._computedRefsCache !== undefined) return evaluator._computedRefsCache;
+        if (!this._instanceHasComputeds(instance)) {
+            evaluator._computedRefsCache = false;
+            return false;
+        }
+        const computed = instance.stateManager.computed;
+        let found = false;
+        if (evaluator.expression) {
+            if (evaluator.isComputed && evaluator.computedName && computed[evaluator.computedName]) {
+                found = true;
+            } else {
+                const matches = evaluator.expression.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*\b/g);
+                if (matches) {
+                    for (let i = 0; i < matches.length; i++) {
+                        if (computed[matches[i]]) { found = true; break; }
+                    }
+                }
+            }
+        }
+        evaluator._computedRefsCache = found;
+        return found;
     },
 
     /**
@@ -3442,6 +3897,8 @@ _updateLists(listElements, instance = null)
         let lazyCtx = prebuiltMergedCtx || null;
         if (!lazyCtx) {
             const _idx = index, _len = dataLen;
+            const origComputeds = instance?.stateManager?._originalComputedFunctions;
+            const self = this;
             lazyCtx = new Proxy(item, {
                 get(target, prop) {
                     if (prop === '_index') return _idx;
@@ -3450,6 +3907,17 @@ _updateLists(listElements, instance = null)
                     if (prop === '_last') return _idx === _len - 1;
                     const val = target[prop];
                     if (val !== undefined) return val;
+                    if (origComputeds) {
+                        const fn = origComputeds.get(prop);
+                        // Match _applyStyleBindingsToRow: route both parameterized
+                        // and bare-form item-level computeds through list-context
+                        // evaluation so `this.X` resolves to item state.
+                        if (fn && typeof fn === 'function') {
+                            try {
+                                return self._evaluateComputedInListContext(instance, prop, item, _idx, listContext);
+                            } catch (e) { return undefined; }
+                        }
+                    }
                     if (componentState && prop in componentState) return componentState[prop];
                     return undefined;
                 }
@@ -3478,10 +3946,24 @@ _updateLists(listElements, instance = null)
                     continue;
                 }
             } catch (e) { continue; }
-            // Targeted rebind: skip DOM attr manipulation for non-matching evaluators
-            if (this._targetedProp && evaluator.expression && !evaluator.expression.includes(this._targetedProp)) continue;
+            // Targeted rebind: skip DOM attr manipulation for non-matching evaluators.
+            // Bypass when the evaluator references a registered computed by name —
+            // the computed body may read the changed prop transitively.
+            if (this._targetedProp && evaluator.expression
+                && !evaluator.expression.includes(this._targetedProp)
+                && !this._evaluatorRefsComputed(evaluator, instance)) continue;
 
             if (resultObject && typeof resultObject === 'object') {
+                // Clear previously-bound attrs that aren't in the new object
+                // (matches the parallel fix in _applyStyleBindingsToRow).
+                const prev = targetEl._boundAttrProps;
+                if (prev && prev.size > 0) {
+                    for (const prevAttr of prev) {
+                        if (Object.prototype.hasOwnProperty.call(resultObject, prevAttr)) continue;
+                        if (targetEl.hasAttribute(prevAttr)) targetEl.removeAttribute(prevAttr);
+                        prev.delete(prevAttr);
+                    }
+                }
                 for (const attr in resultObject) {
                     if (this._isBlocklistedAttr(attr)) continue;
                     const val = resultObject[attr];
@@ -3493,6 +3975,8 @@ _updateLists(listElements, instance = null)
                         targetEl.setAttribute(attr, String(sanitized));
                     }
                 }
+                if (!targetEl._boundAttrProps) targetEl._boundAttrProps = new Set();
+                for (const k in resultObject) targetEl._boundAttrProps.add(k);
             }
         }
     },
@@ -3584,9 +4068,21 @@ _updateLists(listElements, instance = null)
      * Returns null if template has computed class bindings (can't statically resolve deps).
      * @private
      */
-    _extractStaticItemProps(compiledMetadata) {
+    _extractStaticItemProps(compiledMetadata, instance) {
         const props = new Set();
         const reservedWords = this._expressionReservedWords;
+        // Item-level computed names whose transitive deps can't be statically resolved.
+        // If any binding expression references one, we must bail to the full first-run
+        // path so reads inside the computed register against the per-item effect.
+        // Only parameterised (fn.length > 0) qualifies — zero-arg computeds are
+        // component-level and tracked by the component refresh effect, not per-item.
+        const itemLevelComputedNames = new Set();
+        const _origComputeds = instance?.stateManager?._originalComputedFunctions;
+        if (_origComputeds) {
+            for (const [name, fn] of _origComputeds) {
+                if (typeof fn === 'function' && fn.length > 0) itemLevelComputedNames.add(name);
+            }
+        }
 
         const addPath = (path) => {
             if (!path || typeof path !== 'string') return;
@@ -3623,11 +4119,33 @@ _updateLists(listElements, instance = null)
             }
         };
 
+        // Helper: bail when an expression's identifiers reference an item-level
+        // computed. Such bindings need the first-run dep-registration path to
+        // run the computed body and register its transitive state reads.
+        const exprRefsItemLevelComputed = (expression, expressionVars) => {
+            if (itemLevelComputedNames.size === 0) return false;
+            if (expressionVars) {
+                for (const v of expressionVars) {
+                    if (itemLevelComputedNames.has(v)) return true;
+                }
+                return false;
+            }
+            if (!expression || typeof expression !== 'string') return false;
+            const stripped = expression.replace(/'[^']*'|"[^"]*"/g, '');
+            const vars = stripped.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || [];
+            for (const v of vars) {
+                if (itemLevelComputedNames.has(v)) return true;
+            }
+            return false;
+        };
+
         // Bindings
         for (const binding of (compiledMetadata.bindings || [])) {
             if (binding.isExpression && binding.expressionVars) {
+                if (exprRefsItemLevelComputed(null, binding.expressionVars)) return null;
                 addExpressionVars(null, binding.expressionVars);
             } else if (!binding.isExpression && !binding.isListContextVar && !binding.isPropsPath && !binding.isComputed) {
+                if (itemLevelComputedNames.has(binding.path)) return null;
                 addPath(binding.path);
             }
         }
@@ -3638,7 +4156,18 @@ _updateLists(listElements, instance = null)
                 return null; // Bail — fall back to touchPath first run
             } else if (classBinding.isSimpleProperty && classBinding.expression) {
                 addPath(classBinding.expression);
+                // Item-level computed referenced as a bare property — transitive deps
+                // (state reads inside the computed) need first-run registration.
+                if (itemLevelComputedNames.has(classBinding.expression)) return null;
             } else if (classBinding.expression) {
+                // If the expression references any item-level computed, the per-item
+                // effect's transitive deps can only be discovered by evaluating the
+                // computed with the actual item — which only happens on first-run.
+                if (classBinding.expressionVars) {
+                    for (const v of classBinding.expressionVars) {
+                        if (itemLevelComputedNames.has(v)) return null;
+                    }
+                }
                 addExpressionVars(classBinding.expression, null);
             }
         }
@@ -3646,21 +4175,27 @@ _updateLists(listElements, instance = null)
         // Style bindings
         for (const styleBinding of (compiledMetadata.styleBindings || [])) {
             if (styleBinding.expression) {
+                if (exprRefsItemLevelComputed(styleBinding.expression, styleBinding.expressionVars)) return null;
                 addExpressionVars(styleBinding.expression, null);
             }
         }
         if (compiledMetadata.rootBindings?.bindStyleExpr) {
-            addExpressionVars(compiledMetadata.rootBindings.bindStyleExpr, null);
+            const rootExpr = compiledMetadata.rootBindings.bindStyleExpr;
+            if (exprRefsItemLevelComputed(rootExpr, null)) return null;
+            addExpressionVars(rootExpr, null);
         }
 
         // Attr bindings
         for (const attrBinding of (compiledMetadata.attrBindings || [])) {
             if (attrBinding.expression) {
+                if (exprRefsItemLevelComputed(attrBinding.expression, attrBinding.expressionVars)) return null;
                 addExpressionVars(attrBinding.expression, null);
             }
         }
         if (compiledMetadata.rootBindings?.bindAttrExpr) {
-            addExpressionVars(compiledMetadata.rootBindings.bindAttrExpr, null);
+            const rootExpr = compiledMetadata.rootBindings.bindAttrExpr;
+            if (exprRefsItemLevelComputed(rootExpr, null)) return null;
+            addExpressionVars(rootExpr, null);
         }
 
         // Model bindings
@@ -3670,12 +4205,32 @@ _updateLists(listElements, instance = null)
 
         // Show bindings
         for (const showBinding of (compiledMetadata.shows || [])) {
-            addPath(showBinding.path);
+            if (showBinding.isExpression && showBinding.expressionVars) {
+                if (exprRefsItemLevelComputed(null, showBinding.expressionVars)) return null;
+                addExpressionVars(null, showBinding.expressionVars);
+            } else {
+                if (itemLevelComputedNames.has(showBinding.path)) return null;
+                addPath(showBinding.path);
+            }
         }
 
         // HTML bindings
         for (const htmlBinding of (compiledMetadata.htmlBindings || [])) {
+            if (itemLevelComputedNames.has(htmlBinding.path)) return null;
             addPath(htmlBinding.path);
+        }
+
+        // Render bindings — same bail-out as shows/binds: an item-level computed
+        // referenced in a render expression needs first-run evaluation so its
+        // sibling-state reads register against the per-item effect.
+        for (const renderBinding of (compiledMetadata.renders || [])) {
+            if (renderBinding.isExpression && renderBinding.expressionVars) {
+                if (exprRefsItemLevelComputed(null, renderBinding.expressionVars)) return null;
+                addExpressionVars(null, renderBinding.expressionVars);
+            } else if (renderBinding.path) {
+                if (itemLevelComputedNames.has(renderBinding.path)) return null;
+                addPath(renderBinding.path);
+            }
         }
 
         // Root bindings
@@ -3935,6 +4490,342 @@ _updateLists(listElements, instance = null)
                 element.removeChild(element.firstChild);
             }
         }
+    },
+
+    // ========================================================================
+    // List context lifecycle + state-change routing.
+    // `this` is the WildflowerJS instance after mixin assembly.
+    // ========================================================================
+
+    // Set up list contexts when a component is initialized
+    _setupListContexts(instance)
+    {
+        if (!instance)
+        {
+            return;
+        }
+
+        // Ensure context system is initialized
+        this._ensureContextSystem();
+
+        // Initialize context collection
+        if (!instance._listContexts)
+        {
+            instance._listContexts = new Map();
+        }
+
+        let relationships = [];
+        try {
+            if (this._contextRegistry && this._contextRegistry.detectTemplateRelationships) {
+                relationships = this._contextRegistry.detectTemplateRelationships(instance.element);
+            }
+        } catch (error) {
+            if (__DEV__) console.error('ERROR detecting template relationships:', error);
+        }
+
+        // Register these relationships in our registry
+        relationships.forEach(({parentPath, childPath}) =>
+        {
+            if (!this._listRelationships.has(parentPath))
+            {
+                this._listRelationships.set(parentPath, new Set());
+            }
+
+            this._listRelationships.get(parentPath).add(childPath);
+        });
+
+        // Find ALL list elements including those in templates for proper discovery
+        // First find all templates
+        const templates = instance.element.querySelectorAll('template');
+        const listsInTemplates = [];
+
+        // Search inside template content for nested lists
+        templates.forEach(template => {
+            const nestedLists = template.content.querySelectorAll(this._attrSelector('list'));
+            nestedLists.forEach(list => listsInTemplates.push(list));
+        });
+
+        // Find all visible lists
+        const visibleListsNodeList = instance.element.querySelectorAll(this._attrSelector('list'));
+
+        const allLists = Array.from(visibleListsNodeList)
+            .filter(el =>
+            {
+                // Only include lists that belong to this component
+                // IMPORTANT: Use [data-component] not [data-component-id] because nested
+                // components may not have been assigned their ID yet during init
+                const closestComponentEl = el.closest('[data-component], [data-wf-component]');
+                return closestComponentEl === instance.element;
+            });
+
+        // Separate visible lists from template lists for different handling
+        const visibleLists = allLists.filter(el => !el.closest('template'));
+        // Use the lists we found inside templates
+        const templateLists = listsInTemplates;
+
+        // Create contexts for visible lists
+        visibleLists.forEach(listElement =>
+        {
+            const listPath = listElement.dataset.list;
+            if (!listPath) return;
+
+            // Skip if context already exists for this list
+            if (listElement._listContext || instance._listContexts.has(listPath)) {
+                return;
+            }
+
+            // Get data for this list
+            let data;
+
+            // Normalize $store.path shorthand to external() before processing
+            const normalizedPath = listPath.includes('$') && this._normalizeStoreShorthands
+                ? this._normalizeStoreShorthands(listPath)
+                : listPath;
+
+            if (normalizedPath.startsWith('computed:')) {
+                data = instance.stateManager.evaluateComputed(normalizedPath.slice(9));
+            } else if (normalizedPath.includes('external(')) {
+                // Handle external() expressions for store data
+                if (this._getExternalFn) {
+                    try {
+                        data = this.evaluateExpression(normalizedPath, instance.state, {
+                            cacheKey: 'listInit',
+                            additionalContext: { external: this._getExternalFn(instance) }
+                        });
+                    } catch (error) {
+                        if (__DEV__) console.warn(`Error evaluating external list path "${normalizedPath}":`, error);
+                        data = [];
+                    }
+                } else {
+                    data = [];
+                }
+            } else {
+                data = instance.stateManager.getValue(normalizedPath);
+            }
+
+            // Use _createListContext (not registry.createListContext directly)
+            // This ensures proper prototype setup and registration
+            const context = this._createListContext(
+                listPath,
+                data,
+                instance,
+                null  // parent context
+            );
+
+            // Store on element for fast lookup
+            if (context) {
+                listElement._listContext = context;
+                context.element = listElement;
+            }
+        });
+
+        // Pre-create contexts for lists in templates (nested lists)
+        // These will be placeholder contexts that get populated during rendering
+        templateLists.forEach(listElement =>
+        {
+            const listPath = listElement.dataset.list;
+            if (!listPath) return;
+
+            // For lists in templates, we don't have data yet, but we can prepare the structure
+            // The actual data and parent relationships will be set during parent item rendering
+            // Mark this as a template list that needs special handling
+            listElement._isTemplateList = true;
+            listElement._componentInstance = instance;
+        });
+    },
+
+    // Handle state changes that affect lists
+    _handleListStateChange(instanceId, path, newValue, _oldValue)
+    {
+        const instance = this.componentInstances.get(instanceId);
+        if (!instance) {
+            return false;
+        }
+
+        // Handle computed property changes that directly affect lists
+        // When a computed property like 'computed:cartItems' changes, update the corresponding list context
+        if (path.startsWith('computed:')) {
+            if (instance._listContexts && instance._listContexts.has(path)) {
+                const context = instance._listContexts.get(path);
+                if (context) {
+                    // Update the list with the new computed value
+                    context.updateData(Array.isArray(newValue) ? newValue : []);
+
+                    // Queue for render
+                    this._contextsToUpdate.add(context);
+                    this._scheduleRender();
+                    return true;
+                }
+            }
+            // No list bound to this computed property
+            return false;
+        }
+
+        // Check for context system usage
+        if (!this._contextSystemInitialized)
+        {
+            // Fall back to original implementation if context system not used
+            return false;
+        }
+
+        // Track affected contexts
+        let contextsAffected = false;
+        const affectedContexts = new Set();
+
+        // Check if this path change affects any computed property that a list depends on
+        // This enables reactive updates for computed lists when their internal dependencies change
+        if (instance._listContexts && instance.stateManager) {
+            instance._listContexts.forEach((context, contextPath) => {
+                // Only check computed lists
+                if (contextPath.startsWith('computed:')) {
+                    const computedName = contextPath.slice(9); // Remove 'computed:' prefix
+
+                    // Check if this computed property depends on the changed path
+                    const deps = instance.stateManager.computedDependencies?.get(path);
+                    if (deps && deps.has(computedName)) {
+                        // The changed path is a dependency of this computed property
+                        // Re-evaluate the computed property and update the list
+                        const freshData = instance.stateManager.evaluateComputed(computedName);
+                        context.updateData(Array.isArray(freshData) ? freshData : []);
+                        contextsAffected = true;
+                        affectedContexts.add(context);
+                    }
+                }
+            });
+        }
+
+        // Check component's contexts
+        if (instance._listContexts && instance._listContexts.size > 0)
+        {
+            // Check each context for potential impact
+            instance._listContexts.forEach((context, contextPath) =>
+            {
+                // Direct list data update
+                if (contextPath === path)
+                {
+                    if (context._cache)
+                    {
+                        context._cache.clear();
+                    }
+
+                    // Update context data
+                    context.updateData(Array.isArray(newValue) ? newValue : []);
+                    contextsAffected = true;
+                    affectedContexts.add(context);
+                }
+                // PERFORMANCE FIX: Precise nested list matching (replacing broad path.endsWith())
+                else if (this._isNestedListUpdate(path, contextPath))
+                {
+                    // This handles nested lists like categories[0].items
+                    // Get fresh data directly from component state instead of stale context resolution
+                    const fullContextPath = context.getFullPath();
+
+                    const dotNotationPath = fullContextPath.replace(/\[(\d+)]/g, '.$1');
+
+                    const freshData = instance.stateManager.getValue(dotNotationPath);
+
+                    context.updateData(Array.isArray(freshData) ? freshData : []);
+                    contextsAffected = true;
+                    affectedContexts.add(context);
+                }
+                else if (path.startsWith(`${contextPath}.`))
+                {
+                    // Only update for structural changes, not property changes
+                    const subPath = path.substring(contextPath.length + 1);
+
+                    // OPTIMIZATION: Skip length notification for clear operations
+                    // When array is cleared (rows = []), we get TWO notifications:
+                    // 1. 'rows' with newValue = [] (direct match, handles the clear)
+                    // 2. 'rows.length' with newValue = 0 (length notification, redundant!)
+                    // Skip #2 since #1 already cleared the list
+                    if (subPath === 'length' && context.data && context.data.length === 0) {
+                        // List was already cleared by the direct 'rows' notification
+                        // Skip this redundant length notification
+                        return;
+                    }
+
+                    // Process structural changes AND item-level changes:
+                    // - length changes (array size modified)
+                    // - splice operations
+                    // - item-level changes (e.g., "0", "10" - numeric indices)
+                    // - ALSO handle property changes within items (e.g., "0.label", "1.name") for direct mutations
+                    if (subPath === 'length' || subPath === 'splice' || subPath.startsWith('splice.') ||
+                        subPath.match(/^\d+$/) || subPath.match(/^\d+\./))
+                    {
+                        const fullContextPath = context.getFullPath();
+                        const dotNotationPath = fullContextPath.replace(/\[(\d+)]/g, '.$1');
+
+                        // Check if there's a pending optimization (append, swap, or sparse-update)
+                        const pendingOp = instance?.stateManager?._arrayOperations?.get(dotNotationPath);
+                        const hasOptimization = pendingOp && (
+                            pendingOp.type === 'append' ||
+                            pendingOp.type === 'swap' ||
+                            pendingOp.type === 'sparse-update'
+                        );
+
+                        if (!hasOptimization) {
+                            // No optimization available, do full update
+                            const freshData = instance.stateManager.getValue(dotNotationPath);
+                            context.updateData(Array.isArray(freshData) ? freshData : []);
+                        }
+                        // Either way, mark context as affected so it gets processed
+                        contextsAffected = true;
+                        affectedContexts.add(context);
+                    }
+                }
+            });
+        }
+
+        // Schedule updates for affected contexts
+        if (contextsAffected && !this._batchMode)
+        {
+            affectedContexts.forEach(context =>
+            {
+                this._contextsToUpdate.add(context);
+            });
+
+            // Schedule render
+            this._scheduleRender();
+        }
+
+        return contextsAffected;
+    },
+
+    // Helper method for precise nested list update detection
+    // PERF: Uses string operations instead of regex allocation (hot path optimization)
+    _isNestedListUpdate(path, contextPath) {
+        // Check for patterns like: "categories.0.items" where contextPath is "items"
+        // This should match parent[index].contextPath but NOT unrelated paths
+        // Pattern: .<digit(s)>.<contextPath> at end of path
+
+        // Fast fail: path must end with contextPath
+        if (!path.endsWith(contextPath)) return false;
+
+        // Get the position before contextPath
+        const prefixLength = path.length - contextPath.length;
+        if (prefixLength < 3) return false; // Need at least ".0."
+
+        // Check for dot before contextPath (charCode 46 = '.')
+        if (path.charCodeAt(prefixLength - 1) !== 46) return false;
+
+        // Find where the index digits end and scan backwards for digits
+        let indexEnd = prefixLength - 2;
+        let indexStart = indexEnd;
+
+        // Scan backwards for digits (charCodes 48-57 = '0'-'9')
+        while (indexStart >= 0) {
+            const charCode = path.charCodeAt(indexStart);
+            if (charCode < 48 || charCode > 57) break;
+            indexStart--;
+        }
+
+        // Must have at least one digit
+        if (indexStart === indexEnd) return false;
+
+        // Must have a dot before the digits
+        if (indexStart < 0 || path.charCodeAt(indexStart) !== 46) return false;
+
+        return true;
     }
 };
 

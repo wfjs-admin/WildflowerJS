@@ -72,9 +72,9 @@ export const ExpressionEvaluatorMethods = {
      * @returns {string[]} Deduplicated array of variable names
      * @private
      */
-    // Cache for extracted expression variables — expressions are static template strings
-    _expressionVarsCache: new Map(),
-
+    // Cache for extracted expression variables — expressions are static template strings.
+    // Initialized per-instance in WildflowerCore constructor (NOT a prototype-level Map,
+    // which would be shared across instances and cause cross-instance contamination).
     _extractExpressionVars(expression) {
         const cached = this._expressionVarsCache.get(expression);
         if (cached) return cached;
@@ -127,9 +127,20 @@ export const ExpressionEvaluatorMethods = {
             return null;
         }
 
+        // Auto-wrap object-literal expressions in parens. JavaScript ASI parses
+        // `return { x: y }` as `return; { x: y }` (block statement) returning
+        // undefined. Parens force object-literal interpretation. Wrapping any
+        // expression in parens is semantically a no-op for non-object cases,
+        // so this is safe to apply universally to expressions that look like
+        // object literals.
+        const trimmed = expression.trim();
+        const exprForFn = (trimmed.startsWith('{') && trimmed.endsWith('}'))
+            ? `(${trimmed})`
+            : expression;
+
         // Compile and cache new function
         try {
-            const fn = new Function(...contextKeys, `"use strict"; return ${expression}`);
+            const fn = new Function(...contextKeys, `"use strict"; return ${exprForFn}`);
             this._expressionEvaluator.set(cacheKey, fn);
             return fn;
         } catch (e) {

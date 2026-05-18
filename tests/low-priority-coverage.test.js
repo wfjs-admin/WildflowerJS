@@ -55,6 +55,40 @@ describe('LOW Priority Coverage', () => {
     // ============================================================
     describe('Very deep nesting (3+ levels)', () => {
 
+        // KNOWN GAP: data-render inside list items accessing parent state doesn't work
+        // The renderInner state is on the parent component, not the list item
+        it.skip('data-bind inside data-render inside data-show inside list', async () => {
+            wildflower.component('deep-nesting-1', {
+                state: {
+                    showOuter: true,
+                    renderInner: true,
+                    items: [{ name: 'Alpha' }, { name: 'Beta' }]
+                }
+            })
+
+            testContainer.innerHTML = `
+                <div data-component="deep-nesting-1">
+                    <div data-show="showOuter">
+                        <div data-list="items">
+                            <template>
+                                <div class="item">
+                                    <div data-render="renderInner">
+                                        <span class="deep-value" data-bind="name"></span>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            `
+            await waitForUpdate(100)
+
+            const values = testContainer.querySelectorAll('.deep-value')
+            expect(values.length).toBe(2)
+            expect(values[0].textContent).toBe('Alpha')
+            expect(values[1].textContent).toBe('Beta')
+        })
+
         it('data-bind-class inside nested conditionals', async () => {
             wildflower.component('deep-nesting-class', {
                 state: {

@@ -212,6 +212,26 @@ export class StoreManager {
                 if (instance.stateManager._lastEvalResult) {
                     instance.stateManager._lastEvalResult.clear();
                 }
+                // Reset the cross-entity LEAN eval path on every computed node.
+                // The lean path (see ComputedPropertyManager:_evaluateComputedFull
+                // line ~927) skips _computedTrackingContext setup on subsequent
+                // re-evals once _externalEvalCount > 0. If a computed's first
+                // eval early-returned BEFORE reading the now-resolved store
+                // (e.g. `if (!id) return null;` before reading store state),
+                // the cross-store dep was never registered through the tracking
+                // proxy. The lean path then preserves that gap on every
+                // subsequent eval — the store's mutations would never wake the
+                // computed even though the entity-dep registration is in place,
+                // because computed re-eval reads the raw store context (no
+                // tracking proxy → no _storeDependencies entry → no externalSources
+                // refresh). Resetting _externalEvalCount forces the next eval
+                // through the FULL path, which re-establishes cross-store
+                // dependency tracking cleanly.
+                if (instance.stateManager._computedNodes) {
+                    instance.stateManager._computedNodes.forEach(function(node) {
+                        if (node._externalEvalCount) node._externalEvalCount = 0;
+                    });
+                }
 
                 // Re-render any list elements in this component that may depend on the store
                 if (instance.element && this.framework._renderList) {
@@ -586,6 +606,39 @@ export class StoreManager {
 
         store._pathSubscribers.get(path).add(componentInstance);
         store._hasPathSubscribers = true;
+        // Invalidate the EntitySystem fast-exit cache. Without this, a store
+        // whose first state-change fired before any subscriber registered
+        // (e.g. the synthetic `_internal.ready` write done at end of
+        // createStoreComponent) leaves _hasNotifyTargets locked at false,
+        // and subsequent mutations short-circuit without dispatching to
+        // path subscribers. Mirrors _registerEntityDependent's invalidation.
+        store._hasNotifyTargets = true;
+
+        // ENTITY-DEP REGISTRATION: also register the component as an entity
+        // dependent of this store. The path-subscriber dispatch only fires
+        // the user's onStoreUpdate(); computed dirty-marking + binding-effect
+        // wakeup happens in the entity-dependent dispatch loop in
+        // _handleEntityStateChange (which iterates _getEntityDependents).
+        // Without this registration, mutations to a subscribed path correctly
+        // call onStoreUpdate but never invalidate computeds that read that
+        // path — DOM bindings stay on their stale cached values.
+        //
+        // Previously this happened only as a side effect of the tracking
+        // proxy when a computed read store state during _evaluateComputedFull.
+        // That path is unreliable: in Chrome, microtask ordering can leave
+        // _currentIssue's first eval taking the early-return branch (before
+        // the cross-store read), and subsequent re-evals can hit the
+        // cross-RSM cache-hit fast path which doesn't re-track. Result was
+        // the PM-demo blank-detail-pane bug on soft reload (Chrome only;
+        // Firefox's timing happened to register pm consistently).
+        //
+        // The path-scoped invalidation gate (_entityPathAffectsDependent in
+        // EntitySystem.js) checks `_storeSubscriptions` first, so this
+        // registration doesn't widen the invalidation surface — only
+        // mutations to subscribed paths will dirty the component's computeds.
+        if (componentInstance && componentInstance.id && this.framework._registerEntityDependent) {
+            this.framework._registerEntityDependent(store.id, componentInstance.id);
+        }
 
         return true;
     }

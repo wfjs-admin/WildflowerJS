@@ -322,6 +322,34 @@ describeIfSSR('SSR Comprehensive', () => {
       const stateAttr = el.getAttribute('data-ssr-state')
       expect(stateAttr).toBeNull()
     })
+
+    it('reads .value (not textContent) when extracting from input/textarea/select', () => {
+      // Regression: hydration used to fall back to textContent for these
+      // form tags, so server-rendered default values were dropped on
+      // client activation. element.value is the right property for input,
+      // textarea, and select.
+      testContainer.innerHTML = `
+        <div data-component="form-extract-test" data-ssr="true">
+          <input data-bind="email" type="text" value="user@example.com">
+          <textarea data-bind="bio">Server-rendered bio body.</textarea>
+          <select data-bind="country">
+            <option value="us">United States</option>
+            <option value="uk" selected>United Kingdom</option>
+            <option value="ca">Canada</option>
+          </select>
+        </div>
+      `
+      const el = testContainer.querySelector('[data-component]')
+      wildflower.ssrManager.prepareElement(el)
+
+      const ssrData = wildflower.ssrManager.ssrComponents.get(el)
+      expect(ssrData).toBeDefined()
+      expect(ssrData.parsedState.email).toBe('user@example.com')
+      expect(ssrData.parsedState.bio).toBe('Server-rendered bio body.')
+      // select.value reflects the selected option's value, not the text
+      // content of all <option>s concatenated.
+      expect(ssrData.parsedState.country).toBe('uk')
+    })
   })
 
   // ============================================

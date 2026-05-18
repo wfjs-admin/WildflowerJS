@@ -40,6 +40,67 @@ if (typeof document !== 'undefined' && document.currentScript) {
     }
 }
 
+/**
+ * Create the DevTools global hook for browser extension integration.
+ * Provides a serialization-safe API that extensions can call via
+ * chrome.devtools.inspectedWindow.eval() to introspect the framework.
+ */
+function _createDevToolsHook(wf) {
+    const L = new Map();
+    ['componentInit','componentDestroy','store-ready','routeChange'].forEach(n => {
+        document.addEventListener('wildflower:' + n, e => {
+            const s = L.get(n); if (s) s.forEach(f => { try { f(e.detail); } catch {} });
+        });
+    });
+    // Shared: serialize stateManager._state to plain object
+    const ss = sm => {
+        const o = {}; if (!sm?._state) return o;
+        try { for (const k of Object.keys(sm._state)) if (!k.startsWith('_')) try { o[k] = sm._state[k]; } catch { o[k] = '(error)'; } } catch {}
+        return o;
+    };
+    return {
+        version: '1.0.0', framework: wf,
+        getComponents() {
+            const r = [];
+            wf.componentInstances.forEach((i, id) => {
+                if (i.isVirtual) return;
+                const c = {}; try { const d = i.definition; if (d?.computed) for (const k of Object.keys(d.computed)) try { c[k] = i.context[k]; } catch { c[k] = '(error)'; } } catch {}
+                r.push({ id, name: i.name, tag: i.element?.tagName?.toLowerCase() || null, state: ss(i.stateManager), computed: c, props: i.props || {}, stores: i.definition?.stores || [], poolCount: i._pools?.size || 0, parentId: wf.componentParents?.get(id) || null });
+            });
+            return r;
+        },
+        getStores() {
+            const r = [], s = wf.storeManager?._namedStores; if (!s) return r;
+            s.forEach((st, n) => {
+                const m = []; try { for (const k of Object.keys(st)) if (typeof st[k] === 'function' && !k.startsWith('_')) m.push(k); } catch {}
+                r.push({ name: n, state: ss(st.stateManager), methods: m });
+            });
+            return r;
+        },
+        getPools() {
+            const r = [];
+            wf.componentInstances.forEach(i => { if (!i._pools) return; i._pools.forEach((p, n) => { r.push({ name: n, owner: i.name, ownerId: i.id, entityCount: p.items?.length ?? 0, recycleSize: p.recycleSize ?? 0, keyProp: p._keyProp || 'id', targetFps: p._targetFps || null }); }); });
+            return r;
+        },
+        getBindings() {
+            const d = wf.domElements, r = []; if (!d) return r;
+            const c = (a, t) => { if (a) a.forEach(b => r.push({ type: t, path: b.path || '', componentId: b.componentId || null, tag: b.element?.tagName?.toLowerCase() || null })); };
+            c(d.bindings,'bind'); c(d.htmlBindings,'html'); c(d.conditionals,'show'); c(d.models,'model'); c(d.lists,'list'); c(d.pools,'pool');
+            return r;
+        },
+        getRoutes() {
+            const rt = wf.RouteManager?._activeRouter; if (!rt) return null;
+            const sr = r => r ? { path: r.path || r.pattern || null, name: r.name || null, params: r.params || {}, query: r.query || {}, hash: r.hash || null, meta: r.meta || {} } : null;
+            const rr = []; try { if (rt.routeTree) for (const r of rt.routeTree) rr.push({ path: r.path || r.pattern || '?', name: r.name || null, meta: r.meta || {}, hasGuard: !!r.beforeEnter, hasChildren: !!(r.children?.length) }); } catch {}
+            return { current: sr(rt.currentRoute), previous: sr(rt.previousRoute), routes: rr, mode: rt.options?.mode || 'history', base: rt.options?.base || '/', defaultRoute: rt.options?.defaultRoute || null, guardCount: { beforeEach: rt.guards?.beforeEach?.length || 0, afterEach: rt.guards?.afterEach?.length || 0 }, isNavigating: rt.isNavigating || false };
+        },
+        setState(id, p, v) { const i = wf.getComponentInstance(id); if (i?.stateManager?._state) { i.stateManager._state[p] = v; return true; } return false; },
+        setStoreState(n, p, v) { const s = wf.getStore(n); if (s?.stateManager?._state) { s.stateManager._state[p] = v; return true; } return false; },
+        on(e, f) { if (!L.has(e)) L.set(e, new Set()); L.get(e).add(f); },
+        off(e, f) { const s = L.get(e); if (s) s.delete(f); }
+    };
+}
+
 // Create a global instance for easy access
 
 /**
@@ -54,6 +115,9 @@ export function createInstance(WildflowerClass) {
     if (typeof window !== 'undefined') {
         window.WildflowerJS = WildflowerClass;
         window.wildflower = instance;
+
+        // DevTools global hook — enables browser extensions to introspect the framework
+        window.__WF_DEVTOOLS_GLOBAL_HOOK__ = _createDevToolsHook(instance);
     }
 
     return instance;

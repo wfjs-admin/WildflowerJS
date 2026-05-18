@@ -6,7 +6,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, hasFeature } from './helpers/load-framework.js'
+
+const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
 async function waitForCompleteRender() {
   if (window.wildflower?._forceCompleteRender) {
@@ -27,7 +29,7 @@ function getInstance(wildflower, el) {
   return wildflower.componentInstances.get(target.dataset.componentId)
 }
 
-describe('Pool Bulk Add', () => {
+describeIfPools('Pool Bulk Add', () => {
   let testContainer
   let wildflower
 
@@ -388,6 +390,52 @@ describe('Pool Bulk Add', () => {
       expect(items.length).toBe(2)
       expect(items[0].querySelector('span').textContent).toBe('Alice')
       expect(items[1].querySelector('span').textContent).toBe('Bob')
+    })
+  })
+
+  describe('Bulk remove timing — O(n) on full clear', () => {
+    it('removing 1000 entities in sequence stays linear (no O(n²) sub-array indexOf)', async () => {
+      // Regression: pool sub-array tracking used Array.prototype.indexOf
+      // for removal even though the main pool used O(1) swap-with-last.
+      // At 800+ entities the quadratic cleanup was visibly slow. Now uses
+      // a stored subIdx for constant-time removal.
+      //
+      // Sanity-bounded timing test: 1000 sequential removes should
+      // complete in well under a second on any non-pathological build.
+      // The bug shape produced ~6+ seconds at 1000 on baseline machines.
+      testContainer.innerHTML = `
+        <div data-component="bulk-remove-timing">
+          <div data-pool="items" data-key="id">
+            <template>
+              <div class="item"><span data-bind="name"></span></div>
+            </template>
+          </div>
+        </div>
+      `
+
+      let pool = null
+      wildflower.component('bulk-remove-timing', {
+        state: {},
+        init() { pool = this.pool('items') }
+      })
+
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+
+      const N = 1000
+      const items = new Array(N)
+      for (let i = 0; i < N; i++) items[i] = { id: i, name: 'n' + i }
+      pool.add(items)
+      expect(pool.size).toBe(N)
+
+      const start = performance.now()
+      for (let i = 0; i < N; i++) pool.remove(i)
+      const elapsed = performance.now() - start
+
+      expect(pool.size).toBe(0)
+      // Generous bound: 1000ms. Sub-array indexOf bug produced 6000+.
+      // Linear behavior typically lands well under 250ms.
+      expect(elapsed).toBeLessThan(1000)
     })
   })
 })

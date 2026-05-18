@@ -718,6 +718,14 @@ export class SSRManager {
             return element.innerHTML;
         }
 
+        // For form inputs, textContent is always empty — read .value instead
+        // so SSR-rendered <input value="..."> survives hydration rather than
+        // clobbering the component's default state with ''.
+        const tag = element.tagName;
+        if ((tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') && 'value' in element) {
+            return element.value;
+        }
+
         // Default to text content
         return content;
     }

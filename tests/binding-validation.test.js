@@ -198,6 +198,50 @@ suiteRunner('Binding Validation', () => {
                     expect(validationWarning).toBeDefined();
                 }
             });
+
+            it('does not warn for expression-bearing attributes whose vars exist (delegates to expression validator)', async () => {
+                // Regression: the validator used to re-parse data-show /
+                // data-bind-class expressions as raw binding paths and flag
+                // identifiers like `!loading` or `isShared && !isLocked` as
+                // unknown. It now hands those off to the expression validator,
+                // which sees the individual variables as defined.
+                const warnCapture = createWarnCapture();
+
+                wildflower.component('validation-test-expr', {
+                    state: {
+                        loading: false,
+                        isShared: true,
+                        isLocked: false,
+                        count: 5
+                    }
+                });
+
+                testContainer.innerHTML = `
+                    <div data-component="validation-test-expr">
+                        <span data-show="!loading">ready</span>
+                        <span data-show="isShared && !isLocked">visible</span>
+                        <span data-show="count > 0 ? 'yes' : 'no'">content</span>
+                        <button data-bind-class="{'is-active': isShared, 'dimmed': !isShared}">btn</button>
+                    </div>
+                `;
+
+                await wildflower.scan();
+                await waitForUpdate();
+                warnCapture.restore();
+
+                // None of the variables in those expressions should be
+                // flagged as unknown — they're all defined in state.
+                if (hasConsoleWarnings()) {
+                    const spurious = warnCapture.captured.find(msg => {
+                        if (!msg.includes('[WF]')) return false;
+                        // Look for the validator's "unknown path" wording
+                        // applied to any of our defined identifiers.
+                        return /loading|isShared|isLocked|count/.test(msg) &&
+                            /unknown|undefined|not defined|invalid path/i.test(msg);
+                    });
+                    expect(spurious).toBeUndefined();
+                }
+            });
         });
 
         describe('Special Path Handling', () => {

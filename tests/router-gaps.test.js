@@ -590,9 +590,11 @@ describeIfRouter('RouteManager Gaps', () => {
       // Start a slow navigation to /b (will hold isNavigating = true for 100ms)
       const navPromise = testRouter.navigate('/b')
 
-      // While that's in flight, simulate a popstate/hashchange
-      // by directly calling the handler (which is what the browser would do)
-      testRouter._handlePopState({ state: null })
+      // While that's in flight, simulate a popstate by dispatching
+      // the real event on window. Calling the private handler directly
+      // doesn't work against minified builds where `_handlePopState`
+      // gets mangled; the window listener is the public contract.
+      window.dispatchEvent(new PopStateEvent('popstate', { state: null }))
 
       await navPromise
       await wait(50)
@@ -635,6 +637,52 @@ describeIfRouter('RouteManager Gaps', () => {
       expect(url).not.toContain('?')
       // Should be /docs or /docs/
       expect(url).toMatch(/\/docs\/?$/)
+    })
+  })
+
+  // ==========================================================================
+  // navigate({ replace: true }) must update the address bar via replaceState
+  // ==========================================================================
+  describe('Replace navigation', () => {
+    let originalUrl
+    beforeEach(() => { originalUrl = window.location.href })
+    afterEach(() => {
+      // History-mode navigation here mutates the real window.location;
+      // restore it so it doesn't leak into the runner or sibling tests.
+      window.history.replaceState(null, '', originalUrl)
+    })
+
+    it('replace navigation updates the URL without adding a history entry', async () => {
+      testRouter = new RouteManager({ mode: 'history' })
+      testRouter.onRoute('/replace-a', { name: 'replace-a', handler: () => {} })
+      testRouter.onRoute('/replace-b', { name: 'replace-b', handler: () => {} })
+      testRouter.init()
+      await wait(50)
+
+      await testRouter.navigate('/replace-a')
+      await wait(50)
+      expect(window.location.pathname.endsWith('/replace-a')).toBe(true)
+      const lenAfterPush = window.history.length
+
+      await testRouter.navigate('/replace-b', { replace: true })
+      await wait(50)
+      // The address bar reflects the new route...
+      expect(window.location.pathname.endsWith('/replace-b')).toBe(true)
+      // ...but no history entry was added.
+      expect(window.history.length).toBe(lenAfterPush)
+    })
+
+    it('replace navigation preserves the query string in the address bar', async () => {
+      testRouter = new RouteManager({ mode: 'history' })
+      testRouter.onRoute('/replace-q', { name: 'replace-q', handler: () => {} })
+      testRouter.init()
+      await wait(50)
+
+      await testRouter.navigate('/replace-q?status=todo&sort=priority', { replace: true })
+      await wait(50)
+      expect(window.location.pathname.endsWith('/replace-q')).toBe(true)
+      expect(window.location.search).toContain('status=todo')
+      expect(window.location.search).toContain('sort=priority')
     })
   })
 })

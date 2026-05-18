@@ -171,8 +171,8 @@ describe('List Bulk Update', () => {
                     ]
                 },
                 computed: {
-                    itemClass() {
-                        return this.completed ? 'done' : 'pending'
+                    itemClass(item) {
+                        return item && item.completed ? 'done' : 'pending'
                     }
                 },
                 init() { instance = this },
@@ -544,8 +544,8 @@ describe('List Bulk Update', () => {
                     ]
                 },
                 computed: {
-                    itemClass() {
-                        return this.completed ? 'done' : 'pending'
+                    itemClass(item) {
+                        return item && item.completed ? 'done' : 'pending'
                     }
                 },
                 init() { instance = this }

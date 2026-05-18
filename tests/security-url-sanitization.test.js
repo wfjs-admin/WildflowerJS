@@ -139,4 +139,64 @@ describe('Security: URL sanitization in attribute bindings', () => {
         const fa = document.getElementById('target').getAttribute('formaction')
         expect(fa === null || !fa.toLowerCase().startsWith('data:text/html')).toBe(true)
     })
+
+    // H1 — data:image/svg+xml is scripting-capable when loaded by <object>,
+    // <iframe>, <embed>, or certain contexts via <img>. The previous
+    // `(?!image\/)` allowlist permitted it. Fix: narrow the allowlist to
+    // raster-only (png/jpeg/gif/webp/avif/bmp/ico/tiff).
+    it('H1 — blocks data:image/svg+xml (scripting-capable)', async () => {
+        wildflower.component('url-san-h1-svg', {
+            state: {
+                attrs: { href: 'data:image/svg+xml,<svg onload=alert(1)/>' }
+            }
+        })
+
+        await setupComponent(wildflower, testContainer, `
+            <div data-component="url-san-h1-svg">
+                <a data-bind-attr="attrs" id="target">link</a>
+            </div>
+        `)
+
+        await waitForUpdate(200)
+        const href = document.getElementById('target').getAttribute('href')
+        expect(href === null || !href.toLowerCase().startsWith('data:image/svg')).toBe(true)
+    })
+
+    it('H1 — blocks data:image/xml variant', async () => {
+        wildflower.component('url-san-h1-xml', {
+            state: {
+                attrs: { href: 'data:image/xml,<svg onload=alert(1)/>' }
+            }
+        })
+
+        await setupComponent(wildflower, testContainer, `
+            <div data-component="url-san-h1-xml">
+                <a data-bind-attr="attrs" id="target">link</a>
+            </div>
+        `)
+
+        await waitForUpdate(200)
+        const href = document.getElementById('target').getAttribute('href')
+        expect(href === null || !href.toLowerCase().startsWith('data:image/xml')).toBe(true)
+    })
+
+    it('H1 — preserves safe data:image/png URIs', async () => {
+        // Control: raster images should still pass through
+        wildflower.component('url-san-h1-png', {
+            state: {
+                attrs: { src: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=' }
+            }
+        })
+
+        await setupComponent(wildflower, testContainer, `
+            <div data-component="url-san-h1-png">
+                <img data-bind-attr="attrs" id="target">
+            </div>
+        `)
+
+        await waitForUpdate(200)
+        const src = document.getElementById('target').getAttribute('src')
+        // Safe PNG should survive sanitization
+        expect(src !== null && src.startsWith('data:image/png')).toBe(true)
+    })
 })

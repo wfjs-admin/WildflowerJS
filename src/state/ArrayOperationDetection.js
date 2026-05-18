@@ -255,9 +255,13 @@ export const ArrayOperationMethods = {
             // OPTIMIZATION: Only reindex from the first mutated index onwards
             // Items before the splice point don't change indices
             const mutations = this._arrayIndexMutations.mutations;
-            const startIndex = mutations.length > 0
-                ? Math.min(...mutations.map(m => m.index))
-                : 0;
+            let startIndex = 0;
+            if (mutations.length > 0) {
+                startIndex = mutations[0].index;
+                for (let i = 1; i < mutations.length; i++) {
+                    if (mutations[i].index < startIndex) startIndex = mutations[i].index;
+                }
+            }
             this._reindexArrayItemPaths(targetObj, path, startIndex);
 
             // NOTE: _itemEffectsByIndex splice is handled by mapArray's structural effect

@@ -34,6 +34,16 @@ describe('data-bind-attr', () => {
         if (testContainer) {
             testContainer.remove();
         }
+        // Belt-and-braces: a few tests in this file insert iframes with
+        // data: URIs (to verify URL sanitization). If the browser is slow
+        // enough to not yet have GC'd a detached iframe, its async
+        // navigation can still fire — polluting window state for later
+        // test files (e.g. security-audit.test.js). Force-clear src on
+        // any remaining iframes and yank them from the document.
+        document.querySelectorAll('iframe').forEach(frame => {
+            frame.src = 'about:blank';
+            frame.remove();
+        });
         // Note: do NOT call wildflower.destroy() here — it corrupts the
         // singleton instance. resetFramework() in beforeEach handles cleanup.
     });
