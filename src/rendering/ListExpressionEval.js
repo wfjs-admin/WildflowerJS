@@ -120,12 +120,25 @@ export const ListExpressionMethods = {
         }
 
         // Strategy 2: Static property binding (fastest)
-        // Check for implicit computed property first
+        //
+        // Documented contract (llms.txt:776 / ai-assistant.html:1788):
+        //   "The framework first reads item[path] and falls back to evaluating
+        //    a computed of the same name when the field is undefined."
+        //
+        // Item field MUST be checked first when in a list context. Previously
+        // this checked the computed registry first and the row's field was
+        // silently shadowed when a same-name component-level computed existed —
+        // sibling bug to the data-bind-style precedence violation fixed
+        // alongside this in _processObjectBinding (PM-demo team page,
+        // 2026-05-17, amber-otter-23).
         if (!expression.includes(' ') && !expression.includes('?')) {
             let value;
             const componentInstance = context?.componentInstance;
 
-            if (componentInstance?.stateManager?.computed?.[expression]) {
+            if (item && Object.prototype.hasOwnProperty.call(item, expression)) {
+                // List item context with a matching field — row data wins.
+                value = this._getValueFromItem(item, expression);
+            } else if (componentInstance?.stateManager?.computed?.[expression]) {
                 // Implicit computed property (no computed: prefix)
                 value = this._evaluateComputedInListContext(
                     componentInstance,
@@ -135,7 +148,9 @@ export const ListExpressionMethods = {
                     context
                 );
             } else if (item) {
-                // List item context - get from item
+                // List item context without a same-name computed — get from item
+                // (returns undefined if the item also lacks the field, matching
+                // the documented "fall back to undefined" behavior).
                 value = this._getValueFromItem(item, expression);
             } else if (componentInstance?.state) {
                 // Standalone context (data-render, data-show) - get from component state
@@ -265,8 +280,32 @@ export const ListExpressionMethods = {
         }
 
         // Handle implicit computed property (simple name, no braces/dots/operators)
-        // Same logic as explicit computed: prefix but without requiring the prefix
+        // Same logic as explicit computed: prefix but without requiring the prefix.
+        //
+        // Documented contract (llms.txt:776 / ai-assistant.html:1788):
+        //   "The framework first reads item[path] and falls back to evaluating
+        //    a computed of the same name when the field is undefined."
+        //
+        // The framework previously checked the computed registry FIRST and
+        // returned its value without ever consulting the item — so a row
+        // field whose name happened to match a component-level computed would
+        // be silently shadowed (initial render AND reactive updates). The
+        // PM-demo team page hit this: a project-row chip bound to
+        // data-bind-style="iconStyle" rendered the parent team's color
+        // because pm-team-view had a leftover iconStyle() component computed.
+        // Surfaced 2026-05-17 (amber-otter-23).
         if (instance && item && !expression.includes('{') && !expression.includes('.') && !expression.includes(' ')) {
+            const itemHasField = Object.prototype.hasOwnProperty.call(item, expression);
+            if (itemHasField) {
+                // Per the documented contract, item[path] wins. The row's
+                // field is an object literal directly applicable as a style
+                // / attr binding — no need to walk the computed registry.
+                const resultObject = item[expression];
+                if (resultObject && typeof resultObject === 'object') {
+                    this._applyObjectBinding(type, element, resultObject);
+                }
+                return;
+            }
             const computed = instance.stateManager?.computed;
             if (computed && expression in computed) {
                 const resultObject = this._evaluateComputedInListContext(instance, expression, item, itemIndex, context);
@@ -341,15 +380,6 @@ export const ListExpressionMethods = {
      * @private
      */
     _evaluateComputedInListContext(instance, computedName, item, itemIndex, context) {
-        // Mark this computed property as item-level (used in list context)
-        // This prevents component-level re-evaluation from overwriting list item values
-        if (instance?.stateManager) {
-            if (!instance.stateManager._itemLevelComputedProperties) {
-                instance.stateManager._itemLevelComputedProperties = new Set();
-            }
-            instance.stateManager._itemLevelComputedProperties.add(computedName);
-        }
-
         // Use the original function stored before wrapping, not the wrapper
         const originalFn = instance?.stateManager?._originalComputedFunctions?.get(computedName);
         if (!originalFn || typeof originalFn !== 'function') {
@@ -361,12 +391,27 @@ export const ListExpressionMethods = {
         // This matches JS array method conventions (map, forEach, filter)
         const isItemLevelComputed = originalFn.length > 0;
 
+        // Only truly item-level computeds (fn.length > 0) belong in
+        // _itemLevelComputedProperties. Zero-arg computeds referenced
+        // inside list templates are still component-level (same value
+        // for every row) and must remain in the component-level flush
+        // queue so cross-store cascades re-evaluate them. Marking them
+        // item-level would cause _flushComputedEvaluationQueue to
+        // permanently skip them, stranding stale cached values whenever
+        // an upstream store mutates (e.g. ui.currentTeamId nav).
+        if (isItemLevelComputed && instance?.stateManager) {
+            if (!instance.stateManager._itemLevelComputedProperties) {
+                instance.stateManager._itemLevelComputedProperties = new Set();
+            }
+            instance.stateManager._itemLevelComputedProperties.add(computedName);
+        }
+
         if (isItemLevelComputed) {
             // Item-level computed: call with (item, index) as arguments
             // 'this' is the component instance for access to this.state, this.computed
 
-            // PHASE 2: Set tracking context for automatic store dependency registration
-            // This allows getStore() calls to register the component as a store dependent
+            // Set tracking context so getStore() calls inside the
+            // computed register the component as a store dependent.
             const previousTrackingContext = this._computedTrackingContext;
             // V8 OPT: Canonical shape — all fields always present
             this._computedTrackingContext = {
@@ -379,9 +424,13 @@ export const ListExpressionMethods = {
             };
 
             try {
-                // Create a context object that provides access to component features
-                // while allowing the computed to receive item as first argument
-                const componentContext = {
+                const self = this;
+                // Build the explicit-access surface (this.state, this.props, etc.)
+                // alongside the legacy this.computed.X pattern. The outer Proxy
+                // below adds the bare-name shortcut (this.saved, this.savedCount)
+                // so item-level computeds resolve property names the same way
+                // component methods and zero-arg computeds do via ContextProxy.
+                const baseContext = {
                     state: instance.state,
                     props: instance.props,
                     stores: instance.context?.stores || {},
@@ -397,7 +446,7 @@ export const ListExpressionMethods = {
                             if (targetFn && targetFn.length > 0) {
                                 // Return a function that can be called with item argument
                                 return (itemArg, indexArg) => {
-                                    return this._evaluateComputedInListContext(
+                                    return self._evaluateComputedInListContext(
                                         instance, prop, itemArg,
                                         indexArg !== undefined ? indexArg : itemIndex,
                                         context
@@ -409,10 +458,54 @@ export const ListExpressionMethods = {
                         }
                     }),
                     // Access to getStore for store dependencies
-                    getStore: (name) => this.getStore(name)
+                    getStore: (name) => self.getStore(name)
                 };
 
-                return originalFn.call(componentContext, item, itemIndex);
+                // Outer proxy: routes bare names (this.X) the same way ContextProxy
+                // does for component methods and zero-arg computeds. Resolution
+                // order matches ContextProxy: own props (state/props/stores/computed/
+                // getStore) → computed (precedence over state) → state.
+                const componentContext = new Proxy(baseContext, {
+                    get(target, prop, receiver) {
+                        if (typeof prop === 'symbol') return Reflect.get(target, prop, receiver);
+                        // 1. Explicit-access escape hatches first
+                        if (prop in target) return target[prop];
+                        // 2. Computed (precedence over state — matches ContextProxy)
+                        //    Item-level computeds return a curried (item) => value fn,
+                        //    zero-arg computeds return the evaluated value, both
+                        //    via the existing target.computed proxy logic.
+                        if (typeof prop === 'string' &&
+                            instance.stateManager?.computed?.[prop]) {
+                            return target.computed[prop];
+                        }
+                        // 3. State (skip underscore-prefixed internal properties)
+                        if (typeof prop === 'string' && !prop.startsWith('_') &&
+                            instance.state && prop in instance.state) {
+                            return instance.state[prop];
+                        }
+                        return undefined;
+                    },
+                    has(target, prop) {
+                        if (prop in target) return true;
+                        if (typeof prop === 'string') {
+                            if (instance.stateManager?.computed?.[prop]) return true;
+                            if (!prop.startsWith('_') && instance.state && prop in instance.state) return true;
+                        }
+                        return false;
+                    }
+                });
+
+                // Pass list-context info as third arg. Functions ignore extra
+                // args, so existing fn(item) and fn(item, index) signatures
+                // keep working. New code can opt in: fn(item, index, info) where
+                // info = { first, last, length }.
+                const _listLen = context?.listLength ?? context?._length ?? context?.data?.length ?? 0;
+                const info = {
+                    first: itemIndex === 0,
+                    last: _listLen > 0 ? itemIndex === _listLen - 1 : false,
+                    length: _listLen
+                };
+                return originalFn.call(componentContext, item, itemIndex, info);
             } catch (e) {
                 if (__DEV__) console.warn(`[WF] Error evaluating computed "${computedName}" in list context:`, e.message);
                 return null;
@@ -422,56 +515,19 @@ export const ListExpressionMethods = {
             }
         }
 
-        // Non-parameterized computed: use enhanced context (standard behavior)
-        // Create enhanced context that includes:
-        // 1. Component state via this.state
-        // 2. Component props via this.props
-        // 3. Component computed properties via this.computed
-        // 4. Item properties directly on this (e.g., this.id, this.name)
-        // 5. List context variables (_index, _length, _first, _last)
-        const listLength = context?.listLength ?? context?._length ?? context?.data?.length ?? 0;
-        const enhancedContext = {
-            // Item properties directly accessible as this.propertyName
-            ...item,
-            // List context variables
-            ...this._buildListContextVars(itemIndex, listLength),
-            // Component state accessible as this.state
-            state: instance.state,
-            // Component props accessible as this.props
-            props: instance.props,
-            // Component computed properties accessible as this.computed
-            computed: new Proxy({}, {
-                get: (target, prop) => {
-                    // Guard: only handle string property names (skip Symbols)
-                    if (typeof prop !== 'string') {
-                        return undefined;
-                    }
-                    return instance.stateManager.evaluateComputed(prop);
-                }
-            })
-        };
-
-        // Set tracking context so getStore() calls register this computed
-        // as having external dependencies (same as parameterized path above)
-        const previousTrackingContext = this._computedTrackingContext;
-        // V8 OPT: Canonical shape — all fields always present
-        this._computedTrackingContext = {
-            componentId: instance.id,
-            computedName: computedName,
-            stateManager: instance.stateManager,
-            listElement: null,
-            isItemLevelComputed: false,
-            itemIndex: itemIndex
-        };
-
+        // Zero-arg computed: evaluate at component scope. Per the docs,
+        // fn(item, ...) is item-level; fn() is component-level. A zero-arg
+        // computed referenced inside a list-template binding is treated as
+        // component-level — same value for every row. (We do NOT runtime-warn
+        // here: legitimate component-level computeds get referenced inside
+        // list templates all the time, e.g. options arrays for dropdowns,
+        // modal-form computeds rendered through `data-list="modalStack"`, etc.
+        // The framework can't statically distinguish those from bare-form
+        // misuse, so the rule is taught via documentation, not runtime noise.)
         try {
-            // Call the original computed function with the enhanced context
-            return originalFn.call(enhancedContext);
+            return instance.stateManager.evaluateComputed(computedName);
         } catch (e) {
-            if (__DEV__) console.warn(`[WF] Error evaluating computed "${computedName}" in list context:`, e.message);
             return null;
-        } finally {
-            this._computedTrackingContext = previousTrackingContext;
         }
     },
     /**
@@ -523,7 +579,7 @@ export const ListExpressionMethods = {
         const lower = attrName.toLowerCase();
 
         // For URL-bearing attributes, normalize and check dangerous protocols
-        if (['href', 'src', 'formaction', 'action', 'poster'].includes(lower)) {
+        if (['href', 'src', 'formaction', 'action', 'poster', 'xlink:href'].includes(lower)) {
             // Strip all whitespace and control characters before protocol check
             // to prevent bypasses like "java\tscript:" or "java\nscript:"
             const normalized = String(value).replace(/[\s\x00-\x1F\x7F]/g, '').toLowerCase();
@@ -533,8 +589,10 @@ export const ListExpressionMethods = {
                 return null;
             }
 
-            // Block all data: URIs except images (data:image/*) in URL attributes
-            if (/^data:(?!image\/)/.test(normalized)) {
+            // Block all data: URIs in URL attributes EXCEPT raster image formats.
+            // data:image/svg+xml and data:image/xml can execute inline scripts
+            // when loaded via <object>/<iframe>/<embed>, so they are NOT allowed.
+            if (/^data:(?!image\/(png|jpe?g|gif|webp|avif|bmp|ico|tiff?|x-icon)[,;])/i.test(normalized)) {
                 if (__DEV__) console.warn(`[WildflowerJS] Blocked dangerous data: URI in ${attrName}`);
                 return null;
             }
@@ -552,11 +610,60 @@ export const ListExpressionMethods = {
      * @private
      */
     _applyObjectBinding(type, element, object) {
-        if (!object || typeof object !== 'object') {
+        if (object == null) return; // null/undefined is intentional no-op
+        if (typeof object !== 'object') {
+            if (__DEV__) {
+                // Warn once per (type, element) so list re-renders don't spam.
+                // The shape mismatch is almost always a CSS-string passed to
+                // data-bind-style ('background:red' instead of {background:'red'})
+                // — silently skipping it leaves the user wondering why colors
+                // never apply. Surface it loudly in dev, no-op in production.
+                this._warnedBindingShape = this._warnedBindingShape || new WeakMap();
+                let perEl = this._warnedBindingShape.get(element);
+                if (!perEl) { perEl = new Set(); this._warnedBindingShape.set(element, perEl); }
+                if (!perEl.has(type)) {
+                    perEl.add(type);
+                    const example = type === 'style'
+                        ? "{ background: '#5b8def' } or { backgroundColor: '#5b8def' }"
+                        : "{ 'data-id': item.id, title: item.label }";
+                    const sample = String(object).slice(0, 60);
+                    const tag = element.tagName ? element.tagName.toLowerCase() : 'element';
+                    const cls = element.className && typeof element.className === 'string'
+                        ? '.' + element.className.split(/\s+/)[0] : '';
+                    console.warn(
+                        `[WildflowerJS] data-bind-${type} expected an object, got ${typeof object} ("${sample}").\n` +
+                        `  Element: <${tag}${cls}>\n` +
+                        `  Use object form: ${example}\n` +
+                        `  CSS strings like "background:red" silently no-op.`
+                    );
+                }
+            }
             return;
         }
 
         const trackProp = type === 'style' ? '_boundStyleProps' : '_boundAttrProps';
+
+        // Clear previously-bound properties that aren't in the new object.
+        // Without this, a key dropping out of the bound result (e.g. a style
+        // computed returning {} after the source value reverted to null) would
+        // leave the previously-applied inline style/attr on the element while
+        // class/text bindings update correctly — partial-reset bug.
+        const prev = element[trackProp];
+        if (prev && prev.size > 0) {
+            for (const prop of prev) {
+                if (Object.prototype.hasOwnProperty.call(object, prop)) continue;
+                try {
+                    if (type === 'attr') {
+                        if (element.hasAttribute(prop)) element.removeAttribute(prop);
+                    } else if (prop.startsWith('--')) {
+                        element.style.removeProperty(prop);
+                    } else {
+                        element.style[prop] = '';
+                    }
+                } catch (e) { /* ignore */ }
+                prev.delete(prop);
+            }
+        }
 
         for (const [prop, value] of Object.entries(object)) {
             try {
@@ -574,13 +681,18 @@ export const ListExpressionMethods = {
 
                     if (sanitized === null || sanitized === undefined) {
                         // Always remove for null/undefined
-                        element.removeAttribute(prop);
+                        if (element.hasAttribute(prop)) element.removeAttribute(prop);
                     } else if (sanitized === false && isBooleanAttr) {
                         // Remove boolean HTML attributes when false (presence = active)
-                        element.removeAttribute(prop);
+                        if (element.hasAttribute(prop)) element.removeAttribute(prop);
                     } else {
-                        // Convert all values to strings, including booleans
-                        element.setAttribute(prop, String(sanitized));
+                        // Skip the write if the attribute already holds the same value —
+                        // some elements (notably <video>) reload their resource when
+                        // `src` is set even to an identical string.
+                        const strValue = String(sanitized);
+                        if (element.getAttribute(prop) !== strValue) {
+                            element.setAttribute(prop, strValue);
+                        }
                     }
                 } else {
                     // Style-specific handling
@@ -696,7 +808,8 @@ export const ListExpressionMethods = {
             // This eliminates 3 querySelectorAll calls per item (30,000 for 10,000 items)
             const cachedElements = itemEl._cachedElementsArray || itemEl._bindingElements;
 
-            // PHASE 3.5: Use compiled metadata for class bindings (attributes may be stripped)
+            // Use compiled metadata for class bindings since the source
+            // attributes may have been stripped during compile.
             const itemMetadata = itemEl._compiledMetadata;
             if (itemMetadata && itemMetadata.classBindings && cachedElements) {
                 // FAST PATH: Use pre-compiled metadata
@@ -1031,11 +1144,12 @@ export const ListExpressionMethods = {
         if (!evaluator) {
             const uniqueVars = this._extractExpressionVars(expression);
 
-            // Compile function that takes all variables as arguments
+            // Compile function that takes all variables as arguments.
+            // Object-literal auto-wrap is handled centrally in _getCompiledExpression
+            // (used via getCSPSafeEvaluatorWithArgs CSP path or new Function path).
             try {
                 let fn;
                 if (this._useCSPSafeEvaluation) {
-                    // CSP-safe path: use AST evaluator
                     fn = getCSPSafeEvaluatorWithArgs(
                         expression,
                         uniqueVars,
@@ -1043,30 +1157,44 @@ export const ListExpressionMethods = {
                         'list-class-binding'
                     );
                     if (!fn) {
-                        // Parse failed - cache a no-op
                         evaluator = () => '';
                         this._expressionEvaluator.set(cacheKey, evaluator);
                         return;
                     }
                 } else if (!_UNSAFE_EXPR_RE.test(expression)) {
-                    // Standard path: use new Function()
-                    fn = new Function(...uniqueVars, `"use strict"; return ${expression}`);
+                    // Auto-wrap object-literal expressions in parens to defeat JS ASI
+                    // ambiguity (`return {x: y}` parses as `return; {x: y}` → undefined).
+                    const trimmed = expression.trim();
+                    const exprForFn = (trimmed.startsWith('{') && trimmed.endsWith('}'))
+                        ? `(${trimmed})`
+                        : expression;
+                    fn = new Function(...uniqueVars, `"use strict"; return ${exprForFn}`);
                 }
 
                 // OPTIMIZATION: Pre-allocate args array to avoid allocation per item
                 const argsLength = uniqueVars.length;
                 const args = new Array(argsLength);
 
-                // Create evaluator that resolves vars from: listContext first, then item, then componentState
-                // Uses pre-allocated args array and for loop instead of map() to avoid per-call allocation
-                evaluator = (item, componentState, listContext) => {
+                // Create evaluator that resolves vars from: listContext, item,
+                // item-level computeds (both parameterised and bare-form),
+                // then componentState. The wrapped accessor at
+                // `itemComputeds[v]` always has fn.length === 0, so we use
+                // `_originalComputedFunctions` to detect computed names and
+                // route through _evaluateComputedInListContext (which handles
+                // both forms with the right `this` binding).
+                const self = this;
+                evaluator = (item, componentState, listContext, component) => {
+                    const itemComputeds = component?.stateManager?.computed;
+                    const origs = component?.stateManager?._originalComputedFunctions;
                     for (let i = 0; i < argsLength; i++) {
                         const v = uniqueVars[i];
-                        // Check list context first (_index, _length, _first, _last)
                         if (v in listContext) args[i] = listContext[v];
-                        // Then item properties
                         else if (v in item) args[i] = item[v];
-                        // Finally component state
+                        else if (itemComputeds && itemComputeds[v] && origs && typeof origs.get(v) === 'function') {
+                            try {
+                                args[i] = self._evaluateComputedInListContext(component, v, item, listContext._index, listContext);
+                            } catch (e) { args[i] = undefined; }
+                        }
                         else args[i] = componentState ? componentState[v] : undefined;
                     }
                     return fn(...args);
@@ -1074,7 +1202,6 @@ export const ListExpressionMethods = {
 
                 this._expressionEvaluator.set(cacheKey, evaluator);
             } catch (e) {
-                // Compilation failed - cache a no-op
                 evaluator = () => '';
                 this._expressionEvaluator.set(cacheKey, evaluator);
             }
@@ -1083,12 +1210,82 @@ export const ListExpressionMethods = {
         // Evaluate with list context
         let result;
         try {
-            result = evaluator(item, componentState, listContext);
+            result = evaluator(item, componentState, listContext, component);
         } catch (e) {
             result = '';
         }
 
-        // Use _toggleBoundClass to properly add/remove classes while preserving existing ones
-        this._toggleBoundClass(element, result ? String(result) : '');
+        // Use shared helper to convert string/array/object results to a class string.
+        this._toggleBoundClass(element, this._classResultToString(result));
+    },
+
+    /**
+     * Convert a class-binding expression result to a class string.
+     * Supports:
+     *   - String: 'foo bar'                  → 'foo bar'
+     *   - Array:  ['foo', 'bar']             → 'foo bar' (falsy entries dropped)
+     *   - Object: { foo: true, bar: false }  → 'foo'     (truthy keys joined)
+     * Without this, `String(obj)` produced literal "[object Object]" as a class.
+     * Used by every code path that evaluates a data-bind-class expression result.
+     * @private
+     */
+    _classResultToString(result) {
+        if (!result) return '';
+        if (typeof result === 'string') return result;
+        if (Array.isArray(result)) return result.filter(Boolean).join(' ');
+        if (typeof result === 'object') {
+            const parts = [];
+            for (const key in result) {
+                if (result[key]) parts.push(key);
+            }
+            return parts.join(' ');
+        }
+        return String(result);
+    },
+
+    /**
+     * Resolve identifiers referenced in a list-template expression to runtime
+     * values. Writes results into the provided `args` array (pre-allocated by
+     * caller for hot-path zero-allocation use).
+     *
+     * Resolution order: item property → item-level computed (called with the
+     * current item) → undefined. Item-level computeds are computed methods
+     * declared with at least one parameter (`fn.length > 0`); they are NOT
+     * included in `componentState` because they require an item argument.
+     * Without this resolution, expressions like `{ shared: isShared }` and
+     * `isShared ? 'on' : ''` see `isShared` as undefined.
+     *
+     * Caller is responsible for component-state fallback if needed (this helper
+     * intentionally does not touch component state, leaving callers free to
+     * compose with their own state-resolution semantics).
+     *
+     * @param {Array} args  Pre-allocated array to fill (length === vars.length)
+     * @param {string[]} vars  Identifier names referenced in the expression
+     * @param {Object} item  The current list item (the iteration's data)
+     * @param {Object} componentInstance  The component owning the list
+     * @private
+     */
+    _resolveListExprArgs(args, vars, item, componentInstance) {
+        const itemComputeds = componentInstance?.stateManager?.computed;
+        const originals = componentInstance?.stateManager?._originalComputedFunctions;
+        for (let v = 0; v < vars.length; v++) {
+            const name = vars[v];
+            if (item && name in item) {
+                args[v] = item[name];
+            } else if (itemComputeds && itemComputeds[name] && originals && typeof originals.get(name) === 'function') {
+                // Item-level computed — both parameterised fn(item) and bare-form
+                // fn() reading `this.X`. Route through _evaluateComputedInListContext
+                // so each form is invoked with the right shape (the wrapped computed
+                // accessor at itemComputeds[name] always has fn.length === 0, so we
+                // can't distinguish forms via the wrapper).
+                try {
+                    args[v] = this._evaluateComputedInListContext(componentInstance, name, item, undefined, null);
+                } catch (e) {
+                    args[v] = undefined;
+                }
+            } else {
+                args[v] = undefined;
+            }
+        }
     }
 };

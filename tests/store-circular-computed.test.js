@@ -48,25 +48,39 @@ describe('Store Circular Computed Properties', () => {
   describe('Circular dependency detection and graceful handling', () => {
     let circularWarnings
     let origWarn
+    let origError
     let componentInitialized
+
+    // Detect either the keyword-bearing dev diagnostic OR the prod error code
+    // (WF-202 = CIRCULAR_DEPENDENCY). Production builds strip the human-readable
+    // message via the __DEV__ guard in wfError(), emitting only the code + doc
+    // URL to console.error — no console.warn fires at all. Intercepting both
+    // channels keeps this test meaningful across dev/raw/min builds.
+    function matches(msg) {
+      return msg.includes('circular') || msg.includes('Circular') ||
+             msg.includes('infinite') || msg.includes('exceeded') ||
+             msg.includes('WF-202')
+    }
 
     beforeEach(() => {
       circularWarnings = 0
       componentInitialized = false
 
-      // Intercept console.warn to detect circular dependency warnings
       origWarn = console.warn
       console.warn = function () {
-        const msg = Array.from(arguments).join(' ')
-        if (msg.includes('circular') || msg.includes('Circular') || msg.includes('infinite') || msg.includes('exceeded')) {
-          circularWarnings++
-        }
+        if (matches(Array.from(arguments).join(' '))) circularWarnings++
         origWarn.apply(console, arguments)
+      }
+      origError = console.error
+      console.error = function () {
+        if (matches(Array.from(arguments).join(' '))) circularWarnings++
+        origError.apply(console, arguments)
       }
     })
 
     afterEach(() => {
       console.warn = origWarn
+      console.error = origError
     })
 
     it('component initializes despite circular computed properties', async () => {

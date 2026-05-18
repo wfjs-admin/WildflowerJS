@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework, isMinifiedBuild } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
 
 async function waitForUpdate(ms = 100) {
   await new Promise(resolve => setTimeout(resolve, ms))
@@ -300,7 +300,7 @@ describe('Data-Render Interactions', () => {
   // =========================================================================
   // 3. data-render + data-pool
   // =========================================================================
-  describe('data-render + data-pool', () => {
+  describe.skipIf(!hasFeature('pools'))('data-render + data-pool', () => {
 
     afterEach(() => {
       if (wildflower._poolLoopRunning) {

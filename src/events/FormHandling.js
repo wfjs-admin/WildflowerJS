@@ -4,7 +4,7 @@
  * @module
  */
 
-import { handlingSubmitSet, lazyDebounceWarnedSet, validationCache } from '../core/DomMetadata.js';
+import { handlingSubmitSet, validationCache } from '../core/DomMetadata.js';
 import { pathResolver } from '../core/wfUtils.js';
 
 /**
@@ -22,31 +22,6 @@ export const FormHandlingMethods = {
         } else {
             item[propertyPath] = value;
         }
-    },
-
-    /**
-     * Handle debounced model input - consolidates common debounce pattern
-     * @param {HTMLElement} element - The input element with data-model-debounce
-     * @param {Function} callback - Function to call after debounce delay
-     * @param {string} componentId - Component ID for unique debounce ID
-     * @param {string} modelPath - Model path for unique debounce ID
-     * @private
-     */
-    _handleDebouncedModelInput(element, callback, componentId, modelPath) {
-        const debounceTime = parseInt(element.dataset.modelDebounce, 10) || 300;
-
-        if (!element._debounceId) {
-            element._debounceId = `${componentId}-${modelPath.replace(/\./g, '_')}`;
-        }
-
-        if (element._debounceTimeout) {
-            clearTimeout(element._debounceTimeout);
-        }
-
-        element._debounceTimeout = setTimeout(() => {
-            callback();
-            element._debounceTimeout = null;
-        }, debounceTime);
     },
 
     /**
@@ -288,12 +263,6 @@ export const FormHandlingMethods = {
         // Handle lazy mode: skip 'input' events, only process 'change' and 'blur'
         const isLazy = mods ? mods.lazy : e.target.hasAttribute('data-model-lazy');
         if (isLazy) {
-            // Lazy mode takes precedence over debounce - warn if both used
-            const hasDebounce = mods ? !!mods.debounce : e.target.hasAttribute('data-model-debounce');
-            if (hasDebounce && !lazyDebounceWarnedSet.has(e.target)) {
-                if (__DEV__) console.warn('[WildflowerJS] data-model-lazy and data-model-debounce are mutually exclusive. Using lazy.');
-                lazyDebounceWarnedSet.add(e.target);
-            }
             // Only process change/blur events in lazy mode
             if (e.type === 'input') {
                 return;
@@ -318,37 +287,6 @@ export const FormHandlingMethods = {
 
             if (bindingContext && bindingContext._isModelBinding)
             {
-                // Handle debouncing if configured (skip for lazy mode - lazy takes precedence)
-                const hasDebounce = mods ? !!mods.debounce : e.target.hasAttribute('data-model-debounce');
-                if (!isLazy && hasDebounce)
-                {
-                    // Build unique debounce path including list context if applicable
-                    // This ensures each list item has its own independent debounce timer
-                    let debouncePath = bindingContext.path;
-                    if (bindingContext.parent && bindingContext.parent.type === 'list') {
-                        // Include parent list path and item index for uniqueness
-                        const parentPath = bindingContext.parent.path || 'list';
-                        const parentIndex = bindingContext._parentIndex ?? 0;
-                        debouncePath = `${parentPath}.${parentIndex}.${bindingContext.path}`;
-                    }
-
-                    this._handleDebouncedModelInput(
-                        e.target,
-                        () => {
-                            this._updateModelValue(bindingContext, currentValue);
-                            e._handledByDebounce = true;
-                        },
-                        bindingContext.componentInstance.id,
-                        debouncePath
-                    );
-
-                    // Mark event as handled to prevent double-processing
-                    e._handledByDebounce = true;
-                    e.preventDefault();
-                    return;
-                }
-
-                // For non-debounced inputs, update immediately
                 this._updateModelValue(bindingContext, currentValue);
                 return;
             }
@@ -376,10 +314,9 @@ export const FormHandlingMethods = {
                         const itemIndex = listItem._listIndex;
                         const propertyPath = e.target.dataset.model || e.target.dataset.wfModel;
 
-                        // Skip direct list update for:
-                        // - computed/store-backed lists (no data in instance.state[listPath])
-                        // - debounced inputs (let them use the debounce handler instead)
-                        if (listPath.startsWith('computed:') || listPath.startsWith('store:') || !instance.state[listPath] || e.target.hasAttribute('data-model-debounce'))
+                        // Skip direct list update for computed/store-backed lists
+                        // (no data in instance.state[listPath])
+                        if (listPath.startsWith('computed:') || listPath.startsWith('store:') || !instance.state[listPath])
                         {
                             // Fall through to normal model binding path
                         }
@@ -481,74 +418,9 @@ export const FormHandlingMethods = {
         const instance = this.componentInstances.get(componentId);
         if (!instance) return;
 
-        // Check if this is a debounced input
-        if (e.target.hasAttribute('data-model-debounce') || e.target.hasAttribute('data-wf-model-debounce'))
-        {
-            const modelPath = e.target.dataset.model || e.target.dataset.wfModel;
-            const currentValue = this._getInputValue(e.target);
-            const modelTarget = this._resolveModelTarget(modelPath);
-
-            // Check if input is in a list item for list-aware debouncing
-            const listItem = this._findListItemAncestor(e.target);
-            let listElement = null;
-            let listPath = null;
-            let itemIndex = null;
-
-            if (listItem) {
-                listElement = this._findDirectParentList(listItem);
-                if (listElement) {
-                    // Build full path for nested lists
-                    const pathResult = this._buildNestedListPath(listElement, listItem);
-                    listPath = pathResult.fullPath;
-                    itemIndex = pathResult.itemIndex;
-                }
-            }
-
-            // Capture mapArray flag for use in callback
-            const isMapArrayMode = listElement?._mapArrayInitialized && instance.state[listPath.split('.')[0]];
-
-            this._handleDebouncedModelInput(
-                e.target,
-                () => {
-                    // Check if this is a list item update
-                    if (listPath !== null && itemIndex !== null) {
-                        // MAPARRAY MODE: Use direct mutation instead of batched update
-                        if (isMapArrayMode) {
-                            const listData = instance.stateManager?.getValue(listPath);
-                            if (Array.isArray(listData) && listData[itemIndex]) {
-                                this._applyMapArrayMutation(listData[itemIndex], modelPath, currentValue);
-                                return;
-                            }
-                        }
-                        // Use list-aware update
-                        this._updateListItemProperty(e.target, instance, listPath, itemIndex, modelPath, currentValue);
-                    } else if (modelTarget && modelTarget.isStore) {
-                        // Store update
-                        pathResolver.set(modelTarget.target, modelTarget.path, currentValue);
-                    } else {
-                        // Direct state update
-                        instance.stateManager.setValue(modelPath, currentValue);
-                    }
-                },
-                componentId,
-                // Use unique ID including list path and index for list items
-                listPath !== null ? `${listPath}.${itemIndex}.${modelPath}` : modelPath
-            );
-
-            // CRITICAL: Mark the event as handled to prevent other
-            // handlers from processing it
-            e._handledByDebounce = true;
-
-            // Prevent default
-            e.preventDefault();
-
-            // Return immediately to skip regular processing
-            return;
-        }
-
-        // For regular inputs (not debounced), proceed with immediate update
-        // BUT ONLY if the event wasn't already handled by debounce or direct update
-        if (!e._handledByDebounce && !e._handledByDirectUpdate)
+        // For regular inputs, proceed with immediate update BUT ONLY if the
+        // event wasn't already handled by the direct list-item update path.
+        if (!e._handledByDirectUpdate)
         {
             this._syncInputToState(e.target, instance);
         }
@@ -655,10 +527,6 @@ export const FormHandlingMethods = {
      */
     _syncInputToState(input, instance)
     {
-        if (input.hasAttribute('data-model-debounce') || input.hasAttribute('data-wf-model-debounce'))
-        {
-            return;
-        }
         const modelPath = input.dataset.model || input.dataset.wfModel;
         if (!modelPath) return;
 

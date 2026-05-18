@@ -1844,4 +1844,182 @@ describe('data-bind-style', () => {
       expect(getStyle(target, 'opacity')).toBe('0.9')
     })
   })
+
+  // =========================================================================
+  // Per-row field precedence inside data-list templates
+  //
+  // Documented contract (www/llms.txt line 776 / ai-assistant.html line 1788):
+  //   "The framework first reads item[path] and falls back to evaluating an
+  //    item-level computed of the same name when the field is undefined."
+  //
+  // and the same docs explicitly list data-bind-style as resolving the same
+  // way as data-bind / data-bind-class / data-bind-attr / data-show / data-render.
+  //
+  // The reactive UPDATE path was found to violate this contract: when a
+  // component-level computed of the same name as a per-row field invalidates
+  // (its dependencies change), the framework re-pushes the computed's new
+  // value to every element bound to that name — including elements inside a
+  // data-list whose per-row item field should take precedence.
+  //
+  // Surfaced 2026-05-17 (amber-otter-23) via PM-demo team page: a project
+  // chip's background color reactively followed the parent team's color
+  // after editing the team, despite the project's per-row iconStyle field
+  // being unchanged. Reloading the page rebuilt the bindings against row
+  // data and the chip went back to the project's color, confirming the
+  // problem was in the update path, not the initial lookup.
+  // =========================================================================
+  describe('Per-row field precedence in data-list templates', () => {
+    it('row field wins over component-level computed of same name on INITIAL render', async () => {
+      // Sanity check: the initial-lookup path already follows the documented
+      // contract (this should pass even pre-fix).
+      wildflower.component('row-vs-comp-initial', {
+        state: { teamColor: '#ffd400' },
+        computed: {
+          // Component-level computed with the same name as a per-row field
+          iconStyle() { return { background: this.state.teamColor }; },
+          rows() {
+            return [
+              { id: 'a', name: 'A', iconStyle: { background: 'rgb(0, 200, 0)' } },
+              { id: 'b', name: 'B', iconStyle: { background: 'rgb(0, 200, 0)' } }
+            ];
+          }
+        }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="row-vs-comp-initial">
+          <div class="list" data-list="rows" data-key="id">
+            <template>
+              <span class="chip" data-bind-style="iconStyle" data-bind="name"></span>
+            </template>
+          </div>
+        </div>
+      `
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const chips = testContainer.querySelectorAll('.chip')
+      expect(chips.length).toBe(2)
+      // Per-row field should win — chips should be green, not yellow.
+      for (const chip of chips) {
+        expect(getStyle(chip, 'backgroundColor')).toBe('rgb(0, 200, 0)')
+      }
+    })
+
+    it('row field still wins after the component-level computed re-evaluates (REGRESSION)', async () => {
+      // The PM-demo bug shape. Same setup as above, but now we mutate the
+      // dependency of the component-level computed AFTER initial render.
+      // The framework's reactive update path must respect the documented
+      // item-first precedence and leave the per-row chips alone.
+      wildflower.component('row-vs-comp-reactive', {
+        state: { teamColor: '#ffd400' },
+        computed: {
+          iconStyle() { return { background: this.state.teamColor }; },
+          rows() {
+            return [
+              { id: 'a', name: 'A', iconStyle: { background: 'rgb(0, 200, 0)' } },
+              { id: 'b', name: 'B', iconStyle: { background: 'rgb(0, 200, 0)' } }
+            ];
+          }
+        }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="row-vs-comp-reactive">
+          <!-- Header element binds to the component-level iconStyle — this
+               proves the computed has a real consumer that fires on the
+               state change below. -->
+          <div class="header" data-bind-style="iconStyle"></div>
+          <div class="list" data-list="rows" data-key="id">
+            <template>
+              <span class="chip" data-bind-style="iconStyle" data-bind="name"></span>
+            </template>
+          </div>
+        </div>
+      `
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const header = testContainer.querySelector('.header')
+      const chips = testContainer.querySelectorAll('.chip')
+
+      // Sanity: initial values per the lookup contract.
+      expect(getStyle(header, 'backgroundColor')).toBe('rgb(255, 212, 0)')   // yellow (component computed)
+      for (const chip of chips) {
+        expect(getStyle(chip, 'backgroundColor')).toBe('rgb(0, 200, 0)')     // green (row field)
+      }
+
+      // Mutate state to invalidate the component-level iconStyle computed.
+      const inst = Array.from(wildflower.componentInstances.values())
+        .find(i => i.name === 'row-vs-comp-reactive')
+      inst.context.state.teamColor = 'rgb(255, 128, 0)'                       // orange
+      await waitForCompleteRender()
+
+      // Header MUST update (it actually consumes the component computed).
+      expect(getStyle(header, 'backgroundColor')).toBe('rgb(255, 128, 0)')
+      // Chips MUST NOT update — their per-row iconStyle field is unchanged
+      // and should take precedence over the component-level computed's
+      // reactive push.
+      for (const chip of chips) {
+        expect(getStyle(chip, 'backgroundColor')).toBe('rgb(0, 200, 0)')
+      }
+    })
+
+    it('STRESS: chip never flips under repeated state mutations (no second writer)', async () => {
+      // The race that surfaced as the PM-demo team-color leak: a second
+      // component-level effect was being registered for the in-list chip,
+      // racing the list-row update path. Some renders, the row writer
+      // won (chip green, correct); some, the component effect won (chip
+      // followed the team color, wrong). User reported 3/10 correct in
+      // Chrome, 2/10 in Firefox.
+      //
+      // A single mutation cycle can hide the race by accident. This test
+      // mutates the component-level computed's dep many times in a row;
+      // if a second writer exists, it should overwrite the chip at least
+      // once across the trials.
+      wildflower.component('chip-stress', {
+        state: { teamColor: '#ffd400' },
+        computed: {
+          iconStyle() { return { background: this.state.teamColor }; },
+          rows() {
+            return [{ id: 'a', iconStyle: { background: 'rgb(0, 200, 0)' } }];
+          }
+        }
+      })
+      testContainer.innerHTML = `
+        <div data-component="chip-stress">
+          <div class="header" data-bind-style="iconStyle"></div>
+          <div class="list" data-list="rows" data-key="id">
+            <template>
+              <span class="chip" data-bind-style="iconStyle"></span>
+            </template>
+          </div>
+        </div>
+      `
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const inst = Array.from(wildflower.componentInstances.values())
+        .find(i => i.name === 'chip-stress')
+      const chip = testContainer.querySelector('.chip')
+
+      // Colors to cycle through — must be distinct from the chip's green.
+      const colors = [
+        'rgb(255, 0, 0)', 'rgb(0, 0, 255)', 'rgb(255, 0, 255)',
+        'rgb(255, 128, 0)', 'rgb(128, 0, 128)', 'rgb(0, 128, 128)'
+      ]
+      const failures = []
+      for (let i = 0; i < 30; i++) {
+        const c = colors[i % colors.length]
+        inst.context.state.teamColor = c
+        await waitForCompleteRender()
+        const chipColor = getStyle(chip, 'backgroundColor')
+        if (chipColor !== 'rgb(0, 200, 0)') {
+          failures.push({ iter: i, expected: 'rgb(0, 200, 0)', got: chipColor })
+        }
+      }
+
+      expect(failures).toEqual([])
+    })
+  })
 })

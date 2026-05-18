@@ -8,6 +8,61 @@ import { RAW_TARGET } from '../state/ContextProxy.js';
 import { pathResolver } from '../core/wfUtils.js';
 
 /**
+ * Internal worker for wildflower.toRaw().
+ *
+ * Walks `value` and returns a deep plain-JS copy. Cyclic refs are preserved
+ * via the `seen` WeakMap. Reads go through the proxy get-trap, so calling
+ * this from inside a reactive effect WILL register dependencies on every
+ * walked path. Callers that want true opacity to reactivity should invoke
+ * toRaw() outside an effect (the typical use case — snapshot for IDB /
+ * postMessage / Web Worker happens in an async callback, not in a tracker).
+ *
+ * Supported types: primitives, null, undefined, Date, RegExp, Map, Set,
+ * Array, plain Object (or proxy-wrapped equivalents). DOM nodes are
+ * returned by reference (not cloned). Functions are skipped.
+ */
+function _toRawWalk(value, seen) {
+    if (value === null || typeof value !== 'object') return value;
+    if (typeof Node !== 'undefined' && value instanceof Node) return value;
+    if (seen.has(value)) return seen.get(value);
+
+    if (value instanceof Date) return new Date(value.getTime());
+    if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+
+    if (value instanceof Map) {
+        const out = new Map();
+        seen.set(value, out);
+        value.forEach((v, k) => out.set(_toRawWalk(k, seen), _toRawWalk(v, seen)));
+        return out;
+    }
+    if (value instanceof Set) {
+        const out = new Set();
+        seen.set(value, out);
+        value.forEach(v => out.add(_toRawWalk(v, seen)));
+        return out;
+    }
+    if (Array.isArray(value)) {
+        const out = new Array(value.length);
+        seen.set(value, out);
+        for (let i = 0; i < value.length; i++) out[i] = _toRawWalk(value[i], seen);
+        return out;
+    }
+
+    // Plain object (or proxy that surface-iterates like one). Skip
+    // functions — they aren't structured-clone-safe and rarely belong
+    // in a state snapshot.
+    const out = {};
+    seen.set(value, out);
+    for (const key in value) {
+        if (Object.prototype.hasOwnProperty.call(value, key)) {
+            const v = value[key];
+            if (typeof v !== 'function') out[key] = _toRawWalk(v, seen);
+        }
+    }
+    return out;
+}
+
+/**
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const EntitySystemMethods = {
@@ -174,6 +229,81 @@ export const EntitySystemMethods = {
         return this._entityDependents.get(entityId) || new Set();
     },
     /**
+     * Decide whether a store mutation at `path` can affect a given dependent
+     * component. Keeps entity-change invalidation path-scoped: a component
+     * that declares `subscribe: { store: [...] }` should not have every
+     * computed re-dirtied and every per-item effect force-rerun when an
+     * unrelated path on that store mutates (e.g. a hover/cursor field it
+     * never reads).
+     *
+     * Conservative by construction — returns true (must invalidate) whenever
+     * irrelevance can't be proven:
+     *   - computed-path notifications (a store computed may transitively read
+     *     anything; the matching `computed:` notification carries precision),
+     *   - components with no `subscribe` declaration for this store (they
+     *     became dependents via runtime tracking only),
+     *   - components that read a computed off this store (the computed's
+     *     transitive state deps aren't recorded on the reader).
+     *
+     * Returns false (safe to skip) only when the component explicitly
+     * subscribed to this store AND `path` prefix-relates to none of its
+     * subscribed paths or runtime-tracked state dependencies.
+     *
+     * @param {Object} dependentInstance - The dependent component instance
+     * @param {string} entityId - ID of the mutated entity
+     * @param {string} path - The path that changed
+     * @returns {boolean} true if the dependent must be invalidated
+     * @private
+     */
+    _entityPathAffectsDependent(dependentInstance, entityId, path) {
+        // Computed-name notifications and non-string paths: can't reason.
+        if (!path || typeof path !== 'string' || path.startsWith('computed')) {
+            return true;
+        }
+
+        // Resolve the bare store name (stores may register as 'store-<name>').
+        const entityInstance = this.componentInstances.get(entityId);
+        let entityName = entityInstance && entityInstance.name;
+        if (!entityName) return true;
+        if (entityName.startsWith('store-')) entityName = entityName.slice(6);
+
+        // Only narrow for components that declared an explicit subscribe
+        // contract for this store. Pure runtime-tracked dependents, and
+        // plugin/component dependents, keep the blanket behavior.
+        const declared = dependentInstance._subscribedStores;
+        if (!declared || declared.indexOf(entityName) === -1) return true;
+
+        // path P relates to dep D when either is a prefix of the other —
+        // covers `filters` <-> `filters.text` and `items` <-> `items.2.label`.
+        const relates = (d) => d === path
+            || path.startsWith(d + '.')
+            || d.startsWith(path + '.');
+
+        // 1. Declared subscribe paths.
+        const subs = dependentInstance._storeSubscriptions;
+        if (subs) {
+            for (let i = 0; i < subs.length; i++) {
+                if (subs[i].storeName === entityName && relates(subs[i].path)) return true;
+            }
+        }
+
+        // 2. Runtime-tracked store dependencies — entries are 'state.<path>'
+        //    or 'computed.<name>'. A computed dep can't be reasoned about, so
+        //    bail to blanket invalidation when one is present.
+        const tracked = dependentInstance._storeDependencies &&
+            dependentInstance._storeDependencies.get(entityName);
+        if (tracked) {
+            for (const dep of tracked) {
+                if (dep.startsWith('computed')) return true;
+                const bare = dep.startsWith('state.') ? dep.slice(6) : dep;
+                if (relates(bare)) return true;
+            }
+        }
+
+        // Explicit subscriber, but `path` matched nothing it reads — skip.
+        return false;
+    },
+    /**
      * AUTOMATIC DEPENDENCY TRACKING PROXY
      *
      * Creates a proxy that tracks property access on entity state/computed
@@ -221,6 +351,40 @@ export const EntitySystemMethods = {
                     instance[depKey].set(entityName, new Set());
                 }
                 instance[depKey].get(entityName).add(path);
+            }
+
+            // Record the source RSM on the currently-evaluating computed's
+            // node so its cache-hit fast path in evaluateComputed can
+            // short-circuit when source _globalEpoch is unchanged.
+            //
+            // Only track STATE-path reads, not computed-path reads. Tracking
+            // a computed source (e.g., C reads B.derivedValue) would falsely
+            // cache-hit when B's result changes in response to an upstream
+            // change that didn't bump B's own _globalEpoch. Cross-store
+            // computed-of-computed chains stay on the existing correct path.
+            if (path && path.charCodeAt(0) === 115 /* 's' */ && path.startsWith('state.')) {
+                const tc = framework._computedTrackingContext;
+                const targetSm = entityContext && entityContext.stateManager;
+                if (tc && tc.stateManager && tc.computedName && targetSm && targetSm !== tc.stateManager) {
+                    const evalNode = tc.stateManager._computedNodes &&
+                        tc.stateManager._computedNodes.get(tc.computedName);
+                    if (evalNode) {
+                        if (!evalNode.externalSources) {
+                            evalNode.externalSources = [{ rsm: targetSm, epoch: targetSm._globalEpoch || 0 }];
+                        } else {
+                            let found = false;
+                            for (let i = 0; i < evalNode.externalSources.length; i++) {
+                                if (evalNode.externalSources[i].rsm === targetSm) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                evalNode.externalSources.push({ rsm: targetSm, epoch: targetSm._globalEpoch || 0 });
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -387,10 +551,16 @@ export const EntitySystemMethods = {
             // Update props first if this component receives props from the changed parent
             this._updateComponentProps(dependentInstance);
 
+            // Path-scoped invalidation: a component that declares a
+            // `subscribe: {}` contract is only re-dirtied / re-run by store
+            // mutations to paths it actually reads. Unprovable cases fall
+            // back to blanket invalidation (see _entityPathAffectsDependent).
+            const pathRelevant = this._entityPathAffectsDependent(dependentInstance, entityId, path);
+
             // Mark computed nodes as DIRTY and schedule re-evaluation.
             // Virtual stores use lean eval (fn() directly) so dirty flags
             // don't matter — only sweep for DOM components.
-            if (!dependentInstance.isVirtual) {
+            if (pathRelevant && !dependentInstance.isVirtual) {
                 if (sm._computedNodes) {
                     for (const [compName, node] of sm._computedNodes) {
                         node.flags |= 2; // DIRTY
@@ -402,6 +572,19 @@ export const EntitySystemMethods = {
                 });
             }
             sm._cacheGeneration = (sm._cacheGeneration || 0) + 1;
+
+            // Wake any per-item effects that registered an external-entity dep
+            // when their item-level computed read from this (or another) entity.
+            // No-op when no item effect subscribed.
+            // Wake item effects on this dependent component. Per-item effects
+            // are not subscribed to external entities (their dep tracking only
+            // covers itemProxy and component state), so a store mutation that
+            // changes a derived value read by an item-level computed wouldn't
+            // otherwise re-evaluate. Force-queue each item effect; the existing
+            // binding diff layer drops no-op DOM writes.
+            if (pathRelevant && sm._dirtyAllItemEffects) {
+                sm._dirtyAllItemEffects();
+            }
 
             // Refresh item-level computed bindings in lists
             // Per-item effects handle this for effect-backed components
@@ -427,8 +610,9 @@ export const EntitySystemMethods = {
         // === STORE-ONLY: Notify path subscribers (subscribe: {} feature) ===
         // Call onStoreUpdate() on components that declared subscribe: { storeName: ['path'] }
         if (!isComponent && instance.name && this.storeManager) {
-            // Get the user-facing store name (without 'store-' prefix if it exists)
-            // Store instances have name like 'store-kanban', but users subscribe as 'kanban'
+            // Get the user-facing store name (without the 'store-' prefix
+            // if present). Store instances are registered with names like
+            // 'store-<name>'; users subscribe with the bare name.
             const storeName = instance.name.startsWith('store-')
                 ? instance.name.slice(6)
                 : instance.name;
@@ -1212,29 +1396,50 @@ export const EntitySystemMethods = {
      */
     startBatch()
     {
-        // Set batch mode flag
+        // Set batch mode flag. Change detection happens at applyBatch by
+        // walking each RSM's _batchChanges Map, which the proxy set traps
+        // populate as a side effect of every batch-mode write. No
+        // upfront state snapshot is needed.
         this._batchMode = true;
         this._suppressRender = true;
 
-        // Store current state for tracking changes
-        this._batchStartState = new Map();
-        this.componentInstances.forEach((instance, id) => {
-            try {
-                this._batchStartState.set(id, this._cycleSafeStringify(instance.state));
-            } catch (e) {
-                // If even our safe stringify fails, mark this component with a special flag
-                if (__DEV__) console.warn(`Unable to capture state for component ${id}, will force update: ${e.message}`);
-                this._batchStartState.set(id, '__FORCE_UPDATE__');
-            }
-        });
-
-        // Return a batch context
         return {
-            // End batch and apply all changes at once
             apply: () => this.applyBatch(),
-            // Cancel batch without applying changes
             cancel: () => this.cancelBatch()
         };
+    },
+    /**
+     * Run a function inside a batch, applying changes on success and
+     * cancelling on error. Equivalent to:
+     *
+     *   const ctx = wildflower.startBatch();
+     *   try { fn(); ctx.apply(); }
+     *   catch (e) { ctx.cancel(); throw e; }
+     *
+     * Removes the manual try/catch boilerplate and makes batch usage
+     * exception-safe by construction. Sync-only — if `fn` returns a
+     * Promise, the batch is applied/cancelled before the Promise
+     * resolves. For async work, use the start/apply/cancel API
+     * directly and manage the lifetime explicitly.
+     *
+     * @param {Function} fn - Function to run inside the batch
+     * @returns {WildflowerJS} - For method chaining
+     * @public
+     */
+    batch(fn) {
+        if (typeof fn !== 'function') {
+            if (__DEV__) console.warn('[WF] wildflower.batch(fn) requires a function argument');
+            return this;
+        }
+        const ctx = this.startBatch();
+        try {
+            fn();
+            ctx.apply();
+        } catch (e) {
+            ctx.cancel();
+            throw e;
+        }
+        return this;
     },
     /**
      * Apply all batched changes at once
@@ -1249,181 +1454,140 @@ export const EntitySystemMethods = {
         this._batchMode = false;
         this._suppressRender = false;
 
+        this._batchChangedComponents = this._batchChangedComponents || new Set();
+        this._batchChangedPaths = this._batchChangedPaths || new Set();
+
+        // CRITICAL ORDERING: processBatchChanges() on each RSM clears
+        // _batchChanges at the end (ReactiveStateManager.js:2111). Snapshot
+        // those Maps BEFORE the clear runs so _applyBatchChangesFromProxy
+        // has data to walk.
+        const proxyBatchSnapshot = this._snapshotProxyBatchChanges();
+
         this.componentInstances.forEach(instance => {
             if (instance.stateManager && typeof instance.stateManager.processBatchChanges === 'function') {
                 instance.stateManager.processBatchChanges();
             }
         });
 
-        // Check which components actually changed during the batch
-        this._batchChangedComponents = this._batchChangedComponents || new Set();
-        this._batchChangedPaths = this._batchChangedPaths || new Set();
+        this._applyBatchChangesFromProxy(proxyBatchSnapshot);
 
-        let changedCount = 0;
-
-        if (this._batchStartState)
-        {
-            this._batchStartState.forEach((startState, id) =>
-            {
-                const instance = this.componentInstances.get(id);
-                if (instance)
-                {
-
-                    if (startState === '__FORCE_UPDATE__') {
-                        this._batchChangedComponents.add(id);
-                        changedCount++;
-                        return;
-                    }
-
-                    try
-                    {
-                        const currentState = this._cycleSafeStringify(instance.state);
-
-                        if (startState !== currentState)
-                        {
-                            this._batchChangedComponents.add(id);
-                            changedCount++;
-
-                            // Find changed paths
-                            try
-                            {
-                                const startObj = JSON.parse(startState);
-                                const currentObj = instance.state;
-
-                                // Track top-level changes
-                                Object.keys(currentObj).forEach(key =>
-                                {
-                                    // Use either cycleSafeEqual or cycleSafeStringify for comparison
-                                    const hasChanged = !this._cycleSafeEqual(startObj[key], currentObj[key]);
-
-                                    if (hasChanged) {
-                                        this._batchChangedPaths.add(key);
-
-                                        // CRITICAL FIX: For arrays, add paths for nested arrays too
-                                        if (Array.isArray(currentObj[key])) {
-                                            // Add individual array item paths
-                                            for (let i = 0; i < currentObj[key].length; i++) {
-                                                // Add path for this array item (e.g., "categories.0")
-                                                this._batchChangedPaths.add(`${key}.${i}`);
-
-                                                // Check for nested arrays in this item
-                                                const item = currentObj[key][i];
-                                                if (item && typeof item === 'object') {
-                                                    Object.entries(item).forEach(([propName, propValue]) => {
-                                                        if (Array.isArray(propValue)) {
-                                                            // Add path for nested array (e.g., "categories.0.items")
-                                                            this._batchChangedPaths.add(`${key}.${i}.${propName}`);
-                                                        }
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            } catch (error)
-                            {
-                                if (__DEV__) console.warn(`Error analyzing state changes:`, error);
-                            }
-                        }
-                    } catch (error)
-                    {
-                        if (__DEV__) console.warn(`Error comparing states for component ${id}:`, error);
-                        // If comparison fails, assume the component changed
-                        this._batchChangedComponents.add(id);
-                        changedCount++;
-                    }
-                }
-            });
-        }
-
-        // Include dependent components in the render batch
         if (this._pendingDependentUpdates && this._pendingDependentUpdates.size > 0)
         {
             this._pendingDependentUpdates.forEach(id =>
             {
                 this._batchChangedComponents.add(id);
-                changedCount++;
             });
         }
 
-        // Apply batch to lists BEFORE general rendering
-        // This ensures all list data is correctly processed first
         this._applyBatchToLists();
 
-        // Schedule render if any changes occurred
         if (this._batchChangedComponents.size > 0)
         {
             this._scheduleRender();
         }
 
-        // Clear batch state tracking
-        this._batchStartState = null;
-
         return this;
     },
-    _cycleSafeStringify(obj, replacer = null, space = null)
-    {
-        const seen = new WeakSet();
 
-        // Custom replacer that handles circular references and special objects
-        const circularReplacer = (key, value) => {
-            // Apply custom replacer if provided
-            if (replacer) {
-                value = replacer(key, value);
+    /**
+     * Snapshot each RSM's _batchChanges Map keyed by entity id. The proxy
+     * set traps in ProxyHandlers.js populate these Maps for free during
+     * batch-mode writes; we capture them here BEFORE processBatchChanges
+     * clears them, so both the new code path and the dev-mode shadow
+     * comparison can read them.
+     *
+     * @returns {Map<string, Map<string, {newValue, oldValue}>>}
+     * @private
+     */
+    _snapshotProxyBatchChanges() {
+        const snapshot = new Map();
+        this.componentInstances.forEach((instance, id) => {
+            const sm = instance.stateManager;
+            if (sm && sm._batchChanges && sm._batchChanges.size > 0) {
+                // Shallow-copy the Map so the post-clear walk still has data.
+                snapshot.set(id, new Map(sm._batchChanges));
             }
+        });
+        return snapshot;
+    },
 
-            // Handle non-object values normally
-            if (typeof value !== 'object' || value === null) {
-                return value;
-            }
+    /**
+     * Proxy-based change detection. For each entity that recorded any
+     * batch-mode mutations, mark the entity dirty and populate
+     * _batchChangedPaths with both the recorded paths and an array
+     * expansion (parent + per-index + nested-array paths for any
+     * top-level state key whose current value is an array). The
+     * expansion ensures downstream list rendering sees the same path
+     * set whether an array was wholesale-replaced, push'd, splice'd,
+     * or had an index assigned directly.
+     *
+     * Filters `.length` paths from the recorded set: those are
+     * proxy-internal markers used to identify array-mutation operations
+     * (push, splice). They feed into the top-level expansion below but
+     * don't belong as standalone changed paths in downstream consumers.
+     *
+     * See docs/future/BATCH_API_DIFF_REPLACEMENT.md.
+     * @private
+     */
+    _applyBatchChangesFromProxy(snapshot) {
+        if (!snapshot || snapshot.size === 0) return;
 
-            // Handle Date objects (including those wrapped in Proxies)
-            // Check constructor name to handle both real Dates and Proxied Dates
-            try {
-                if (value instanceof Date ||
-                    (value.constructor && value.constructor.name === 'Date') ||
-                    Object.prototype.toString.call(value) === '[object Date]') {
-                    return value.toISOString();
+        snapshot.forEach((changes, id) => {
+            this._batchChangedComponents.add(id);
+
+            const instance = this.componentInstances.get(id);
+            const state = instance ? instance.state : null;
+
+            // Collect top-level state keys touched by any change, while
+            // copying recorded paths into _batchChangedPaths (skipping
+            // .length proxy markers).
+            const topLevelKeys = new Set();
+
+            changes.forEach((change, path) => {
+                // .length writes are batch-tracking signals only — they
+                // tell us "this array changed via push/splice/etc." but
+                // shouldn't appear in the public _batchChangedPaths set.
+                if (path.endsWith('.length')) {
+                    const arrayKey = path.slice(0, -'.length'.length);
+                    const dotIdx = arrayKey.indexOf('.');
+                    const topKey = dotIdx === -1 ? arrayKey : arrayKey.slice(0, dotIdx);
+                    if (topKey) topLevelKeys.add(topKey);
+                    return;
                 }
-            } catch (e) {
-                // If we can't check the type, try to get ISO string anyway
-                if (typeof value.toISOString === 'function') {
-                    try {
-                        return value.toISOString();
-                    } catch (e2) {
-                        return '[Date]';
+
+                this._batchChangedPaths.add(path);
+                const dotIdx = path.indexOf('.');
+                const topKey = dotIdx === -1 ? path : path.slice(0, dotIdx);
+                topLevelKeys.add(topKey);
+            });
+
+            // For each top-level key currently holding an array in state,
+            // add the parent path plus per-index paths and any nested-
+            // array sub-paths. Downstream list rendering relies on this
+            // expanded path set whether the array was wholesale-replaced,
+            // push'd, splice'd, or had an index assigned directly.
+            if (state && typeof state === 'object') {
+                topLevelKeys.forEach(topKey => {
+                    const arr = state[topKey];
+                    if (!Array.isArray(arr)) return;
+
+                    this._batchChangedPaths.add(topKey);
+                    for (let i = 0; i < arr.length; i++) {
+                        this._batchChangedPaths.add(`${topKey}.${i}`);
+                        const item = arr[i];
+                        if (item && typeof item === 'object') {
+                            for (const propName of Object.keys(item)) {
+                                if (Array.isArray(item[propName])) {
+                                    this._batchChangedPaths.add(`${topKey}.${i}.${propName}`);
+                                }
+                            }
+                        }
                     }
-                }
+                });
             }
-
-            // Handle other built-in objects that don't serialize well
-            if (value instanceof RegExp) {
-                return value.toString();
-            }
-            if (value instanceof Map) {
-                return { __type: 'Map', entries: Array.from(value.entries()) };
-            }
-            if (value instanceof Set) {
-                return { __type: 'Set', values: Array.from(value.values()) };
-            }
-
-            // Check for circular references
-            if (seen.has(value)) {
-                return '[Circular]';
-            }
-
-            // Mark this object as seen
-            seen.add(value);
-
-            return value;
-        };
-
-        return JSON.stringify(obj, circularReplacer, space);
+        });
     },
-    _cycleSafeEqual(obj1, obj2)
-    {
-        return objectUtils.isEqual(obj1, obj2);
-    },
+
     _applyBatchToLists()
     {
         if (!this._batchChangedComponents || !this._batchChangedPaths) return;
@@ -1464,8 +1628,25 @@ export const EntitySystemMethods = {
         this._batchMode = false;
         this._suppressRender = false;
 
-        // Clear batch state tracking
-        this._batchStartState = null;
+        // Clear per-RSM _batchChanges Maps so cancelled mutations don't
+        // leak into the next batch's bookkeeping. The proxy populates
+        // these during batch mode; on a normal apply, processBatchChanges
+        // clears them, but on cancel we have to do it explicitly.
+        //
+        // Note: cancelBatch does NOT roll back the writes themselves —
+        // mutations made during the batch persist in instance.state.
+        // It only skips the post-batch render scheduling and clears
+        // change-tracking bookkeeping. A true rollback would iterate
+        // _batchChanges and write back .oldValue for each path, but
+        // that is a separate feature, not current behavior.
+        this.componentInstances.forEach(instance => {
+            if (instance.stateManager?._batchChanges) {
+                instance.stateManager._batchChanges.clear();
+            }
+            if (instance.stateManager?._batchArrayUpdates) {
+                instance.stateManager._batchArrayUpdates = [];
+            }
+        });
 
         return this;
     },
@@ -1546,5 +1727,37 @@ export const EntitySystemMethods = {
         }
 
         return true;
+    },
+
+    /**
+     * Return a deep plain-JS copy of a reactive value.
+     *
+     * WildflowerJS wraps store and component state in reactive Proxies for
+     * dependency tracking. Some Web Platform APIs use the structured-clone
+     * algorithm and reject proxies with DataCloneError: IndexedDB,
+     * postMessage, Web Workers, BroadcastChannel, the Cache API, History API
+     * state. Use this to snapshot WF state at the boundary before handing
+     * it off.
+     *
+     * Example:
+     *   await db.put('issues', wildflower.toRaw(pm.issues));
+     *   worker.postMessage(wildflower.toRaw(state));
+     *   await caches.open('app').then(c => c.put(req,
+     *       new Response(JSON.stringify(wildflower.toRaw(state)))));
+     *
+     * Supported types: primitives, null, undefined, Date, RegExp, Map, Set,
+     * Array, plain Object. Cyclic references are preserved. DOM nodes are
+     * returned by reference (not cloned). Functions are skipped.
+     *
+     * Caveat: calling toRaw() from inside a reactive effect/computed will
+     * register every walked path as a dependency. Snapshotting is typically
+     * done from async callbacks (debounced save, postMessage trigger), so
+     * this rarely matters in practice — but worth knowing.
+     *
+     * @param {*} value - Any value: primitive, object, array, proxy.
+     * @returns {*} A structured-clone-safe deep copy.
+     */
+    toRaw(value) {
+        return _toRawWalk(value, new WeakMap());
     }
 };

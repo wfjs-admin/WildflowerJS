@@ -32,9 +32,6 @@ export const ssrStateChangedElements = new WeakSet();
 /** SSR elements with action binding enabled during protection */
 export const ssrAllowActionsElements = new WeakSet();
 
-/** Elements that have already shown the lazy+debounce mutual exclusion warning */
-export const lazyDebounceWarnedSet = new WeakSet();
-
 /** Form elements currently handling a submit (prevents double-fire) */
 export const handlingSubmitSet = new WeakSet();
 

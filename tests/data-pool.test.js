@@ -7,7 +7,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework, isMinifiedBuild } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
+
+const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
 // Helper to wait for framework processing (component init, DOM scanning)
 async function waitForUpdate(ms = 50) {
@@ -45,7 +47,7 @@ function getInstance(wildflower, el) {
   return wildflower.componentInstances.get(target.dataset.componentId)
 }
 
-describe('Data-Pool Entity Pool Rendering', () => {
+describeIfPools('Data-Pool Entity Pool Rendering', () => {
   let testContainer
   let wildflower
 
@@ -1630,6 +1632,202 @@ describe('Data-Pool Entity Pool Rendering', () => {
       const z1 = parseInt(el1.style.zIndex) || 0
       const z2 = parseInt(el2.style.zIndex) || 0
       expect(z2).toBeGreaterThan(z1)
+    })
+  })
+
+  // ===========================================================================
+  // Boolean DOM properties (checked, disabled, selected, ...) — must sync the
+  // JS property, not just the attribute. Once a user interacts with a checkbox
+  // the attribute and the .checked property desync, so removeAttribute alone
+  // would leave a checkbox visually checked.
+  // ===========================================================================
+  describe('boolean DOM property sync via data-bind-attr', () => {
+    it('checkbox uncheck via mutation also clears el.checked after a user interaction', async () => {
+      testContainer.innerHTML = `
+        <div data-component="boolean-attr-test">
+          <div data-pool="todos" data-key="id">
+            <template>
+              <input type="checkbox" data-bind-attr="{ checked: completed }">
+            </template>
+          </div>
+        </div>
+      `
+
+      let pool = null
+      wildflower.component('boolean-attr-test', {
+        state: {},
+        pools: { todos: {} },
+        init() { pool = this.pool('todos'); }
+      })
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+
+      pool.push({ id: 1, completed: false })
+      await waitForRAF()
+
+      const cb = testContainer.querySelector('input[type="checkbox"]')
+      expect(cb.checked).toBe(false)
+
+      // Simulate the user clicking the checkbox: el.checked flips to true
+      // independent of the attribute. (Pre-fix, removeAttribute couldn't
+      // reset this back.)
+      cb.checked = true
+      expect(cb.checked).toBe(true)
+
+      // Now mutate the entity back to completed: false. Pool flushes; the
+      // .checked property must be cleared too, not just the attribute.
+      pool.get(1).completed = false
+      await waitForRAF()
+      expect(cb.checked).toBe(false)
+    })
+
+    it('data-bind on <input> writes el.value, not textContent', async () => {
+      testContainer.innerHTML = `
+        <div data-component="input-bind-test">
+          <div data-pool="rows" data-key="id">
+            <template>
+              <input type="text" data-bind="label">
+            </template>
+          </div>
+        </div>
+      `
+
+      let pool = null
+      wildflower.component('input-bind-test', {
+        state: {},
+        pools: { rows: {} },
+        init() { pool = this.pool('rows'); }
+      })
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+
+      pool.push({ id: 1, label: 'hello' })
+      await waitForRAF()
+
+      const input = testContainer.querySelector('input')
+      // Must show up as the input's value, not its textContent.
+      expect(input.value).toBe('hello')
+      expect(input.textContent).toBe('')
+
+      // Mutating the entity updates the displayed value
+      pool.get(1).label = 'updated'
+      await waitForRAF()
+      expect(input.value).toBe('updated')
+    })
+
+    // =========================================================================
+    // Dotted-path bindings. `data-bind="props.X"` and `data-show="props.X"`
+    // don't contain any operators, so the expression-detector doesn't flag
+    // them as expressions. They fall into the direct-path lookup, which was
+    // treating the literal string "props.X" as a single key on ctx and
+    // getting undefined. Fixed by walking dotted paths in the fallback.
+    // =========================================================================
+    it('data-show with a dotted props path resolves correctly', async () => {
+      testContainer.innerHTML = `
+        <div data-component="show-props-path">
+          <div data-pool="items" data-key="id">
+            <template>
+              <div class="row" data-show="props.visible">
+                <span>row</span>
+              </div>
+            </template>
+          </div>
+        </div>
+      `
+
+      let pool = null
+      wildflower.component('show-props-path', {
+        state: {},
+        pools: {
+          items: {
+            props: { visible: true },
+            entity: {}
+          }
+        },
+        init() { pool = this.pool('items'); }
+      })
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+
+      pool.push({ id: 1 })
+      await waitForRAF()
+
+      const row = testContainer.querySelector('.row')
+      expect(row.style.display).not.toBe('none')
+
+      // Flip the pool prop; data-show should react.
+      pool.props.visible = false
+      await waitForRAF()
+      expect(row.style.display).toBe('none')
+    })
+
+    it('data-bind with a dotted props path resolves correctly', async () => {
+      testContainer.innerHTML = `
+        <div data-component="bind-props-path">
+          <div data-pool="items" data-key="id">
+            <template>
+              <span class="label" data-bind="props.caption"></span>
+            </template>
+          </div>
+        </div>
+      `
+
+      let pool = null
+      wildflower.component('bind-props-path', {
+        state: {},
+        pools: {
+          items: {
+            props: { caption: 'hello' },
+            entity: {}
+          }
+        },
+        init() { pool = this.pool('items'); }
+      })
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+
+      pool.push({ id: 1 })
+      await waitForRAF()
+
+      const label = testContainer.querySelector('.label')
+      expect(label.textContent).toBe('hello')
+
+      // Mutate the prop; text binding reflects.
+      pool.props.caption = 'goodbye'
+      await waitForRAF()
+      expect(label.textContent).toBe('goodbye')
+    })
+
+    it('dotted path returns undefined (not a crash) when segment is missing', async () => {
+      testContainer.innerHTML = `
+        <div data-component="missing-segment">
+          <div data-pool="items" data-key="id">
+            <template>
+              <span class="label" data-bind="props.nested.deep"></span>
+            </template>
+          </div>
+        </div>
+      `
+
+      wildflower.component('missing-segment', {
+        state: {},
+        pools: {
+          items: {
+            // props.nested doesn't exist; walking past it must yield undefined,
+            // not throw "Cannot read properties of undefined".
+            props: {},
+            entity: {}
+          }
+        },
+        init() { this.pool('items').push({ id: 1 }); }
+      })
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+      await waitForRAF()
+
+      const label = testContainer.querySelector('.label')
+      // undefined becomes empty string in textContent, not a crash.
+      expect(label.textContent).toBe('')
     })
   })
 })

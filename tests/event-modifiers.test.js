@@ -358,6 +358,55 @@ describe('Event Modifiers', () => {
       await waitForUpdate(300)
       expect(count.textContent).toBe('1')
     })
+
+    it('does not write stale values from an in-flight debounced handler over fresher input', async () => {
+      // Regression: a debounced handler captured the input value at
+      // schedule time and applied it to state when its timer fired,
+      // even if the user had typed more characters in the meantime.
+      // The result was state regressing to a stale value just after
+      // the user kept typing. Now the handler reads the live value at
+      // fire time, so newer input always wins.
+      const fired = []
+
+      wildflower.component('debounce-stale-test', {
+        state: { value: '' },
+        onInput(event) {
+          this.state.value = event.target.value
+          fired.push(event.target.value)
+        }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="debounce-stale-test">
+          <input id="i" data-action="input:onInput" data-event-debounce="60">
+          <span class="out" data-bind="value"></span>
+        </div>
+      `
+
+      await wildflower.scan()
+      await waitForUpdate()
+
+      const input = testContainer.querySelector('#i')
+
+      // Type "ab" — schedules debounce at value="a", then debounce
+      // refreshes at "ab" before timer fires.
+      input.value = 'a'
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      await waitForUpdate(20)
+
+      input.value = 'ab'
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      // Wait past the debounce window for the trailing fire.
+      await waitForUpdate(120)
+
+      // Handler must fire with the LIVE value ("ab"), not the stale
+      // one captured on the first input event.
+      expect(fired[fired.length - 1]).toBe('ab')
+
+      const inst = wildflower.getComponent('debounce-stale-test')
+      expect(inst.state.value).toBe('ab')
+      expect(testContainer.querySelector('.out').textContent).toBe('ab')
+    })
   })
 
   describe('data-event-throttle', () => {
@@ -872,6 +921,196 @@ describe('Event Modifiers', () => {
       await waitForUpdate()
       expect(closeCount.textContent).toBe('1')
     })
+
+    it('row click inside a data-list still fires when wrapping ancestor uses data-event-outside', async () => {
+      // Regression test for a bug surfaced by the pm-internal demo:
+      //
+      // A wrapper element carries `data-action="closeFoo" data-event-outside`.
+      // Inside the wrapper sits a `<div data-list>` whose row template has
+      // `data-action="pickItem"`. The framework strips data-action from
+      // rendered list rows as a parsing optimization, so the row's actual
+      // attribute is gone by click time.
+      //
+      // When the user clicks a row, list click delegation does
+      // `event.target.closest('[data-action]')`. With the row's attribute
+      // stripped, that walk skips the row and returns the WRAPPER's
+      // `data-action="closeFoo"`. The handler then sees that the wrapper
+      // is outside the popover's data-list (`closestList !== listElement`)
+      // and bails — never falling through to the metadata fallback that
+      // would have located the row's compiled `pickItem`. Result: row
+      // clicks do nothing.
+      testContainer.innerHTML = `
+        <div data-component="popover-list-test">
+          <span data-action="closePopover" data-event-outside>
+            <button id="trigger" data-action="togglePopover" type="button">trigger</button>
+            <div id="popover" data-list="rows" data-key="id">
+              <template>
+                <button class="row" data-action="pickRow" type="button">
+                  <span data-bind="label"></span>
+                </button>
+              </template>
+            </div>
+          </span>
+          <div id="picked" data-bind="lastPicked"></div>
+          <div id="closed" data-bind="closeCount"></div>
+        </div>
+      `
+
+      wildflower.component('popover-list-test', {
+        state: {
+          rows: [
+            { id: 'a', label: 'Alpha' },
+            { id: 'b', label: 'Bravo' },
+            { id: 'c', label: 'Charlie' }
+          ],
+          lastPicked: '',
+          closeCount: 0
+        },
+        togglePopover() { /* no-op for the test */ },
+        closePopover() { this.state.closeCount++ },
+        pickRow(event, element, details) {
+          this.state.lastPicked = (details && details.item && details.item.id) || ''
+        }
+      })
+
+      await waitForUpdate()
+
+      // The popover renders three rows.
+      const rowEls = testContainer.querySelectorAll('#popover .row')
+      expect(rowEls.length).toBe(3)
+
+      // Click the second row. pickRow MUST fire with the right item id.
+      rowEls[1].click()
+      await waitForUpdate()
+      expect(testContainer.querySelector('#picked').textContent).toBe('b')
+
+      // The wrapper's outside-click handler must NOT have fired —
+      // the click was inside the wrapper.
+      expect(testContainer.querySelector('#closed').textContent).toBe('0')
+    })
+
+    it('row click in a data-list still fires when a non-outside data-action ancestor would otherwise shadow it', async () => {
+      // Companion to the above. The same bug shape applies whenever any
+      // ancestor of the list carries data-action, not only data-event-outside.
+      // The row's data-action is stripped from the DOM during compilation;
+      // closest('[data-action]') would walk past the empty row and return
+      // the ancestor's data-action; the delegated handler then sees the
+      // ancestor is outside the list and must retry the metadata fallback
+      // rather than bailing. data-event-outside isn't involved here at all.
+      testContainer.innerHTML = `
+        <div data-component="ancestor-action-test">
+          <div id="header" data-action="onHeader">
+            <h3>A list with a clickable header wrapper</h3>
+            <div id="list" data-list="rows" data-key="id">
+              <template>
+                <button class="row" data-action="pickRow" type="button">
+                  <span data-bind="label"></span>
+                </button>
+              </template>
+            </div>
+          </div>
+          <div id="picked" data-bind="lastPicked"></div>
+          <div id="header-count" data-bind="headerCount"></div>
+        </div>
+      `
+
+      wildflower.component('ancestor-action-test', {
+        state: {
+          rows: [
+            { id: 'x', label: 'X' },
+            { id: 'y', label: 'Y' }
+          ],
+          lastPicked: '',
+          headerCount: 0
+        },
+        onHeader() { this.state.headerCount++ },
+        pickRow(event, element, details) {
+          this.state.lastPicked = (details && details.item && details.item.id) || ''
+        }
+      })
+
+      await waitForUpdate()
+
+      const rowEls = testContainer.querySelectorAll('#list .row')
+      expect(rowEls.length).toBe(2)
+
+      // Click the second row — pickRow MUST fire, onHeader MUST NOT.
+      rowEls[1].click()
+      await waitForUpdate()
+      expect(testContainer.querySelector('#picked').textContent).toBe('y')
+      expect(testContainer.querySelector('#header-count').textContent).toBe('0')
+
+      // Clicking the header (outside the list) still fires onHeader.
+      testContainer.querySelector('h3').click()
+      await waitForUpdate()
+      expect(testContainer.querySelector('#header-count').textContent).toBe('1')
+    })
+
+    it('nested data-list: outer list handler does NOT claim clicks on inner-list rows via the metadata fallback', async () => {
+      // Safety check on the metadata-fallback retry: when the bug fix kicks
+      // in for an outer list whose row template contains an inner list, the
+      // metadata walk must NOT resolve to an inner row and route the click
+      // back through the outer list's handler. Fix verifies the resolved
+      // row's parentElement is THIS list before accepting it.
+      testContainer.innerHTML = `
+        <div data-component="nested-list-safety">
+          <div id="outer" data-list="groups" data-key="id">
+            <template>
+              <section class="group" data-action="pickGroup">
+                <h4 data-bind="title"></h4>
+                <div class="inner" data-list="items" data-key="id">
+                  <template>
+                    <button class="leaf" data-action="pickLeaf" type="button">
+                      <span data-bind="name"></span>
+                    </button>
+                  </template>
+                </div>
+              </section>
+            </template>
+          </div>
+          <div id="leaf" data-bind="lastLeaf"></div>
+          <div id="group" data-bind="lastGroup"></div>
+        </div>
+      `
+
+      wildflower.component('nested-list-safety', {
+        state: {
+          groups: [
+            { id: 'g1', title: 'Group 1', items: [{ id: 'a', name: 'a' }, { id: 'b', name: 'b' }] },
+            { id: 'g2', title: 'Group 2', items: [{ id: 'c', name: 'c' }] }
+          ],
+          lastLeaf: '',
+          lastGroup: ''
+        },
+        pickGroup(event, element, details) {
+          this.state.lastGroup = (details && details.item && details.item.id) || ''
+        },
+        pickLeaf(event, element, details) {
+          this.state.lastLeaf = (details && details.item && details.item.id) || ''
+        }
+      })
+
+      await waitForUpdate()
+
+      const leaves = testContainer.querySelectorAll('.leaf')
+      expect(leaves.length).toBe(3)
+
+      // Click an inner-list leaf. pickLeaf fires with the leaf's id.
+      // pickGroup MUST NOT fire — the outer list handler must reject the
+      // metadata-fallback hit because the resolved row's parent is the
+      // inner list, not the outer one.
+      leaves[2].click()
+      await waitForUpdate()
+      expect(testContainer.querySelector('#leaf').textContent).toBe('c')
+      expect(testContainer.querySelector('#group').textContent).toBe('')
+
+      // Sanity: clicking an outer-row part that's NOT inside the inner list
+      // still fires pickGroup with the outer row's id.
+      const titles = testContainer.querySelectorAll('h4')
+      titles[0].click()
+      await waitForUpdate()
+      expect(testContainer.querySelector('#group').textContent).toBe('g1')
+    })
   })
 
   describe('data-event-passive', () => {
@@ -1067,10 +1306,11 @@ describe('Event Modifiers', () => {
       btn.click()
       await waitForUpdate()
 
-      // With capture on the framework handler:
-      // Native capture (C) fires first, then framework capture (F), then propagation stops
-      // The bubble listener (B) won't fire because framework stops propagation
-      expect(nativeOrder).toBe('CF')
+      // Capture-phase ordering: native capture (C) fires first, then framework
+      // capture (F). The bubble listener (B) fires last because WF no longer
+      // calls event.stopPropagation() by default (changed in v1.1 for legacy
+      // delegation coexistence; opt back in with data-event-stop).
+      expect(nativeOrder).toBe('CFB')
       expect(order.textContent).toBe('F')
     })
   })

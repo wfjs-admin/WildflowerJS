@@ -6,7 +6,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, hasFeature } from './helpers/load-framework.js'
+
+const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
 async function waitForRAF() {
   await new Promise(resolve => requestAnimationFrame(() => {
@@ -34,7 +36,7 @@ function getInstance(wildflower, el) {
   return wildflower.componentInstances.get(target.dataset.componentId)
 }
 
-describe('Pool Props (Parent-Injected Shared Data)', () => {
+describeIfPools('Pool Props (Parent-Injected Shared Data)', () => {
   let testContainer
   let wildflower
 
@@ -351,6 +353,89 @@ describe('Pool Props (Parent-Injected Shared Data)', () => {
       const instance = getInstance(wildflower, testContainer.querySelector('[data-component]'))
       expect(instance.pools.items.props).toBeDefined()
       expect(typeof instance.pools.items.props).toBe('object')
+    })
+  })
+
+  describe('data-bind on form inputs inside a pool template', () => {
+    it('renders text-input value via data-bind on a pool entity field', async () => {
+      // Regression: `data-bind` on form inputs (input/textarea/select)
+      // must write to .value, not textContent. Verifies the pool-entity
+      // rendering path routes through the form-element handler.
+      testContainer.innerHTML = `
+        <div data-component="form-input-pool-test">
+          <div data-pool="rows" data-key="id">
+            <template>
+              <input class="txt" type="text" data-bind="label">
+            </template>
+          </div>
+        </div>
+      `
+
+      let pool = null
+      wildflower.component('form-input-pool-test', {
+        state: {},
+        init() {
+          pool = this.pool('rows')
+          pool.add([
+            { id: 'a', label: 'alpha' },
+            { id: 'b', label: 'bravo' }
+          ])
+        }
+      })
+
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+
+      const inputs = testContainer.querySelectorAll('.txt')
+      expect(inputs.length).toBe(2)
+      expect(inputs[0].value).toBe('alpha')
+      expect(inputs[1].value).toBe('bravo')
+
+      pool.update('a', { label: 'ALPHA' })
+      await waitForCompleteRender()
+
+      expect(inputs[0].value).toBe('ALPHA')
+    })
+
+    it('checkbox checked state via data-bind-attr inside a pool template', async () => {
+      // The idiomatic checkbox binding uses data-bind-attr={ checked: bool }.
+      // Verifies pool-entity boolean values propagate through that path.
+      testContainer.innerHTML = `
+        <div data-component="checkbox-pool-test">
+          <div data-pool="items" data-key="id">
+            <template>
+              <input class="cb" type="checkbox" data-bind-attr="{ checked: done }">
+            </template>
+          </div>
+        </div>
+      `
+
+      let pool = null
+      wildflower.component('checkbox-pool-test', {
+        state: {},
+        init() {
+          pool = this.pool('items')
+          pool.add([
+            { id: 1, done: true },
+            { id: 2, done: false }
+          ])
+        }
+      })
+
+      ensureComponentScanning(wildflower)
+      await waitForCompleteRender()
+
+      const cbs = testContainer.querySelectorAll('.cb')
+      expect(cbs.length).toBe(2)
+      expect(cbs[0].checked).toBe(true)
+      expect(cbs[1].checked).toBe(false)
+
+      pool.update(1, { done: false })
+      pool.update(2, { done: true })
+      await waitForCompleteRender()
+
+      expect(cbs[0].checked).toBe(false)
+      expect(cbs[1].checked).toBe(true)
     })
   })
 })

@@ -54,8 +54,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    progressStyle() {
-                        const tasks = this.tasks || []
+                    progressStyle(item) {
+                        const tasks = (item && item.tasks) || []
                         if (tasks.length === 0) return { width: '0%' }
                         const completed = tasks.filter(t => t.completed).length
                         const progress = Math.round((completed / tasks.length) * 100)
@@ -102,8 +102,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    progressText() {
-                        const tasks = this.tasks || []
+                    progressText(item) {
+                        const tasks = (item && item.tasks) || []
                         if (tasks.length === 0) return '0%'
                         const completed = tasks.filter(t => t.completed).length
                         return Math.round((completed / tasks.length) * 100) + '%'
@@ -142,13 +142,13 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    displayValue() {
+                    displayValue(item) {
                         // Access list item property
-                        return this.value + '%'
+                        return item.value + '%'
                     },
-                    barStyle() {
+                    barStyle(item) {
                         // Access list item property
-                        return { width: this.value + '%' }
+                        return { width: item.value + '%' }
                     }
                 }
             })
@@ -201,8 +201,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    activeCount() {
-                        const employees = this.employees || []
+                    activeCount(dept) {
+                        const employees = (dept && dept.employees) || []
                         return employees.filter(e => e.active).length + ' active'
                     }
                 }
@@ -243,12 +243,12 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    statusClass() {
-                        return this.status === 'active' ? 'bg-success' : 'bg-danger'
+                    statusClass(item) {
+                        return item.status === 'active' ? 'bg-success' : 'bg-danger'
                     },
-                    priorityClass() {
-                        if (this.priority >= 3) return 'priority-high'
-                        if (this.priority >= 2) return 'priority-medium'
+                    priorityClass(item) {
+                        if (item.priority >= 3) return 'priority-high'
+                        if (item.priority >= 2) return 'priority-medium'
                         return 'priority-low'
                     }
                 }
@@ -292,11 +292,11 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    formattedTitle() {
-                        if (this.highlight) {
-                            return `<strong>${this.title}</strong>`
+                    formattedTitle(item) {
+                        if (item.highlight) {
+                            return `<strong>${item.title}</strong>`
                         }
-                        return `<em>${this.title}</em>`
+                        return `<em>${item.title}</em>`
                     }
                 }
             })
@@ -341,11 +341,11 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    isInStock() {
-                        return this.stock > 0
+                    isInStock(item) {
+                        return item.stock > 0
                     },
-                    isOutOfStock() {
-                        return this.stock === 0
+                    isOutOfStock(item) {
+                        return item.stock === 0
                     }
                 }
             })
@@ -394,8 +394,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    showAdminBadge() {
-                        return this.isAdmin === true
+                    showAdminBadge(user) {
+                        return user.isAdmin === true
                     }
                 }
             })
@@ -441,10 +441,10 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    grade() {
-                        if (this.score >= 90) return 'A'
-                        if (this.score >= 80) return 'B'
-                        if (this.score >= 70) return 'C'
+                    grade(item) {
+                        if (item.score >= 90) return 'A'
+                        if (item.score >= 80) return 'B'
+                        if (item.score >= 70) return 'C'
                         return 'F'
                     }
                 },
@@ -493,8 +493,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    taskClass() {
-                        return this.completed ? 'task-done' : 'task-pending'
+                    taskClass(task) {
+                        return task.completed ? 'task-done' : 'task-pending'
                     }
                 },
                 init() {
@@ -540,8 +540,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    barStyle() {
-                        return { width: this.progress + '%' }
+                    barStyle(bar) {
+                        return { width: bar.progress + '%' }
                     }
                 },
                 init() {
@@ -591,16 +591,16 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    cardClass() {
-                        return this.completed ? 'bg-light border-success' : 'border-primary'
+                    cardClass(todo) {
+                        return todo.completed ? 'bg-light border-success' : 'border-primary'
                     },
-                    priorityBadgeClass() {
+                    priorityBadgeClass(todo) {
                         const classes = {
                             'High': 'bg-danger',
                             'Medium': 'bg-warning',
                             'Low': 'bg-success'
                         }
-                        return classes[this.priority] || 'bg-secondary'
+                        return classes[todo.priority] || 'bg-secondary'
                     }
                 },
                 init() {
@@ -666,8 +666,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    countLabel() {
-                        return `Count: ${this.count}`
+                    countLabel(item) {
+                        return `Count: ${item.count}`
                     }
                 },
                 init() {
@@ -719,10 +719,10 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    formattedText() {
-                        return this.important
-                            ? `<strong>${this.text}</strong>`
-                            : `<span>${this.text}</span>`
+                    formattedText(msg) {
+                        return msg.important
+                            ? `<strong>${msg.text}</strong>`
+                            : `<span>${msg.text}</span>`
                     }
                 },
                 init() {
@@ -773,8 +773,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    rowLabel() {
-                        return `Row ${this._index + 1}: ${this.name}`
+                    rowLabel(item, index) {
+                        return `Row ${index + 1}: ${item.name}`
                     }
                 }
             })
@@ -808,9 +808,9 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    positionClass() {
-                        if (this._first) return 'first-item'
-                        if (this._last) return 'last-item'
+                    positionClass(item, index, info) {
+                        if (info.first) return 'first-item'
+                        if (info.last) return 'last-item'
                         return 'middle-item'
                     }
                 }
@@ -848,8 +848,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    positionInfo() {
-                        return `${this._index + 1} of ${this._length}`
+                    positionInfo(item, index, info) {
+                        return `${index + 1} of ${info.length}`
                     }
                 }
             })
@@ -888,11 +888,11 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    activeClass() {
-                        return this.active ? 'is-active' : 'is-inactive'
+                    activeClass(item) {
+                        return item.active ? 'is-active' : 'is-inactive'
                     },
-                    sizeStyle() {
-                        return { width: this.size + 'px' }
+                    sizeStyle(item) {
+                        return { width: item.size + 'px' }
                     }
                 }
             })
@@ -931,14 +931,14 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    subtotal() {
-                        return '$' + (this.price * this.quantity)
+                    subtotal(p) {
+                        return '$' + (p.price * p.quantity)
                     },
-                    description() {
-                        return `${this.quantity}x ${this.name}`
+                    description(p) {
+                        return `${p.quantity}x ${p.name}`
                     },
-                    rowClass() {
-                        return this.quantity > 2 ? 'high-qty' : 'low-qty'
+                    rowClass(p) {
+                        return p.quantity > 2 ? 'high-qty' : 'low-qty'
                     }
                 }
             })
@@ -994,13 +994,13 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    activeMembers() {
-                        const members = this.members || []
+                    activeMembers(team) {
+                        const members = (team && team.members) || []
                         const active = members.filter(m => m.active)
                         return active.map(m => m.name).join(', ') || 'None'
                     },
-                    activeBadge() {
-                        const members = this.members || []
+                    activeBadge(team) {
+                        const members = (team && team.members) || []
                         const count = members.filter(m => m.active).length
                         return count > 0 ? 'has-active' : 'no-active'
                     }
@@ -1053,8 +1053,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    orderTotal() {
-                        const items = this.items || []
+                    orderTotal(order) {
+                        const items = (order && order.items) || []
                         const total = items.reduce((sum, item) => sum + item.price, 0)
                         return '$' + total
                     }
@@ -1095,9 +1095,9 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    formattedPrice() {
-                        const tax = this.basePrice * this.state.taxRate
-                        const total = this.basePrice + tax
+                    formattedPrice(product) {
+                        const tax = product.basePrice * this.state.taxRate
+                        const total = product.basePrice + tax
                         return `${total} ${this.state.currency}`
                     }
                 }
@@ -1136,8 +1136,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    displayValue() {
-                        const val = this.value
+                    displayValue(item) {
+                        const val = item ? item.value : undefined
                         if (val === undefined) return 'N/A'
                         if (val === null) return 'Empty'
                         return String(val)
@@ -1173,8 +1173,8 @@ describe('Computed Properties in List Item Context', () => {
                     items: []
                 },
                 computed: {
-                    displayValue() {
-                        return this.value + '!'
+                    displayValue(item) {
+                        return item.value + '!'
                     }
                 }
             })
@@ -1205,8 +1205,8 @@ describe('Computed Properties in List Item Context', () => {
                     ]
                 },
                 computed: {
-                    nestedValue() {
-                        return this.data?.nested?.value || 'fallback'
+                    nestedValue(item) {
+                        return item?.data?.nested?.value || 'fallback'
                     }
                 }
             })

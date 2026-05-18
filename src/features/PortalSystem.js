@@ -86,6 +86,14 @@ export const PortalSystemMethods = {
 
         // Find all portal elements within this component
         const portalElements = element.querySelectorAll('[data-portal]');
+        // Cache the discovery result so _scheduleComponentRender can skip the
+        // per-state-change querySelectorAll inside _updatePortalVisibility for
+        // components that have no portals. PM-demo profile (2026-05-16) showed
+        // 38% of main-thread time in that querySelectorAll across components
+        // that had zero portals. Flag is true only when portals exist; absent
+        // / false means the per-state-change call is a no-op and can be
+        // elided entirely.
+        instance._hasPortals = portalElements.length > 0;
         if (portalElements.length === 0) return;
 
         // Initialize portal tracking for this component
@@ -118,6 +126,12 @@ export const PortalSystemMethods = {
         // Find all portal elements within list items (not the list container itself)
         const portalElements = element.querySelectorAll('[data-portal]');
         if (portalElements.length === 0) return;
+
+        // Promote the cached flag: list items can introduce portals after the
+        // component-level _processPortals pass ran, so the instance may have
+        // been marked _hasPortals=false at init. Flip it now so the state-
+        // change path stops eliding _updatePortalVisibility.
+        instance._hasPortals = true;
 
         // Initialize portal tracking for this component
         const componentId = instance.id;
@@ -523,16 +537,20 @@ export const PortalSystemMethods = {
      */
     _renderPortalBindings(instance)
     {
-        // Get all binding contexts for this component
         if (!this._contextSystemInitialized || !this._contextRegistry) return;
 
-        const componentBindings = this._contextRegistry.getContextsByType('binding')
-            .filter(ctx => ctx.componentInstance && ctx.componentInstance.id === instance.id);
+        // PERF: iterate the per-component index instead of scanning every
+        // binding context in the whole app and filtering by componentId.
+        // The old path was O(total-bindings) per portal teleport; this is
+        // O(bindings-in-this-component).
+        const componentContexts = this._contextRegistry.contextsByComponent?.get(instance.id);
+        if (!componentContexts) return;
 
-        // Update each binding's value
-        componentBindings.forEach(bindingContext => {
-            this._updateBindingContext(bindingContext);
-        });
+        for (const ctx of componentContexts.values()) {
+            if (ctx.type === 'binding') {
+                this._updateBindingContext(ctx);
+            }
+        }
     },
     /**
      * Update a single binding context with current value
@@ -865,8 +883,25 @@ export const PortalSystemMethods = {
         if (!portals || portals.length === 0) return;
 
         portals.forEach(portalRecord => {
-            // Remove all portaled content from the DOM
+            // Remove all portaled content from the DOM.
+            // Before detaching, strip event listeners we added in
+            // _bindPortaledAction / _bindPortaledModel so the handler
+            // closures (which capture `instance`) are eligible for GC
+            // immediately, not on a subsequent WeakMap cleanup cycle.
             portalRecord.content.forEach(child => {
+                // child is a root; action/model elements may be inside it
+                const allEls = child.querySelectorAll
+                    ? [child, ...child.querySelectorAll('*')]
+                    : [child];
+                for (const el of allEls) {
+                    const handlers = portalHandlersCache.get(el);
+                    if (handlers && handlers.length > 0) {
+                        for (const { eventType, handler } of handlers) {
+                            el.removeEventListener(eventType, handler);
+                        }
+                        portalHandlersCache.delete(el);
+                    }
+                }
                 if (child.parentNode) {
                     child.remove();
                 }

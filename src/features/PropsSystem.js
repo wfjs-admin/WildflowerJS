@@ -638,12 +638,6 @@ export const PropsSystemMethods = {
                     bindingContext._isModelBinding = true;
                     bindingContext._itemData = item;
 
-                    // Cache debounce config for document-level handler
-                    if (element.hasAttribute('data-model-debounce') || element.hasAttribute('data-wf-model-debounce'))
-                    {
-                        bindingContext._debounceTime = parseInt(element.dataset.modelDebounce || element.dataset.wfModelDebounce, 10) || 300;
-                    }
-
                     // Cache model modifiers for document-level handler
                     if (!bindingContext.modelModifiers) {
                         const inputType = element.type;
@@ -651,7 +645,6 @@ export const PropsSystemMethods = {
                             trim: element.hasAttribute('data-model-trim') || element.hasAttribute('data-wf-model-trim'),
                             number: element.hasAttribute('data-model-number') || element.hasAttribute('data-wf-model-number'),
                             lazy: element.hasAttribute('data-model-lazy') || element.hasAttribute('data-wf-model-lazy'),
-                            debounce: bindingContext._debounceTime || null,
                             event: (inputType === 'checkbox' || inputType === 'radio') ? 'change' : 'input'
                         };
                     }
@@ -675,9 +668,10 @@ export const PropsSystemMethods = {
             return false;
         }
 
-        // If no value was passed, capture from the element
-        // But if a value WAS passed (e.g., from debounce callback), use it
-        // This prevents debounced updates from reading stale values after list re-renders
+        // Defensive fallback: if no value was passed, read from the element.
+        // Callers pass the input value captured at event-dispatch time so a
+        // mid-tick list re-render that swaps context.element doesn't cause a
+        // stale/empty read here.
         if (newValue === undefined) {
             newValue = this._getInputValue(context.element);
         }
@@ -989,7 +983,8 @@ export const PropsSystemMethods = {
             return;
         }
 
-        // PHASE 3.5: Use metadata when available (for stripped templates)
+        // Use compiled metadata when available — necessary for templates
+        // whose source attributes have been stripped.
         const metadata = itemEl._compiledMetadata;
         const cachedElements = itemEl._bindingElements || itemEl._cachedElementsArray;
 
@@ -1639,41 +1634,93 @@ export const PropsSystemMethods = {
      * @private
      */
 
-    _setupOutsideClickHandler(element, instance, methodName)
+    _setupOutsideClickHandler(element, instance, methodName, rowContext)
     {
-
-        // Create a unique ID for this handler
-        const handlerId = `outside-${instance.id}-${methodName}-${Date.now()}`;
-
-        // Create the outside click handler
-        const outsideHandler = (event) =>
-        {
-            // Only proceed if the click is outside the element
-            if (!element.contains(event.target) && element !== event.target)
+        // Single document-level listener for the entire framework
+        // (lazy-initialized on first call). A per-element registry
+        // keyed by methodName collects every active subscription;
+        // iteration at click time drops entries whose element has
+        // detached (element.isConnected === false), so the registry
+        // self-cleans without needing element-destroy hooks.
+        //
+        // Why this shape: the original implementation added a fresh
+        // document.addEventListener per call, with the element
+        // captured in closure. When the element was re-bound (list
+        // reconciliation re-running per-row context creation), old
+        // listeners stayed alive and fired on every click, clobbering
+        // state with stale element refs. A single listener + a
+        // registry keyed by element eliminates the leak: re-binds
+        // are idempotent (existing entry returned), and detached
+        // elements drop themselves on the next click.
+        if (!this._outsideClickRegistry) {
+            // Map<HTMLElement, Map<methodName, { instance, rowContext }>>.
+            // Strong refs are fine — the lazy isConnected sweep drops
+            // entries for detached elements within one click. rowContext is
+            // null for non-list handlers, or { item, index, listContext }
+            // for a data-list row child so the handler gets a details arg.
+            this._outsideClickRegistry = new Map();
+            const self = this;
+            document.addEventListener('click', (event) =>
             {
-                try
+                if (self._outsideClickRegistry.size === 0) return;
+                const target = event.target;
+                for (const [el, methodMap] of self._outsideClickRegistry)
                 {
-                    // Call the method from the component
-                    instance.context[methodName](event, element);
-                } catch (error)
-                {
-                    this._handleError(`Error in outside click handler for ${methodName}`, error, instance);
+                    if (!el.isConnected)
+                    {
+                        self._outsideClickRegistry.delete(el);
+                        continue;
+                    }
+                    if (el === target || el.contains(target)) continue;
+                    for (const [name, entry] of methodMap)
+                    {
+                        try
+                        {
+                            let details;
+                            if (entry.rowContext)
+                            {
+                                const rc = entry.rowContext;
+                                let listData = null;
+                                try { listData = rc.listContext ? rc.listContext.resolveData() : null; }
+                                catch (e) { listData = null; }
+                                if (Array.isArray(listData) && typeof rc.index === 'number')
+                                {
+                                    const idx = rc.index;
+                                    details = {
+                                        item: listData[idx],
+                                        index: idx,
+                                        list: listData,
+                                        length: listData.length,
+                                        first: idx === 0,
+                                        last: idx === listData.length - 1,
+                                        context: rc.listContext
+                                    };
+                                }
+                                else
+                                {
+                                    details = { item: rc.item, index: rc.index, list: null, context: rc.listContext };
+                                }
+                            }
+                            entry.instance.context[name](event, el, details);
+                        } catch (error)
+                        {
+                            self._handleError(`Error in outside click handler for ${name}`, error, entry.instance);
+                        }
+                    }
                 }
-            }
-        };
+            });
+        }
 
-        // Add the handler to document body to catch all clicks
-        document.addEventListener('click', outsideHandler);
-
-        // Store the handler for cleanup
-        this.eventHandlers.set(handlerId, {
-            target: document,
-            event: 'click',
-            handler: outsideHandler,
-            options: {capture: true}
-        });
-
-        return outsideHandler;
+        let methodMap = this._outsideClickRegistry.get(element);
+        if (!methodMap)
+        {
+            methodMap = new Map();
+            this._outsideClickRegistry.set(element, methodMap);
+        }
+        // Re-registering the same (element, methodName) pair just
+        // refreshes the entry — a later registration (e.g. a row re-mount)
+        // overwrites with fresh context. No duplicate dispatch on click.
+        methodMap.set(methodName, { instance, rowContext: rowContext || null });
     },
     _applyEventConfiguration(event, config)
     {

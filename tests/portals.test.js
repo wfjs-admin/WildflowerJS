@@ -1158,4 +1158,66 @@ describeIfPortals('Portals', () => {
       expect(portalTarget.querySelector('.survive-portal').textContent).toBe('Portal 2')
     })
   })
+
+  describe('Listener cleanup on destroy', () => {
+    it('clicks on portaled actions do not fire against a destroyed component', async () => {
+      // Regression: listeners registered on portaled elements (via
+      // _bindPortaledAction in PortalSystem) were not removed before the
+      // portaled content was detached on component destroy. The handler
+      // closures captured the component instance and stayed reachable
+      // until the next GC cycle. The user-visible consequence: a click
+      // on a portaled element AFTER the owning component is destroyed
+      // could re-enter the closure and invoke the action against
+      // post-destroy state.
+      //
+      // The fix removes those listeners eagerly during destroy. This
+      // test validates the user-visible contract: clicks on portaled
+      // action elements must NOT invoke the action after destroy.
+      let bumpCount = 0
+      wildflower.component('portal-leak-test', {
+        state: { count: 0 },
+        bump() {
+          bumpCount++
+          this.state.count++
+        }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="portal-leak-test">
+          <div data-portal="#portal-target">
+            <button class="portaled-btn" data-portaled data-action="bump">Bump</button>
+          </div>
+        </div>
+      `
+      await wildflower.scan()
+      await waitForUpdate()
+
+      const portaledBtn = portalTarget.querySelector('.portaled-btn')
+      expect(portaledBtn).not.toBeNull()
+
+      // Sanity: clicking fires the action pre-destroy.
+      portaledBtn.click()
+      await waitForUpdate()
+      expect(bumpCount).toBe(1)
+
+      const compEl = testContainer.querySelector('[data-component-id]')
+      const compId = compEl.dataset.componentId
+
+      // Destroy the component. _cleanupComponentPortals should remove
+      // the action listener and detach the portaled content.
+      wildflower.destroyComponent(compId)
+      compEl.remove()
+
+      // The portaled button may already be detached. If it survives the
+      // detach (some portal targets keep their children), a click on it
+      // must NOT re-invoke the bump handler against the destroyed
+      // component.
+      if (portaledBtn.isConnected) {
+        portaledBtn.click()
+        await waitForUpdate()
+      }
+
+      expect(bumpCount).toBe(1) // unchanged after destroy
+    })
+  })
 })

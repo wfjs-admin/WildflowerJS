@@ -41,15 +41,19 @@ describe('@wildflowerjs/test-utils', () => {
         const mode = getDistMode()
         // 'source' is deprecated but still accepted; defaults to 'ai-dev'
         // 'experimental' and 'experimental-dev' are for testing ListRenderer.v2
-        expect(['source', 'core', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev']).toContain(mode)
+        // '*-raw' modes load uncompressed (plain .js) bundles
+        // '*-min' modes load explicitly-minified bundles (alias of the
+        // unsuffixed build; included so the 15-variant pre-launch sweep
+        // exercises the test utility against the explicit names too)
+        expect(['source', 'core', 'mini', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'mini-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev', 'core-raw', 'mini-raw', 'lite-raw', 'spa-raw', 'full-raw', 'core-min', 'mini-min', 'lite-min', 'spa-min', 'full-min', 'experimental-min']).toContain(mode)
       })
 
       it('should default to ai-dev mode', () => {
         const mode = getDistMode()
         // Default is now 'ai-dev' (full framework with debug info)
         // When WILDFLOWER_DIST is explicitly set, it returns that mode
-        // 'experimental' modes are also valid
-        expect(['core', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev']).toContain(mode)
+        // 'experimental', '*-raw', and explicit '*-min' modes are also valid
+        expect(['core', 'mini', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'mini-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev', 'core-raw', 'mini-raw', 'lite-raw', 'spa-raw', 'full-raw', 'core-min', 'mini-min', 'lite-min', 'spa-min', 'full-min', 'experimental-min']).toContain(mode)
       })
     })
 
@@ -63,12 +67,14 @@ describe('@wildflowerjs/test-utils', () => {
       it('should return full-dev scripts for deprecated source mode', () => {
         // 'source' mode is deprecated and now falls back to full-dev
         const scripts = getFrameworkScripts('source')
-        expect(scripts).toEqual(['/dist/wildflower.full.dev.js'])
+        const dir = (typeof __WILDFLOWER_DIST_DIR__ !== 'undefined') ? __WILDFLOWER_DIST_DIR__ : '/dist'
+        expect(scripts).toEqual([`${dir}/wildflower.full.dev.js`])
       })
 
       it('should return minified script for core mode', () => {
         const scripts = getFrameworkScripts('core')
-        expect(scripts).toEqual(['/dist/wildflower.min.js'])
+        const dir = (typeof __WILDFLOWER_DIST_DIR__ !== 'undefined') ? __WILDFLOWER_DIST_DIR__ : '/dist'
+        expect(scripts).toEqual([`${dir}/wildflower.min.js`])
       })
     })
 

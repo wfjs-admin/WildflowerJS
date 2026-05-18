@@ -1365,12 +1365,22 @@ export const TemplateSystemMethods = {
                     parent = parent.parentElement;
                 }
 
+                // Detect data-event-outside on row-template action elements.
+                // Without this, an action like `<span data-action="closeFoo"
+                // data-event-outside>` inside a data-list template is a silent
+                // no-op: the list-row context-creation path doesn't read it,
+                // and the regular _setupActions path skips list-row children.
+                // The flag is consumed by ListItemBinding and onBulkCreate to
+                // register PropsSystem._setupOutsideClickHandler eagerly.
+                const hasEventOutside = this._hasAttr(el, 'event-outside');
+
                 metadata.actions.push({
                     index: i,
                     actionName: actionName,
                     elementPath,
                     isInNestedList,
-                    isInNestedComponent
+                    isInNestedComponent,
+                    hasEventOutside
                 });
             }
 
@@ -1633,17 +1643,25 @@ export const TemplateSystemMethods = {
                 tokenIndex++;
             }
 
-            // ================================================================
-            // PHASE 3.5: Strip framework attributes from compiled template
-            // ================================================================
-            // These attributes are no longer needed once bindings are compiled
-            // into metadata. Stripping reduces DOM bloat and browser style/layout time.
+            // Strip framework attributes from the compiled template.
+            // These aren't needed once bindings are compiled into metadata,
+            // and stripping reduces DOM bloat and browser style/layout time.
             // STRIP: All framework binding attributes (tests use context registry helpers)
             // NOTE: List items are identified by _listIndex JS property, not DOM attributes
+            //
+            // Action attributes are stripped here for DOM-bloat / krausest
+            // benchmark reasons (10K rows × per-row data-action adds up).
+            // The runtime click delegation in EventSystem reads the action
+            // name back from compiled metadata when the DOM attribute is
+            // missing — see _handleDelegatedActionWithListItem's metadata
+            // fallback. If you reorder or touch the strip path, make sure
+            // the metadata fallback still resolves the action name; the
+            // silent dead-click bug fixed 2026-05-17 (amber-otter-23) was
+            // exactly this attribute/metadata desync.
             const attrsToStrip = [
                 // Text binding attributes
                 'data-bind', 'data-wf-bind',
-                // Action attributes - contexts looked up via compiled metadata
+                // Action attributes — contexts looked up via compiled metadata
                 'data-action', 'data-wf-action',
                 // Verbose attributes with expressions
                 'data-bind-class', 'data-wf-bind-class',
@@ -1653,7 +1671,14 @@ export const TemplateSystemMethods = {
                 'data-show', 'data-wf-show',
                 'data-render', 'data-wf-render',
                 'data-if', 'data-wf-if',
-                'data-key', 'data-wf-key'
+                'data-key', 'data-wf-key',
+                // Anti-FOUC marker — must be stripped from the cached
+                // template (and innerHTML parts), not just from the
+                // initial DOM scan. Otherwise rows added later (or moved
+                // between sibling data-lists) inherit data-cloak from
+                // the template and stay [data-cloak]{display:none}
+                // forever, defeating data-show on inner elements.
+                'data-cloak', 'data-wf-cloak'
             ];
 
             // Strip from templateClone root element
@@ -1728,8 +1753,16 @@ export const TemplateSystemMethods = {
                         if (evalFn) evalFn._usesMergedContext = true;
                     } else if (!_UNSAFE_EXPR_RE.test(expr)) {
                         // Standard path: use new Function()
+                        // Auto-wrap object-literal expressions in parens. JS ASI parses
+                        // `return { x: y }` as `return; { x: y }` (block) → undefined.
+                        // Parens force object-literal interpretation. Safe no-op for
+                        // non-object expressions.
+                        const trimmedExpr = expr.trim();
+                        const exprForReturn = (trimmedExpr.startsWith('{') && trimmedExpr.endsWith('}'))
+                            ? `(${trimmedExpr})`
+                            : expr;
                         const destructure = allVars.length > 0 ? `const {${allVars.join(',')}} = ctx;` : '';
-                        evalFn = new Function('ctx', `"use strict"; ${destructure} return ${expr};`);
+                        evalFn = new Function('ctx', `"use strict"; ${destructure} return ${exprForReturn};`);
                         evalFn._usesMergedContext = true;
                     }
                 } catch (e) {
@@ -1764,9 +1797,13 @@ export const TemplateSystemMethods = {
                     );
                     if (evalFn) evalFn._usesMergedContext = true;
                 } else if (!_UNSAFE_EXPR_RE.test(expr)) {
-                    // Standard path: use new Function()
+                    // Standard path: use new Function() with object-literal auto-wrap
+                    const trimmedExpr = expr.trim();
+                    const exprForReturn = (trimmedExpr.startsWith('{') && trimmedExpr.endsWith('}'))
+                        ? `(${trimmedExpr})`
+                        : expr;
                     const destructure = allVars.length > 0 ? `const {${allVars.join(',')}} = ctx;` : '';
-                    evalFn = new Function('ctx', `"use strict"; ${destructure} return ${expr};`);
+                    evalFn = new Function('ctx', `"use strict"; ${destructure} return ${exprForReturn};`);
                     evalFn._usesMergedContext = true;
                 }
             } catch (e) {

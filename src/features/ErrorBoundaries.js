@@ -455,7 +455,29 @@ export const ErrorBoundariesMethods = {
             this._cleanupPools(instance);
         }
 
-        // Call user destroy hook if available
+        // Call user destroy hook if available.
+        //
+        // Ordering: the destroy hook fires BEFORE binding/render effects
+        // are disposed (the per-effect
+        // disposers run later in this function, and the catch-all sweep at
+        // the bottom runs last). State mutations inside destroy() therefore
+        // queue effects that fire against a partially torn-down component.
+        //
+        // For BINDING effects, this is benign: the component context was
+        // removed at line 440 above (_notifyComponentDestroyed). When a
+        // queued binding effect runs in the microtask drain after this
+        // function returns, its context-lookup misses and it silently
+        // no-ops. The effect itself is also marked disposed by the
+        // fallback sweep at the bottom of this function before the drain.
+        //
+        // For CUSTOM effects (createEffect with scope: instance / context),
+        // the same fallback sweep disposes them before the microtask drain,
+        // so .disposed is true when they're scheduled to run and _runEffect
+        // returns early.
+        //
+        // The accidental safety hinges on (a) context-removal-before-destroy
+        // at line 440 and (b) the fallback sweep at the end of this function.
+        // If either changes, revisit this ordering.
         if (typeof instance.context.destroy === 'function')
         {
             try
@@ -560,6 +582,38 @@ export const ErrorBoundariesMethods = {
         if (this.storeManager) {
             this.storeManager.removePendingDependencies(componentId);
         }
+
+        // Fallback sweep: dispose every effect that lives within this
+        // component's reactive surface. Three places effects can be
+        // registered, all of which must be cleaned up on destroy:
+        //   - instance._effects — used when createEffect is invoked with
+        //     `scope: instance` (e.g. framework's _renderEffect)
+        //   - instance.context._effects — used when user code calls
+        //     `sm.createEffect(fn, { scope: this })` from inside init(),
+        //     since `this` is the context proxy
+        //   - instance.stateManager._effects — every effect on this RSM
+        //     regardless of scope. Catches framework-internal effects
+        //     scoped to the RSM's `component` stub ({id, name}, set in
+        //     _createComponentStateManager because the instance object
+        //     doesn't exist yet at RSM construction). The mapArray
+        //     structural effect and per-item list effects land here and
+        //     would otherwise survive destroy and keep firing against
+        //     external store mutations.
+        // Snapshot before iteration: _disposeEffect mutates the source Set.
+        // Idempotent — already-disposed effects short-circuit.
+        const _disposeScopeEffects = (effectsSet) => {
+            if (!effectsSet || effectsSet.size === 0) return;
+            const remaining = Array.from(effectsSet);
+            for (let i = 0; i < remaining.length; i++) {
+                const effect = remaining[i];
+                if (!effect.disposed && effect._rsm) {
+                    effect._rsm._disposeEffect(effect);
+                }
+            }
+        };
+        _disposeScopeEffects(instance._effects);
+        if (instance.context) _disposeScopeEffects(instance.context._effects);
+        if (instance.stateManager) _disposeScopeEffects(instance.stateManager._effects);
 
         this.componentInstances.delete(componentId);
         this._contextHierarchyDirty = true;

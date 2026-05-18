@@ -44,11 +44,31 @@ export const BindingResolverMethods = {
         if (binding.isExpression && binding.compiledFn && binding.expressionVars) {
             const vars = binding.expressionVars;
             const args = new Array(vars.length);
+            // Item-level computeds — both parameterized fn(item) (fn.length > 0)
+            // AND bare-form fn() reading `this.X` — need per-item evaluation.
+            // componentState resolves bare-form at the component level, which
+            // produces a stale value because `this.X` reads off the component
+            // context. Route both forms through _evaluateComputedInListContext
+            // so `this.X` resolves to item state.
+            const origComputeds = componentInstance?.stateManager?._originalComputedFunctions;
             for (let v = 0; v < vars.length; v++) {
                 const varName = vars[v];
                 if (varName in item) {
                     args[v] = item[varName];
-                } else if (varName in componentState) {
+                    continue;
+                }
+                if (origComputeds) {
+                    const fn = origComputeds.get(varName);
+                    if (fn && typeof fn === 'function') {
+                        try {
+                            args[v] = this._evaluateComputedInListContext(
+                                componentInstance, varName, item, itemIndex, listContext
+                            );
+                        } catch (e) { args[v] = undefined; }
+                        continue;
+                    }
+                }
+                if (varName in componentState) {
                     args[v] = componentState[varName];
                 } else if (varName === 'external' && componentInstance) {
                     args[v] = this._getExternalFn(componentInstance);
@@ -222,6 +242,24 @@ export const BindingResolverMethods = {
 
                 if (itemIndex !== undefined && listLength !== undefined) {
                     Object.assign(mergedState, this._buildListContextVars(itemIndex, listLength));
+                }
+
+                // Item-level computeds — both parameterized fn(item) and bare-form
+                // fn() reading `this.X` — need per-item evaluation. componentState
+                // resolves bare-form at the component level, producing a stale
+                // value because `this.X` reads off the component context. Route
+                // both forms through _evaluateComputedInListContext.
+                const origComputeds = componentInstance?.stateManager?._originalComputedFunctions;
+                if (origComputeds && item && typeof item === 'object') {
+                    for (const [name, fn] of origComputeds) {
+                        if (typeof fn === 'function') {
+                            try {
+                                mergedState[name] = this._evaluateComputedInListContext(
+                                    componentInstance, name, item, itemIndex, listContext
+                                );
+                            } catch (e) { mergedState[name] = undefined; }
+                        }
+                    }
                 }
 
                 const options = { cacheKey: 'listBindingResolved' };

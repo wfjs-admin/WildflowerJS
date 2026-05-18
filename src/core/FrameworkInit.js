@@ -117,8 +117,17 @@ export const FrameworkInitMethods = {
         // With autoSave restoring state (e.g., localStorage), stripping cloaks
         // synchronously here would expose elements for 1 frame before conditionals
         // hide them — defeating the purpose of data-cloak.
+        //
+        // Before removing the attribute we commit a visibility verdict for any
+        // element that also carries data-show. This closes the Chrome-observed
+        // race where the cloak strip lands before the data-show binding effect
+        // has run (or has finished re-running after init-time state mutations).
+        // The verdict uses the same evaluator the render effect uses, so a
+        // subsequent effect re-run writes the same value (idempotent).
         requestAnimationFrame(() => {
-            document.querySelectorAll('[data-cloak]').forEach(el => el.removeAttribute('data-cloak'));
+            document.querySelectorAll('[data-cloak]').forEach(el => {
+                this._stripCloakWithVerdict(el);
+            });
         });
 
         // SSR: Activate all SSR components for exact functional equivalence
@@ -453,9 +462,36 @@ export const FrameworkInitMethods = {
                     const parentItem = parentData[this._parentIndex];
                     if (parentItem && typeof parentItem === 'object')
                     {
-                        // If parent item exists, get our data from it
+                        // If parent item has an own field of that name, use it
                         const nestedList = parentItem[this.path];
-                        return Array.isArray(nestedList) ? nestedList : [];
+                        if (Array.isArray(nestedList)) return nestedList;
+
+                        // Otherwise evaluate the path as an item-level computed
+                        // on the parent item's shape, so nested lists whose
+                        // source is a computed (not a stored field) resolve
+                        // the same array here as during rendering.
+                        const wf = this._wf;
+                        if (wf && wf._resolveRawBinding)
+                        {
+                            try
+                            {
+                                const scope = {
+                                    componentState: this.componentInstance?.state || {},
+                                    componentInstance: this.componentInstance,
+                                    itemIndex: this._parentIndex,
+                                    listLength: parentData.length,
+                                    listContext: this.parent,
+                                    propsData: this.componentInstance?._propsData
+                                };
+                                const computed = wf._resolveRawBinding(this.path, parentItem, scope);
+                                if (Array.isArray(computed)) return computed;
+                            } catch (e)
+                            {
+                                if (__DEV__) wfWarn(`Failed to evaluate item-level computed for nested list "${this.path}": ${e.message}`);
+                            }
+                        }
+
+                        return [];
                     }
                 }
             }

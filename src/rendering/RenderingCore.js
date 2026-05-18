@@ -5,6 +5,7 @@
  */
 
 import { listBoundElements, ssrAdoptedElements } from '../core/DomMetadata.js';
+import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -553,7 +554,11 @@ export const RenderingCoreMethods = {
                 bindingContext._updateClassBindingElement(value);
             }
 
-            if (instance._effectMeta) {
+            // See the matching guard in _processObjectBindingElements for the
+            // rationale: don't register a component-level effect for in-list
+            // elements, or the list-row machinery and the component effect
+            // race to write competing values to the same chip.
+            if (instance._effectMeta && !result.inList) {
                 instance._effectMeta.push({
                     element: bindingElement,
                     type: 'class',
@@ -602,7 +607,23 @@ export const RenderingCoreMethods = {
                 }
             }
 
-            if (instance._effectMeta) {
+            // Only register a component-level effect for elements that are NOT
+            // inside a data-list. List-row elements are updated by the list-row
+            // machinery (PropsSystem._refreshListItemBindings + the binding
+            // path through ListExpressionEval._processObjectBinding, which
+            // resolves item[expr] first per the documented contract). Pushing
+            // a component-effect meta for an in-list element causes a second
+            // writer (the component-level computed of the same name) to race
+            // the list-row writer — initial render usually shows the
+            // component-computed value (race winner) and the list-row's per-row
+            // field is silently shadowed. Surfaced 2026-05-17 (amber-otter-23)
+            // via PM-demo team page: project chips bound to data-bind-style="iconStyle"
+            // rendered the parent team's color most of the time, alternating
+            // with the project's own color on reload (3/10 in Chrome, 2/10 in
+            // Firefox). Sibling guard: see the listBoundElements check on
+            // data-bind text in _processComponentBindingsFromCompiled — text
+            // binds already had this guard; style/attr did not.
+            if (instance._effectMeta && !inList) {
                 instance._effectMeta.push({
                     element: bindingElement,
                     type: type,
@@ -653,9 +674,11 @@ export const RenderingCoreMethods = {
 
             // WF-501: Warn if using $store.path in data-model (store paths are read-only)
             if (modelPath.includes('$')) {
-                if (__DEV__) console.warn(`[WF-501] Store shorthand ($store.path) cannot be used in data-model. ` +
-                    `Store paths are read-only. Use component state with an action to mediate writes. ` +
-                    `Found: data-model="${modelPath}"`);
+                if (__DEV__) wfError(WF_ERRORS.MODEL_STORE_SHORTHAND, {
+                    context: `data-model="${modelPath}"`,
+                    suggestion: 'Use component state and an action that mediates writes back to the store.',
+                    warn: true
+                });
                 return; // Skip this element - it's an invalid binding
             }
 
@@ -706,8 +729,6 @@ export const RenderingCoreMethods = {
                 trim: element.hasAttribute('data-model-trim'),
                 number: element.hasAttribute('data-model-number'),
                 lazy: element.hasAttribute('data-model-lazy'),
-                debounce: element.hasAttribute('data-model-debounce')
-                    ? (parseInt(element.dataset.modelDebounce, 10) || 300) : null,
                 event: (inputType === 'checkbox' || inputType === 'radio') ? 'change' : 'input'
             };
         }
@@ -790,7 +811,10 @@ export const RenderingCoreMethods = {
      */
     _isOwnedBindingElement(el, componentElement) {
         if (el.closest('[data-use-template-rendered]')) return false;
-        const ancestorList = el.closest('[data-list]');
+        // Only exclude elements INSIDE a list — the list root itself owns its own bindings
+        // (bind-style, bind-class, bind-attr on the container are authored by the component,
+        // not by the list renderer, which only manages children).
+        const ancestorList = el.parentElement?.closest('[data-list]');
         if (ancestorList && ancestorList !== componentElement && componentElement.contains(ancestorList)) return false;
         const closestComponent = this._getComponentElement(el);
         if (closestComponent === componentElement) return true;
@@ -1321,6 +1345,20 @@ export const RenderingCoreMethods = {
             typeHint = typeHintMatch[2];
         }
 
+        // If the path contains expression operators, it's not a simple property
+        // reference — delegate to the expression-variable validator so each
+        // identifier in the expression is checked individually. Without this,
+        // `data-show="activePattern === 'intro'"` would be treated as a single
+        // property name `"activePattern === 'intro'"` and always report
+        // "undefined state property".
+        // Valid simple-path characters: word chars, dots (nested), and leading `!`.
+        // Anything else (spaces, `=`, `&`, `|`, `?`, `>`, `<`, `+`, `*`, `(`, etc.)
+        // means the attribute holds an expression.
+        if (!/^!?[\w.]+$/.test(actualPath)) {
+            this._validateExpressionVariables(actualPath, stateKeys, componentName, bindingType);
+            return;
+        }
+
         // Skip list context variables
         const listContextVars = ['_index', '_length', '_first', '_last', '_item'];
         const cleanPath = actualPath.replace(/^!/, ''); // Remove negation prefix
@@ -1411,8 +1449,12 @@ export const RenderingCoreMethods = {
         // quotes ('priority-option high') are not variable references
         const noStrings = cleanExpression.replace(/'[^']*'|"[^"]*"/g, '');
 
-        // Extract variable names from the expression
-        const propertyRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+        // Extract variable names — only ROOT identifiers, not property accesses.
+        // `(?<!\.)` lookbehind excludes identifiers preceded by a dot so that
+        // `events.length` produces `['events']` not `['events', 'length']`.
+        // Without this, built-in props like .length/.includes/.toLowerCase()
+        // appear as "undefined state property" — noisy false positives.
+        const propertyRegex = /(?<!\.)\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
         const matches = noStrings.match(propertyRegex);
 
         if (!matches) return;
@@ -1610,7 +1652,7 @@ export const RenderingCoreMethods = {
         return matrix[b.length][a.length];
     },
     // ==========================================
-    // PHASE 2: TYPE INFERENCE
+    // Type inference
     // ==========================================
 
     /**
@@ -1666,7 +1708,7 @@ export const RenderingCoreMethods = {
         }
     },
     // ==========================================
-    // PHASE 3: RUNTIME TYPE CHECKING
+    // Runtime type checking
     // ==========================================
 
     /**
@@ -1971,9 +2013,11 @@ export const RenderingCoreMethods = {
                     ? this._resolveEffectExpression(meta.path, instance)
                     : stateManager.getValue(meta.path);
             } catch (e) {
-                if (__DEV__) {
-                    console.warn(`[WF-EFFECT] Error resolving "${meta.path}":`, e);
-                }
+                if (__DEV__) wfError(WF_ERRORS.EFFECT_PATH, {
+                    context: `"${meta.path}"`,
+                    cause: e,
+                    warn: true
+                });
                 continue;
             }
 
@@ -2129,6 +2173,88 @@ export const RenderingCoreMethods = {
     },
 
     /**
+     * Evaluate the visibility verdict for a cloaked element about to have its
+     * data-cloak attribute stripped. Returns false when data-show resolves
+     * falsy (element should be hidden), true otherwise (no data-show, truthy
+     * verdict, or evaluation gave up — fail-open so we never accidentally hide
+     * something the user expects to see).
+     *
+     * Used by the cloak-strip rAF in FrameworkInit and ComponentScanning to
+     * commit the same display verdict the render effect would have written,
+     * synchronously with attribute removal. Closes the race where a cloak
+     * strip lands before the data-show binding effect has run (or has finished
+     * re-running after init-time state mutations).
+     *
+     * Uses the SAME expression evaluator (`_resolveEffectExpression`) that the
+     * render effect uses, so the verdict is identical to what a subsequent
+     * effect run would produce — making the eventual effect re-run idempotent.
+     * Outside an active effect context, reads do not register dependencies, so
+     * this introduces no spurious tracking.
+     *
+     * @param {HTMLElement} el - Element with [data-cloak] about to be stripped
+     * @returns {boolean} False if data-show is falsy (should hide), true otherwise
+     * @private
+     */
+    _evaluateCloakShowVerdict(el) {
+        const showAttr = this._getAttr ? this._getAttr(el, 'show') : el.getAttribute('data-show');
+        if (!showAttr) return true;
+        const componentEl = this._getComponentElement(el);
+        if (!componentEl) return true;
+        const componentId = componentEl.dataset && componentEl.dataset.componentId;
+        if (!componentId) return true;
+        const instance = this.componentInstances.get(componentId);
+        if (!instance || !this._resolveEffectExpression) return true;
+        try {
+            const negate = showAttr.charAt(0) === '!';
+            const path = negate ? showAttr.slice(1) : showAttr;
+            const value = this._resolveEffectExpression(path, instance);
+            return negate ? !value : Boolean(value);
+        } catch (e) {
+            // Fail open: don't hide if evaluation throws (preserves prior behavior
+            // where show effect's `continue` left display unchanged on error).
+            return true;
+        }
+    },
+
+    /**
+     * Strip data-cloak from an element, deferring if its nearest [data-component]
+     * ancestor is registered but not yet initialized (no data-component-id).
+     *
+     * Late-registered components — defer-loaded scripts whose wildflower.component
+     * call runs after the framework's initial scan — only initialize their DOM
+     * elements when their definition is registered. If the cloak-strip rAF runs
+     * before that registration, stripping cloak makes the element visible before
+     * the render effect has had a chance to write display:none, causing the
+     * "appear then hide" flash the user reported in Chrome.
+     *
+     * The deferred strip is picked up by the per-component pass in
+     * _initializeComponentElement, which runs after the render effect's first
+     * synchronous run has already set display correctly.
+     *
+     * When not deferred, commits the data-show visibility verdict (if present)
+     * before removing the attribute. See _evaluateCloakShowVerdict for verdict
+     * semantics.
+     *
+     * @param {HTMLElement} el - Element carrying [data-cloak]
+     * @returns {boolean} True if the strip ran, false if it was deferred
+     * @private
+     */
+    _stripCloakWithVerdict(el) {
+        const componentEl = this._getComponentElement(el);
+        if (componentEl && !(componentEl.dataset && componentEl.dataset.componentId)) {
+            // Ancestor component is registered (has data-component) but not yet
+            // initialized (no data-component-id). Skip — the per-component strip
+            // pass after init will handle it.
+            return false;
+        }
+        if (!this._evaluateCloakShowVerdict(el)) {
+            if (el.style.display !== 'none') el.style.display = 'none';
+        }
+        el.removeAttribute('data-cloak');
+        return true;
+    },
+
+    /**
      * Execute data-bind-class for Effect.
      * @private
      */
@@ -2215,11 +2341,17 @@ export const RenderingCoreMethods = {
                     ? this._sanitizeAttrValue(attr, attrValue)
                     : attrValue;
                 if (sanitized == null || sanitized === false) {
-                    el.removeAttribute(attr);
+                    if (el.hasAttribute(attr)) el.removeAttribute(attr);
                 } else if (sanitized === true) {
-                    el.setAttribute(attr, '');
+                    if (el.getAttribute(attr) !== '') el.setAttribute(attr, '');
                 } else {
-                    el.setAttribute(attr, sanitized);
+                    // Skip the write if the attribute already holds the same value —
+                    // some elements (notably <video>) reload their resource when `src`
+                    // is set even to an identical string.
+                    const strValue = String(sanitized);
+                    if (el.getAttribute(attr) !== strValue) {
+                        el.setAttribute(attr, strValue);
+                    }
                 }
             });
         }

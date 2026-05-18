@@ -17,6 +17,8 @@
 // Minimal version supporting WildflowerJS expression grammar
 // =============================================================================
 
+import { WF_ERRORS, wfError } from './wfUtils.js';
+
 const PERIOD_CODE = 46; // '.'
 const COMMA_CODE = 44;  // ','
 const SQUOTE_CODE = 39; // '
@@ -83,13 +85,10 @@ function parseExpression(expr) {
 
     function throwError(message) {
         if (typeof __DEV__ !== 'undefined' && __DEV__) {
-            console.error(
-                `[WF-CSP-SYNTAX] Cannot parse expression: "${expr}"\n` +
-                `Error at position ${index}: ${message}\n` +
-                `CSP mode supports: identifiers, member access, arithmetic, ` +
-                `comparisons, logical operators, ternary, and external() calls.\n` +
-                `Unsupported: arrow functions, template literals, destructuring, spread, async/await.`
-            );
+            wfError(WF_ERRORS.CSP_SYNTAX, {
+                context: `"${expr}" — position ${index}: ${message}`,
+                suggestion: 'CSP mode supports identifiers, member access, arithmetic, comparisons, logical operators, ternary, and external() calls. Arrow functions, template literals, destructuring, spread, async/await are not supported.'
+            });
         }
         return null;
     }
@@ -514,7 +513,10 @@ function parseExpression(expr) {
         return ast;
     } catch (e) {
         if (typeof __DEV__ !== 'undefined' && __DEV__) {
-            console.error(`[WF-CSP-SYNTAX] Parse error in expression: "${expr}"`, e);
+            wfError(WF_ERRORS.CSP_SYNTAX, {
+                context: `"${expr}"`,
+                cause: e
+            });
         }
         return null;
     }
@@ -665,10 +667,11 @@ function evaluateAST(node, context) {
 
         default:
             if (typeof __DEV__ !== 'undefined' && __DEV__) {
-                console.warn(
-                    `[WF-CSP-UNSUPPORTED] Expression uses unsupported syntax: ${node.type}\n` +
-                    `Consider using a computed property or component method instead.`
-                );
+                wfError(WF_ERRORS.CSP_UNSUPPORTED, {
+                    context: node.type,
+                    suggestion: 'Use a computed property or component method instead.',
+                    warn: true
+                });
             }
             return undefined;
     }
@@ -686,10 +689,11 @@ function evaluateIdentifier(node, context) {
     // Block access to dangerous globals
     if (BLOCKED_GLOBALS.has(name)) {
         if (typeof __DEV__ !== 'undefined' && __DEV__) {
-            console.warn(
-                `[WF-CSP-SECURITY] Blocked access to global "${name}" in expression. ` +
-                `Use external() for cross-component data access.`
-            );
+            wfError(WF_ERRORS.CSP_SECURITY, {
+                context: `blocked global "${name}"`,
+                suggestion: 'Use external() for cross-component data access.',
+                warn: true
+            });
         }
         return undefined;
     }
@@ -716,7 +720,10 @@ function evaluateMember(node, context) {
     // Security check for blocked properties
     if (BLOCKED_PROPERTIES.has(prop)) {
         if (typeof __DEV__ !== 'undefined' && __DEV__) {
-            console.warn(`[WF-CSP-SECURITY] Blocked property access: ${prop}`);
+            wfError(WF_ERRORS.CSP_SECURITY, {
+                context: `blocked property "${prop}"`,
+                warn: true
+            });
         }
         return undefined;
     }
@@ -747,10 +754,11 @@ function evaluateCall(node, context) {
         const calleeName = node.callee.type === 'Identifier'
             ? node.callee.name
             : 'anonymous';
-        console.warn(
-            `[WF-CSP-SECURITY] Blocked function call: ${calleeName}. ` +
-            `Only external() is allowed in expressions.`
-        );
+        wfError(WF_ERRORS.CSP_SECURITY, {
+            context: `blocked call to "${calleeName}()"`,
+            suggestion: 'Only external() is allowed in CSP-mode expressions.',
+            warn: true
+        });
     }
     return undefined;
 }

@@ -123,93 +123,119 @@
  * - 700-799: Router errors
  * - 800-899: SSR errors
  * - 900-999: Store errors
+ * - WF-CSP-* / WF-EFFECT: non-numeric category codes (CSP-safe evaluator, render effect)
  *
- * See: https://github.com/sutt01/wildflowerJS/blob/main/docs/errors.md
+ * See: https://www.wildflowerjs.com/docs/error-codes
+ * Deep-link a specific code: https://www.wildflowerjs.com/docs/error-codes?code=WF-505
  */
 
 export const WF_ERRORS = {
     // Core/initialization (001-099)
-    ROOT_NOT_FOUND: { code: 'WF-001', ...(__DEV__ && { message: 'Root element not found' }) },
+    ROOT_NOT_FOUND: { code: 'WF-001', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Root element not found' }) },
 
     // Component lifecycle (100-199)
-    COMPONENT_INIT_FAILED: { code: 'WF-101', ...(__DEV__ && { message: 'Error initializing component' }) },
-    COMPONENT_NOT_FOUND: { code: 'WF-102', ...(__DEV__ && { message: 'Component instance not found' }) },
-    COMPONENT_CONTEXT_MISSING: { code: 'WF-103', ...(__DEV__ && { message: 'Component context not available' }) },
-    PARENT_HANDLER_ERROR: { code: 'WF-104', ...(__DEV__ && { message: 'Error in parent event handler' }) },
+    COMPONENT_INIT_FAILED: { code: 'WF-101', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error initializing component' }) },
+    COMPONENT_NOT_FOUND: { code: 'WF-102', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Component instance not found' }) },
+    COMPONENT_CONTEXT_MISSING: { code: 'WF-103', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Component context not available' }) },
+    PARENT_HANDLER_ERROR: { code: 'WF-104', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in parent event handler' }) },
 
     // State/reactivity (200-299)
-    COMPUTED_EVAL_ERROR: { code: 'WF-201', ...(__DEV__ && { message: 'Error evaluating computed property' }) },
-    CIRCULAR_DEPENDENCY: { code: 'WF-202', ...(__DEV__ && { message: 'Circular dependency detected' }) },
-    STATE_SET_ERROR: { code: 'WF-203', ...(__DEV__ && { message: 'Error setting state value' }) },
-    STATE_DELETE_ERROR: { code: 'WF-204', ...(__DEV__ && { message: 'Error deleting state value' }) },
-    STATE_LOAD_ERROR: { code: 'WF-205', ...(__DEV__ && { message: 'Error loading state from storage' }) },
-    STATE_SAVE_ERROR: { code: 'WF-206', ...(__DEV__ && { message: 'Error saving state to storage' }) },
-    STATE_UPDATE_INVALID: { code: 'WF-207', ...(__DEV__ && { message: 'Invalid parameter for state update' }) },
-    COMPUTED_NOT_FOUND: { code: 'WF-208', ...(__DEV__ && { message: 'Computed property does not exist' }) },
-    COMPUTED_NOT_FUNCTION: { code: 'WF-209', ...(__DEV__ && { message: 'Computed property must be a function' }) },
-    PATH_INVALID: { code: 'WF-210', ...(__DEV__ && { message: 'Invalid path segment' }) },
-    SUBSCRIPTION_ERROR: { code: 'WF-211', ...(__DEV__ && { message: 'Error in subscription callback' }) },
+    COMPUTED_EVAL_ERROR: { code: 'WF-201', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating computed property' }) },
+    CIRCULAR_DEPENDENCY: { code: 'WF-202', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Circular dependency detected' }) },
+    STATE_SET_ERROR: { code: 'WF-203', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error setting state value' }) },
+    STATE_DELETE_ERROR: { code: 'WF-204', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error deleting state value' }) },
+    STATE_LOAD_ERROR: { code: 'WF-205', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading state from storage' }) },
+    STATE_SAVE_ERROR: { code: 'WF-206', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error saving state to storage' }) },
+    STATE_UPDATE_INVALID: { code: 'WF-207', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid parameter for state update' }) },
+    COMPUTED_NOT_FOUND: { code: 'WF-208', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed property does not exist' }) },
+    COMPUTED_NOT_FUNCTION: { code: 'WF-209', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed property must be a function' }) },
+    PATH_INVALID: { code: 'WF-210', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid path segment' }) },
+    SUBSCRIPTION_ERROR: { code: 'WF-211', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in subscription callback' }) },
 
     // Context system (300-399)
-    CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...(__DEV__ && { message: 'Error resolving data in context' }) },
-    CONTEXT_MISSING_INSTANCE: { code: 'WF-302', ...(__DEV__ && { message: 'Missing component instance in context' }) },
-    CONTEXT_UPDATE_ERROR: { code: 'WF-303', ...(__DEV__ && { message: 'Error updating context' }) },
-    CONTEXT_DEPENDENCY_ERROR: { code: 'WF-304', ...(__DEV__ && { message: 'Error in context dependency notification' }) },
+    CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
+    CONTEXT_MISSING_INSTANCE: { code: 'WF-302', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Missing component instance in context' }) },
+    CONTEXT_UPDATE_ERROR: { code: 'WF-303', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error updating context' }) },
+    CONTEXT_DEPENDENCY_ERROR: { code: 'WF-304', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in context dependency notification' }) },
 
     // List rendering (400-499)
-    TEMPLATE_NOT_FOUND: { code: 'WF-401', ...(__DEV__ && { message: 'Template not found for list' }) },
-    LIST_RENDER_ERROR: { code: 'WF-402', ...(__DEV__ && { message: 'Error rendering list' }) },
-    LIST_ITEM_UPDATE_ERROR: { code: 'WF-403', ...(__DEV__ && { message: 'Error updating list item' }) },
-    LIST_ITEM_REMOVE_ERROR: { code: 'WF-404', ...(__DEV__ && { message: 'Error removing list item' }) },
-    LIST_APPEND_ERROR: { code: 'WF-405', ...(__DEV__ && { message: 'Error in append optimization' }) },
-    LIST_SWAP_ERROR: { code: 'WF-406', ...(__DEV__ && { message: 'Error in swap optimization' }) },
-    LIST_SPARSE_ERROR: { code: 'WF-407', ...(__DEV__ && { message: 'Error in sparse update optimization' }) },
+    TEMPLATE_NOT_FOUND: { code: 'WF-401', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Template not found for list' }) },
+    LIST_RENDER_ERROR: { code: 'WF-402', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error rendering list' }) },
+    LIST_ITEM_UPDATE_ERROR: { code: 'WF-403', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error updating list item' }) },
+    LIST_ITEM_REMOVE_ERROR: { code: 'WF-404', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error removing list item' }) },
+    LIST_APPEND_ERROR: { code: 'WF-405', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in append optimization' }) },
+    LIST_SWAP_ERROR: { code: 'WF-406', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in swap optimization' }) },
+    LIST_SPARSE_ERROR: { code: 'WF-407', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in sparse update optimization' }) },
 
     // Binding errors (500-599)
-    BINDING_EVAL_ERROR: { code: 'WF-501', ...(__DEV__ && { message: 'Error evaluating binding expression' }) },
-    CLASS_BINDING_ERROR: { code: 'WF-502', ...(__DEV__ && { message: 'Error evaluating class binding' }) },
-    HTML_BINDING_ERROR: { code: 'WF-503', ...(__DEV__ && { message: 'Failed to create HTML binding context' }) },
-    CONDITIONAL_UPDATE_ERROR: { code: 'WF-504', ...(__DEV__ && { message: 'Error updating conditional context' }) },
+    BINDING_EVAL_ERROR: { code: 'WF-501', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating binding expression' }) },
+    // Shares WF-501 with BINDING_EVAL_ERROR (docs entry covers both shapes);
+    // distinct here so the dev-mode message matches the specific case.
+    MODEL_STORE_SHORTHAND: { code: 'WF-501', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: '$store.path cannot be used in data-model (store paths are read-only)' }) },
+    CLASS_BINDING_ERROR: { code: 'WF-502', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating class binding' }) },
+    HTML_BINDING_ERROR: { code: 'WF-503', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create HTML binding context' }) },
+    CONDITIONAL_UPDATE_ERROR: { code: 'WF-504', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error updating conditional context' }) },
+    CLASS_BINDING_SHAPE: { code: 'WF-505', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Class binding shape mismatch (coerced)' }) },
 
     // Action/event errors (600-699)
-    ACTION_HANDLER_ERROR: { code: 'WF-601', ...(__DEV__ && { message: 'Error in action handler' }) },
-    METHOD_ERROR: { code: 'WF-602', ...(__DEV__ && { message: 'Error in component method' }) },
-    EMIT_NO_INSTANCE: { code: 'WF-603', ...(__DEV__ && { message: 'Cannot emit - component instance not found' }) },
-    EMIT_NO_CONTEXT: { code: 'WF-604', ...(__DEV__ && { message: 'Cannot emit - component context not available' }) },
+    ACTION_HANDLER_ERROR: { code: 'WF-601', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in action handler' }) },
+    METHOD_ERROR: { code: 'WF-602', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in component method' }) },
+    EMIT_NO_INSTANCE: { code: 'WF-603', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component instance not found' }) },
+    EMIT_NO_CONTEXT: { code: 'WF-604', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component context not available' }) },
 
     // Router errors (700-799)
-    ROUTE_NOT_FOUND: { code: 'WF-701', ...(__DEV__ && { message: 'Route not found' }) },
-    ROUTE_ALIAS_ERROR: { code: 'WF-702', ...(__DEV__ && { message: 'Target route not found for alias' }) },
-    ROUTE_GUARD_ERROR: { code: 'WF-703', ...(__DEV__ && { message: 'Error in route guard' }) },
-    ROUTE_NAVIGATION_ERROR: { code: 'WF-704', ...(__DEV__ && { message: 'Navigation queue exceeded retry limit' }) },
-    NAMED_ROUTE_NOT_FOUND: { code: 'WF-705', ...(__DEV__ && { message: 'Named route not found' }) },
-    ROUTE_CONFIG_INVALID: { code: 'WF-706', ...(__DEV__ && { message: 'Invalid route configuration' }) },
-    ROUTE_ALREADY_INIT: { code: 'WF-707', ...(__DEV__ && { message: 'Router already initialized' }) },
-    ROUTE_NO_MATCH: { code: 'WF-708', ...(__DEV__ && { message: 'No route matched for path' }) },
-    ROUTE_HANDLER_ERROR: { code: 'WF-709', ...(__DEV__ && { message: 'Error in route handler' }) },
-    ROUTE_COMPONENT_ERROR: { code: 'WF-710', ...(__DEV__ && { message: 'Error loading route component' }) },
-    ROUTE_SCROLL_ERROR: { code: 'WF-711', ...(__DEV__ && { message: 'Error in scroll behavior' }) },
-    ROUTE_HOOK_ERROR: { code: 'WF-712', ...(__DEV__ && { message: 'Error in route lifecycle hook' }) },
+    ROUTE_NOT_FOUND: { code: 'WF-701', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Route not found' }) },
+    ROUTE_ALIAS_ERROR: { code: 'WF-702', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Target route not found for alias' }) },
+    ROUTE_GUARD_ERROR: { code: 'WF-703', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route guard' }) },
+    ROUTE_NAVIGATION_ERROR: { code: 'WF-704', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Navigation queue exceeded retry limit' }) },
+    NAMED_ROUTE_NOT_FOUND: { code: 'WF-705', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Named route not found' }) },
+    ROUTE_CONFIG_INVALID: { code: 'WF-706', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid route configuration' }) },
+    ROUTE_ALREADY_INIT: { code: 'WF-707', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Router already initialized' }) },
+    ROUTE_NO_MATCH: { code: 'WF-708', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'No route matched for path' }) },
+    ROUTE_HANDLER_ERROR: { code: 'WF-709', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route handler' }) },
+    ROUTE_COMPONENT_ERROR: { code: 'WF-710', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading route component' }) },
+    ROUTE_SCROLL_ERROR: { code: 'WF-711', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in scroll behavior' }) },
+    ROUTE_HOOK_ERROR: { code: 'WF-712', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route lifecycle hook' }) },
 
     // SSR errors (800-899)
-    SSR_ACTIVATION_ERROR: { code: 'WF-801', ...(__DEV__ && { message: 'Error during SSR activation' }) },
-    SSR_HYDRATION_ERROR: { code: 'WF-802', ...(__DEV__ && { message: 'Error during hydration' }) },
+    SSR_ACTIVATION_ERROR: { code: 'WF-801', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error during SSR activation' }) },
+    SSR_HYDRATION_ERROR: { code: 'WF-802', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error during hydration' }) },
 
     // Store errors (900-999)
-    STORE_NAME_INVALID: { code: 'WF-901', ...(__DEV__ && { message: 'Store component name must be a string' }) },
-    STORE_DEF_INVALID: { code: 'WF-902', ...(__DEV__ && { message: 'Store component definition must be an object' }) },
-    STORE_INIT_ERROR: { code: 'WF-903', ...(__DEV__ && { message: 'Error in store init hook' }) },
-    STORE_CREATE_ERROR: { code: 'WF-904', ...(__DEV__ && { message: 'Error creating store component' }) },
-    STORE_EXTERNAL_ERROR: { code: 'WF-905', ...(__DEV__ && { message: 'Error in external() accessing store' }) },
-    STORE_SUBSCRIPTION_ERROR: { code: 'WF-906', ...(__DEV__ && { message: 'Error in store subscription callback' }) },
-    STORE_DEFAULT_ERROR: { code: 'WF-907', ...(__DEV__ && { message: 'Failed to create default app-store' }) }
+    STORE_NAME_INVALID: { code: 'WF-901', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store component name must be a string' }) },
+    STORE_DEF_INVALID: { code: 'WF-902', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store component definition must be an object' }) },
+    STORE_INIT_ERROR: { code: 'WF-903', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in store init hook' }) },
+    STORE_CREATE_ERROR: { code: 'WF-904', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error creating store component' }) },
+    STORE_EXTERNAL_ERROR: { code: 'WF-905', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in external() accessing store' }) },
+    STORE_SUBSCRIPTION_ERROR: { code: 'WF-906', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in store subscription callback' }) },
+    STORE_DEFAULT_ERROR: { code: 'WF-907', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create default app-store' }) },
+
+    // CSP-safe expression evaluator (non-numeric codes — separate category
+    // from the 1xx-9xx ranges because they describe parser / security
+    // policy outcomes, not framework-internal errors).
+    CSP_SYNTAX: { code: 'WF-CSP-SYNTAX', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot parse expression' }) },
+    CSP_UNSUPPORTED: { code: 'WF-CSP-UNSUPPORTED', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Expression uses unsupported syntax' }) },
+    CSP_SECURITY: { code: 'WF-CSP-SECURITY', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Blocked access to restricted API' }) },
+
+    // Render-effect path resolution failures
+    EFFECT_PATH: { code: 'WF-EFFECT', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving path in render effect' }) }
 };
+
+/**
+ * Build the canonical doc URL for an error code.
+ * @param {string} code - Error code (e.g., 'WF-505')
+ * @returns {string} Full URL to the error-codes page deep-linked to the code
+ */
+function errorDocUrl(code) {
+    return `https://www.wildflowerjs.com/docs/error-codes?code=${code}`;
+}
 
 /**
  * Log an error with structured error code, context, and suggestions.
  *
  * In production builds (__DEV__ = false), outputs compact error with code + doc link.
- * In development builds (__DEV__ = true), outputs full context and suggestions.
+ * In development builds (__DEV__ = true), outputs full context and suggestions
+ * followed by the same doc link so devs can jump to the canonical reference.
  *
  * @param {Object} errorDef - Error definition from WF_ERRORS
  * @param {Object} options - Additional error context
@@ -217,13 +243,20 @@ export const WF_ERRORS = {
  * @param {string} [options.suggestion] - How to fix the issue
  * @param {Error} [options.cause] - Original error object
  * @param {Object} [options.data] - Additional data for debugging
+ * @param {boolean} [options.warn=false] - Emit via console.warn instead of
+ *   console.error. Use for diagnostic-but-recoverable conditions (coerced
+ *   bindings, blocked CSP-mode globals, etc.) that ship with a code but
+ *   shouldn't trip error-tracking pipelines.
  */
 export function wfError(errorDef, options = {}) {
-    const { context, suggestion, cause, data } = options;
+    const { context, suggestion, cause, data, warn } = options;
+    const log = warn ? console.warn.bind(console) : console.error.bind(console);
 
-    if (__DEV__) {
-        // Development: full context output
-        console.error(`[WF ${errorDef.code}] ${errorDef.message}${context ? `: ${context}` : ''}`);
+    if (typeof __DEV__ !== 'undefined' && __DEV__) {
+        // Development: full context output, including the doc URL so the
+        // canonical reference is one click away even when the inline
+        // message/suggestion already explain the issue.
+        log(`[WF ${errorDef.code}] ${errorDef.message}${context ? `: ${context}` : ''}`);
 
         if (suggestion) {
             console.warn(`  ↳ Suggestion: ${suggestion}`);
@@ -234,9 +267,10 @@ export function wfError(errorDef, options = {}) {
         if (cause) {
             console.warn(`  ↳ Caused by:`, cause.message || cause);
         }
+        console.warn(`  ↳ Docs: ${errorDocUrl(errorDef.code)}`);
     } else {
         // Production: compact error code + doc link
-        console.error(`[${errorDef.code}] https://wildflowerjs.dev/docs/error-codes?code=${errorDef.code}`);
+        log(`[${errorDef.code}] ${errorDocUrl(errorDef.code)}`);
     }
 }
 
@@ -456,10 +490,8 @@ export const pathResolver = new PathResolver();
 /**
  * ObjectUtils - Unified deep clone and equality comparison for WildflowerJS
  *
- * Consolidates _deepClone and _isEqual patterns used across:
- * - reactiveStateManager.js
- * - storeManager.js
- * - wildflowerJS.js (_cycleSafeEqual)
+ * Consolidates _deepClone and _isEqual patterns used across
+ * reactiveStateManager.js and storeManager.js.
  *
  * Features:
  * - Deep cloning with circular reference handling
