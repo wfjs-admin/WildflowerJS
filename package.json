@@ -28,7 +28,7 @@
   },
   "types": "types/wildflowerJS.d.ts",
   "scripts": {
-    "build": "echo 'Bundles ship pre-built; rebuild from source via the main repo (rollup + terser).' && exit 0",
+    "build": "node scripts/fetch-rollup.cjs && node scripts/fetch-terser.cjs && node scripts/build-rollup.cjs",
     "test": "vitest run --config tests/vitest.browser.config.js",
     "test:watch": "vitest --config tests/vitest.browser.config.js",
     "test:setup": "npx playwright install chromium"
