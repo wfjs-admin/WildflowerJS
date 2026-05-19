@@ -29,6 +29,12 @@ export default defineConfig({
     // Include only tests in tests directory
     include: ['tests/**/*.test.js', 'tests/**/*.spec.js'],
 
+    // Exclude archived tests and benchmarks (run benchmarks explicitly)
+    exclude: [
+      'tests/archive/**',
+      'tests/benchmark-*.test.js',
+    ],
+
     // Test timeout
     testTimeout: 30000,
 
