@@ -92,8 +92,8 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
 
       const button = testContainer.querySelector('#test-button')
 
-      // Verify action context was created
-      const actionContext = registry.getContextForElement(button)
+      // Verify action record was created on the element
+      const actionContext = button._actionContext
       expect(actionContext).toBeDefined()
       expect(actionContext.type).toBe('action')
       expect(actionContext.path).toBe('handleClick')
@@ -137,25 +137,25 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const listItems = getListItems(testContainer.querySelector('[data-list="items"]'))
       expect(listItems.length).toBe(3)
 
-      // Check action context for first item's remove button
+      // Check action record for first item's remove button
       const firstRemoveButton = listItems[0].querySelector('.remove-btn')
-      const removeContext = registry.getContextForElement(firstRemoveButton)
+      const removeContext = firstRemoveButton._actionContext
 
       expect(removeContext).toBeDefined()
       expect(removeContext.type).toBe('action')
       expect(removeContext.path).toBe('removeItem')
 
-      // Check action context for first item's edit button
+      // Check action record for first item's edit button
       const firstEditButton = listItems[0].querySelector('.edit-btn')
-      const editContext = registry.getContextForElement(firstEditButton)
+      const editContext = firstEditButton._actionContext
 
       expect(editContext).toBeDefined()
       expect(editContext.type).toBe('action')
       expect(editContext.path).toBe('editItem')
 
-      // Check action context for second item's buttons
+      // Check action record for second item's buttons
       const secondRemoveButton = listItems[1].querySelector('.remove-btn')
-      const secondRemoveContext = registry.getContextForElement(secondRemoveButton)
+      const secondRemoveContext = secondRemoveButton._actionContext
 
       expect(secondRemoveContext).toBeDefined()
       expect(secondRemoveContext.type).toBe('action')
@@ -186,7 +186,7 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
 
       const listItems = getListItems(testContainer.querySelector('[data-list="items"]'))
       const firstButton = listItems[0].querySelector('.action-btn')
-      const actionContext = registry.getContextForElement(firstButton)
+      const actionContext = firstButton._actionContext
 
       expect(actionContext).toBeDefined()
       expect(actionContext.parent).toBeDefined()
@@ -230,106 +230,10 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
     })
   })
 
-  describe('Binding Context Infrastructure', () => {
-    it('creates binding context for data-bind elements', async () => {
-      testContainer.innerHTML = `
-        <div data-component="binding-context-test">
-          <div id="name-display" data-bind="name"></div>
-          <div id="count-display" data-bind="count"></div>
-        </div>
-      `
-
-      wildflower.component('binding-context-test', {
-        state: {
-          name: 'Test',
-          count: 42
-        }
-      })
-
-      await waitForUpdate()
-
-      const nameDisplay = testContainer.querySelector('#name-display')
-      const countDisplay = testContainer.querySelector('#count-display')
-
-      // Verify binding contexts were created
-      const nameContext = registry.getContextForElement(nameDisplay)
-      const countContext = registry.getContextForElement(countDisplay)
-
-      expect(nameContext).toBeDefined()
-      expect(nameContext.type).toBe('binding')
-      expect(nameContext.path).toBe('name')
-
-      expect(countContext).toBeDefined()
-      expect(countContext.type).toBe('binding')
-      expect(countContext.path).toBe('count')
-    })
-
-    it('creates binding context for list item bindings', async () => {
-      testContainer.innerHTML = `
-        <div data-component="list-binding-context-test">
-          <ul data-list="items">
-            <template>
-              <li>
-                <span class="name-binding" data-bind="name"></span>
-                <span class="value-binding" data-bind="value"></span>
-              </li>
-            </template>
-          </ul>
-        </div>
-      `
-
-      wildflower.component('list-binding-context-test', {
-        state: {
-          items: [
-            { name: 'First', value: 100 },
-            { name: 'Second', value: 200 }
-          ]
-        }
-      })
-
-      await waitForCompleteRender()
-      await waitForUpdate(100)
-
-      const listItems = getListItems(testContainer.querySelector('[data-list="items"]'))
-      const firstItem = listItems[0]
-      const nameBinding = firstItem.querySelector('.name-binding')
-      const valueBinding = firstItem.querySelector('.value-binding')
-
-      // Get binding contexts
-      const nameContext = registry.getContextForElement(nameBinding)
-      const valueContext = registry.getContextForElement(valueBinding)
-
-      expect(nameContext).toBeDefined()
-      expect(valueContext).toBeDefined()
-
-      // Verify parent-child relationships
-      expect(nameContext.parent).toBeDefined()
-      expect(nameContext.parent.type).toBe('list')
-    })
-
-    it('binding contexts have correct component instance reference', async () => {
-      testContainer.innerHTML = `
-        <div data-component="binding-instance-test">
-          <div id="test-binding" data-bind="value"></div>
-        </div>
-      `
-
-      wildflower.component('binding-instance-test', {
-        state: { value: 'test' }
-      })
-
-      await waitForUpdate()
-
-      const component = testContainer.querySelector('[data-component="binding-instance-test"]')
-      const componentId = component.dataset.componentId
-      const instance = wildflower.componentInstances.get(componentId)
-
-      const bindingElement = testContainer.querySelector('#test-binding')
-      const bindingContext = registry.getContextForElement(bindingElement)
-
-      expect(bindingContext.componentInstance).toBe(instance)
-    })
-  })
+  // Removed describe('Binding Context Infrastructure') — its only test asserted
+  // list-item data-bind created a per-binding context. Per-item effects now paint
+  // list-item bindings from the row item proxy (no context); behavioral coverage
+  // lives in bindings.test.js / template-system.test.js / general.test.js.
 
   describe('List Context Infrastructure', () => {
     it('creates list context for data-list elements', async () => {
@@ -357,12 +261,12 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const componentId = component.dataset.componentId
       const instance = wildflower.componentInstances.get(componentId)
 
-      const listContexts = registry.getContextsByType('list')
-        .filter(ctx => ctx.componentInstance === instance)
-
-      expect(listContexts.length).toBeGreaterThan(0)
-
-      const listContext = listContexts[0]
+      // List contexts are plain objects tracked on the component instance
+      // (instance._listContexts) and the element (element._listContext), not in
+      // the registry type index.
+      const listContext = instance._listContexts.get('items')
+      expect(listContext).toBeDefined()
+      expect(listContext.type).toBe('list')
       expect(listContext.path).toBe('items')
       expect(listContext.data).toHaveLength(2)
     })
@@ -391,10 +295,8 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const componentId = component.dataset.componentId
       const instance = wildflower.componentInstances.get(componentId)
 
-      // Get initial list context
-      const listContexts = registry.getContextsByType('list')
-        .filter(ctx => ctx.componentInstance === instance)
-      const listContext = listContexts[0]
+      // Get initial list context (plain object on the instance map)
+      const listContext = instance._listContexts.get('items')
 
       expect(listContext.data).toHaveLength(1)
 
@@ -441,16 +343,17 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const componentId = component.dataset.componentId
       const instance = wildflower.componentInstances.get(componentId)
 
-      // Get all list contexts for this component
-      const listContexts = registry.getContextsByType('list')
-        .filter(ctx => ctx.componentInstance === instance)
+      // List contexts are plain objects tracked on the instance map (keyed by
+      // path; nested lists use a parentPath[index].childPath key).
+      const listContexts = Array.from(instance._listContexts.values())
 
       // Should have parent list + nested lists
       expect(listContexts.length).toBeGreaterThanOrEqual(1)
 
       // Find the parent list context
-      const parentListContext = listContexts.find(ctx => ctx.path === 'categories')
+      const parentListContext = instance._listContexts.get('categories')
       expect(parentListContext).toBeDefined()
+      expect(parentListContext.path).toBe('categories')
     })
   })
 
@@ -474,21 +377,15 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const componentId = component.dataset.componentId
       const instance = wildflower.componentInstances.get(componentId)
 
-      // Get contexts before destruction
-      const bindingElement = testContainer.querySelector('#binding')
+      // The action record is element-local (data-bind text is effect-driven).
       const actionElement = testContainer.querySelector('#action')
+      expect(actionElement._actionContext).toBeDefined()
+      expect(actionElement._actionContext.type).toBe('action')
 
-      const bindingContext = registry.getContextForElement(bindingElement)
-      const actionContext = registry.getContextForElement(actionElement)
-
-      expect(bindingContext).toBeDefined()
-      expect(actionContext).toBeDefined()
-
-      // Destroy the component
+      // Destroy the component — observable no-leak: the instance is gone.
       wildflower.destroyComponent(componentId)
       await waitForUpdate()
 
-      // Verify component is destroyed
       expect(wildflower.componentInstances.has(componentId)).toBe(false)
     })
 
@@ -509,19 +406,14 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const component = testContainer.querySelector('[data-component="gc-test"]')
       const componentId = component.dataset.componentId
 
-      // Get initial context count
-      const initialContextCount = registry.contexts.size
-
-      // Destroy component (orphans contexts)
+      // Destroy component, then run the public component-level GC.
       wildflower.destroyComponent(componentId)
       await waitForUpdate()
 
-      // Run garbage collection
-      if (registry.garbageCollect) {
-        const gcResult = registry.garbageCollect()
-        // GC returns the count of removed contexts
-        expect(gcResult).toBeGreaterThanOrEqual(0)
-      }
+      const gcResult = wildflower.garbageCollect()
+      expect(gcResult).toBeDefined()
+      // Observable no-leak: the destroyed component's instance is gone.
+      expect(wildflower.componentInstances.has(componentId)).toBe(false)
     })
 
     it('list item contexts are cleaned up when items are removed', async () => {
@@ -561,11 +453,6 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const listElement = component.querySelector('[data-list="cleanupItems"]')
       let listItems = getListItems(listElement)
       expect(listItems.length).toBe(3)
-
-      // Get context for first item's binding
-      const firstItemBinding = listItems[0].querySelector('span')
-      const initialContext = registry.getContextForElement(firstItemBinding)
-      expect(initialContext).toBeDefined()
 
       // Remove the first item
       const componentId = component.dataset.componentId
@@ -612,54 +499,24 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
       const componentId = component.dataset.componentId
       const instance = wildflower.componentInstances.get(componentId)
 
-      // Get contexts by type
-      const bindingContexts = registry.getContextsByType('binding')
-        .filter(ctx => ctx.componentInstance === instance)
-      const actionContexts = registry.getContextsByType('action')
-        .filter(ctx => ctx.componentInstance === instance)
-      const listContexts = registry.getContextsByType('list')
-        .filter(ctx => ctx.componentInstance === instance)
+      // Non-list binding contexts and action records are no longer
+      // registry-tracked (action records live on the element); list contexts are
+      // plain objects on the instance map.
+      const listContexts = Array.from(instance._listContexts.values())
+
+      // The button's action record is element-local now
+      const button = component.querySelector('button[data-action], button')
+      expect(button._actionContext).toBeDefined()
+      expect(button._actionContext.type).toBe('action')
 
       // Verify correct counts (at least the expected minimum)
-      expect(bindingContexts.length).toBeGreaterThanOrEqual(2) // name, value (+ list bindings)
-      expect(actionContexts.length).toBeGreaterThanOrEqual(1) // doSomething
       expect(listContexts.length).toBeGreaterThanOrEqual(1) // items
     })
 
-    it('getContextForElement returns null for unregistered elements', async () => {
-      const orphanElement = document.createElement('div')
-      orphanElement.setAttribute('data-bind', 'nonexistent')
-
-      const context = registry.getContextForElement(orphanElement)
-      expect(context).toBeNull()
-    })
-
-    it('contextsByElement map tracks element-context associations', async () => {
-      testContainer.innerHTML = `
-        <div data-component="element-map-test">
-          <div id="test-element" data-bind="value"></div>
-        </div>
-      `
-
-      wildflower.component('element-map-test', {
-        state: { value: 'test' }
-      })
-
-      await waitForUpdate()
-
-      const element = testContainer.querySelector('#test-element')
-
-      // Verify element is in the map
-      expect(registry.contextsByElement.has(element)).toBe(true)
-
-      const context = registry.contextsByElement.get(element)
-      expect(context).toBeDefined()
-      expect(context.type).toBe('binding')
-    })
   })
 
   describe('Conditional Context Infrastructure', () => {
-    it('creates conditional context for data-show elements', async () => {
+    it('applies data-show visibility for component-level elements', async () => {
       testContainer.innerHTML = `
         <div data-component="conditional-context-test">
           <div id="visible-when-true" data-show="isVisible">Visible</div>
@@ -673,15 +530,21 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
 
       await waitForUpdate()
 
+      // data-show is applied directly to the elements (no registry-tracked
+      // conditional context). With isVisible true, the positive element shows
+      // and the negated one hides.
+      const positive = testContainer.querySelector('#visible-when-true')
+      const negated = testContainer.querySelector('#visible-when-false')
+      expect(positive.style.display).not.toBe('none')
+      expect(negated.style.display).toBe('none')
+
+      // Toggling state flips both.
       const component = testContainer.querySelector('[data-component="conditional-context-test"]')
-      const componentId = component.dataset.componentId
-      const instance = wildflower.componentInstances.get(componentId)
-
-      // Get conditional contexts
-      const conditionalContexts = registry.getContextsByType('conditional')
-        .filter(ctx => ctx.componentInstance === instance)
-
-      expect(conditionalContexts.length).toBeGreaterThanOrEqual(2)
+      const instance = wildflower.componentInstances.get(component.dataset.componentId)
+      instance.state.isVisible = false
+      await waitForUpdate()
+      expect(positive.style.display).toBe('none')
+      expect(negated.style.display).not.toBe('none')
     })
 
     it('conditional context in list items', async () => {
@@ -725,31 +588,9 @@ describe.skipIf(isMinifiedBuild())('Context Infrastructure', () => {
     })
   })
 
-  describe('Model Context Infrastructure', () => {
-    it('creates binding context for data-model elements', async () => {
-      testContainer.innerHTML = `
-        <div data-component="model-context-test">
-          <input id="name-input" type="text" data-model="name">
-          <div id="name-display" data-bind="name"></div>
-        </div>
-      `
-
-      wildflower.component('model-context-test', {
-        state: { name: 'Initial' }
-      })
-
-      await waitForUpdate()
-
-      const input = testContainer.querySelector('#name-input')
-      const context = registry.getContextForElement(input)
-
-      expect(context).toBeDefined()
-      expect(context.type).toBe('binding')
-      expect(context.path).toBe('name')
-    })
-
-    // NOTE: Test "model context in list items enables two-way binding" was removed
-    // because it tested context-mode specific behavior. mapArray uses per-item effects
-    // instead of the context registry for list item bindings.
-  })
+  // Model Context Infrastructure tests were removed: non-list data-model bindings
+  // no longer create a per-binding CM context (Bucket A) — the model record lives
+  // on the element (_wfModel) and two-way binding behavior is covered by the
+  // model-modifiers / form / nested-list-form-input suites. List-item model
+  // bindings use per-item effects, not the context registry.
 })

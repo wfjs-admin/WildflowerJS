@@ -92,13 +92,7 @@ describe('Expression Evaluation', () => {
       const instance = wildflower.componentInstances.get(el.dataset.componentId)
       const indicator = testContainer.querySelector('#positive-indicator')
 
-      // Verify conditional context was created for expression
-      const registry = wildflower._contextRegistry
-      const conditionalContext = registry.getContextForElement(indicator)
-      expect(conditionalContext).toBeDefined()
-      expect(conditionalContext.type).toBe('conditional')
-      expect(conditionalContext.path).toBe('count > 0')
-
+      // data-show with an expression is applied directly (no registry context).
       // Initially count is 0, should be hidden
       expect(indicator.style.display).toBe('none')
 
@@ -262,13 +256,7 @@ describe('Expression Evaluation', () => {
       const instance = wildflower.componentInstances.get(el.dataset.componentId)
       const content = testContainer.querySelector('#show-content')
 
-      // Verify conditional context was created for AND expression
-      const registry = wildflower._contextRegistry
-      const andContext = registry.getContextForElement(content)
-      expect(andContext).toBeDefined()
-      expect(andContext.type).toBe('conditional')
-      expect(andContext.path).toBe('isReady && hasData')
-
+      // data-show with an AND expression is applied directly (no registry context).
       // Both false, should be hidden
       expect(content.style.display).toBe('none')
 

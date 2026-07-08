@@ -247,18 +247,32 @@ export const FormHandlingMethods = {
         // Guard against non-element targets (text nodes, document, etc.)
         if (!e.target || !e.target.dataset || !(e.target.dataset.model || e.target.dataset.wfModel)) return;
 
-        // Skip all custom elements — they are handled by element-level listeners
+        // Skip all custom elements; they are handled by element-level listeners
         // set up in _bindWebComponentModel (via registered adapter or smart default)
         const tagName = e.target.tagName.toLowerCase();
         if (tagName.includes('-')) {
             return;
         }
 
-        // Try to use cached modelModifiers from context (populated at bind time)
-        // Falls back to DOM reads for document-level events without a context
-        const _ctxForMods = this._contextSystemInitialized && this._contextRegistry
-            ? this._contextRegistry.getContextForElement(e.target) : null;
-        const mods = _ctxForMods?.modelModifiers;
+        // Checkboxes and radios are driven by 'change' only (matching their
+        // model-binding event). A single toggle fires both 'input' and 'change';
+        // processing both runs the model update twice, which is benign for a
+        // stable list but corrupts a filtered/computed list; the first update
+        // mutates the row and the list reconciles, so the duplicate update lands
+        // on the now-shifted item. Skip the redundant 'input' pass for these.
+        const _inputType = e.target.type;
+        if (e.type === 'input' && (_inputType === 'checkbox' || _inputType === 'radio')) {
+            return;
+        }
+
+        // Resolve the model record for this input (populated at bind time).
+        // Non-list data-model bindings carry a slim element-local record (_wfModel);
+        // list-item model bindings still resolve through the CM list context. Both
+        // expose the same shape (modelModifiers / elementMeta / _isModelBinding /
+        // path / componentInstance), so the write-back below is record-agnostic.
+        // Falls back to DOM reads for document-level events without a record.
+        const _modelRec = e.target._wfModel || null;
+        const mods = _modelRec?.modelModifiers;
 
         // Handle lazy mode: skip 'input' events, only process 'change' and 'blur'
         const isLazy = mods ? mods.lazy : e.target.hasAttribute('data-model-lazy');
@@ -276,20 +290,15 @@ export const FormHandlingMethods = {
         }
 
         // Use _getInputValue to correctly handle checkboxes, numbers, etc.
-        const currentValue = this._getInputValue(e.target, true, _ctxForMods?.elementMeta, mods);
+        const currentValue = this._getInputValue(e.target, true, _modelRec?.elementMeta, mods);
         if (currentValue === undefined) return; // Skip unchecked radio buttons
 
-        // CONTEXT-BASED APPROACH: First try to resolve through context system
-        if (this._contextSystemInitialized && this._contextRegistry)
+        // Resolve the write-back through the model record (element-local OR CM
+        // list context; _updateModelValue accepts either).
+        if (_modelRec && _modelRec._isModelBinding)
         {
-            // Reuse context already looked up above
-            const bindingContext = _ctxForMods;
-
-            if (bindingContext && bindingContext._isModelBinding)
-            {
-                this._updateModelValue(bindingContext, currentValue);
-                return;
-            }
+            this._updateModelValue(_modelRec, currentValue);
+            return;
         }
 
 
@@ -455,17 +464,13 @@ export const FormHandlingMethods = {
                     const value = this._getInputValue(input);
                     if (value === undefined) return; // Skip unchecked radios
 
-                    // MAPARRAY MODE: Use direct mutation instead of batched update
-                    if (listElement._mapArrayInitialized && instance.state[listPath]) {
-                        const item = instance.state[listPath][itemIndex];
-                        if (item) {
-                            this._applyMapArrayMutation(item, modelPath, value);
-                        }
-                        return;
+                    // List row model write-back: mutate the reactive item proxy
+                    // directly (the same proxy the render effect tracks), so the
+                    // set propagates through the graph.
+                    const item = instance.state[listPath]?.[itemIndex];
+                    if (item) {
+                        this._applyMapArrayMutation(item, modelPath, value);
                     }
-
-                    // Use our context-aware method for updating
-                    this._updateListItemProperty(input, instance, listPath, itemIndex, modelPath, value);
                     return; // Skip standard handling
                 }
             }
@@ -544,16 +549,12 @@ export const FormHandlingMethods = {
                 // Build full path for nested lists (e.g., teams.1.players)
                 const { fullPath: listPath, itemIndex } = this._buildNestedListPath(listElement, listItem);
 
-                // MAPARRAY MODE: Use direct mutation instead of batched update
-                if (listElement._mapArrayInitialized) {
-                    const listData = instance.stateManager?.getValue(listPath);
-                    if (Array.isArray(listData) && listData[itemIndex]) {
-                        this._applyMapArrayMutation(listData[itemIndex], modelPath, value);
-                        return;
-                    }
+                // List row model write-back via direct proxy mutation (the same
+                // proxy the render effect tracks; getValue handles nested paths).
+                const listData = instance.stateManager?.getValue(listPath);
+                if (Array.isArray(listData) && listData[itemIndex]) {
+                    this._applyMapArrayMutation(listData[itemIndex], modelPath, value);
                 }
-
-                this._updateListItemProperty(input, instance, listPath, itemIndex, modelPath, value);
                 return;
             }
         }
@@ -676,7 +677,7 @@ export const FormHandlingMethods = {
     {
         // Use the browser's native Constraint Validation API
         // This covers required, type (email/url/number), min, max, step,
-        // minlength, maxlength, pattern — and any future HTML5 constraints
+        // minlength, maxlength, pattern, and any future HTML5 constraints
         if (!input.validity.valid)
         {
             return input.validationMessage || 'This field is invalid';
@@ -759,7 +760,7 @@ export const FormHandlingMethods = {
     /**
      * Handle blur/change validation for forms with data-validate-on.
      * On focusout: validates only if "blur" is in the trigger list.
-     * On change: always validates — selects, checkboxes, and radios are
+     * On change: always validates; selects, checkboxes, and radios are
      * deliberate, complete actions that should clear errors immediately.
      * @param {Event} e - The focusout or change event
      * @private
@@ -877,7 +878,7 @@ export const FormHandlingMethods = {
         const handler = (e) =>
         {
             // Value extraction: for non-value properties (e.g. 'checked'), always
-            // read from the element directly — e.detail.value would return the HTML
+            // read from the element directly; e.detail.value would return the HTML
             // value attribute (e.g. "" or "on") instead of the boolean checked state.
             let value;
             if (valueProp !== 'value') {
@@ -932,10 +933,10 @@ export const FormHandlingMethods = {
      */
     _bindStandardModel(element, instance, path)
     {
-        // Initial value setting only — event handling is delegated to
+        // Initial value setting only; event handling is delegated to
         // document-level _handleInputChange (capture phase)
 
-        // Skip for list items — they get values from item data during rendering
+        // Skip for list items; they get values from item data during rendering
         const listItemParent = this._findListItemAncestor(element);
         if (listItemParent) {
             return;
@@ -953,7 +954,7 @@ export const FormHandlingMethods = {
 
     // ========================================================================
     // LIST FORM SUBMISSION DELEGATION
-    // (Moved from EventSystem.js — form-specific event handling)
+    // (Moved from EventSystem.js: form-specific event handling)
     // ========================================================================
 
     /**
@@ -978,12 +979,9 @@ export const FormHandlingMethods = {
             // In that case, fall back to context registry lookup
             let actionAttr = this._getAttr(form, 'action');
 
-            // If no attribute, try context registry (for stripped templates)
-            if (!actionAttr && this._contextRegistry) {
-                const actionContext = this._contextRegistry.getContextForElement(form, 'action');
-                if (actionContext && actionContext.path) {
-                    actionAttr = actionContext.path;
-                }
+            // If no attribute, try the element-local action record (for stripped templates)
+            if (!actionAttr && form._actionContext && form._actionContext.path) {
+                actionAttr = form._actionContext.path;
             }
 
             if (!actionAttr) return;
@@ -1028,45 +1026,30 @@ export const FormHandlingMethods = {
             // Find the list item and build details
             const listItem = this._findListItemForAction(form, closestList);
 
-            if (listItem && closestList._listContext)
+            if (listItem && listItem._listIndex !== undefined && listItem._itemData !== undefined)
             {
-                const currentListContext = closestList._listContext;
-                const itemIndex = listItem._listIndex;
+                // Build the detail off the row's reactive item-proxy + getValue,
+                // same as regular list actions (one-graph absorption); falls
+                // through to the no-detail fallback when the list does not
+                // resolve cleanly.
+                const detail = this._buildListActionDetail(listItem, targetInstance);
 
-                if (typeof itemIndex === 'number')
+                if (detail)
                 {
-                    const listData = currentListContext.resolveData();
-
-                    if (Array.isArray(listData) && itemIndex >= 0 && itemIndex < listData.length)
+                    try
                     {
-                        const detail = {
-                            index: itemIndex,
-                            item: listData[itemIndex],
-                            list: listData,
-                            length: listData.length,
-                            first: itemIndex === 0,
-                            last: itemIndex === listData.length - 1,
-                            context: currentListContext
-                        };
-
-                        // Build parent context chain for nested lists
-                        this._buildParentListChain(detail, currentListContext);
-
-                        try
-                        {
-                            targetInstance.context[methodName](event, form, detail);
-                        }
-                        catch (error)
-                        {
-                            this._handleError(
-                                `Error in form action handler '${methodName}'`,
-                                error,
-                                targetInstance,
-                                { actionName: methodName, lifecycle: 'action' }
-                            );
-                        }
-                        return;
+                        targetInstance.context[methodName](event, form, detail);
                     }
+                    catch (error)
+                    {
+                        this._handleError(
+                            `Error in form action handler '${methodName}'`,
+                            error,
+                            targetInstance,
+                            { actionName: methodName, lifecycle: 'action' }
+                        );
+                    }
+                    return;
                 }
             }
 

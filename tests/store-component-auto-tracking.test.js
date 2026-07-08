@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework, isMinifiedBuild} from './helpers/load-framework.js'
+import { loadFramework, resetFramework } from './helpers/load-framework.js'
 
 // Helper to wait for framework processing
 async function waitForUpdate(ms = 50) {
@@ -61,168 +61,11 @@ describe('Store-Component Automatic Dependency Tracking', () => {
     }
   })
 
-  describe('Tracking Context Setup', () => {
-    it.skipIf(isMinifiedBuild())('sets tracking context during computed evaluation', async () => {
-      // Create a store
-      wildflower.store('tracking-test', {
-        state: { value: 42 }
-      })
-
-      // Register component with computed that accesses store
-      wildflower.component('tracking-observer', {
-        computed: {
-          storeValue() {
-            // During this evaluation, _computedTrackingContext should be set
-            const store = wildflower.getStore('tracking-test')
-            return store.state.value
-          }
-        }
-      })
-
-      testContainer.innerHTML = `
-        <div data-component="tracking-observer">
-          <span data-bind="computed:storeValue"></span>
-        </div>
-      `
-
-      wildflower.scan()
-      await waitForUpdate()
-
-      const instance = getComponentInstance('[data-component="tracking-observer"]')
-      expect(instance).toBeDefined()
-
-      // Verify the computed was evaluated
-      const value = instance.stateManager.evaluateComputed('storeValue')
-      expect(value).toBe(42)
-
-      // Tracking context should be null outside of evaluation
-      expect(wildflower._computedTrackingContext).toBeNull()
-    })
-
-    it.skipIf(isMinifiedBuild())('tracking context does not leak after computed evaluation', async () => {
-      // The behavioral concern: after a computed that reads a store finishes
-      // evaluating, subsequent non-computed store access should NOT accidentally
-      // register as a computed dependency.
-      wildflower.store('leak-test', {
-        state: { value: 'initial' }
-      })
-      wildflower.store('unrelated-store', {
-        state: { other: 'data' }
-      })
-
-      wildflower.component('leak-checker', {
-        subscribe: { 'leak-test': ['value'] },
-        computed: {
-          derived() {
-            return this.stores['leak-test']?.value + '!'
-          }
-        }
-      })
-
-      testContainer.innerHTML = `
-        <div data-component="leak-checker">
-          <span id="derived" data-bind="computed:derived"></span>
-        </div>
-      `
-
-      wildflower.scan()
-      await waitForUpdate()
-
-      expect(testContainer.querySelector('#derived').textContent).toBe('initial!')
-
-      // After computed eval completes, tracking context should be cleared
-      expect(wildflower._computedTrackingContext).toBeNull()
-
-      // Non-computed store access should not pollute dependencies
-      const unrelated = wildflower.getStore('unrelated-store')
-      const val = unrelated.state.other
-      expect(val).toBe('data')
-
-      // Update the subscribed store — component should still react
-      const store = wildflower.getStore('leak-test')
-      store.state.value = 'updated'
-      await waitForUpdate()
-
-      expect(testContainer.querySelector('#derived').textContent).toBe('updated!')
-    })
-  })
-
-  describe('Automatic Dependency Registration', () => {
-    it.skipIf(isMinifiedBuild())('automatically registers component as dependent when accessing store.state', async () => {
-      const store = wildflower.store('auto-dep-store', {
-        state: { count: 0 }
-      })
-
-      wildflower.component('auto-dep-component', {
-        computed: {
-          currentCount() {
-            // This should automatically register the dependency
-            return wildflower.getStore('auto-dep-store').state.count
-          }
-        }
-      })
-
-      testContainer.innerHTML = `
-        <div data-component="auto-dep-component">
-          <span class="count-display" data-bind="computed:currentCount"></span>
-        </div>
-      `
-
-      wildflower.scan()
-      await waitForUpdate()
-      const instance = getComponentInstance('[data-component="auto-dep-component"]')
-
-      // Verify initial render
-      const countDisplay = testContainer.querySelector('.count-display')
-      expect(countDisplay.textContent).toBe('0')
-
-      // Get the store instance to find its ID
-      const storeInstance = wildflower.storeManager._namedStores.get('auto-dep-store')
-      expect(storeInstance).toBeDefined()
-
-      // Verify dependency was registered
-      const dependents = wildflower._getEntityDependents(storeInstance.id)
-      expect(dependents.has(instance.id)).toBe(true)
-    })
-
-    it.skipIf(isMinifiedBuild())('automatically registers component as dependent when accessing store.computed', async () => {
-      wildflower.store('computed-dep-store', {
-        state: { items: [1, 2, 3] },
-        computed: {
-          itemCount() {
-            return this.state.items.length
-          }
-        }
-      })
-
-      wildflower.component('computed-dep-component', {
-        computed: {
-          displayCount() {
-            return wildflower.getStore('computed-dep-store').computed.itemCount
-          }
-        }
-      })
-
-      testContainer.innerHTML = `
-        <div data-component="computed-dep-component">
-          <span class="item-count" data-bind="computed:displayCount"></span>
-        </div>
-      `
-
-      wildflower.scan()
-      await waitForUpdate()
-      const instance = getComponentInstance('[data-component="computed-dep-component"]')
-
-      // Verify initial render
-      const itemCount = testContainer.querySelector('.item-count')
-      expect(itemCount.textContent).toBe('3')
-
-      // Verify dependency was registered
-      const storeInstance = wildflower.storeManager._namedStores.get('computed-dep-store')
-      const dependents = wildflower._getEntityDependents(storeInstance.id)
-      expect(dependents.has(instance.id)).toBe(true)
-    })
-  })
+  // (The RSM-internal "Tracking Context Setup" and "Automatic Dependency
+  // Registration" blocks that lived here probed _computedTrackingContext /
+  // _getEntityDependents — bookkeeping Meadow eliminates by linking store leaf
+  // nodes directly in the one shared graph. The observable auto-tracking behavior
+  // is covered by the blocks below.)
 
   describe('Automatic Reactivity Without Manual Subscription', () => {
     it('component computed updates when store state changes (no manual subscribe)', async () => {

@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest';
-import { loadFramework, resetFramework, waitForUpdate, waitForCompleteRender, isMinifiedBuild, initContextSystem } from './helpers/load-framework.js';
+import { loadFramework, resetFramework, waitForUpdate, waitForCompleteRender, initContextSystem } from './helpers/load-framework.js';
 
 describe('Computed Stability Promotion', () => {
     let testContainer;
@@ -86,14 +86,13 @@ describe('Computed Stability Promotion', () => {
         instance.state.a = 10;
         await waitForCompleteRender();
 
-        // Verify node is STABLE
-        const STABLE = 1;
-        const node = rsm._computedNodes && rsm._computedNodes.get('result');
-        expect(node).toBeTruthy();
-        expect(node.flags & STABLE).toBeTruthy();
-        expect(node.deps).not.toContain('c');
+        // Meadow has no STATIC/STABLE/DYNAMIC tier ladder and no _computedNodes;
+        // it retracks deps on every evaluation, so the stale-baked-deps bug this
+        // test guards against cannot occur. The behavioral assertions below (the
+        // computed returns the correct value after the conditional branch + its
+        // newly-relevant dep change) are what matter.
 
-        // Switch useB=false → _updateNode calculates correct result but keeps wrong deps
+        // Switch useB=false → recompute calculates correct result with fresh deps
         instance.state.useB = false;
         await waitForCompleteRender();
 
@@ -164,22 +163,15 @@ describe('Computed Stability Promotion', () => {
         instance.state.a = 10;
         await waitForCompleteRender();
 
-        // Verify promoted to STABLE
-        const STABLE = 1;
-        const DYNAMIC = 8;
-        const node = rsm._computedNodes && rsm._computedNodes.get('muxResult');
-        expect(node).toBeTruthy();
-        expect(node.flags & STABLE).toBeTruthy();
+        // (RSM promoted this computed to STABLE here; Meadow has no tier ladder.
+        // What matters behaviorally is that flipping the condition re-tracks the
+        // newly-relevant dependency, asserted below.)
 
-        // Flip condition — deps change from {cond, a} to {cond, b}
-        // _updateNode should detect this and demote to DYNAMIC
+        // Flip condition — deps change from {cond, a} to {cond, b}; the recompute
+        // must re-track so the computed reacts to b.
         instance.state.cond = false;
         await waitForCompleteRender();
         expect(rsm.evaluateComputed('muxResult')).toBe(60); // b=20 * 3
-
-        // Verify node was demoted to DYNAMIC
-        expect(node.flags & DYNAMIC).toBeTruthy();
-        expect(node.flags & STABLE).toBeFalsy();
 
         // NOW: condition stays false, only change b
         // This is the critical test — if dep tracking failed, the computed

@@ -81,10 +81,11 @@ describe('Effect cleanup on component destroy', () => {
         }
 
         // Sanity: we should be capturing both instance-scoped framework
-        // effects (_renderEffect) AND RSM-internal effects (mapArray
-        // structural + per-row item effects). Three rows + structural +
-        // user effect + render effect → at least 6.
-        expect(snapshot.size).toBeGreaterThan(4)
+        // effects (_renderEffect) AND RSM-internal effects (the mapArray
+        // structural effect). Per-row effects no longer exist (P4-S6: rows
+        // update through the per-list dispatcher), so the floor is
+        // structural + user effect + render effect → at least 3.
+        expect(snapshot.size).toBeGreaterThan(2)
 
         // Detach + destroy.
         compEl.remove()

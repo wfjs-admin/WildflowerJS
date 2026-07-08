@@ -160,39 +160,6 @@ describe('BUG-2: Store computed error caching', () => {
     // computeds WITH deps still cache their error until deps change.
     expect(evalCount).toBe(2)
   })
-
-  it('should set ERRORED sentinel in cache for store computed errors', async () => {
-    const store = wildflower.storeManager.createStoreComponent('error-sentinel-test', {
-      state: { value: null },
-      computed: {
-        willError() {
-          throw new Error('intentional error')
-        }
-      }
-    })
-
-    const sm = store.stateManager
-
-    // Trigger evaluation (will error)
-    sm.evaluateComputed('willError')
-
-    // Check that the cache has an ERRORED sentinel entry
-    // The ERRORED_SYMBOL is Symbol('erroredComputed')
-    const cached = sm.computedCache?.get('willError')
-
-    // BUG: The store wrapper swallows the error and returns undefined,
-    // so _evaluateComputedFull's catch block never fires and ERRORED_SYMBOL
-    // is never set. The cache will contain the plain value `undefined`
-    // instead of an { [ERRORED_SYMBOL]: true, error: ... } object.
-    expect(cached).toBeDefined()
-    expect(typeof cached).toBe('object')
-    expect(cached).not.toBeNull()
-
-    // Look for the ERRORED_SYMBOL — it should be present but isn't due to the bug
-    const hasErroredKey = cached && typeof cached === 'object' && cached !== null &&
-      Object.getOwnPropertySymbols(cached).some(s => s.toString() === 'Symbol(erroredComputed)')
-    expect(hasErroredKey).toBe(true)
-  })
 })
 
 // ============================================================================

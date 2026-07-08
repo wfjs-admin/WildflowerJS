@@ -1143,9 +1143,9 @@ describe('Error Boundaries', () => {
       wildflower._contextSystemInitialized = false
       wildflower._contextRegistry = undefined
 
-      // Should not throw
+      // Should not throw destroying with the context system torn down
       expect(() => {
-        wildflower._notifyComponentDestroyed(compId)
+        wildflower.destroyComponent(compId)
       }).not.toThrow()
 
       // Restore

@@ -58,9 +58,10 @@ export const PortalSystemMethods = {
 
         if (!listContext) return null;
 
-        // Resolve fresh data from list context
-        const data = listContext.resolveData();
-        const itemData = Array.isArray(data) && index >= 0 && index < data.length ? data[index] : null;
+        // The row's reactive item-proxy is the live item; read it straight off
+        // the row element instead of resolving the list context by index. Being
+        // the reactive proxy, it stays fresh for downstream reads (no snapshot).
+        const itemData = listItem._itemData || null;
 
         const listItemContext = {
             listContext: listContext,
@@ -226,25 +227,20 @@ export const PortalSystemMethods = {
      */
     _evaluateConditionWithListContext(condition, instance, listItemContext)
     {
-        // If we have list item context, get FRESH data from the list context
-        // (not the cached itemData snapshot which may be stale)
-        if (listItemContext && listItemContext.listContext && listItemContext.index !== undefined) {
-            const listData = listItemContext.listContext.resolveData();
-            const index = listItemContext.index;
+        // itemData is the reactive item-proxy (set in _getListItemContextForPortal),
+        // so it is always live; read it directly, no list-context re-resolve.
+        if (listItemContext && listItemContext.index !== undefined) {
+            const freshItemData = listItemContext.itemData;
 
-            if (Array.isArray(listData) && index >= 0 && index < listData.length) {
-                const freshItemData = listData[index];
-
+            if (freshItemData) {
                 // Check if the condition path exists in item data
-                if (freshItemData && condition in freshItemData) {
+                if (condition in freshItemData) {
                     return !!freshItemData[condition];
                 }
                 // Also check nested paths
-                if (freshItemData) {
-                    const value = this._getNestedValue(freshItemData, condition);
-                    if (value !== undefined) {
-                        return !!value;
-                    }
+                const value = this._getNestedValue(freshItemData, condition);
+                if (value !== undefined) {
+                    return !!value;
                 }
             }
         }
@@ -377,47 +373,46 @@ export const PortalSystemMethods = {
                 portalListItemContextCache.set(bindingElement, listItemContext);
             }
 
-            // Create binding context with list context as parent if available
-            // CRITICAL: Pass index to generate unique context ID per list item
-            let bindingContext;
+            // List-item portal bindings get a plain record with the row's list
+            // context as parent (the component render effect can't reach teleported
+            // list rows). Component-level bindings are driven by the deferred effect
+            // meta below; they create no record (the old item-level call always
+            // returned null for them).
+            // CRITICAL: Pass index for row-scoped resolution.
+            let bindingContext = null;
             if (listItemContext && listItemContext.listContext) {
-                bindingContext = this._contextRegistry.createBindingContext(
+                bindingContext = this._contextRecords.createPortalBindingRecord(
                     bindPath,
                     instance,
                     bindingElement,
                     listItemContext.listContext,  // Use list context as parent
-                    listItemContext.index  // Ensures unique ID: parentId[index]:path
+                    listItemContext.index  // parent + index for row-scoped resolution
                 );
                 if (bindingContext) {
                     bindingContext._parentIndex = listItemContext.index;
                     bindingContext._portalListItemContext = listItemContext;
+                    (instance._portalBindingRecords || (instance._portalBindingRecords = [])).push(bindingContext);
                 }
-            } else {
-                bindingContext = this._contextRegistry._createItemLevelContext({
-                    element: bindingElement,
-                    contextType: 'binding',
-                    path: bindPath,
-                    instance,
-                    createMethod: this._contextRegistry.createBindingContext.bind(this._contextRegistry)
-                });
             }
 
-            // Mark as processed
-            if (bindingContext) {
-                bindingContextCache.set(bindingElement, bindingContext);
-                // Build deferred effect metadata (component-level portals only)
-                if (!listItemContext) {
-                    if (!instance._deferredEffectMeta) instance._deferredEffectMeta = [];
-                    const entry = {
-                        element: bindingElement,
-                        type: 'bind',
-                        path: bindPath,
-                        isInput: bindingElement.tagName === 'INPUT' || bindingElement.tagName === 'TEXTAREA' || bindingElement.tagName === 'SELECT',
-                        isExpression: this.isExpression(bindPath) || bindPath.includes('$')
-                    };
-                    if (bindingElement.tagName.includes('-')) entry.isWebComponent = true;
-                    instance._deferredEffectMeta.push(entry);
-                }
+            // Mark as processed (cache stores the record when present, else a truthy
+            // marker; it's a dedup set, never read back as a context).
+            bindingContextCache.set(bindingElement, bindingContext || true);
+
+            // Build deferred effect metadata (component-level portals only). This drives
+            // ongoing reactivity through the render effect, INDEPENDENT of whether a binding
+            // context exists, so the portal stays reactive as context creation is retired.
+            if (!listItemContext) {
+                if (!instance._deferredEffectMeta) instance._deferredEffectMeta = [];
+                const entry = {
+                    element: bindingElement,
+                    type: 'bind',
+                    path: bindPath,
+                    isInput: bindingElement.tagName === 'INPUT' || bindingElement.tagName === 'TEXTAREA' || bindingElement.tagName === 'SELECT',
+                    isExpression: this.isExpression(bindPath) || bindPath.includes('$')
+                };
+                if (bindingElement.tagName.includes('-')) entry.isWebComponent = true;
+                instance._deferredEffectMeta.push(entry);
             }
         });
 
@@ -425,44 +420,38 @@ export const PortalSystemMethods = {
         if (contentElement.dataset && contentElement.dataset.bind) {
             const bindPath = contentElement.dataset.bind;
             if (!bindingContextCache.has(contentElement)) {
-                // CRITICAL: Pass index to generate unique context ID per list item
-                let bindingContext;
+                // List-item: plain record with the row's list context as parent.
+                // Component-level: no record (deferred effect meta drives it).
+                // CRITICAL: Pass index for row-scoped resolution.
+                let bindingContext = null;
                 if (listItemContext && listItemContext.listContext) {
-                    bindingContext = this._contextRegistry.createBindingContext(
+                    bindingContext = this._contextRecords.createPortalBindingRecord(
                         bindPath,
                         instance,
                         contentElement,
                         listItemContext.listContext,
-                        listItemContext.index  // Ensures unique ID: parentId[index]:path
+                        listItemContext.index  // parent + index for row-scoped resolution
                     );
                     if (bindingContext) {
                         bindingContext._parentIndex = listItemContext.index;
                         bindingContext._portalListItemContext = listItemContext;
+                        (instance._portalBindingRecords || (instance._portalBindingRecords = [])).push(bindingContext);
                     }
-                } else {
-                    bindingContext = this._contextRegistry._createItemLevelContext({
-                        element: contentElement,
-                        contextType: 'binding',
-                        path: bindPath,
-                        instance,
-                        createMethod: this._contextRegistry.createBindingContext.bind(this._contextRegistry)
-                    });
                 }
-                if (bindingContext) {
-                    bindingContextCache.set(contentElement, bindingContext);
-                    // Build deferred effect metadata (component-level portals only)
-                    if (!listItemContext) {
-                        if (!instance._deferredEffectMeta) instance._deferredEffectMeta = [];
-                        const entry = {
-                            element: contentElement,
-                            type: 'bind',
-                            path: bindPath,
-                            isInput: contentElement.tagName === 'INPUT' || contentElement.tagName === 'TEXTAREA' || contentElement.tagName === 'SELECT',
-                            isExpression: this.isExpression(bindPath) || bindPath.includes('$')
-                        };
-                        if (contentElement.tagName.includes('-')) entry.isWebComponent = true;
-                        instance._deferredEffectMeta.push(entry);
-                    }
+                bindingContextCache.set(contentElement, bindingContext || true);
+                // Build deferred effect metadata (component-level portals only),
+                // independent of the binding context (the effect drives reactivity).
+                if (!listItemContext) {
+                    if (!instance._deferredEffectMeta) instance._deferredEffectMeta = [];
+                    const entry = {
+                        element: contentElement,
+                        type: 'bind',
+                        path: bindPath,
+                        isInput: contentElement.tagName === 'INPUT' || contentElement.tagName === 'TEXTAREA' || contentElement.tagName === 'SELECT',
+                        isExpression: this.isExpression(bindPath) || bindPath.includes('$')
+                    };
+                    if (contentElement.tagName.includes('-')) entry.isWebComponent = true;
+                    instance._deferredEffectMeta.push(entry);
                 }
             }
         }
@@ -482,8 +471,7 @@ export const PortalSystemMethods = {
         // Process data-bind-class elements (children + self)
         this._processPortalBindingType(contentElement, instance, '[data-bind-class]', 'bindClass', classBindingContextCache, (el, ctx) => {
             ctx._isClassBinding = true;
-            const value = ctx.resolveData();
-            ctx._updateClassBindingElement(value);
+            ctx._updateClassBindingElement(this._resolvePortalBindingValue(ctx));
         }, metaFlag ? 'class' : null);
 
         // Process data-bind-style elements (children + self)
@@ -512,9 +500,10 @@ export const PortalSystemMethods = {
             const path = el.dataset[datasetKey];
             if (!path || contextCache.has(el)) continue;
 
-            const ctx = this._contextRegistry.createBindingContext(path, instance, el);
+            const ctx = this._contextRecords.createPortalBindingRecord(path, instance, el);
             if (ctx) {
                 contextCache.set(el, ctx);
+                (instance._portalBindingRecords || (instance._portalBindingRecords = [])).push(ctx);
                 postProcess(el, ctx, path);
                 // Build deferred effect metadata (component-level portals only)
                 if (metaType) {
@@ -537,20 +526,65 @@ export const PortalSystemMethods = {
      */
     _renderPortalBindings(instance)
     {
-        if (!this._contextSystemInitialized || !this._contextRegistry) return;
+        // Paint the instance's portal binding records (list-item bindings + the
+        // class/style/html writers). Component-level text bindings are NOT here;
+        // they're driven by the component render effect via the deferred effect
+        // meta. Records live on the instance, so this is O(portal-bindings).
+        const records = instance._portalBindingRecords;
+        if (!records) return;
 
-        // PERF: iterate the per-component index instead of scanning every
-        // binding context in the whole app and filtering by componentId.
-        // The old path was O(total-bindings) per portal teleport; this is
-        // O(bindings-in-this-component).
-        const componentContexts = this._contextRegistry.contextsByComponent?.get(instance.id);
-        if (!componentContexts) return;
-
-        for (const ctx of componentContexts.values()) {
-            if (ctx.type === 'binding') {
-                this._updateBindingContext(ctx);
-            }
+        // Compact in place: drop records whose element has been detached (its
+        // list row was removed / the portal torn down). List-item portal records
+        // are never otherwise pruned and would pin detached DOM + a parent item
+        // proxy for the component's lifetime (with a frozen _parentIndex that, on
+        // re-teleport, would paint the wrong row's data into a detached node).
+        let write = 0;
+        for (let i = 0; i < records.length; i++) {
+            const ctx = records[i];
+            const el = ctx && ctx.element;
+            if (!el || !el.isConnected) continue;
+            records[write++] = ctx;
+            this._updateBindingContext(ctx);
         }
+        records.length = write;
+    },
+    /**
+     * Resolve a portal binding's current value through the single graph.
+     * Component-level bindings (parentIndex undefined) use the SAME resolution the
+     * render effect uses (getValue for simple paths, _resolveEffectExpression for
+     * expressions / $store refs), so the portal's one-shot teleport paint can't
+     * diverge from the effect's ongoing updates. List-item portal contexts
+     * (parentIndex set) resolve the path against the row item via the shared
+     * binding resolver (the same resolution resolveData performs internally),
+     * sourcing the item from the parent list context's data + index (a portal
+     * teleports its element out of the row, so the DOM ancestor is gone).
+     * @param {Object} bindingContext
+     * @returns {*} resolved value
+     * @private
+     */
+    _resolvePortalBindingValue(bindingContext)
+    {
+        const inst = bindingContext.componentInstance;
+        const path = bindingContext.path;
+        if (bindingContext._parentIndex === undefined && inst && inst.stateManager) {
+            return (this.isExpression(path) || path.includes('$'))
+                ? this._resolveEffectExpression(path, inst)
+                : inst.stateManager.getValue(path);
+        }
+        const parent = bindingContext.parent;
+        const idx = bindingContext._parentIndex;
+        const parentData = parent && Array.isArray(parent.data) ? parent.data : null;
+        const item = (parentData && idx !== undefined && idx < parentData.length)
+            ? parentData[idx] : undefined;
+        const scope = {
+            componentState: inst?.state || {},
+            componentInstance: inst,
+            itemIndex: idx,
+            listLength: parentData ? parentData.length : 0,
+            listContext: parent,
+            propsData: inst?._propsData
+        };
+        return this._resolveRawBinding(path, item, scope);
     },
     /**
      * Update a single binding context with current value
@@ -563,11 +597,15 @@ export const PortalSystemMethods = {
         const path = bindingContext.path;
 
         if (!element || !path) return;
+        // Don't write to a detached element. The class path guards via
+        // isElementAttached inside _updateClassBindingElement; the text/value
+        // path below had no such guard and would paint a removed/teleported-away
+        // node.
+        if (!element.isConnected) return;
 
-        // Skip class bindings - they don't update textContent
+        // Class bindings: resolve via the single graph, write through the class writer.
         if (bindingContext._isClassBinding) {
-            const value = bindingContext.resolveData();
-            bindingContext._updateClassBindingElement(value);
+            bindingContext._updateClassBindingElement(this._resolvePortalBindingValue(bindingContext));
             return;
         }
 
@@ -577,8 +615,7 @@ export const PortalSystemMethods = {
         }
 
         try {
-            // Use the binding context's resolveData() which handles list item context properly
-            let value = bindingContext.resolveData();
+            const value = this._resolvePortalBindingValue(bindingContext);
 
             // Update the element
             if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
@@ -654,7 +691,7 @@ export const PortalSystemMethods = {
             // Create action context if context system is available
             let actionContext;
             if (this._contextSystemInitialized) {
-                actionContext = this._contextRegistry.createActionContext(
+                actionContext = this._contextRecords.createActionContext(
                     methodName,
                     instance,
                     actionEl,

@@ -534,9 +534,16 @@ describe('Store → Computed → List Chain', () => {
     store.state.items.push({ id: 2, name: 'Added' })
     await waitForCompleteRender()
 
-    // Verify list rendered the new item
+    // Verify the store→computed→list chain delivered the pushed item. The
+    // `storeItems` computed returns the items array BY IDENTITY, so a length-only
+    // push does not change its value — under lazy graph evaluation it correctly
+    // does NOT re-run, yet the data-list still reconciles via its structural
+    // (length) dependency. Assert the user-facing outcome (rendered data) rather
+    // than the computed re-running, which was an artifact of the old unconditional
+    // eager re-eval (removed: ReactiveGraph propagates store changes via tracked
+    // graph edges, not a blanket force-eval).
     expect(testContainer.querySelectorAll('.item').length).toBe(2)
-    // The computed should have been called at least once after the store update
-    expect(callOrder).toContain('computed')
+    expect(Array.from(testContainer.querySelectorAll('.item')).map(e => e.textContent))
+      .toEqual(['Initial', 'Added'])
   })
 })

@@ -16,7 +16,7 @@
 const RAW_TARGET = Symbol('contextProxy.rawTarget');
 
 /**
- * Essential framework properties that ALWAYS win over state — these are
+ * Essential framework properties that ALWAYS win over state; these are
  * core to framework operation and cannot be shadowed by user state.
  * Used by the ContextProxy to decide collision resolution.
  */
@@ -30,7 +30,7 @@ const ESSENTIAL_FRAMEWORK_PROPERTIES = new Set([
 ]);
 
 /**
- * All framework-reserved property names — includes essential properties
+ * All framework-reserved property names: includes essential properties
  * plus those where state is allowed to win on collision (parent, listItem,
  * name, reset). Used for dev-mode collision warnings so users know their
  * state property shares a name with a framework property.
@@ -61,7 +61,7 @@ function createContextProxy(rawContext, stateManager) {
 
             // Own properties on raw context (framework props, methods).
             // For non-essential framework properties (parent, listItem, etc.),
-            // state wins when both exist — prevents framework-injected values
+            // state wins when both exist; prevents framework-injected values
             // from shadowing user state with the same key.
             if (prop in target) {
                 if (typeof prop === 'string' && !ESSENTIAL_FRAMEWORK_PROPERTIES.has(prop) &&
@@ -74,13 +74,6 @@ function createContextProxy(rawContext, stateManager) {
 
             // Computed (precedence over state, matching template resolution)
             if (stateManager.computed && stateManager.computed[prop]) {
-                // Track computed-to-computed dependency (same as this.computed proxy)
-                // PERF: Lightweight tracking for _updateNode dep comparison.
-                if (stateManager._nodeTrackingSet) {
-                    stateManager._nodeTrackingSet.add(`computed:${prop}`);
-                } else if (stateManager.activeComputation) {
-                    stateManager._trackDependency(`computed:${prop}`);
-                }
                 return stateManager.evaluateComputed(prop);
             }
 
@@ -109,7 +102,7 @@ function createContextProxy(rawContext, stateManager) {
 
             // Block computed writes (dev warning, no-op)
             if (stateManager.computed && stateManager.computed[prop]) {
-                if (__DEV__) console.warn(`[WF] Cannot set computed property "${prop}" — computed properties are read-only`);
+                if (__DEV__) console.warn(`[WF] Cannot set computed property "${prop}"; computed properties are read-only`);
                 return true;
             }
 

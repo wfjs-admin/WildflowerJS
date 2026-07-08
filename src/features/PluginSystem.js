@@ -1,10 +1,12 @@
 /**
- * PluginSystem - Plugins, directives, hooks
+ * PluginSystem - Plugins and dependency injection (provide / uses).
+ * Directives and hooks were split into DirectiveSystem.js / HookSystem.js so they
+ * can ship in every build; this module stays gated to full / spa / standard.
  *
  * @module
  */
 
-import { ReactiveStateManager } from '../state/ReactiveStateManager.js';
+import { createStateManager } from '../state/createStateManager.js';
 import { createContextProxy, patchSelfReferences, warnCollisions, RAW_TARGET } from '../state/ContextProxy.js';
 import { pathResolver } from '../core/wfUtils.js';
 
@@ -96,7 +98,7 @@ export const PluginSystemMethods = {
         if (initialState) {
             this._setupReactivePluginState(name, metadata, initialState);
         } else {
-            // Lightweight path: methods-only plugin (no RSM overhead)
+            // Lightweight path: methods-only plugin (no state manager overhead)
             this._setupLightweightPluginState(name, metadata);
         }
     },
@@ -122,7 +124,7 @@ export const PluginSystemMethods = {
         });
     },
     /**
-     * Set up a reactive plugin with RSM backing.
+     * Set up a reactive plugin with state manager backing.
      * Uses shared entity patterns: _handleEntityStateChange for notification,
      * _createEntitySubscription for subscribe API, _registerEntityDependent
      * for dependency tracking.
@@ -140,7 +142,7 @@ export const PluginSystemMethods = {
         // Create ReactiveStateManager for this plugin
         // Note: We disable microtask batching for plugins to ensure synchronous
         // watch/subscribe callbacks, which is the expected behavior for plugin APIs
-        const stateManager = new ReactiveStateManager({
+        const stateManager = createStateManager({
             onStateChange: (path, newValue, oldValue) => {
                 // Plugin-specific: Call watch handlers if defined
                 const raw = context ? context[RAW_TARGET] : null;
@@ -195,7 +197,7 @@ export const PluginSystemMethods = {
             return context;
         };
 
-        // NOTE: external() is inherited from _createBaseEntityContext — no override needed.
+        // NOTE: external() is inherited from _createBaseEntityContext; no override needed.
         // The base version handles dependency registration, pending store resolution,
         // plugin-to-plugin lookups, and write support.
 
@@ -219,7 +221,7 @@ export const PluginSystemMethods = {
         }
         this._bindEntityMethods(filteredDef, context);
 
-        // Add computed properties — bind to context proxy so this.X shorthand works
+        // Add computed properties; bind to context proxy so this.X shorthand works
         if (metadata.computed) {
             const boundComputedProps = {};
             Object.entries(metadata.computed).forEach(([propName, fn]) => {
@@ -251,27 +253,6 @@ export const PluginSystemMethods = {
         // Register in componentInstances for unified entity handling
         this.componentInstances.set(entityKey, pluginInstance);
 
-        // Register in context registry (same as stores) for dependency tracking
-        if (this._contextSystemInitialized && this._contextRegistry) {
-            const componentContext = this._contextRegistry.createComponentContext(
-                entityKey,
-                `plugin:${name}`,
-                {
-                    parent: this._contextRegistry.rootContext,
-                    componentInstance: pluginInstance,
-                    data: {
-                        virtual: true,
-                        type: 'plugin-component'
-                    }
-                }
-            );
-
-            // Bidirectional reference for proper dependency tracking
-            pluginInstance._componentContext = componentContext;
-            if (componentContext) {
-                componentContext.componentInstance = pluginInstance;
-            }
-        }
 
         // Register tick lifecycle hook if defined (shared rAF loop with components)
         if (typeof metadata.tick === 'function') {
@@ -286,7 +267,7 @@ export const PluginSystemMethods = {
         this._createPluginAccessor(name);
     },
     /**
-     * Set up a lightweight plugin (methods only, no RSM)
+     * Set up a lightweight plugin (methods only, no state manager)
      * @private
      */
     _setupLightweightPluginState(name, metadata)
@@ -429,261 +410,4 @@ export const PluginSystemMethods = {
             }
         }
     },
-// CUSTOM DIRECTIVE SYSTEM
-
-    /**
-     * Register a custom directive
-     * @param {string} name - Directive name (used as data-{name})
-     * @param {Object} handlers - Lifecycle handlers { init, update, destroy }
-     * @returns {WildflowerJS} - Returns this for chaining
-     */
-    directive(name, handlers)
-    {
-        if (!name || typeof name !== 'string') {
-            throw new Error('Directive name must be a non-empty string');
-        }
-
-        if (!handlers || typeof handlers !== 'object') {
-            throw new Error('Directive handlers must be an object');
-        }
-
-        if (this._customDirectives.has(name)) {
-            if (__DEV__) console.warn(`[WF] Directive "${name}" is being overwritten`);
-        }
-
-        this._customDirectives.set(name, {
-            init: handlers.init || null,
-            update: handlers.update || null,
-            destroy: handlers.destroy || null
-        });
-
-        // Invalidate cached selector so it gets rebuilt with the new directive
-        this._customDirectivesSelector = null;
-
-        return this;
-    },
-    /**
-     * Process custom directives on an element
-     * @private
-     */
-    _processCustomDirectives(element, component)
-    {
-        // Get all data-* attributes
-        const attributes = Array.from(element.attributes);
-
-        for (const attr of attributes) {
-            if (!attr.name.startsWith('data-')) continue;
-
-            const directiveName = attr.name.slice(5); // Remove 'data-' prefix
-            const directive = this._customDirectives.get(directiveName);
-
-            if (!directive) continue;
-
-            const value = attr.value;
-            const context = this._buildDirectiveContext(element, value, component);
-
-            // Store context for updates and cleanup
-            if (!this._directiveContexts.has(element)) {
-                this._directiveContexts.set(element, new Map());
-            }
-            this._directiveContexts.get(element).set(directiveName, {
-                value,
-                context,
-                lastResolvedValue: context.resolvedValue
-            });
-
-            // Call init
-            if (directive.init) {
-                try {
-                    directive.init(element, value, context);
-                } catch (error) {
-                    if (__DEV__) console.error(`[WF] Directive "${directiveName}" init error:`, error);
-                }
-            }
-        }
-    },
-    /**
-     * Build context object for directive
-     * @private
-     */
-    _buildDirectiveContext(element, valuePath, component)
-    {
-        const context = {
-            component,
-            path: valuePath,
-            resolvedValue: this._resolveDirectiveValue(valuePath, component),
-            listItem: null,
-            listIndex: null,
-            parentContexts: []
-        };
-
-        // Check if inside a list
-        const listItemElement = this._findListItemAncestor(element);
-        if (listItemElement) {
-            context.listIndex = listItemElement._listIndex;
-            // Try to get the list item data
-            context.listItem = this._getListItemData(listItemElement, component);
-        }
-
-        return context;
-    },
-    /**
-     * Resolve a value path against component state
-     * @private
-     */
-    _resolveDirectiveValue(path, component)
-    {
-        if (!path || !component?.state) return undefined;
-
-        // Handle special $item reference (for list contexts)
-        if (path === '$item' || path.startsWith('$item.')) {
-            // Will be handled by list context
-            return undefined;
-        }
-
-        return pathResolver.get(component.state, path);
-    },
-    /**
-     * Update custom directives when state changes
-     * @private
-     */
-    _updateCustomDirectives(element, component, changedPath)
-    {
-        const elementDirectives = this._directiveContexts.get(element);
-        if (!elementDirectives) return;
-
-        for (const [directiveName, data] of elementDirectives) {
-            const directive = this._customDirectives.get(directiveName);
-            if (!directive?.update) continue;
-
-            // Check if this directive's value path is affected
-            if (changedPath && !this._isDirectivePathAffected(data.value, changedPath)) continue;
-
-            const newValue = this._resolveDirectiveValue(data.value, component);
-            const oldValue = data.lastResolvedValue;
-
-            // Skip if value hasn't changed
-            if (newValue === oldValue) continue;
-
-            // Update stored value
-            data.lastResolvedValue = newValue;
-            data.context.resolvedValue = newValue;
-
-            try {
-                directive.update(element, newValue, oldValue, data.context);
-            } catch (error) {
-                if (__DEV__) console.error(`[WF] Directive "${directiveName}" update error:`, error);
-            }
-        }
-    },
-    /**
-     * Check if a changed path affects a directive's value path
-     * @private
-     */
-    _isDirectivePathAffected(directivePath, changedPath)
-    {
-        if (!changedPath) return true; // Full update
-        return changedPath.startsWith(directivePath) ||
-               directivePath.startsWith(changedPath);
-    },
-    /**
-     * Cleanup custom directives on an element
-     * @private
-     */
-    _cleanupCustomDirectives(element)
-    {
-        const elementDirectives = this._directiveContexts.get(element);
-        if (!elementDirectives) return;
-
-        for (const [directiveName, data] of elementDirectives) {
-            const directive = this._customDirectives.get(directiveName);
-            if (!directive?.destroy) continue;
-
-            try {
-                directive.destroy(element, data.context);
-            } catch (error) {
-                if (__DEV__) console.error(`[WF] Directive "${directiveName}" destroy error:`, error);
-            }
-        }
-
-        this._directiveContexts.delete(element);
-    },
-    /**
-     * Apply a callback to every element in a subtree (root + all descendants).
-     * Shared traversal for process/update/cleanup directive operations.
-     * @private
-     */
-    _forEachDirectiveElement(rootElement, callback) {
-        if (this._customDirectives.size === 0) return;
-        callback(rootElement);
-        const allElements = rootElement.querySelectorAll('*');
-        for (const element of allElements) {
-            callback(element);
-        }
-    },
-    /** @private */
-    _processCustomDirectivesInSubtree(rootElement, component) {
-        this._forEachDirectiveElement(rootElement, el => this._processCustomDirectives(el, component));
-    },
-    /** @private */
-    _updateCustomDirectivesInSubtree(rootElement, component, changedPath) {
-        this._forEachDirectiveElement(rootElement, el => this._updateCustomDirectives(el, component, changedPath));
-    },
-    /** @private */
-    _cleanupCustomDirectivesInSubtree(rootElement) {
-        this._forEachDirectiveElement(rootElement, el => this._cleanupCustomDirectives(el));
-    },
-
-// LIFECYCLE HOOK SYSTEM
-
-    /**
-     * Register a global lifecycle hook
-     * @param {string} hookName - Hook name (e.g., 'component:afterInit')
-     * @param {Function} handler - Handler function
-     * @returns {Function} - Unsubscribe function
-     */
-    hook(hookName, handler)
-    {
-        if (!hookName || typeof hookName !== 'string') {
-            throw new Error('Hook name must be a non-empty string');
-        }
-
-        if (typeof handler !== 'function') {
-            throw new Error('Hook handler must be a function');
-        }
-
-        if (!this._hooks.has(hookName)) {
-            this._hooks.set(hookName, []);
-        }
-
-        this._hooks.get(hookName).push(handler);
-
-        // Return unsubscribe function
-        return () => {
-            const handlers = this._hooks.get(hookName);
-            if (handlers) {
-                const index = handlers.indexOf(handler);
-                if (index > -1) {
-                    handlers.splice(index, 1);
-                }
-            }
-        };
-    },
-    /**
-     * Trigger a lifecycle hook
-     * @private
-     */
-    _triggerHook(hookName, ...args)
-    {
-        const handlers = this._hooks.get(hookName);
-        if (!handlers) return;
-
-        for (const handler of handlers) {
-            try {
-                handler(...args);
-            } catch (error) {
-                if (__DEV__) console.error(`[WF] Hook "${hookName}" error:`, error);
-            }
-        }
-    }
 };

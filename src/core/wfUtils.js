@@ -129,6 +129,32 @@
  * Deep-link a specific code: https://www.wildflowerjs.com/docs/error-codes?code=WF-505
  */
 
+/**
+ * Shared text-binding primitives. These are the single source of truth for how
+ * a bound value becomes text and how it lands on an element, so the generic
+ * render path, the directWriter, and any future compiled row updater all
+ * produce byte-identical DOM. Coercion matches the historical inline form
+ * (`'' + num` is a faster path than String(num) but produces the same string).
+ */
+export function __wf_str(v) {
+    return v == null ? '' : (typeof v === 'number' ? '' + v : String(v));
+}
+
+export function __wf_txt(el, s) {
+    // Fast path: a single text-node child (the common bound-element shape after
+    // first render) is mutated in place via its .data, preserving node identity.
+    // Setting el.textContent instead destroys all children and allocates a fresh
+    // text node on every write; measurably more script/DOM churn on updates
+    // (vs the in-place set nodeValue that fine-grained frameworks use). Empty,
+    // multi-child, or element-child cases fall back to textContent (unchanged).
+    const fc = el.firstChild;
+    if (fc !== null && fc.nodeType === 3 && fc.nextSibling === null) {
+        if (fc.data !== s) fc.data = s;
+    } else if (el.textContent !== s) {
+        el.textContent = s;
+    }
+}
+
 export const WF_ERRORS = {
     // Core/initialization (001-099)
     ROOT_NOT_FOUND: { code: 'WF-001', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Root element not found' }) },
@@ -151,6 +177,10 @@ export const WF_ERRORS = {
     COMPUTED_NOT_FUNCTION: { code: 'WF-209', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed property must be a function' }) },
     PATH_INVALID: { code: 'WF-210', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid path segment' }) },
     SUBSCRIPTION_ERROR: { code: 'WF-211', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in subscription callback' }) },
+    POOL_AGGREGATE_NONREACTIVE: { code: 'WF-212', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool aggregate (length/size) read inside a computed; pool aggregates bypass reactivity, so the computed will not re-evaluate when the pool changes' }) },
+    INDEXED_PATH_OBSERVER: { code: 'WF-213', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Watch/subscribe path targets a list item by numeric index; index paths reflect the item\'s position when first observed and go stale after splice/reorder' }) },
+    ITEM_COMPUTED_THIS_MISS: { code: 'WF-214', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Zero-arg computed referenced in a list row reads a property via `this` that is undefined on the component but present on the list item; item-level computeds receive the item as their first argument' }) },
+    DUPLICATE_REGISTRATION_CONFLICT: { code: 'WF-215', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component or store is being re-registered under a name that already exists with a DIFFERENT definition; the new definition is ignored and the original is kept. Unregister the existing one first (wildflower.unregister(name)) or use a distinct name' }) },
 
     // Context system (300-399)
     CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
@@ -181,7 +211,6 @@ export const WF_ERRORS = {
     ACTION_HANDLER_ERROR: { code: 'WF-601', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in action handler' }) },
     METHOD_ERROR: { code: 'WF-602', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in component method' }) },
     EMIT_NO_INSTANCE: { code: 'WF-603', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component instance not found' }) },
-    EMIT_NO_CONTEXT: { code: 'WF-604', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component context not available' }) },
 
     // Router errors (700-799)
     ROUTE_NOT_FOUND: { code: 'WF-701', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Route not found' }) },
@@ -210,7 +239,7 @@ export const WF_ERRORS = {
     STORE_SUBSCRIPTION_ERROR: { code: 'WF-906', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in store subscription callback' }) },
     STORE_DEFAULT_ERROR: { code: 'WF-907', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create default app-store' }) },
 
-    // CSP-safe expression evaluator (non-numeric codes — separate category
+    // CSP-safe expression evaluator (non-numeric codes: separate category
     // from the 1xx-9xx ranges because they describe parser / security
     // policy outcomes, not framework-internal errors).
     CSP_SYNTAX: { code: 'WF-CSP-SYNTAX', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot parse expression' }) },
@@ -275,7 +304,7 @@ export function wfError(errorDef, options = {}) {
 }
 
 /**
- * Log a runtime warning. Survives production builds intentionally —
+ * Log a runtime warning. Survives production builds intentionally;
  * these are user-facing diagnostics (e.g., misconfigured bindings,
  * deprecated usage) that should be visible regardless of build mode.
  *
@@ -287,6 +316,34 @@ export function wfWarn(message, data) {
     if (data) {
         console.warn(`  ↳ Data:`, data);
     }
+}
+
+/**
+ * Dev-only structural + source signature of an entity definition, used by
+ * WF-215 to decide whether a re-registration under an existing name carries a
+ * DIFFERENT definition. Function-valued keys contribute a hash of their source
+ * (arity alone is not enough: two demos can share method names and signatures
+ * yet differ only in a method body, which is exactly the collision WF-215 must
+ * catch). Only called inside __DEV__ blocks, so it never runs in production.
+ *
+ * @param {Object} def - Component or store definition object
+ * @returns {string} A comparable signature string
+ */
+export function definitionSignature(def) {
+    if (!def || typeof def !== 'object') return String(def);
+    const parts = [];
+    const hash = (s) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return h; };
+    const walk = (obj, prefix, depth) => {
+        if (!obj || typeof obj !== 'object' || depth > 4) return;
+        for (const k of Object.keys(obj).sort()) {
+            const v = obj[k];
+            if (typeof v === 'function') parts.push(prefix + k + '=fn:' + v.length + ':' + hash(v.toString()));
+            else if (v && typeof v === 'object') { parts.push(prefix + k + '{'); walk(v, prefix + k + '.', depth + 1); }
+            else parts.push(prefix + k + '=' + typeof v);
+        }
+    };
+    walk(def, '', 0);
+    return parts.join('|');
 }
 
 

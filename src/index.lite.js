@@ -37,6 +37,9 @@ import { DomAbstractionMethods } from './dom/DomAbstraction.js';
 // Features (core features only - no portals/transitions/modals/plugins)
 import { PropsSystemMethods } from './features/PropsSystem.js';
 import { ErrorBoundariesMethods } from './features/ErrorBoundaries.js';
+// Extension points (directives + hooks) - shipped in every build
+import { DirectiveSystemMethods } from './features/DirectiveSystem.js';
+import { HookSystemMethods } from './features/HookSystem.js';
 
 // Bootstrap (creates instance)
 import { createInstance } from './core/Bootstrap.js';
@@ -72,7 +75,11 @@ Object.assign(WildflowerJS.prototype,
 
     // Features (core only - no plugins)
     PropsSystemMethods,
-    ErrorBoundariesMethods
+    ErrorBoundariesMethods,
+
+    // Extension points (directives + hooks)
+    DirectiveSystemMethods,
+    HookSystemMethods
 );
 
 // =============================================================================

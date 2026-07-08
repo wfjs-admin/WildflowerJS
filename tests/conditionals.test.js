@@ -90,13 +90,7 @@ describe('Conditional Context', () => {
     const instance = wildflower.componentInstances.get(componentId)
     const conditionalElement = component.querySelector('#conditional-element')
 
-    // Verify conditional context was created
-    const registry = wildflower._contextRegistry
-    const conditionalContext = registry.getContextForElement(conditionalElement)
-    expect(conditionalContext).toBeDefined()
-    expect(conditionalContext.type).toBe('conditional')
-    expect(conditionalContext.path).toBe('isVisible')
-
+    // data-show is applied directly (no registry-tracked conditional context).
     // Test initial visibility
     expect(conditionalElement.style.display).not.toBe('none')
 
@@ -138,19 +132,7 @@ describe('Conditional Context', () => {
     const loadingElement = component.querySelector('#loading-indicator')
     const contentElement = component.querySelector('#content-area')
 
-    // Verify conditional contexts were created
-    const registry = wildflower._contextRegistry
-    const loadingContext = registry.getContextForElement(loadingElement)
-    const contentContext = registry.getContextForElement(contentElement)
-
-    expect(loadingContext).toBeDefined()
-    expect(loadingContext.type).toBe('conditional')
-    expect(loadingContext.path).toBe('isLoading')
-
-    expect(contentContext).toBeDefined()
-    expect(contentContext.type).toBe('conditional')
-    expect(contentContext.path).toBe('!isLoading')
-
+    // data-show (incl. negation) is applied directly to the elements.
     // Test initial state
     expect(loadingElement.style.display).not.toBe('none')
     expect(contentElement.style.display).toBe('none')
@@ -196,19 +178,7 @@ describe('Conditional Context', () => {
     const positiveElement = component.querySelector('#positive-message')
     const nonPositiveElement = component.querySelector('#non-positive-message')
 
-    // Verify conditional contexts were created with computed paths
-    const registry = wildflower._contextRegistry
-    const positiveContext = registry.getContextForElement(positiveElement)
-    const negatedContext = registry.getContextForElement(nonPositiveElement)
-
-    expect(positiveContext).toBeDefined()
-    expect(positiveContext.type).toBe('conditional')
-    expect(positiveContext.path).toBe('computed:isPositive')
-
-    expect(negatedContext).toBeDefined()
-    expect(negatedContext.type).toBe('conditional')
-    expect(negatedContext.path).toBe('!computed:isPositive')
-
+    // data-show with computed (incl. negation) is applied directly.
     // Test initial state (count is positive)
     expect(positiveElement.style.display).not.toBe('none')
     expect(nonPositiveElement.style.display).toBe('none')
@@ -271,17 +241,6 @@ describe('Conditional Context', () => {
     expect(completedIndicator2.style.display).toBe('none')
     expect(completeButton2.style.display).not.toBe('none')
 
-    // Verify conditional context in list item exists with correct properties
-    const registry = wildflower._contextRegistry
-    const conditionalContext = registry.getContextForElement(completedIndicator1)
-    expect(conditionalContext).toBeDefined()
-    expect(conditionalContext.type).toBe('conditional')
-    expect(conditionalContext.path).toBe('completed')
-
-    // Verify parent-child relationship
-    expect(conditionalContext.parent).toBeDefined()
-    expect(conditionalContext.parent.type).toBe('list')
-
     // Toggle a task's completion state
     const updatedTasks = [...instance.state.tasks]
     updatedTasks[1].completed = true
@@ -336,14 +295,8 @@ describe('Conditional Context', () => {
 
     const showElement = innerComponent.querySelector('#dynamic-show')
 
-    // Verify conditional context was created despite batch mode from list rendering
-    const registry = wildflower._contextRegistry
-
-    const showContext = registry.getContextForElement(showElement)
-    expect(showContext).toBeDefined()
-    expect(showContext.type).toBe('conditional')
-    expect(showContext.path).toBe('showContent')
-
+    // data-show on a dynamically scanned component is applied directly despite
+    // the list rendering above (regression guard for batch-mode blocking).
     // Verify initial visibility
     expect(showElement.style.display).not.toBe('none')
 

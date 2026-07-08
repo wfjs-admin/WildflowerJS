@@ -1,5 +1,5 @@
 /**
- * WildflowerJS — Mini Package Entry Point
+ * WildflowerJS: Mini Package Entry Point
  *
  * Smallest possible build: core reactive UI + components + lists, NO pools.
  *
@@ -44,9 +44,12 @@ import { FormHandlingMethods } from './events/FormHandling.js';
 // DOM abstraction (WildQuery)
 import { DomAbstractionMethods } from './dom/DomAbstraction.js';
 
-// Features (core only — no plugins, portals, transitions, modals)
+// Features (core only, no plugins, portals, transitions, modals)
 import { PropsSystemMethods } from './features/PropsSystem.js';
 import { ErrorBoundariesMethods } from './features/ErrorBoundaries.js';
+// Extension points (directives + hooks) - shipped in every build
+import { DirectiveSystemMethods } from './features/DirectiveSystem.js';
+import { HookSystemMethods } from './features/HookSystem.js';
 
 // Bootstrap (creates instance)
 import { createInstance } from './core/Bootstrap.js';
@@ -81,7 +84,11 @@ Object.assign(WildflowerJS.prototype,
 
     // Features (core only)
     PropsSystemMethods,
-    ErrorBoundariesMethods
+    ErrorBoundariesMethods,
+
+    // Extension points (directives + hooks)
+    DirectiveSystemMethods,
+    HookSystemMethods
 );
 
 // =============================================================================
@@ -99,7 +106,7 @@ Object.assign(WildflowerJS.prototype,
                 `[WildflowerJS Mini] Component "${name}" declares \`pools\` but the mini ` +
                 `build does not include the data-pool renderer.\n\n` +
                 `Fix: change your script tag from wildflower.mini.min.js to wildflower.lite.min.js\n` +
-                `(or any higher tier — standard / spa / full).\n\n` +
+                `(or any higher tier: standard / spa / full).\n\n` +
                 `Build ladder: mini → lite → standard → spa → full. ` +
                 `See https://wildflowerjs.com/docs/builds`
             );

@@ -117,9 +117,8 @@ describe('Data Resolution', () => {
     expect(secondSubId.textContent).toBe('21')
 
     // Verify context data resolution through nested hierarchy
-    const registry = wildflower._contextRegistry
     const parentList = testContainer.querySelector('.parent-list')
-    const parentListContext = registry.getContextForElement(parentList)
+    const parentListContext = parentList._listContext
     expect(parentListContext).toBeDefined()
     expect(parentListContext.type).toBe('list')
     expect(parentListContext.path).toBe('nestedResolveItems')
@@ -131,7 +130,7 @@ describe('Data Resolution', () => {
 
     // Verify nested list context has correct parent relationship
     const nestedList = firstItem.querySelector('.sub-items')
-    const nestedListContext = registry.getContextForElement(nestedList)
+    const nestedListContext = nestedList._listContext
     expect(nestedListContext).toBeDefined()
     expect(nestedListContext.type).toBe('list')
     expect(nestedListContext.path).toBe('subItems')

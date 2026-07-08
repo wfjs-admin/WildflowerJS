@@ -1,6 +1,6 @@
 {
   "name": "wildflowerjs",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Lightweight reactive JavaScript framework with no build step and no virtual DOM",
   "type": "module",
   "main": "dist/wildflower.min.js",
@@ -30,6 +30,7 @@
   "scripts": {
     "build": "node scripts/fetch-rollup.cjs && node scripts/fetch-terser.cjs && node scripts/build-rollup.cjs",
     "test": "vitest run --config tests/vitest.browser.config.js",
+    "test:retry": "node scripts/test-with-retry.cjs",
     "test:watch": "vitest --config tests/vitest.browser.config.js",
     "test:setup": "npx playwright install chromium"
   },

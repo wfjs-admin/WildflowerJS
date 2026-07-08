@@ -42,6 +42,9 @@ describe('Subscribe Wait Feature', () => {
     });
 
     afterEach(() => {
+        // Restore real timers in case a test enabled fake timers (no-op otherwise).
+        vi.useRealTimers();
+
         // Cleanup
         if (testContainer && testContainer.parentNode) {
             testContainer.parentNode.removeChild(testContainer);
@@ -364,6 +367,7 @@ describe('Subscribe Wait Feature', () => {
         });
 
         it('should timeout and call init() anyway after subscribeTimeout', async () => {
+            vi.useFakeTimers(); // deterministic virtual time — immune to CI event-loop starvation
             // Create a store that never becomes ready
             wildflower.store('slow-store', {
                 state: { value: 'pending' },
@@ -389,8 +393,8 @@ describe('Subscribe Wait Feature', () => {
             testContainer.innerHTML = '<div data-component="timeout-test"></div>';
             wildflower._scanForDynamicComponents();
 
-            // Wait for timeout + buffer
-            await new Promise(resolve => setTimeout(resolve, 400));
+            // Advance past the 200ms timeout (well short of the 10000ms store init).
+            await vi.advanceTimersByTimeAsync(400);
 
             expect(initCalled).toBe(true);
             // Should have waited approximately 200ms (the timeout), not 10000ms
@@ -430,6 +434,7 @@ describe('Subscribe Wait Feature', () => {
         });
 
         it('should respect component-level subscribeTimeout override', async () => {
+            vi.useFakeTimers(); // deterministic virtual time — immune to CI event-loop starvation
             // Set global timeout to 1000ms
             wildflower.config({ subscribeTimeout: 1000 });
 
@@ -454,7 +459,8 @@ describe('Subscribe Wait Feature', () => {
             testContainer.innerHTML = '<div data-component="override-test"></div>';
             wildflower._scanForDynamicComponents();
 
-            await new Promise(resolve => setTimeout(resolve, 300));
+            // Advance past the 150ms component timeout (short of the 1000ms global).
+            await vi.advanceTimersByTimeAsync(300);
 
             // Should use component timeout (150ms), not global (1000ms)
             expect(initTime).toBeGreaterThanOrEqual(130);
@@ -614,6 +620,11 @@ describe('Subscribe Wait Feature', () => {
         });
 
         it('should use global timeout when component does not specify one', async () => {
+            // Fake timers make this deterministic: virtual time means the measured
+            // initTime is exact regardless of event-loop load. Under real timers this
+            // wall-clock bound flaked hard on a busy CI box (measured 13000-19000ms
+            // against the <400ms wall when the loop was starved).
+            vi.useFakeTimers();
             wildflower.config({ subscribeTimeout: 200 });
 
             wildflower.store('slow-store', {
@@ -637,7 +648,8 @@ describe('Subscribe Wait Feature', () => {
             testContainer.innerHTML = '<div data-component="global-timeout-test"></div>';
             wildflower._scanForDynamicComponents();
 
-            await new Promise(resolve => setTimeout(resolve, 400));
+            // Advance past the 200ms global timeout (short of the 10000ms store init).
+            await vi.advanceTimersByTimeAsync(400);
 
             // Should use global timeout (200ms)
             expect(initTime).toBeGreaterThanOrEqual(180);
@@ -744,6 +756,7 @@ describe('Subscribe Wait Feature', () => {
         });
 
         it.skipIf(isMinifiedBuild())('should not block other components without subscribe', async () => {
+            vi.useFakeTimers(); // deterministic virtual time — immune to CI event-loop starvation
             wildflower.store('slow-store', {
                 state: {},
                 async init() {
@@ -775,7 +788,8 @@ describe('Subscribe Wait Feature', () => {
             `;
             wildflower._scanForDynamicComponents();
 
-            await new Promise(resolve => setTimeout(resolve, 600));
+            // Advance past the store's 500ms init so the dependent component unblocks.
+            await vi.advanceTimersByTimeAsync(600);
 
             // Independent component should init much faster
             expect(independentInitTime).toBeLessThan(100);

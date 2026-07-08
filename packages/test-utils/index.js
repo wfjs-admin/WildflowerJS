@@ -353,8 +353,16 @@ export function hasFeature(feature) {
   const mode = getDistMode()
   const baseMode = getBaseMode(mode)
 
-  // Features stripped from lite build only
-  const liteStrippedFeatures = ['portals', 'transitions', 'modals', 'configurable-templates', 'plugins']
+  // Directives and hooks were split out of the plugin system and now ship in every build.
+  if (feature === 'directives' || feature === 'hooks') {
+    return true
+  }
+
+  // Features stripped from lite build only.
+  // NOTE: configurable-templates/slots ship in EVERY build (incl. lite/mini) by
+  // product decision (2026-06-10) — they are core features, so their suites run
+  // on all variants. Same for CSP evaluation (never listed here).
+  const liteStrippedFeatures = ['portals', 'transitions', 'modals', 'plugins']
 
   if ((baseMode === 'lite' || baseMode === 'mini') && liteStrippedFeatures.includes(feature)) {
     return false
@@ -408,6 +416,27 @@ export function isMinifiedBuild() {
  */
 export function hasConsoleWarnings() {
   return !isMinifiedBuild()
+}
+
+/**
+ * Check if we're testing the Meadow alternative reactive core.
+ *
+ * On the spike/unified-graph-core branch Meadow IS the reactive core for every
+ * build (the core swap is the branch's whole purpose), and `dist` now holds
+ * Meadow — the `dist`/`dist-meadow` split is collapsed (see build-rollup.cjs).
+ * So this is unconditionally true here: the path-based heuristic it used before
+ * (matching `/meadow/i` against `__WILDFLOWER_DIST_DIR__`) no longer applies.
+ *
+ * Used by `skipIf(isMeadowBuild())` to skip tests that assert RSM-internal
+ * structures Meadow legitimately does not have (pattern-trie, version/epoch
+ * staleness machinery, computed-tier promotion ladder, external-dependency
+ * bookkeeping). Those skips are retired in B1 once RSM is deleted; until then
+ * this keeps gating them.
+ *
+ * @returns {boolean} Whether the current build is the Meadow core
+ */
+export function isMeadowBuild() {
+  return true
 }
 
 /**

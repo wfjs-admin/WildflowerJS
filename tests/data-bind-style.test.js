@@ -846,6 +846,55 @@ describe('data-bind-style', () => {
       expect(getStyle(items[2], 'backgroundColor')).toBe('rgb(0, 0, 255)')
     })
 
+    it('should set a CSS custom property in a list item (row writer)', async () => {
+      wildflower.component('style-list-customprop', {
+        state: { items: [{ id: 1, c: '#ff6600' }, { id: 2, c: '#0066ff' }] }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="style-list-customprop">
+          <div data-list="items" data-key="id">
+            <template>
+              <div class="item" data-bind-style="{ '--row-color': c }"></div>
+            </template>
+          </div>
+        </div>
+      `
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const items = testContainer.querySelectorAll('.item')
+      // Custom properties only apply via setProperty; the old row writer used
+      // `style[prop] = v`, a silent no-op for `--x`.
+      expect(items[0].style.getPropertyValue('--row-color')).toBe('#ff6600')
+      expect(items[1].style.getPropertyValue('--row-color')).toBe('#0066ff')
+    })
+
+    it('should honor !important in a list item style value (row writer)', async () => {
+      wildflower.component('style-list-important', {
+        state: { items: [{ id: 1, c: 'red !important' }] }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="style-list-important">
+          <div data-list="items" data-key="id">
+            <template>
+              <div class="item" data-bind-style="{ color: c }"></div>
+            </template>
+          </div>
+        </div>
+      `
+
+      wildflower.scan()
+      await waitForCompleteRender()
+
+      const item = testContainer.querySelector('.item')
+      // The `style[prop] = 'red !important'` setter drops the priority; the fix
+      // routes through setProperty so the priority sticks.
+      expect(item.style.getPropertyPriority('color')).toBe('important')
+    })
+
     it('should bind style from item + component state comparison', async () => {
       wildflower.component('style-list-selected', {
         state: {

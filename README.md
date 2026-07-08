@@ -1,5 +1,7 @@
 # WildflowerJS
 
+**Reactive JS, No BS.** A no-build, buildless reactive JavaScript framework. Build full reactive apps in plain HTML, CSS, and JavaScript.
+
 [![npm version](https://img.shields.io/npm/v/wildflowerjs.svg)](https://www.npmjs.com/package/wildflowerjs)
 [![license](https://img.shields.io/npm/l/wildflowerjs.svg)](https://github.com/wfjs-admin/WildflowerJS/blob/main/LICENSE)
 [![bundle size](https://img.shields.io/bundlephobia/minzip/wildflowerjs)](https://bundlephobia.com/package/wildflowerjs)

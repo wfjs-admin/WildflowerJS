@@ -77,8 +77,8 @@ describe('DOM Integration', () => {
     // Get the list element
     const listElement = testContainer.querySelector('#elem-assoc-list')
 
-    // Test element lookup
-    const contextFromElement = wildflower._contextRegistry.getContextForElement(listElement)
+    // Test element lookup (list contexts are plain objects on the element)
+    const contextFromElement = listElement._listContext
 
     expect(contextFromElement).toBeDefined()
     expect(contextFromElement.type).toBe('list')
@@ -247,14 +247,14 @@ describe('DOM Integration', () => {
     const newContainer = testContainer.querySelector('#new-container')
 
     // Verify initial context association
-    const initialContext = wildflower._contextRegistry.getContextForElement(listElement)
+    const initialContext = listElement._listContext
     expect(initialContext).toBeDefined()
 
     // Move the list element to a different container
     newContainer.appendChild(listElement)
 
-    // Verify context association is maintained after move
-    const movedContext = wildflower._contextRegistry.getContextForElement(listElement)
+    // Verify context association is maintained after move (rides with the element)
+    const movedContext = listElement._listContext
     expect(movedContext).toBeDefined()
     expect(movedContext.id).toBe(initialContext.id)
 

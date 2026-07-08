@@ -3,7 +3,7 @@
  *
  * @module
  */
-import { ContextRegistry } from '../state/ContextManager.js';
+import { ContextRecords } from '../state/ContextRecords.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -88,12 +88,8 @@ export const FrameworkInitMethods = {
      */
     _completeInitialization()
     {
-        this._updateLists(this.domElements.lists);
+        this._mountLists(this.domElements.lists);
 
-        // Build component context hierarchy after lists are rendered
-        // (previously called twice - before and after _updateLists - but
-        // list rendering doesn't depend on hierarchy, so single call suffices)
-        this._buildComponentContextHierarchy();
         this._processDeferredDependencies();
 
         // Set up event delegation for lists
@@ -116,7 +112,7 @@ export const FrameworkInitMethods = {
         // data-render conditionals) is itself deferred via requestAnimationFrame.
         // With autoSave restoring state (e.g., localStorage), stripping cloaks
         // synchronously here would expose elements for 1 frame before conditionals
-        // hide them — defeating the purpose of data-cloak.
+        // hide them, defeating the purpose of data-cloak.
         //
         // Before removing the attribute we commit a visibility verdict for any
         // element that also carries data-show. This closes the Chrome-observed
@@ -146,9 +142,6 @@ export const FrameworkInitMethods = {
             detail: {instance: this}
         });
         document.dispatchEvent(readyEvent);
-
-        // Process any early store accesses for diagnostic purposes
-        this.storeManager._processEarlyStoreAccesses();
     },
     _ensureContextSystem()
     {
@@ -157,11 +150,7 @@ export const FrameworkInitMethods = {
             return;
         }
 
-        this._contextRegistry = new ContextRegistry(this);
-        // Store reference to wildflower instance on registry for data-render element processing
-        this._contextRegistry._wildflower = this;
-        // Keep both property names pointing to the same instance
-        this.contextRegistry = this._contextRegistry;
+        this._contextRecords = new ContextRecords(this);
         this._contextSystemInitialized = true;
     },
 // EVENT SYSTEM INITIALIZATION
@@ -185,35 +174,41 @@ export const FrameworkInitMethods = {
         // Blur validation for forms with data-validate-on including "blur"
         const boundValidationBlur = this._handleValidationBlur.bind(this);
         document.addEventListener('focusout', boundValidationBlur, true);
-        // Also validate on change — clears errors immediately for selects, checkboxes, radios
+        // Also validate on change; clears errors immediately for selects, checkboxes, radios
         document.addEventListener('change', boundValidationBlur, true);
     },
 // GLOBAL EVENT BINDING
     _createListContext(path, data, componentInstance, parentContext = null, itemIndex = undefined)
     {
-        // Ensure context system is initialized
+        // Ensure the records factory (id generator) is initialized
         this._ensureContextSystem();
 
-        // Use the registry's context creation method
+        // Build the list context as a PLAIN object. A list context is only ever
+        // reached via element._listContext / instance._listContexts, and
+        // _listContextMethods below provide everything it needs. Top-level lists
+        // have no parent list (parent === null); _propagateToParent only acts when
+        // the parent is itself a list, so a null parent is correct here.
         // Only pass itemIndex for nested lists (when parentContext exists and itemIndex is a number)
         const parentIndex = (parentContext && typeof itemIndex === 'number') ? itemIndex : undefined;
-        const context = this._contextRegistry.createListContext(
+        const parent = parentContext || null;
+        // Unique id (nested form encodes parent + index)
+        const baseId = this._contextRecords._generateContextId(path, { type: 'list' });
+        const id = (parent?.id && parentIndex !== undefined)
+            ? `${parent.id}[${parentIndex}]:${path}:${baseId}`
+            : baseId;
+        const context = Object.assign({
+            id,
             path,
-            Array.isArray(data) ? data : [],
+            parent,
+            children: new Map(),
+            data: Array.isArray(data) ? data : [],
+            element: null,
             componentInstance,
-            parentContext,
-            null, // element parameter (not used in this case)
-            parentIndex // Only set for nested lists: parentId[index]:path
-        );
-
-        // Add our list context methods to the context
-        // CRITICAL: Use Object.assign instead of setPrototypeOf to preserve the
-        // ListContext → Context prototype chain. setPrototypeOf replaces the chain
-        // with a plain object, stripping inherited methods like _updateClassBindingElement.
-        Object.assign(context, this._listContextMethods);
-
-        // Store framework instance reference so _listContextMethods can avoid window.wildflower
-        context._wf = this;
+            // Framework instance reference so _listContextMethods can avoid window.wildflower
+            _wf: this,
+            type: 'list'
+        }, this._listContextMethods);
+        if (parentIndex !== undefined) context._parentIndex = parentIndex;
 
         // Store reference in component instance for lookup
         if (!componentInstance._listContexts)

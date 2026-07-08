@@ -95,7 +95,7 @@ describe('Duplicate Binding Paths', () => {
             expect(countDisplay.textContent).toBe('4');
         });
 
-        it.skipIf(isMinifiedBuild())('should create separate binding contexts for each element', async () => {
+        it.skipIf(isMinifiedBuild())('renders the same computed to each element and updates both', async () => {
             container.innerHTML = `
                 <div data-component="context-check">
                     <span class="first" data-bind="computed:value"></span>
@@ -115,19 +115,21 @@ describe('Duplicate Binding Paths', () => {
             wildflower.scan();
             await waitForUpdate(100);
 
-            // Check that both elements have separate binding contexts
             const first = container.querySelector('.first');
             const second = container.querySelector('.second');
 
-            const bindingContexts = wildflower._contextRegistry.getContextsByType('binding')
-                .filter(ctx => ctx.path === 'computed:value');
+            // Both elements bound to the same computed render its value independently
+            expect(first.textContent).toBe('10');
+            expect(second.textContent).toBe('10');
 
-            expect(bindingContexts.length).toBe(2);
+            // And both update when the computed's source state changes
+            const componentEl = container.querySelector('[data-component="context-check"]');
+            const instance = wildflower.componentInstances.get(componentEl.dataset.componentId);
+            instance.state.count = 7;
+            await waitForUpdate(100);
 
-            // Verify contexts are associated with different elements
-            const elements = bindingContexts.map(ctx => ctx.element);
-            expect(elements).toContain(first);
-            expect(elements).toContain(second);
+            expect(first.textContent).toBe('14');
+            expect(second.textContent).toBe('14');
         });
     });
 

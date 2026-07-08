@@ -75,10 +75,9 @@ describe('Array Operation Detection', () => {
       const component = testContainer.querySelector('[data-component="append-test"]')
       const instance = wildflower.componentInstances.get(component.dataset.componentId)
 
-      // Verify list context exists before append
-      const registry = wildflower._contextRegistry
+      // Verify list context exists before append (plain object on the element)
       const listElement = component.querySelector('[data-list="items"]')
-      const listContext = registry.getContextForElement(listElement)
+      const listContext = listElement._listContext
       expect(listContext).toBeDefined()
       expect(listContext.type).toBe('list')
       const originalContextId = listContext.id
@@ -91,7 +90,7 @@ describe('Array Operation Detection', () => {
       expect(listItems.length).toBe(12)
 
       // Verify context was reused after append
-      const afterContext = registry.getContextForElement(listElement)
+      const afterContext = listElement._listContext
       expect(afterContext.id).toBe(originalContextId)
     })
 
@@ -225,9 +224,8 @@ describe('Array Operation Detection', () => {
       const instance = wildflower.componentInstances.get(component.dataset.componentId)
 
       // Capture context ID before replace
-      const registry = wildflower._contextRegistry
       const listElement = component.querySelector('[data-list="items"]')
-      const originalContextId = registry.getContextForElement(listElement).id
+      const originalContextId = listElement._listContext.id
 
       // Replace entire array
       instance.state.items = [
@@ -242,7 +240,7 @@ describe('Array Operation Detection', () => {
       expect(listItems[0].textContent).toBe('new1')
 
       // Verify context was reused after bulk replace
-      const afterContext = registry.getContextForElement(listElement)
+      const afterContext = listElement._listContext
       expect(afterContext.id).toBe(originalContextId)
 
       // Verify data resolution reflects new items

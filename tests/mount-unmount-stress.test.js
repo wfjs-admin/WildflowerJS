@@ -235,8 +235,8 @@ describe.skipIf(isMinifiedBuild())('Mount/Unmount Cycle Stress Tests', () => {
     const parentInstance = wildflower.componentInstances.get(parentId)
 
     // Baseline after initial render
-    wildflower._contextRegistry.garbageCollect()
-    const baselineContexts = wildflower._contextRegistry.contexts.size
+    wildflower.garbageCollect()
+    const baselineInstances = wildflower.componentInstances.size
 
     // Run 50 mount/unmount cycles with periodic GC
     for (let i = 0; i < 50; i++) {
@@ -247,16 +247,16 @@ describe.skipIf(isMinifiedBuild())('Mount/Unmount Cycle Stress Tests', () => {
 
       // Periodic GC every 10 cycles
       if (i % 10 === 9) {
-        wildflower._contextRegistry.garbageCollect()
+        wildflower.garbageCollect()
       }
     }
 
     // Final GC
-    wildflower._contextRegistry.garbageCollect()
-    const finalContexts = wildflower._contextRegistry.contexts.size
+    wildflower.garbageCollect()
+    const finalInstances = wildflower.componentInstances.size
 
-    // Context count should not grow unbounded - allow reasonable tolerance
-    // (baseline + some overhead for active child contexts)
-    expect(finalContexts).toBeLessThanOrEqual(baselineContexts + 20)
+    // Observable no-leak: rapid mount/unmount cycling does not leak component
+    // instances (the child re-mounts to a single live instance each cycle).
+    expect(finalInstances).toBeLessThanOrEqual(baselineInstances + 2)
   }, 30000)
 })

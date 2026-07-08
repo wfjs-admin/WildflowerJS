@@ -8,7 +8,7 @@
  */
 
 // ═══════════════════════════════════════════════════════════════
-// Group A — Boolean flags (WeakSets)
+// Group A: Boolean flags (WeakSets)
 // ═══════════════════════════════════════════════════════════════
 
 /** Elements bound by list rendering (prevents component from overwriting) */
@@ -36,7 +36,7 @@ export const ssrAllowActionsElements = new WeakSet();
 export const handlingSubmitSet = new WeakSet();
 
 // ═══════════════════════════════════════════════════════════════
-// Group B — Cached metadata (WeakMaps)
+// Group B: Cached metadata (WeakMaps)
 // ═══════════════════════════════════════════════════════════════
 
 /** Cached static portal attributes: { target, show, render } */
@@ -61,7 +61,7 @@ export const storedTemplatesCache = new WeakMap();
 export const boundActionsCache = new WeakMap();
 
 // ═══════════════════════════════════════════════════════════════
-// Group C — Portal context references (WeakMaps)
+// Group C: Portal context references (WeakMaps)
 // ═══════════════════════════════════════════════════════════════
 
 /** Cached resolved list item context for portal elements */

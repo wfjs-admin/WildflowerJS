@@ -155,6 +155,77 @@ describe('data-render in List Templates', () => {
     expect(desc1.textContent).toBe('Desc 1')
   })
 
+  it('data-render in list item updates without orphaned-timer error', async () => {
+    // Regression: commit c9c59e6 left an orphaned `self._perfTimers.render`
+    // reference (never initialized) in the per-item effect's renders branch.
+    // On any subsequent re-run of a list item that has data-render, it threw a
+    // TypeError that the effect try/catch swallowed (console.error). Updating
+    // an item with active data-render must re-render cleanly with no such error.
+    const cn = unique('drl-render-update')
+    let componentRef
+
+    testContainer.innerHTML = `
+      <div data-component="${cn}">
+        <div data-list="items">
+          <template>
+            <div class="item">
+              <span class="name" data-bind="name"></span>
+              <div class="details" data-render="showDetails">
+                <span class="desc" data-bind="description"></span>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    `
+
+    wildflower.component(cn, {
+      state: {
+        items: [
+          { id: 1, name: 'Item 1', description: 'Desc 1', showDetails: true },
+          { id: 2, name: 'Item 2', description: 'Desc 2', showDetails: true }
+        ]
+      },
+      init() { componentRef = this }
+    })
+
+    wildflower.scan()
+    await waitForCompleteRender()
+
+    // Capture console.error to detect the swallowed orphaned-timer TypeError
+    const errors = []
+    const origError = console.error
+    console.error = (...args) => { errors.push(args.map(String).join(' ')); origError.apply(console, args) }
+    try {
+      // Subsequent re-runs of an item that HAS data-render active — this is the
+      // exact path (renders branch) where the orphaned _perfTimers ref lived.
+      componentRef.state.items[0].description = 'Updated Desc 1'
+      await waitForCompleteRender()
+      componentRef.state.items[0].showDetails = false
+      await waitForCompleteRender()
+      componentRef.state.items[0].showDetails = true
+      await waitForCompleteRender()
+    } finally {
+      console.error = origError
+    }
+
+    // The data-render re-show (showDetails false -> true) can lag a single flush
+    // when the scheduler is saturated; pump forced renders until the item's .desc
+    // re-appears (non-masking: if it never renders, the assertions below still fail).
+    for (let i = 0; i < 40 && !testContainer.querySelector('.item')?.querySelector('.desc'); i++) {
+      await waitForCompleteRender()
+    }
+
+    // Functional: the render reacted correctly across the updates
+    const items = testContainer.querySelectorAll('.item')
+    expect(items[0].querySelector('.desc')).not.toBeNull()
+    expect(items[0].querySelector('.desc').textContent).toBe('Updated Desc 1')
+
+    // Regression guard: no orphaned-timer / undefined-property error was thrown
+    const timerErrors = errors.filter(e => /_perfTimers|Cannot read|is not defined|of undefined/.test(e))
+    expect(timerErrors).toEqual([])
+  })
+
   it('data-render + data-bind on same element in list', async () => {
     const cn = unique('drl-same-el')
 

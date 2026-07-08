@@ -104,16 +104,15 @@ describe('HIERARCHY - Context Relationships', () => {
     expect(childItems[1].querySelector('.child-name').textContent).toBe('Child 1B')
 
     // Verify context hierarchy
-    const registry = wildflower._contextRegistry
     const parentListElement = testContainer.querySelector('.parent-list')
-    const parentContext = registry.getContextForElement(parentListElement)
+    const parentContext = parentListElement._listContext
     expect(parentContext).toBeDefined()
     expect(parentContext.type).toBe('list')
     expect(parentContext.path).toBe('parentHierarchyItems')
 
     // Verify child list context has correct parent
     const childListElement = parentItems[0].querySelector('.child-list')
-    const childContext = registry.getContextForElement(childListElement)
+    const childContext = childListElement._listContext
     expect(childContext).toBeDefined()
     expect(childContext.type).toBe('list')
     expect(childContext.path).toBe('children')
