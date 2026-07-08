@@ -650,6 +650,55 @@ describe('Keyboard Events', () => {
       expect(display.textContent).toBe('1')
     })
 
+    it('should handle a combo outside the historical whitelist (Ctrl+K) on exactly that combo', async () => {
+      // Regression: combos were parsed from a hardcoded 18-entry whitelist and
+      // the catch-all skipped names containing '+', so an undeclared combo like
+      // data-event-key-ctrl+k produced an EMPTY spec — and the matcher's
+      // "no modifiers → match all" rule fired the handler on EVERY key.
+      testContainer.innerHTML = `
+        <div data-component="ctrl-k-test">
+          <input id="test-input" data-action="keydown:palette" data-event-key-ctrl+k />
+          <div id="palette-count" data-bind="paletteCount"></div>
+        </div>
+      `
+
+      wildflower.component('ctrl-k-test', {
+        state: {
+          paletteCount: 0
+        },
+        palette() {
+          this.state.paletteCount++
+        }
+      })
+
+      await waitForUpdate()
+
+      const input = testContainer.querySelector('#test-input')
+      const display = testContainer.querySelector('#palette-count')
+
+      expect(display.textContent).toBe('0')
+
+      // Plain 'k' without Ctrl - should NOT trigger
+      input.dispatchEvent(createKeyboardEvent('keydown', 'k'))
+      await waitForUpdate()
+      expect(display.textContent).toBe('0')
+
+      // Unrelated key - should NOT trigger
+      input.dispatchEvent(createKeyboardEvent('keydown', 'a'))
+      await waitForUpdate()
+      expect(display.textContent).toBe('0')
+
+      // Ctrl + unrelated key - should NOT trigger
+      input.dispatchEvent(createKeyboardEvent('keydown', 'a', { ctrlKey: true }))
+      await waitForUpdate()
+      expect(display.textContent).toBe('0')
+
+      // Ctrl+K - should trigger
+      input.dispatchEvent(createKeyboardEvent('keydown', 'k', { ctrlKey: true }))
+      await waitForUpdate()
+      expect(display.textContent).toBe('1')
+    })
+
     it('should handle Ctrl+Z combination', async () => {
       testContainer.innerHTML = `
         <div data-component="ctrl-z-test">

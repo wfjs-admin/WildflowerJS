@@ -103,9 +103,8 @@ export class WildflowerJS
         // Using WeakMap allows automatic GC when list containers are removed from DOM
         this._resolvedTemplateCache = new WeakMap();
 
-        this.contextRegistry = null; // Created by _ensureContextSystem()
+        this._contextRecords = null; // Created by _ensureContextSystem()
         this._contextSystemInitialized = false;
-        this._contextHierarchyDirty = false;
 
         // SSR support
         this.ssrManager = null;
@@ -160,13 +159,15 @@ export class WildflowerJS
 
         this.storeManager = new StoreManager(this);
 
-        // Plugin system initialization (only when plugin feature is enabled)
+        // Directive + hook state: these features ship in every build.
+        this._customDirectives = new Map();
+        this._directiveContexts = new WeakMap(); // element -> directive contexts
+        this._hooks = new Map();
+
+        // Plugin + dependency-injection state: only when the plugin feature is enabled.
         if (__FEATURE_PLUGINS__) {
             this._plugins = [];
             this._pluginsByName = new Map();
-            this._customDirectives = new Map();
-            this._directiveContexts = new WeakMap(); // element -> directive contexts
-            this._hooks = new Map();
             this._pluginStates = new Map(); // Plugin reactive state storage
             this._providers = new Map(); // Service providers (for uses: [...])
         }
@@ -212,16 +213,13 @@ export class WildflowerJS
         // transitions when first assigned on hot paths.
         this._renderCounter = 0;
         this._bindingUpdateCount = 0;
-        this._deferredComputedClassElements = new Set();
         this._expressionCache = new Map();
         this._componentsToUpdate = new Set();
         this._contextsToUpdate = new Set();
         this._externalDependencies = new Map();
         this._pendingStateChanges = new Set();
-        this._updatedPaths = new Set();
         this._notifyingPaths = new Set();
         this._initialRenderQueue = new Set();
-        this._batchListUpdates = new Map();
         this._instanceIdCounter = 0;
 
         // Web Component adapter registry
@@ -281,6 +279,26 @@ export class WildflowerJS
             return `[data-${baseName}="${value}"],[data-wf-${baseName}="${value}"]`;
         }
         return `[data-${baseName}],[data-wf-${baseName}]`;
+    }
+
+    /**
+     * Set the attribute prefix mode
+     * @param {boolean} exclusive - When true, only process data-wf-* attributes (ignore data-*)
+     *                              When false, process both data-* and data-wf-* (default)
+     *
+     * Use exclusive mode when integrating with third-party libraries that use
+     * data-action, data-bind, or other data-* attributes that conflict with WildflowerJS.
+     *
+     * @example
+     * // Enable exclusive mode to avoid conflicts with Bootstrap, Alpine, etc.
+     * wildflower.setWfPrefixMode(true);
+     *
+     * // Now use data-wf-* for WildflowerJS, data-* for third-party
+     * // <button data-action="bootstrapModal">Bootstrap</button>
+     * // <button data-wf-action="myMethod">WildflowerJS</button>
+     */
+    setWfPrefixMode(exclusive) {
+        this.options.useWfPrefixOnly = !!exclusive;
     }
 
     /**
@@ -356,6 +374,22 @@ export class WildflowerJS
         if (newOptions && typeof newOptions === 'object') {
             // Merge new options with existing
             Object.assign(this.options, newOptions);
+            // forceCSPMode must take effect at RUNTIME, not just land in the
+            // options bag: every evaluation site reads the
+            // _useCSPSafeEvaluation snapshot computed at construction, so
+            // update it here or the documented `config({ forceCSPMode: true })`
+            // call is a silent no-op. One-way switch: already-compiled
+            // fast-path evaluators keep working, new compilations go through
+            // the CSP-safe parser. (To skip the construction-time capability
+            // probe entirely — zero CSP violation reports — set the
+            // `data-csp-safe` attribute on the framework script tag instead.)
+            if (newOptions.forceCSPMode === true) {
+                this._useCSPSafeEvaluation = true;
+                // The AST-evaluator cache is normally created in the
+                // constructor's CSP branch; a runtime flip must create it too
+                // or the first CSP-path compile crashes on the missing Map.
+                if (!this._astCache) this._astCache = new Map();
+            }
         }
         // Return a copy of current options
         return { ...this.options };
@@ -477,8 +511,8 @@ export class WildflowerJS
 
 
 
-    // _setupListContexts, _handleListStateChange, and _isNestedListUpdate
-    // live in rendering/ListRenderer.js. They reach WildflowerJS.prototype
+    // _setupListContexts and _handleListStateChange live in
+    // rendering/ListRenderer.js. They reach WildflowerJS.prototype
     // via the mixin assembly in each index.*.js entry point.
 
     // ========================================================================
@@ -537,6 +571,34 @@ export class WildflowerJS
     }
 
     /**
+     * Unregister a component and/or store definition by name.
+     *
+     * The unified teardown entry point: removes a component definition (and
+     * destroys its live instances) and/or disposes a store of that name,
+     * freeing the name for a fresh registration. A name can be both a component
+     * and a store; both are handled. Safe to call for an unknown name.
+     *
+     * Primary uses: live-preview / HMR teardown before re-registering the same
+     * name with a different definition, dynamic apps that swap components, and
+     * tests. See also WF-215, the dev warning for a re-registration that skipped
+     * this step.
+     *
+     * @param {string} name - The component and/or store name to unregister
+     * @returns {boolean} True if a component or a store was removed
+     *
+     * @example
+     * wildflower.unregister('task-manager'); // before re-registering the name
+     */
+    unregister(name)
+    {
+        if (!name || typeof name !== 'string') return false;
+        const removedComponent = this.unregisterComponent ? this.unregisterComponent(name) : false;
+        const removedStore = this.storeManager && this.storeManager.unregisterStore
+            ? this.storeManager.unregisterStore(name) : false;
+        return removedComponent || removedStore;
+    }
+
+    /**
      * Get an existing store by name.
      *
      * @param {string} [name='app-store'] - Name of the store to retrieve
@@ -559,11 +621,18 @@ export class WildflowerJS
     _forceCompleteRender()
     {
 
-        // Cancel any pending render
-        if (this._renderScheduled)
+        // Cancel any pending render. _renderScheduled is a boolean flag, not an
+        // rAF handle: clearing it makes the queued microtask early-return; the
+        // synchronous _render() below then commits. (No cancelAnimationFrame; it
+        // would coerce the boolean to handle 1 and cancel an unrelated frame.)
+        this._renderScheduled = null;
+
+        // Mount any lists whose scheduled discovery-time mount hasn't fired yet
+        // (this helper is called synchronously between scan and the initial-render
+        // macrotask); "complete render" must include list bootstrap.
+        if (this._mountLists)
         {
-            cancelAnimationFrame(this._renderScheduled);
-            this._renderScheduled = null;
+            this._mountLists(this.domElements.lists);
         }
 
         // Force render now
@@ -590,10 +659,10 @@ export class WildflowerJS
         return new Promise(resolve => {
             // The framework has four async layers that must all drain:
             //
-            //   1. Microtask queue  — EffectScheduler.flush() is scheduled here
-            //   2. setTimeout(0)    — Component init() is deferred here
-            //   3. rAF              — _scheduleRender and pool flushes fire here
-            //   4. Final microtask  — Effects triggered by render/pool flush
+            //   1. Microtask queue  : EffectScheduler.flush() is scheduled here
+            //   2. setTimeout(0)    : Component init() is deferred here
+            //   3. rAF              : _scheduleRender and pool flushes fire here
+            //   4. Final microtask  : Effects triggered by render/pool flush
             //
             // We chain through all four layers so the returned promise
             // resolves only after the entire pipeline has quiesced.
@@ -642,9 +711,19 @@ export class WildflowerJS
             }
         }
 
-        // Dispose context registry (clears its GC interval)
-        if (this._contextRegistry && this._contextRegistry.dispose) {
-            this._contextRegistry.dispose();
+        // Remove the DevTools global-hook document listeners (registered in
+        // Bootstrap._createDevToolsHook). The hook closes over `framework: wf`,
+        // so leaving these attached pins this instance for the page's lifetime.
+        if (this._devToolsListeners) {
+            for (const { event, handler } of this._devToolsListeners) {
+                document.removeEventListener(event, handler);
+            }
+            this._devToolsListeners = null;
+        }
+
+        // Dispose the records factory
+        if (this._contextRecords && this._contextRecords.dispose) {
+            this._contextRecords.dispose();
         }
     }
 

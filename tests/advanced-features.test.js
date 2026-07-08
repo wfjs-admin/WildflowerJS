@@ -337,8 +337,8 @@ describe('Advanced Features', () => {
 
     const childElement = testContainer.querySelector('#child-element')
 
-    // Test lookup by element
-    const context = wildflower._contextRegistry.getContextForElement(childElement)
+    // Test lookup by element (list contexts are plain objects on the element)
+    const context = childElement._listContext
     expect(context).toBeDefined()
     expect(context.type).toBe('list')
 
@@ -351,8 +351,8 @@ describe('Advanced Features', () => {
     testContainer.querySelector('#parent-element').appendChild(newContainer)
     newContainer.appendChild(childElement)
 
-    // Context should still be associated
-    const movedContext = wildflower._contextRegistry.getContextForElement(childElement)
+    // Context should still be associated (the record rides with the element)
+    const movedContext = childElement._listContext
     expect(movedContext).toBeDefined()
     expect(movedContext.id).toBe(context.id)
 

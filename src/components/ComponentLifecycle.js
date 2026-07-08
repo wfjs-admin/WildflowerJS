@@ -4,17 +4,18 @@
  * @module
  */
 
-import { ReactiveStateManager } from '../state/ReactiveStateManager.js';
+import { createStateManager } from '../state/createStateManager.js';
 import { RAW_TARGET } from '../state/ContextProxy.js';
-import { pathResolver } from '../core/wfUtils.js';
+import { objectUtils, pathResolver, wfError, WF_ERRORS } from '../core/wfUtils.js';
 
 // Named constants (replaces magic numbers)
 const LARGE_ARRAY_THRESHOLD = 500;     // Arrays above this size use synchronous render
 const READY_POLL_INTERVAL_MS = 10;     // Polling interval for waitForReady()
-const READY_POLL_MAX_ATTEMPTS = 1000;  // Max polls before timeout (10s at 10ms)
+const READY_TIMEOUT_MS = 10000;        // Wall-clock timeout for waitForReady() (NOT poll count)
+const STALE_DEPENDENCY_MS = 30000;     // Deferred dependencies older than this are dropped (cross-component/store dep resolution)
 
 // Methods the framework drives directly via instance.context.X(). These bypass
-// the action-before-init queue in _wrapMethod — queueing init() itself would
+// the action-before-init queue in _wrapMethod; queueing init() itself would
 // deadlock _initReady, and other lifecycle hooks must fire at framework-known
 // points regardless of init state.
 const LIFECYCLE_HOOK_NAMES = new Set([
@@ -143,7 +144,7 @@ export const ComponentLifecycleMethods = {
         }
         this._processComponentBindings(instance);
         this._bindComponentActions(instance);
-        // Set up entity pools (data-pool) — handles declarative pools block + population
+        // Set up entity pools (data-pool): handles declarative pools block + population
         if (this._setupPools) {
             this._setupPools(instance);
         }
@@ -230,7 +231,7 @@ export const ComponentLifecycleMethods = {
      * @private
      */
     _createComponentStateManager(instanceId, componentName, element) {
-        return new ReactiveStateManager({
+        return createStateManager({
             onStateChange: (path, newValue, oldValue) => {
                 this._handleEntityStateChange(instanceId, path, newValue, oldValue);
             },
@@ -393,7 +394,8 @@ export const ComponentLifecycleMethods = {
                 definition, parentInstance, context } = params;
 
         // Infer types from initial state values and merge with explicit types
-        const inferredTypes = this._inferTypesFromState(state);
+        // (dev-only: inferred types feed _checkTypeMatch, which is stripped from prod)
+        const inferredTypes = __DEV__ ? this._inferTypesFromState(state) : {};
         const explicitTypes = definition.types || {};
         const types = { ...inferredTypes, ...explicitTypes }; // Explicit types override inferred
 
@@ -429,30 +431,10 @@ export const ComponentLifecycleMethods = {
 
         if (!this._contextSystemInitialized) return;
 
-        // Find parent context
-        let parentContext = null;
-        if (parentInstance && parentInstance._componentContext) {
-            parentContext = parentInstance._componentContext;
-        } else if (parentId) {
-            parentContext = this._contextRegistry.getContextById(parentId);
-        }
-        if (!parentContext) {
-            parentContext = this._contextRegistry.rootContext;
-        }
-
-        // Create component context
-        const componentContext = this._contextRegistry.createComponentContext(
-            instance.id,
-            componentName,
-            {
-                parent: parentContext,
-                element: element,
-                componentInstance: instance
-            }
-        );
-
-        instance._componentContext = componentContext;
-        componentContext.componentInstance = instance;
+        // Component contexts are no longer created; emit() bubbles via the DOM
+        // ancestry (not a maintained context tree), and the public `this.context`
+        // API is independent of the CM Context object. Only the deferred-dependency
+        // drain remains here.
 
         // Process deferred dependencies
         if (this._deferredDependencies && this._deferredDependencies.length > 0) {
@@ -610,7 +592,7 @@ export const ComponentLifecycleMethods = {
 
         // Mark init complete and replay any queued action calls. Actions
         // bound at the synchronous mount step (ComponentLifecycle.js:127)
-        // can fire before the deferred init() runs — for example, a click
+        // can fire before the deferred init() runs, for example, a click
         // dispatched in the same task as mount, or while waiting for a
         // subscribed store. _wrapMethod queues those calls; we replay them
         // here so they observe the post-init state the user expected.
@@ -619,6 +601,11 @@ export const ComponentLifecycleMethods = {
             const queued = instance._pendingActions;
             instance._pendingActions = null;
             for (let i = 0; i < queued.length; i++) {
+                // init() (or an earlier replayed action) may have destroyed this
+                // component. Don't replay queued actions against a torn-down
+                // instance; its effects are disposed and handlers removed. The
+                // pre-init guard above only covers destruction BEFORE init runs.
+                if (!this.componentInstances.has(instance.id)) break;
                 try {
                     queued[i]();
                 } catch (e) {
@@ -734,17 +721,21 @@ export const ComponentLifecycleMethods = {
      */
     _scheduleOnUpdateHook(instance) {
         const hasOnUpdate = typeof instance.context.onUpdate === 'function';
-        // Check for plugin hooks only when plugin feature is enabled
-        const hasPluginHooks = __FEATURE_PLUGINS__ && this._hooks &&
+        // Check for lifecycle hooks (the hook system ships in every build)
+        const hasPluginHooks = this._hooks &&
             this._hooks.has('component:afterUpdate') &&
             this._hooks.get('component:afterUpdate').length > 0;
 
-        // Skip if no callbacks needed
-        if (!hasOnUpdate && !hasPluginHooks) return;
+        // Skip if no callbacks needed. Release _lastChangeInfo first: with no
+        // consumer it would otherwise retain its `oldValue` (e.g. a cleared
+        // list's entire old array, and through each item's graph nodes its
+        // directWriter closures + detached row elements) until the next change.
+        if (!hasOnUpdate && !hasPluginHooks) { instance._lastChangeInfo = null; return; }
 
         // Use requestAnimationFrame to ensure DOM has been updated
         requestAnimationFrame(() => {
             this._callOnUpdateHook(instance, instance._lastChangeInfo);
+            instance._lastChangeInfo = null; // consumed, release oldValue
         });
     },
     /**
@@ -834,6 +825,10 @@ export const ComponentLifecycleMethods = {
         // We must not lose those - they need their own render pass
         const queueSnapshot = new Set(this._initialRenderQueue);
 
+        // Mount lists discovered since the last pass (dynamically scanned
+        // components' lists mount here, not in _render's sweep)
+        this._mountLists(this.domElements.lists);
+
         // Render all queued components
         this._render();
 
@@ -841,12 +836,6 @@ export const ComponentLifecycleMethods = {
         if (this._contextSystemInitialized && this._deferredDependencies && this._deferredDependencies.length > 0)
         {
             this._processDeferredDependencies();
-        }
-
-        //Rebuild component hierarchy after all components are rendered
-        if (this._contextSystemInitialized)
-        {
-            this._buildComponentContextHierarchy();
         }
 
         // Remove only the components we processed from the queue
@@ -890,15 +879,6 @@ export const ComponentLifecycleMethods = {
                     if (typeof prop !== 'string') {
                         return undefined;
                     }
-                    // Track computed-to-computed dependency
-                    // When formalGreeting accesses this.computed.greeting,
-                    // we need to record that formalGreeting depends on computed:greeting
-                    // PERF: Lightweight tracking for _updateNode dep comparison.
-                    if (stateManager._nodeTrackingSet) {
-                        stateManager._nodeTrackingSet.add(`computed:${prop}`);
-                    } else if (stateManager.activeComputation) {
-                        stateManager._trackDependency(`computed:${prop}`);
-                    }
                     return stateManager.evaluateComputed(prop);
                 }
             }),
@@ -925,7 +905,7 @@ export const ComponentLifecycleMethods = {
                 return !state._internal || state._internal.ready !== false;
             },
 
-            // TODO(v2): Replace polling with event-driven notification from RSM.
+            // TODO(v2): Replace polling with event-driven notification from state manager.
             // Requires threading a "ready" event through the state manager subscription
             // system. Polling is correct but inelegant for a reactive framework.
             waitForReady: function() {
@@ -933,11 +913,15 @@ export const ComponentLifecycleMethods = {
                     if (!state._internal || state._internal.ready !== false) {
                         resolve();
                     } else {
-                        let attempts = 0;
+                        // Bound the timeout by WALL-CLOCK elapsed, not poll count. Under load the
+                        // chained 10ms timers are throttled, so a count-based limit lets the "10s"
+                        // deadline stretch to tens of seconds (the more churn, the later it fires).
+                        // A wall-clock deadline keeps the contract honest regardless of timer drift.
+                        const deadline = performance.now() + READY_TIMEOUT_MS;
                         const checkReady = () => {
                             if (state._internal.ready) {
                                 resolve();
-                            } else if (++attempts >= READY_POLL_MAX_ATTEMPTS) {
+                            } else if (performance.now() >= deadline) {
                                 reject(new Error('waitForReady timed out after 10s'));
                             } else {
                                 setTimeout(checkReady, READY_POLL_INTERVAL_MS);
@@ -956,72 +940,22 @@ export const ComponentLifecycleMethods = {
              * @returns {any} The value from the target entity's state
              */
             external: function(entityNameOrId, path, value) {
-                // Find the target entity
-                let targetEntity = framework.componentInstances.get(entityNameOrId);
-
-                // If not found by ID, try to find by name
-                if (!targetEntity) {
-                    const components = framework.getComponentsByType(entityNameOrId);
-                    if (components.length > 0) {
-                        targetEntity = components[0];
-                    } else if (framework.storeManager) {
-                        // Try to find as a store component
-                        targetEntity = framework.storeManager.getStoreComponentByName(entityNameOrId);
-                    }
-                }
+                // Find the target entity (shared lookup chain)
+                const targetEntity = framework._externalFindTarget(entityNameOrId);
 
                 // Try to resolve as a plugin if not found yet (only when plugin feature is enabled)
                 if (__FEATURE_PLUGINS__) {
-                    if (!targetEntity && framework._pluginStates) {
-                        let pluginName = entityNameOrId;
-                        if (pluginName.startsWith('plugin:')) {
-                            pluginName = pluginName.slice(7);
-                        }
-
-                        const pluginContext = framework._pluginStates.get(pluginName);
-                        if (pluginContext && pluginContext.state) {
-                            // Register dependency for plugins
-                            framework._registerPluginDependent(pluginName, this.id);
-
-                            if (arguments.length === 2) {
-                                try {
-                                    if (path.startsWith('computed:')) {
-                                        const computedName = path.slice(9);
-                                        return pluginContext._stateManager?.evaluateComputed(computedName) ??
-                                               pluginContext[computedName];
-                                    } else {
-                                        return pathResolver.get(pluginContext.state, path);
-                                    }
-                                } catch (error) {
-                                    return path.startsWith('computed:') ? 0 : null;
-                                }
-                            }
-                            return undefined;
-                        }
+                    if (!targetEntity) {
+                        const pluginHit = framework._externalPluginGet(entityNameOrId, path, arguments.length, this.id);
+                        if (pluginHit) return pluginHit.value;
                     }
                 }
 
                 if (!targetEntity) {
-                    // PENDING STORE DEPENDENCY: If we're in a computed evaluation and
-                    // the store doesn't exist yet, register a pending dependency so
-                    // the computed property will be re-evaluated when the store is created.
-                    // Check both tracking context (set during list eval) and activeComputation (always set during computed eval)
-                    const trackingContext = framework._computedTrackingContext;
-                    const activeComputed = this.stateManager?.activeComputation;
-
-                    if (framework.storeManager && (trackingContext || activeComputed)) {
-                        const componentId = trackingContext?.componentId || this.id;
-                        const computedName = trackingContext?.computedName || activeComputed;
-
-                        if (componentId && computedName) {
-                            framework.storeManager.registerPendingStoreDependency(
-                                entityNameOrId,
-                                componentId,
-                                computedName,
-                                null // listElement will be associated during list binding
-                            );
-                        }
-                    }
+                    // PENDING STORE DEPENDENCY: if we're in a computed evaluation
+                    // and the store doesn't exist yet, register so the computed
+                    // re-evaluates when the store is created.
+                    framework._externalRegisterPending(entityNameOrId, this.id, this.stateManager);
 
                     framework._log('debug', `Entity not found: ${entityNameOrId}, returning fallback value`);
                     // For 1-arg calls, return null; for 2-arg calls check if it's a computed path
@@ -1033,8 +967,9 @@ export const ComponentLifecycleMethods = {
                     framework._registerEntityDependent(targetEntity.id, this.id);
                 }
 
-                // Register external dependency for list item reactivity
-                // This tracks which components depend on external() values so we can refresh them
+                // Register external dependency for list item reactivity.
+                // NOTE: registered for EVERY arity here; the component-context
+                // override registers only on the 2-arg GET. Preserved as-is.
                 if (framework._registerExternalDependency) {
                     framework._registerExternalDependency(this.id, targetEntity.id, path);
                 }
@@ -1047,30 +982,15 @@ export const ComponentLifecycleMethods = {
 
                 // GET VALUE case
                 if (arguments.length === 2) {
-                    let resolvedValue;
-
                     try {
-                        if (path.startsWith('computed:')) {
-                            const computedPath = path.slice(9);
-                            if (computedPath.includes('.')) {
-                                resolvedValue = targetEntity.stateManager._resolveComputedPath(computedPath);
-                            } else {
-                                resolvedValue = targetEntity.stateManager.evaluateComputed(computedPath);
-                            }
-                        } else {
-                            resolvedValue = targetEntity.stateManager.getValue(path);
-                        }
+                        const resolvedValue = framework._externalResolveTargetValue(targetEntity, path);
 
-                        // Try to register dependency in context system
-                        if (framework._contextSystemInitialized && framework._contextRegistry) {
-                            const sourceContext = framework._contextRegistry.getContextById(this.id);
-                            const targetContext = framework._contextRegistry.getContextById(targetEntity.id);
-
-                            if (sourceContext && targetContext) {
-                                framework._contextRegistry.registerDependency(sourceContext, targetContext, path);
-                            } else {
-                                framework._addDeferredDependency(this.id, targetEntity.id, path, 'external');
-                            }
+                        // Late-binding re-eval: defer so _processDeferredDependencies
+                        // re-evaluates this component once the external target appears.
+                        // (Ongoing external reactivity is graph-edge driven; the
+                        // dependents graph is gone.)
+                        if (framework._contextSystemInitialized) {
+                            framework._addDeferredDependency(this.id, targetEntity.id, path, 'external');
                         }
 
                         return resolvedValue;
@@ -1082,12 +1002,7 @@ export const ComponentLifecycleMethods = {
 
                 // SET VALUE case
                 if (arguments.length === 3) {
-                    targetEntity.stateManager.setValue(path, value);
-                    if (framework._componentsToUpdate) {
-                        framework._componentsToUpdate.add(targetEntity.id);
-                    }
-                    framework._scheduleRender();
-                    return value;
+                    return framework._externalSetTargetValue(targetEntity, path, value);
                 }
             }
         };
@@ -1120,7 +1035,7 @@ export const ComponentLifecycleMethods = {
             // Stores declared in `subscribe: { storeName: [...] }` are available via this.stores.storeName
             stores: {},
 
-            // Entity pool access — this.pool('enemies') or this.pool('enemies', { onAdd, onRemove, onClear })
+            // Entity pool access: this.pool('enemies') or this.pool('enemies', { onAdd, onRemove, onClear })
             // Uses instanceId + framework lookup since `instance` doesn't exist yet at context creation time
             pool: (name, options) => {
                 if (!self._getPool) return null;
@@ -1154,91 +1069,23 @@ export const ComponentLifecycleMethods = {
 
             external: function (componentNameOrId, path, value)
             {
-                // CROSS-COMPONENT REACTIVITY: If we're inside a computed evaluation,
-                // mark that computed as having external dependencies. This ensures
-                // it will always re-evaluate (skip stale check optimization) since
-                // the dirty flag mechanism only works within a single stateManager.
-                if (stateManager && stateManager.activeComputation) {
-                    if (!stateManager._computedsWithExternalDeps) {
-                        stateManager._computedsWithExternalDeps = new Set();
-                    }
-                    stateManager._computedsWithExternalDeps.add(stateManager.activeComputation);
-                }
-
-                // Find the target component
-                let targetComponent = self.componentInstances.get(componentNameOrId);
-
-                // If not found by ID, try to find by name
-                if (!targetComponent)
-                {
-                    const components = self.getComponentsByType(componentNameOrId);
-                    if (components.length > 0)
-                    {
-                        targetComponent = components[0];
-                    } else if (self.storeManager)
-                    {
-                        // Try to find as a store component
-                        targetComponent = self.storeManager.getStoreComponentByName(componentNameOrId);
-                    }
-                }
+                // Find the target component (shared lookup chain)
+                const targetComponent = self._externalFindTarget(componentNameOrId);
 
                 // Try to resolve as a plugin if not found yet (only when plugin feature is enabled)
                 if (__FEATURE_PLUGINS__) {
-                    if (!targetComponent && self._pluginStates) {
-                        let pluginName = componentNameOrId;
-
-                        // Handle both "plugin:name" and direct "name" format
-                        if (pluginName.startsWith('plugin:')) {
-                            pluginName = pluginName.slice(7);
-                        }
-
-                        const pluginContext = self._pluginStates.get(pluginName);
-                        if (pluginContext && pluginContext.state) {
-                            // Register this component as depending on this plugin
-                            self._registerPluginDependent(pluginName, this.id);
-
-                            // Return plugin value directly (GET case)
-                            if (arguments.length === 2) {
-                                try {
-                                    if (path.startsWith('computed:')) {
-                                        const computedName = path.slice(9);
-                                        return pluginContext._stateManager?.evaluateComputed(computedName) ??
-                                               pluginContext[computedName];
-                                    } else {
-                                        return pathResolver.get(pluginContext.state, path);
-                                    }
-                                } catch (error) {
-                                    return path.startsWith('computed:') ? 0 : null;
-                                }
-                            }
-                            // For SET case, plugins don't support external writes
-                            return undefined;
-                        }
+                    if (!targetComponent) {
+                        const pluginHit = self._externalPluginGet(componentNameOrId, path, arguments.length, this.id);
+                        if (pluginHit) return pluginHit.value;
                     }
                 }
 
                 if (!targetComponent)
                 {
-                    // PENDING STORE DEPENDENCY: If we're in a computed evaluation and
-                    // the store doesn't exist yet, register a pending dependency so
-                    // the computed property will be re-evaluated when the store is created.
-                    // Check both tracking context (set during list eval) and activeComputation (always set during computed eval)
-                    const trackingContext = self._computedTrackingContext;
-                    const activeComputed = stateManager ? stateManager.activeComputation : null;
-
-                    if (self.storeManager && (trackingContext || activeComputed)) {
-                        const componentId = trackingContext?.componentId || instanceId;
-                        const computedName = trackingContext?.computedName || activeComputed;
-
-                        if (componentId && computedName) {
-                            self.storeManager.registerPendingStoreDependency(
-                                componentNameOrId,
-                                componentId,
-                                computedName,
-                                null // listElement will be associated during list binding
-                            );
-                        }
-                    }
+                    // PENDING STORE DEPENDENCY: if we're in a computed evaluation
+                    // and the store doesn't exist yet, register so the computed
+                    // re-evaluates when the store is created.
+                    self._externalRegisterPending(componentNameOrId, instanceId, stateManager);
 
                     self._log('debug', `Component not found: ${componentNameOrId}, returning fallback value`);
                     // For 1-arg calls, return null; for 2-arg calls check if it's a computed path
@@ -1259,49 +1106,24 @@ export const ComponentLifecycleMethods = {
                 // GET VALUE case
                 if (arguments.length === 2)
                 {
-                    let value;
-
                     try
                     {
+                        const resolved = self._externalResolveTargetValue(targetComponent, path);
 
-                        if (path.startsWith('computed:')) {
-                            const computedPath = path.slice(9);
-
-                            // Handle dot notation in computed paths
-                            if (computedPath.includes('.')) {
-                                value = targetComponent.stateManager._resolveComputedPath(computedPath);
-                            } else {
-                                value = targetComponent.stateManager.evaluateComputed(computedPath);
-                            }
-                        } else {
-                            // Handle dot notation in regular state paths
-                            value = targetComponent.stateManager.getValue(path);
-                        }
-
-                        // Note: Entity dependency registration moved before argument count checks
-                        // to handle all cases (1-arg, 2-arg, 3-arg)
-
-                        // Register external dependency for list item reactivity
-                        // This tracks which components depend on external() values so we can refresh them
+                        // Register external dependency for list item reactivity.
+                        // NOTE: registered only on the 2-arg GET here; the
+                        // base-entity external() registers for every arity.
+                        // Preserved as-is.
                         if (self._registerExternalDependency) {
                             self._registerExternalDependency(this.id, targetComponent.id, path);
                         }
 
-                        // Try to register dependency
-                        const sourceContext = self._contextRegistry.getContextById(this.id);
-                        const targetContext = self._contextRegistry.getContextById(targetComponent.id);
+                        // Late-binding re-eval: defer so the component re-evaluates
+                        // once the external target appears (the dependents graph was
+                        // removed; ongoing reactivity is graph-edge driven).
+                        self._addDeferredDependency(this.id, targetComponent.id, path, 'external');
 
-                        // If both contexts exist, register the dependency
-                        if (sourceContext && targetContext)
-                        {
-                            self._contextRegistry.registerDependency(sourceContext, targetContext, path);
-                        }
-                        else
-                        {
-                            self._addDeferredDependency(this.id, targetComponent.id, path, 'external');
-                        }
-
-                        return value;
+                        return resolved;
 
                     } catch (error)
                     {
@@ -1312,16 +1134,7 @@ export const ComponentLifecycleMethods = {
                 // SET VALUE case
                 if (arguments.length === 3)
                 {
-                    targetComponent.stateManager.setValue(path, value);
-
-                    // Trigger a render for the target component
-                    if (self._componentsToUpdate)
-                    {
-                        self._componentsToUpdate.add(targetComponent.id);
-                    }
-                    self._scheduleRender();
-
-                    return value;
+                    return self._externalSetTargetValue(targetComponent, path, value);
                 }
             },
 
@@ -1564,47 +1377,28 @@ export const ComponentLifecycleMethods = {
                     return false;
                 }
 
-                const componentContext = componentInstance._componentContext;
-
-                if (!componentContext)
+                // Bubble the event up the DOM component ancestry: from the emitting
+                // component's element, walk up [data-component] ancestors and invoke
+                // each one's on<Event> handler. DOM-native, reflects the live
+                // structure with no maintained context tree / scan-time hierarchy
+                // rebuild, and works during init (the element is already in the DOM).
+                const handlerName = `on${eventName.charAt(0).toUpperCase()}${eventName.slice(1)}`;
+                let ancestorEl = componentInstance.element?.parentElement?.closest('[data-component]') || null;
+                while (ancestorEl)
                 {
-                    self._error(WF_ERRORS.EMIT_NO_CONTEXT, {
-                        context: this.id,
-                        suggestion: 'Component context may not be ready - ensure emit() is called after init()'
-                    });
-                    return false;
-                }
-
-                let currentContext = componentContext.parent;
-
-                // Walk up the context hierarchy
-                while (currentContext && currentContext.type === 'component')
-                {
-                    // Only proceed if this context has a component instance
-                    if (currentContext.componentInstance)
+                    const ancestor = self.componentInstances.get(ancestorEl.dataset.componentId);
+                    if (ancestor && ancestor.context && typeof ancestor.context[handlerName] === 'function')
                     {
-                        const parentComponent = currentContext.componentInstance;
-
-                        // Create handler name using convention (e.g., "onClick" from "click")
-                        const handlerName = `on${eventName.charAt(0).toUpperCase()}${eventName.slice(1)}`;
-
-                        // Call handler if it exists in the parent component
-                        if (typeof parentComponent.context[handlerName] === 'function')
+                        try
                         {
-                            try
-                            {
-                                parentComponent.context[handlerName](detail);
-                            } catch (error)
-                            {
-                                if (__DEV__) console.error(`Error in parent event handler ${handlerName}:`, error);
-                            }
+                            ancestor.context[handlerName](detail);
+                        } catch (error)
+                        {
+                            if (__DEV__) console.error(`Error in parent event handler ${handlerName}:`, error);
                         }
                     }
-
-                    // Move to the next parent in context hierarchy
-                    currentContext = currentContext.parent;
+                    ancestorEl = ancestorEl.parentElement?.closest('[data-component]') || null;
                 }
-
 
                 return true;
             },
@@ -1822,17 +1616,6 @@ export const ComponentLifecycleMethods = {
     },
 
     /**
-     * Get list of store names that component needs to wait for.
-     * @param {Object} definition - Component definition
-     * @returns {string[]} Array of store names
-     * @private
-     */
-    _getSubscribedStoreNames(definition) {
-        const parsed = this._parseSubscribeDeclaration(definition.subscribe);
-        return Object.keys(parsed);
-    },
-
-    /**
      * Set up declarative store subscriptions from subscribe: {} in component definition.
      * This registers the component for onStoreUpdate() callbacks when watched store paths change.
      * Also handles the subscribe-wait feature: components wait for subscribed stores before init().
@@ -1947,7 +1730,7 @@ export const ComponentLifecycleMethods = {
                         // Track subscription for cleanup
                         instance._storeSubscriptions.push({ storeName, path });
                     } else if (instance.id) {
-                        // Store doesn't exist yet — register pending dependency
+                        // Store doesn't exist yet; register pending dependency
                         // so the component re-renders when the store is created.
                         // Uses '_subscribe_' as a synthetic computed name to trigger
                         // general re-render + subscribePath retry.
@@ -1997,11 +1780,38 @@ export const ComponentLifecycleMethods = {
                 return;
             }
 
+            // RG-5 (review 2026-07-02, Chris decision): watching a list item by
+            // numeric index is an anti-pattern. Reactivity is identity-based, so
+            // the index in an onStateChange path reflects the item's position
+            // when FIRST observed; after a splice/reorder the watcher misfires
+            // or goes silent. WF-213, dev-only, warn-severity (recoverable
+            // diagnostic; must not trip error-tracking pipelines).
+            if (__DEV__ && /(^|\.)\d+(\.|$)|\[\d+\]/.test(path)) {
+                wfError(WF_ERRORS.INDEXED_PATH_OBSERVER, {
+                    warn: true,
+                    context: `watch path "${path}"`,
+                    suggestion: 'Watch the array (or a computed over it) and track items by id instead of position'
+                });
+            }
+
             // Register local state watcher
             instance._watcherHandlers = instance._watcherHandlers || new Map();
             instance._watcherHandlers.set(path, boundHandler);
 
-            // Execute immediately if requested — uses _resolveComponentValue for computed-first resolution
+            // A computed change reaches this watcher as a `computed:NAME` pulse
+            // (matched by _executeWatchers via exact `computed:NAME` key or the
+            // bare-name fallback). Tell the state manager to install that
+            // computed's notifier (lazy by default). The watched key may be bare
+            // (`derived`) or prefixed (`computed:derived`); record the bare
+            // computed name either way. A non-computed name is harmless; the
+            // notifier only materializes if a computed by that name exists. A `*`
+            // wildcard watcher matches every pulse, so it must observe all.
+            if (stateManager._ensureComputedNotifier) {
+                if (path === '*') stateManager._observeAllComputedNotifiers();
+                else stateManager._ensureComputedNotifier(path.startsWith('computed:') ? path.slice(9) : path);
+            }
+
+            // Execute immediately if requested; uses _resolveComponentValue for computed-first resolution
             if (isImmediate)
             {
                 try
@@ -2084,7 +1894,7 @@ export const ComponentLifecycleMethods = {
             // Action-before-init guard. If the user's init() hook hasn't run
             // yet (instance._initReady !== true), queue external calls and
             // replay them after init completes. Re-entrant calls (a method
-            // invoking another method during execution) bypass the queue —
+            // invoking another method during execution) bypass the queue;
             // we're already inside a known execution frame.
             if (!isLifecycle && !instance._initReady && !instance._inMethodExecution) {
                 if (!instance._pendingActions) instance._pendingActions = [];
@@ -2215,11 +2025,737 @@ export const ComponentLifecycleMethods = {
             this._render();
             // Call onUpdate after synchronous render
             this._callOnUpdateHook(instance, instance._lastChangeInfo);
+            instance._lastChangeInfo = null; // consumed, release oldValue
         } else {
             // Standard async render for small updates
             this._scheduleRender();
             // Schedule onUpdate to be called after async render completes
             this._scheduleOnUpdateHook(instance);
+        }
+
+        return true;
+    },
+
+    /**
+     * Add a deferred dependency if not already present (deduplication)
+     * @private
+     */
+    _addDeferredDependency(sourceId, targetId, path, source) {
+        if (!this._deferredDependencies) {
+            this._deferredDependencies = [];
+        }
+        // Check for duplicate
+        const isDuplicate = this._deferredDependencies.some(d =>
+            d.sourceId === sourceId &&
+            d.targetId === targetId &&
+            d.path === path
+        );
+        if (!isDuplicate) {
+            this._deferredDependencies.push({
+                sourceId,
+                targetId,
+                path,
+                timestamp: Date.now(),
+                _source: source
+            });
+        }
+    },
+    /**
+     * Process any deferred dependencies that couldn't be registered earlier
+     * @private
+     */
+    _processDeferredDependencies() {
+        if (!this._deferredDependencies || this._deferredDependencies.length === 0) return;
+
+        // Prevent recursive processing
+        if (this._processingDeferredDependencies) return;
+        this._processingDeferredDependencies = true;
+
+        const now = Date.now();
+        const stillDeferred = [];
+        const forceReEvaluation = new Set(); // Components that need computed re-evaluation
+
+        this._deferredDependencies.forEach(dep => {
+            // Skip very old dependencies - drop silently
+            if (now - dep.timestamp > STALE_DEPENDENCY_MS) {
+                return;
+            }
+
+            const sourceComponent = this.componentInstances.get(dep.sourceId);
+            let targetComponent = this.componentInstances.get(dep.targetId);
+
+            // Try to find target by name if not found by ID
+            if (!targetComponent && typeof dep.targetId === 'string') {
+                if (dep.targetId === 'app-store') {
+                    targetComponent = this.storeManager.getStoreComponentByName('app-store');
+                } else if (dep.targetId.startsWith('store-')) {
+                    targetComponent = this.storeManager.getStoreComponentByName(dep.targetId);
+                }
+            }
+
+            // Check if both components still exist
+            if (!sourceComponent || !targetComponent) {
+                // For store-not-found, keep trying but not forever (30 second limit already applied above)
+                if (dep.reason === 'store-not-found' && targetComponent === undefined) {
+                    // Store might get created later, keep in queue (timeout still applies)
+                    stillDeferred.push(dep);
+                }
+                // For all other cases, drop the dependency
+                return;
+            }
+
+            // For store-not-ready dependencies, check if store is now ready
+            if (dep.reason === 'store-not-ready' && targetComponent.state._internal) {
+                if (!targetComponent.state._internal.ready) {
+                    stillDeferred.push(dep); // Store still not ready
+                    return;
+                }
+                // Store is now ready, force re-evaluation
+                forceReEvaluation.add(dep.sourceId);
+            }
+
+            // Both components exist (resolved above). Component contexts are no
+            // longer registered and there is no dependents graph to register into,
+            // so keep the dependency queued; ongoing reactivity is graph-edge driven
+            // (the store-ready path above already forced re-evaluation when needed).
+            stillDeferred.push(dep);
+        });
+
+        // Update the deferred dependencies list
+        this._deferredDependencies = stillDeferred;
+
+        // Force re-evaluation of computed properties for components that got new dependencies
+        forceReEvaluation.forEach(componentId => {
+            const component = this.componentInstances.get(componentId);
+            if (component && component.stateManager) {
+                // Clear computed cache
+                component.stateManager.computedCache.clear();
+
+                // Re-evaluate all computed properties
+                Object.keys(component.stateManager.computed || {}).forEach(propName => {
+                    try {
+                        const oldValue = component.stateManager._cachedComputedValue
+                            ? component.stateManager._cachedComputedValue(propName)
+                            : component.stateManager._lastEvalResult?.get(propName);
+                        const newValue = component.stateManager.evaluateComputed(propName);
+
+                        // Trigger state change notification if value changed
+                        if (!objectUtils.isEqual(oldValue, newValue)) {
+                            component.stateManager.onStateChange(`computed:${propName}`, newValue, oldValue);
+                        }
+                    } catch (error) {
+                        if (__DEV__) console.error(`Error re-evaluating ${propName}:`, error);
+                    }
+                });
+            }
+        });
+
+        // Clear recursive guard
+        this._processingDeferredDependencies = false;
+    },
+
+    // COMPONENT DESTRUCTION
+
+    /**
+     * Destroy a component instance and clean up all its resources.
+     *
+     * This method performs comprehensive cleanup including:
+     * - Calling beforeDestroy and destroy lifecycle hooks
+     * - Destroying child components (unless marked data-external)
+     * - Cleaning up store watcher subscriptions
+     * - Removing all context registrations (bindings, actions, conditionals, lists)
+     * - Cleaning up event handlers and portals
+     * - Removing from component hierarchy tracking
+     *
+     * @param {string} componentId - The unique identifier of the component to destroy
+     * @returns {boolean} True if the component was found and destroyed, false otherwise
+     *
+     * @example
+     * // Destroy a specific component
+     * const wasDestroyed = wildflower.destroyComponent('counter-1');
+     *
+     * @example
+     * // Destroy component and let framework clean up children
+     * wildflower.destroyComponent(instance.id);
+     */
+    destroyComponent(componentId)
+    {
+        const instance = this.componentInstances.get(componentId);
+        if (!instance) return false;
+
+        // Trigger plugin beforeDestroy hook (only if plugin system is loaded)
+        if (this._triggerHook) {
+            this._triggerHook('component:beforeDestroy', instance);
+        }
+
+        // Call beforeDestroy lifecycle hook (before any cleanup starts)
+        this._callBeforeDestroyHook(instance);
+
+        // Clean up portaled content before removing context
+        // Only if portal system is included (not in lite build)
+        if (this._cleanupComponentPortals) {
+            this._cleanupComponentPortals(componentId);
+        }
+
+
+        // Handle child components - but skip those marked as external
+        const childIds = [...(this.componentChildren.get(componentId) || [])];
+        childIds.forEach(childId => {
+            const childInstance = this.componentInstances.get(childId);
+            if (childInstance && childInstance.element && childInstance.element.hasAttribute('data-external')) {
+                return;
+            }
+            this.destroyComponent(childId);
+        });
+
+        // Clean up entity pools (data-pool)
+        if (this._cleanupPools) {
+            this._cleanupPools(instance);
+        }
+
+        // Call user destroy hook if available.
+        //
+        // Ordering: the destroy hook fires BEFORE binding/render effects
+        // are disposed (the per-effect
+        // disposers run later in this function, and the catch-all sweep at
+        // the bottom runs last). State mutations inside destroy() therefore
+        // queue effects that fire against a partially torn-down component.
+        //
+        // For BINDING effects, this is benign: the component's contexts are
+        // removed during this destroy pass. When a queued binding effect runs
+        // in the microtask drain after this function returns, its context-lookup
+        // misses and it silently no-ops. The effect itself is also marked disposed by the
+        // fallback sweep at the bottom of this function before the drain.
+        //
+        // For CUSTOM effects (createEffect with scope: instance / context),
+        // the same fallback sweep disposes them before the microtask drain,
+        // so .disposed is true when they're scheduled to run and _runEffect
+        // returns early.
+        //
+        // The accidental safety hinges on (a) context-removal-before-destroy
+        // at line 440 and (b) the fallback sweep at the end of this function.
+        // If either changes, revisit this ordering.
+        if (typeof instance.context.destroy === 'function')
+        {
+            try
+            {
+                instance.context.destroy();
+            } catch (error)
+            {
+                this._handleError('Error in destroy hook', error, instance, { lifecycle: 'destroy' });
+            }
+        }
+
+        // Clean up store watcher subscriptions
+        if (instance._storeWatcherCleanups && instance._storeWatcherCleanups.length > 0) {
+            instance._storeWatcherCleanups.forEach(unsubscribe => {
+                try {
+                    if (typeof unsubscribe === 'function') {
+                        unsubscribe();
+                    }
+                } catch (error) {
+                    // Silently ignore cleanup errors
+                }
+            });
+            instance._storeWatcherCleanups = [];
+        }
+
+        // Clean up declarative store path subscriptions (subscribe: {} feature)
+        if (this.storeManager && instance._storeSubscriptions && instance._storeSubscriptions.length > 0) {
+            this.storeManager.unsubscribeAllPaths(instance);
+        }
+
+        // Clean up slot templates (subscriptions and rendered elements)
+        if (instance._slotContexts || instance._slotCleanups) {
+            this._cleanupSlotTemplates(instance);
+        }
+
+        // Dispose render effect if component uses effect-based rendering
+        if (instance._renderEffect) {
+            this._disposeComponentRenderEffect(instance);
+        }
+
+        // No context registry to sweep: binding/conditional contexts no longer
+        // exist, action records are element-local (listeners cleaned by
+        // _cleanupComponentEventHandlers below), list contexts are plain objects
+        // that GC with the element / instance, and render/portal records GC with
+        // the render effect + instance arrays.
+
+        // Clean up any remaining event handlers
+        this._cleanupComponentEventHandlers(componentId);
+
+        // Dispatch component destroy event for optional module cleanup (e.g., RouteManager)
+        document.dispatchEvent(new CustomEvent('wildflower:componentDestroy', {
+            detail: { instance, context: instance.context }
+        }));
+
+        // Remove from component hierarchy
+        this._removeFromComponentHierarchy(componentId);
+
+        // Clean up from update tracking to prevent stale update warnings
+        if (this._componentsToUpdate) {
+            this._componentsToUpdate.delete(componentId);
+        }
+
+        // Clean up from unified entity dependents (stores, plugins, etc.)
+        if (this._entityDependents) {
+            this._entityDependents.forEach((dependents) => {
+                dependents.delete(componentId);
+            });
+        }
+
+        // Purge cross-store tracking-proxy cache entries involving this entity
+        // (as reader: outer key; as read store: inner key of other readers)
+        if (this._trackingProxyCache) {
+            this._trackingProxyCache.delete(componentId);
+            this._trackingProxyCache.forEach((perStore) => {
+                perStore.delete(componentId);
+            });
+        }
+
+        // Clean up deferred dependencies referencing this component
+        if (this._deferredDependencies && this._deferredDependencies.length > 0) {
+            this._deferredDependencies = this._deferredDependencies.filter(dep =>
+                dep.sourceId !== componentId && dep.targetId !== componentId
+            );
+        }
+
+        // Clean up Configurable Component Templates
+        if (instance._itemTemplates) {
+            instance._itemTemplates.clear();
+        }
+
+        // Clean up custom directives (only if plugin system is loaded)
+        if (instance.element && this._cleanupCustomDirectivesInSubtree) {
+            this._cleanupCustomDirectivesInSubtree(instance.element);
+        }
+
+        // Trigger plugin afterDestroy hook (only if plugin system is loaded)
+        if (this._triggerHook) {
+            this._triggerHook('component:afterDestroy', componentId);
+        }
+
+        // Clean up any pending store dependencies for this component
+        if (this.storeManager) {
+            this.storeManager.removePendingDependencies(componentId);
+        }
+
+        // Run the data-list mapArray cleanups registered at list init (RG-2).
+        // The reconciler's structural effect is a raw core effect held only on
+        // element._disposeMapArray and these closures. It is NOT created via
+        // createEffect, so it is NOT in stateManager._effects and the destroy()
+        // sweep below cannot reach it. Without this, a list fed (via a computed)
+        // from a long-lived store keeps its structural effect alive through the
+        // store's node observers, and every post-destroy store mutation re-runs
+        // the reconcile against the destroyed component, growing detached rows
+        // and registering fresh per-item effects forever. Each cleanup is
+        // idempotent (disposeNode short-circuits on F_DISPOSED), so stale
+        // entries from a list re-init are safe to re-run.
+        if (instance._mapArrayCleanups) {
+            for (let i = 0; i < instance._mapArrayCleanups.length; i++) {
+                try { instance._mapArrayCleanups[i](); } catch (e) { /* already gone */ }
+            }
+            instance._mapArrayCleanups = null;
+        }
+
+        // Dispose every effect on this component's reactive surface. createEffect
+        // adds UNCONDITIONALLY to stateManager._effects (and additionally to a
+        // scope set when scoped to instance/context), so stateManager._effects is
+        // the superset of every effect created THROUGH IT: the framework
+        // _renderEffect, per-item list effects, computed notifiers. (The mapArray
+        // structural effect is the exception, a raw core effect handled by the
+        // _mapArrayCleanups pass above.) destroy() walks that superset and
+        // _disposeEffect removes each from every set it lives in (_effects,
+        // scope._effects, _listItemEffects), so a single destroy() covers what
+        // the old multi-set fallback sweep did. It also sets _destroyed so a
+        // still-pending deferred computed-notifier install (queued before
+        // destroy) skips instead of orphaning an effect.
+        if (instance.stateManager && instance.stateManager.destroy) {
+            instance.stateManager.destroy();
+        }
+
+        this.componentInstances.delete(componentId);
+
+        return true;
+    },
+    _removeFromComponentHierarchy(componentId)
+    {
+        // Remove from parent's children array
+        const parentId = this.componentParents.get(componentId);
+        if (parentId)
+        {
+            const siblings = this.componentChildren.get(parentId) || [];
+            this.componentChildren.set(
+                parentId,
+                siblings.filter(id => id !== componentId)
+            );
+
+            // Update parent instance references if needed
+            const parentInstance = this.componentInstances.get(parentId);
+            if (parentInstance && Array.isArray(parentInstance.children))
+            {
+                parentInstance.children = parentInstance.children.filter(
+                    child => child.id !== componentId
+                );
+            }
+        }
+
+        // Remove component's own entries
+        this.componentParents.delete(componentId);
+        this.componentChildren.delete(componentId);
+
+    },
+    /**
+     * Clean up event handlers for a component when it's destroyed
+     * @param {string} componentId - The ID of the component being destroyed
+     * @private
+     */
+    _cleanupComponentEventHandlers(componentId)
+    {
+        if (!componentId) return;
+
+        // Find all event handlers associated with this component
+        const handlersToRemove = [];
+
+        // Check for handlers with this component ID in their key (using precise matching)
+        this.eventHandlers.forEach((handler, key) =>
+        {
+            // Use precise matching instead of substring to avoid false positives
+            const isComponentHandler = (
+                key.startsWith(`action-${componentId}-`) ||
+                key.startsWith(`listener-${componentId}-`) ||
+                key.startsWith(`outside-${componentId}-`) ||
+                key.startsWith(`model-${componentId}-`) ||
+                key.startsWith(`manual_${componentId}_`) ||  // WildQuery $el().on() handlers
+                key.startsWith(`${componentId}-`) ||
+                key === componentId
+            );
+
+            if (isComponentHandler)
+            {
+                // Remove structured event listener if present
+                if (typeof handler === 'object' && handler.target && handler.event && handler.handler)
+                {
+                    handler.target.removeEventListener(
+                        handler.event,
+                        handler.handler,
+                        handler.options
+                    );
+                }
+                handlersToRemove.push(key);
+            }
+        });
+
+        // Remove all identified handlers
+        handlersToRemove.forEach(key =>
+        {
+            this.eventHandlers.delete(key);
+        });
+
+        // Drop this component's outside-click registrations. Otherwise the
+        // registry retains the destroyed instance (and its element) until the
+        // next document click happens to run the lazy isConnected sweep.
+        if (this._outsideClickRegistry)
+        {
+            for (const [el, methodMap] of this._outsideClickRegistry)
+            {
+                for (const [name, entry] of methodMap)
+                {
+                    if (entry && entry.instance && entry.instance.id === componentId)
+                    {
+                        methodMap.delete(name);
+                    }
+                }
+                if (methodMap.size === 0) this._outsideClickRegistry.delete(el);
+            }
+        }
+
+
+
+
+        // Also clean up from DOM elements collections
+
+        ['bindings', 'conditionals', 'lists', 'models'].forEach(collectionName =>
+        {
+            const collection = this.domElements[collectionName];
+            if (Array.isArray(collection))
+            {
+                this.domElements[collectionName] = collection.filter(item => item.componentId !== componentId);
+            }
+        });
+
+        // Recursively clean up child components' event handlers
+        const childIds = this.componentChildren.get(componentId) || [];
+
+        childIds.forEach(childId =>
+        {
+            this._cleanupComponentEventHandlers(childId);
+        });
+    },
+    // GARBAGE COLLECTION
+    /**
+     * Perform garbage collection to clean up orphaned components and resources.
+     *
+     * This method identifies and removes:
+     * - Components whose DOM elements are no longer in the document
+     * - DOM elements with component IDs that don't match active components
+     * - Event handlers for non-existent components
+     * - Binding references for destroyed components
+     * - Orphaned contexts in the context registry
+     * - Stale deferred dependencies
+     *
+     * Note: Virtual/persistent components and components marked with data-external
+     * are preserved and not garbage collected.
+     *
+     * @returns {Object} Statistics about what was cleaned up:
+     *   - orphanedComponentsRemoved: Number of orphaned components destroyed
+     *   - orphanedElementsRemoved: Number of orphaned DOM elements removed
+     *   - eventHandlersCleared: Number of event handlers cleaned up
+     *   - bindingsRemoved: Number of binding references removed
+     *   - orphanedContextsRemoved: Number of orphaned contexts cleaned (if context system active)
+     *   - deferredDependenciesCleared: Number of stale deferred dependencies removed
+     *
+     * @example
+     * // Manual garbage collection
+     * const stats = wildflower.garbageCollect();
+     * console.log(`Cleaned up ${stats.orphanedComponentsRemoved} orphaned components`);
+     *
+     * @example
+     * // Periodic cleanup in long-running apps
+     * setInterval(() => wildflower.garbageCollect(), 60000);
+     */
+    garbageCollect(scopeElement)
+    {
+        // Track stats
+        const stats = {
+            orphanedComponentsRemoved: 0,
+            orphanedElementsRemoved: 0,
+            eventHandlersCleared: 0,
+            bindingsRemoved: 0
+        };
+
+        // Scope: search within scopeElement if provided, otherwise the whole document
+        const root = scopeElement || document;
+
+        // Find elements with component-id that aren't associated with active components.
+        // Only remove elements that are detached from the document; live DOM elements
+        // may be awaiting re-initialization and must not be destroyed.
+        const elementsWithComponentId = root.querySelectorAll('[data-component-id]');
+        Array.from(elementsWithComponentId).forEach(el =>
+        {
+            const componentId = el.dataset.componentId;
+            if (!this.componentInstances.has(componentId))
+            {
+                if (!document.body.contains(el)) {
+                    // Truly orphaned (detached from DOM) - safe to remove
+                    el.remove();
+                    stats.orphanedElementsRemoved++;
+                } else {
+                    // Still in live DOM but no instance; strip stale component-id
+                    // so it can be re-scanned as a fresh component
+                    delete el.dataset.componentId;
+                }
+            }
+        });
+
+        // Find components with no DOM presence
+        const orphanedIds = [];
+        this.componentInstances.forEach((instance, id) =>
+        {
+            // Skip virtual/store components that don't have DOM elements
+            if (instance.name === 'app-store' || id.includes('app-store') ||
+                instance.isVirtual || instance.isPersistent) {
+                // Don't garbage collect virtual/persistent components
+                return;
+            }
+
+            // Skip components marked as external (preserved components)
+            if (instance.element && instance.element.hasAttribute('data-external')) return;
+
+            // When scoped, only collect components within the scope element
+            if (scopeElement && instance.element && !scopeElement.contains(instance.element)) return;
+
+            if (!instance.element || !document.body.contains(instance.element))
+            {
+                orphanedIds.push(id);
+            }
+        });
+
+        // Clean up each orphaned component
+        orphanedIds.forEach(id =>
+        {
+            const result = this.destroyComponent(id);
+            if (result) stats.orphanedComponentsRemoved++;
+        });
+
+        // Clean up orphaned event handlers
+        this.eventHandlers.forEach((handler, key) =>
+        {
+            // Determine the component ID - prefer explicit componentId property if available
+            // Fall back to parsing the key for older-style handlers
+            let componentId;
+            if (handler && handler.componentId) {
+                // New format: componentId stored explicitly on handler object
+                componentId = handler.componentId;
+            } else {
+                // Fallback format: parse from key (type-componentId-...)
+                // Note: This doesn't work for manual_ keys where component IDs contain hyphens
+                const [_type, parsedId] = key.split('-');
+                componentId = parsedId;
+            }
+
+            // If this handler belongs to a component that no longer exists
+            if (componentId && !this.componentInstances.has(componentId))
+            {
+                if (typeof handler === 'object' && handler.target && handler.event)
+                {
+                    handler.target.removeEventListener(handler.event, handler.handler, handler.options);
+                }
+                this.eventHandlers.delete(key);
+                stats.eventHandlersCleared++;
+            }
+        });
+
+        // Clean up binding references for non-existent components
+        const activeComponentIds = new Set(this.componentInstances.keys());
+
+        ['bindings', 'conditionals', 'lists', 'models'].forEach(collection =>
+        {
+            const initialLength = this.domElements[collection].length;
+            this.domElements[collection] = this.domElements[collection].filter(
+                item => activeComponentIds.has(item.componentId)
+            );
+            stats.bindingsRemoved += (initialLength - this.domElements[collection].length);
+        });
+
+        // No context registry to garbage-collect: binding/conditional/component
+        // contexts are gone, and the surviving records (render/portal/list/action)
+        // GC with their owning element / instance / effect.
+        stats.orphanedContextsRemoved = 0;
+
+        // Clean up deferred dependencies for components that no longer exist
+        // Keep only if: source is active AND (target is active OR target is a store reference)
+        if (this._deferredDependencies && this._deferredDependencies.length > 0) {
+            const initialDeferredCount = this._deferredDependencies.length;
+            this._deferredDependencies = this._deferredDependencies.filter(dep => {
+                // Source must be an active component
+                if (!activeComponentIds.has(dep.sourceId)) {
+                    return false;
+                }
+                // Target can be active component OR a store reference (starts with 'store-' or is 'app-store')
+                const isStoreTarget = typeof dep.targetId === 'string' &&
+                    (dep.targetId.startsWith('store-') || dep.targetId === 'app-store');
+                return activeComponentIds.has(dep.targetId) || isStoreTarget;
+            });
+            stats.deferredDependenciesCleared = initialDeferredCount - this._deferredDependencies.length;
+        }
+
+        return stats;
+    },
+    // COMPLETE FRAMEWORK DESTRUCTION
+
+    /**
+     * Completely destroy the framework instance and release all resources.
+     *
+     * This is a comprehensive teardown that:
+     * - Clears auto-optimization and leak detection intervals
+     * - Destroys all component instances
+     * - Clears all component definitions and instances
+     * - Clears all template caches
+     * - Removes all event handlers
+     * - Clears plugin system state
+     * - Resets the context registry
+     *
+     * Use this when completely removing WildflowerJS from a page, such as
+     * during hot module replacement or when transitioning to a different
+     * framework/application.
+     *
+     * @returns {void}
+     *
+     * @example
+     * // Complete framework teardown
+     * wildflower.destroy();
+     *
+     * @example
+     * // HMR cleanup
+     * if (module.hot) {
+     *   module.hot.dispose(() => wildflower.destroy());
+     * }
+     */
+    destroy()
+    {
+        // Destroy all components
+        const componentIds = [...this.componentInstances.keys()];
+        componentIds.forEach(id => this.destroyComponent(id));
+
+        // Clear all collections
+        this.componentInstances.clear();
+        this.componentDefinitions.clear();
+        this.componentParents.clear();
+        this.componentChildren.clear();
+        this._templateCache.general.clear();
+        this._templateCache.lists.clear();
+        this._templateCache.compiled.clear();
+        this._templateCache.extracted.clear();
+        this._templateCache.fragmentPools.clear();
+        this._templateCache.stats.clear();
+        this._listRelationships.clear();
+
+        // Clear DOM elements collections
+        this.domElements = {
+            bindings: [],
+            conditionals: [],
+            lists: [],
+            models: [],
+            slots: []
+        };
+
+        // Clear event handlers
+        this.eventHandlers.forEach((handler, _key) =>
+        {
+            if (typeof handler === 'object' && handler.target && handler.event)
+            {
+                handler.target.removeEventListener(handler.event, handler.handler, handler.options);
+            }
+        });
+        this.eventHandlers.clear();
+
+        // Clear directive + hook state (these ship in every build).
+        this._customDirectives.clear();
+        this._directiveContexts = new WeakMap();
+        this._hooks.clear();
+
+        // Clear plugin + DI state (only when the plugin feature is enabled).
+        if (__FEATURE_PLUGINS__) {
+            this._plugins = [];
+            this._pluginsByName.clear();
+            this._pluginStates.clear();
+            this._providers.clear();
+
+            // Remove dynamic $pluginName accessors
+            for (const key of Object.keys(this)) {
+                if (key.startsWith('$') && key !== '$') {
+                    delete this[key];
+                }
+            }
+        }
+
+        // Clear deferred dependencies
+        this._deferredDependencies = [];
+
+        // Clear external dependencies
+        if (this._externalDependencies) {
+            this._externalDependencies.clear();
+        }
+
+        // Clear entity dependents
+        if (this._entityDependents) {
+            this._entityDependents.clear();
+        }
+
+        // Clear cross-store tracking-proxy cache
+        if (this._trackingProxyCache) {
+            this._trackingProxyCache.clear();
         }
 
         return true;

@@ -13,9 +13,9 @@ async function waitForUpdate(ms = 50) {
   await new Promise(resolve => setTimeout(resolve, ms))
 }
 
-const describeIfPlugins = hasFeature('plugins') ? describe : describe.skip
+const describeIfHooks = hasFeature('hooks') ? describe : describe.skip
 
-describeIfPlugins('Plugin Lifecycle Hooks', () => {
+describeIfHooks('Plugin Lifecycle Hooks', () => {
     let testContainer
     let wildflower
 

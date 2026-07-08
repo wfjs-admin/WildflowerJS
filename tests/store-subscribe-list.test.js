@@ -1561,6 +1561,10 @@ describe('Store-Backed List Patterns', () => {
                     const store = wildflower.getStore('kanban-persist')
                     if (store) {
                         store.subscribe('columns', function(newColumns) {
+                            // This subscription is never torn down (no destroy cleanup),
+                            // so it can fire after the component/store are reset; guard
+                            // against a non-array value at that point.
+                            if (!Array.isArray(newColumns)) return
                             const col = newColumns.find(c => c.id === self.state._colId)
                             if (col) {
                                 console.log('[component] subscription updating settingsName to:', col.name)
@@ -1726,6 +1730,10 @@ describe('Store-Backed List Patterns', () => {
                     const store = wildflower.getStore('kanban-color')
                     if (store) {
                         store.subscribe('columns', function(newColumns) {
+                            // This subscription is never torn down (no destroy cleanup),
+                            // so it can fire after the component/store are reset; guard
+                            // against a non-array value at that point.
+                            if (!Array.isArray(newColumns)) return
                             const col = newColumns.find(c => c.id === self.state._colId)
                             if (col) {
                                 console.log('[component] subscription updating color to:', col.color)

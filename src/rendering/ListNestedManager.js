@@ -13,70 +13,6 @@
  */
 export const ListNestedMethods = {
     /**
-     * Create a nested list context from a parent list context.
-     * @param {Object} parentContext - Parent list context
-     * @param {number} parentIndex - Index in parent list
-     * @param {string} childPath - Path to nested array property
-     * @returns {Object|null} Nested list context or null if invalid
-     * @private
-     */
-    _createNestedListContext(parentContext, parentIndex, childPath)
-    {
-        if (!parentContext || parentIndex === undefined || !childPath) return null;
-
-        // Get parent data
-        const parentData = parentContext.resolveData();
-        if (!Array.isArray(parentData) || parentIndex >= parentData.length) return null;
-
-        // Get nested data
-        const parentItem = parentData[parentIndex];
-        if (!parentItem || typeof parentItem !== 'object') return null;
-
-        let childData = parentItem[childPath];
-
-        // Fallback: when the child path isn't a raw field on the item but
-        // IS a defined item-level computed property on the component, evaluate
-        // it in the item's context. This mirrors data-bind's implicit computed
-        // resolution and lets nested data-list paths use item-level computeds.
-        if (childData === undefined &&
-            !childPath.includes('.') &&
-            parentContext.componentInstance?.stateManager?.computed?.[childPath]) {
-            try {
-                childData = this._evaluateComputedInListContext(
-                    parentContext.componentInstance,
-                    childPath,
-                    parentItem,
-                    parentIndex,
-                    parentContext
-                );
-            } catch (e) {
-                if (typeof __DEV__ !== 'undefined' && __DEV__) {
-                    console.error(`Error evaluating nested list computed "${childPath}":`, e);
-                }
-            }
-        }
-
-        if (childData === undefined || childData === null) childData = [];
-
-        // Create child context with proper parent relationship
-        const context = this._createListContext(
-            childPath,
-            Array.isArray(childData) ? childData : [],
-            parentContext.componentInstance,
-            parentContext,  // Parent relationship
-            parentIndex     // Pass item index for unique key generation
-        );
-
-        // Set parent index explicitly for proper resolution
-        if (context)
-        {
-            context._parentIndex = parentIndex;
-        }
-
-        return context;
-    },
-
-    /**
      * Initialize nested components within a list item immediately
      * This ensures actions inside nested components work correctly without
      * waiting for the mutation observer
@@ -126,6 +62,54 @@ export const ListNestedMethods = {
         });
     },
     /**
+     * Dispose the mapArray effects of any nested data-list inside a removed list
+     * row. Removing the parent row from the DOM does NOT tear these down: a nested
+     * list's structural + refresh + per-row item effects are linked into the
+     * long-lived component-state node's observers and keep running until component
+     * destroy. The whole-list dispose, component destroy, and in-place re-render
+     * paths already cascade through element._disposeMapArray (the wrappedDispose
+     * walk in _renderList); the row-removal paths (onRemove / onBulkRemove) must
+     * do the same. Each nested dispose nulls its own _disposeMapArray, so
+     * re-encountering an already-disposed inner list later in the walk is a no-op.
+     * Also prunes the row's nested-list contexts from instance._listContexts:
+     * those are stored under index-bearing keys and would otherwise be retained
+     * for the parent component's whole lifetime, pinning the detached nested list
+     * element and parent item proxy (and bloating the EntitySystem list-affected
+     * scan that iterates the map).
+     * @param {HTMLElement} itemEl - the list row being removed
+     * @param {Object} [instance] - owning component instance (for _listContexts prune)
+     * @private
+     */
+    _disposeNestedListsInItem(itemEl, instance) {
+        if (!itemEl || !itemEl.querySelectorAll) return;
+        const listContexts = instance && instance._listContexts;
+        const nestedListEls = itemEl.querySelectorAll('[data-list], [data-wf-list]');
+        for (let i = 0; i < nestedListEls.length; i++) {
+            const nested = nestedListEls[i];
+            if (nested._mapArrayInitialized && nested._disposeMapArray) {
+                try { nested._disposeMapArray(); } catch (e) { /* already gone */ }
+                nested._mapArrayInitialized = false;
+                nested._disposeMapArray = null;
+            }
+            const childContext = nested._listContext;
+            if (childContext) {
+                if (listContexts && childContext._wfListContextKey) {
+                    listContexts.delete(childContext._wfListContextKey);
+                }
+                // Also unlink from the parent list context's children Map, which
+                // is otherwise never pruned (delete by value: _parentIndex is
+                // reassigned on reorder, so it isn't a reliable key here).
+                const parent = childContext.parent;
+                if (parent && parent.children && parent.children.size) {
+                    for (const [k, v] of parent.children) {
+                        if (v === childContext) { parent.children.delete(k); break; }
+                    }
+                }
+            }
+            nested._listContext = null;
+        }
+    },
+    /**
      * Update props for nested components within a list item when the item shifts position
      * This is called during optimized single-removal to update data-prop-X="." bindings
      * @param {HTMLElement} itemEl - The list item element
@@ -169,7 +153,7 @@ export const ListNestedMethods = {
             }
 
             // If props changed, update all binding contexts that use props.* paths
-            if (propsChanged && this._contextSystemInitialized && this._contextRegistry) {
+            if (propsChanged && this._contextSystemInitialized && this._contextRecords) {
                 this._updatePropsBindingsForComponent(instance);
             }
         });
@@ -185,27 +169,9 @@ export const ListNestedMethods = {
         // instance._propsData with the correct values. We just need to refresh
         // the DOM bindings that use props.* paths.
 
-        // Find all binding contexts for this component that use props.* paths
-        const bindingContexts = this._contextRegistry.getContextsByType('binding')
-            .filter(ctx =>
-                ctx.componentInstance &&
-                ctx.componentInstance.id === instance.id &&
-                ctx.path.startsWith('props.')
-            );
-
-        bindingContexts.forEach(context => {
-            // Re-evaluate the binding value from the updated props
-            // getValue('props.todo.text') reads from instance.props which proxies _propsData
-            const value = instance.stateManager.getValue(context.path);
-
-            // Update the DOM element
-            if (context._updateBindingElement) {
-                context._updateBindingElement(value);
-            } else if (context.element) {
-                // Fallback direct update
-                this._updateElementValue(context.element, value);
-            }
-        });
+        // props.* DOM bindings are repainted by the component render effect (no
+        // registry binding contexts to refresh here). We still invalidate computed
+        // properties so they recalculate against the new props values.
 
         // Invalidate all computed properties when props change
         // Note: Props access doesn't track dependencies (props proxy has no get trap),
@@ -304,8 +270,15 @@ export const ListNestedMethods = {
                         childContext._parentItemProxy = item;
                         childContext._childPath = childPath;
 
-                        // Use unique key for nested list contexts to prevent collision
+                        // Use unique key for nested list contexts to prevent collision.
+                        // Stamp the key on the context so the row-removal teardown
+                        // (_disposeNestedListsInItem) can delete this entry: these
+                        // index-bearing entries are never pruned otherwise (the old
+                        // ContextManager.garbageCollect() that nulled disconnected
+                        // refs is gone), so they accumulate and pin detached nested
+                        // list elements + parent item proxies.
                         const contextKey = `${context.path}[${index}].${childPath}`;
+                        childContext._wfListContextKey = contextKey;
                         if (instance._listContexts && !instance._listContexts.has(contextKey)) {
                             instance._listContexts.set(contextKey, childContext);
                         }
@@ -364,17 +337,7 @@ export const ListNestedMethods = {
 
 
             // Store parent-child relationship
-            if (!this._listRelationships)
-            {
-                this._listRelationships = new Map();
-            }
-
-            if (!this._listRelationships.has(parentPath))
-            {
-                this._listRelationships.set(parentPath, new Set());
-            }
-
-            this._listRelationships.get(parentPath).add(childPath);
+            this._registerListRelationships([{parentPath, childPath}]);
 
             // Recursively process deeper nesting
             this._processNestedTemplates(childTemplate, childPath, componentName, instance);

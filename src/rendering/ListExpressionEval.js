@@ -11,6 +11,43 @@
 
 import { getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
 import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
+import { applyShow, applyAttrObj, applyStyleObj, applyText } from '../core/BindingWriters.js';
+import { wfError, WF_ERRORS } from '../core/wfUtils.js';
+
+// WF-214 dedupe: one warning per (component name, computed name) per page life.
+// Dev-only storage; the emitting block below is __DEV__-gated, so production
+// builds strip the reads and this Set holds nothing.
+const _wf214Warned = new Set();
+
+// WF-214 (dev-only): a zero-arg computed evaluated for a list-row binding runs
+// at component scope, so `this.<prop>` reads of ITEM fields silently resolve
+// undefined. Static-scan the function source for `this.<prop>` and flag props
+// that are NOT resolvable on the component (state or computed) but ARE present
+// on the current item: that miss+hit conjunction is the authoring error, and
+// legitimate component-scope computeds referenced in rows never trigger it.
+// The scan runs once per (component, computed) and only in dev builds.
+function _warnItemComputedThisMiss(instance, computedName, originalFn, item) {
+    const key = (instance.name || '?') + ':' + computedName;
+    if (_wf214Warned.has(key)) return;
+    const src = String(originalFn);
+    const re = /\bthis\.([A-Za-z_$][\w$]*)/g;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+        const prop = m[1];
+        const onComponent =
+            (instance.state && prop in instance.state) ||
+            !!(instance.stateManager && instance.stateManager.computed && instance.stateManager.computed[prop]);
+        if (!onComponent && Object.prototype.hasOwnProperty.call(item, prop)) {
+            _wf214Warned.add(key);
+            wfError(WF_ERRORS.ITEM_COMPUTED_THIS_MISS, {
+                warn: true,
+                context: `computed "${computedName}" on component "${instance.name}" reads this.${prop}`,
+                suggestion: `Declare the item parameter: ${computedName}(item) { ... item.${prop} ... }`
+            });
+            return;
+        }
+    }
+}
 
 /** Blocklisted attributes for data-bind-attr security (O(1) lookup, no per-call allocation) */
 const _LIST_BLOCKED_ATTRS = new Set([
@@ -23,15 +60,6 @@ const _LIST_BLOCKED_ATTRS = new Set([
     'data-wf-render', 'data-wf-component', 'data-wf-template', 'data-wf-slot',
     'data-wf-portal', 'data-wf-bind-html', 'data-wf-bind-class', 'data-wf-bind-style',
     'data-wf-bind-attr', 'data-wf-model', 'data-wf-key'
-]);
-
-/** Boolean HTML attributes where presence = active (regardless of value) */
-const BOOLEAN_HTML_ATTRS = new Set([
-    'disabled', 'readonly', 'required', 'checked', 'selected',
-    'multiple', 'hidden', 'autofocus', 'autoplay', 'controls',
-    'loop', 'muted', 'default', 'defer', 'async', 'novalidate',
-    'formnovalidate', 'open', 'reversed', 'allowfullscreen',
-    'ismap', 'nomodule', 'playsinline', 'disablepictureinpicture'
 ]);
 
 /**
@@ -69,13 +97,6 @@ export const ListExpressionMethods = {
                     } else {
                         this._toggleBoundClass(element, '');
                     }
-                    // Clear any deferred binding markers from previous renders
-                    // to prevent _processDeferredComputedClassBindings from re-evaluating
-                    // without list item context
-                    delete element._computedClassBinding;
-                    if (this._deferredComputedClassElements) {
-                        this._deferredComputedClassElements.delete(element);
-                    }
                     return;
                 } catch (e) {
                     if (__DEV__) console.error(`Error evaluating computed class binding "${computedName}" in list context:`, e);
@@ -83,10 +104,8 @@ export const ListExpressionMethods = {
                 }
             }
 
-            // Defer to render cycle when component context is available (non-list case)
-            element._computedClassBinding = computedName;
-            // Track in Set for efficient lookup (avoids document.querySelectorAll('*'))
-            this._deferredComputedClassElements.add(element);
+            // Standalone (non-list) computed class is painted by the component
+            // render effect (_executeClassBindForEffect), not here.
             return;
         }
 
@@ -96,7 +115,7 @@ export const ListExpressionMethods = {
             expression = this._normalizeStoreShorthands(expression);
         }
 
-        // Handle external() function calls (standalone only — list items fall through
+        // Handle external() function calls (standalone only; list items fall through
         // to _applyCompiledClassBinding which merges item data + external function)
         if (expression.includes('external(') && !isListItem) {
             // Get component instance - try context first, then DOM lookup
@@ -127,16 +146,15 @@ export const ListExpressionMethods = {
         //
         // Item field MUST be checked first when in a list context. Previously
         // this checked the computed registry first and the row's field was
-        // silently shadowed when a same-name component-level computed existed —
+        // silently shadowed when a same-name component-level computed existed;
         // sibling bug to the data-bind-style precedence violation fixed
-        // alongside this in _processObjectBinding (PM-demo team page,
-        // 2026-05-17, amber-otter-23).
+        // alongside this in _processObjectBinding.
         if (!expression.includes(' ') && !expression.includes('?')) {
             let value;
             const componentInstance = context?.componentInstance;
 
             if (item && Object.prototype.hasOwnProperty.call(item, expression)) {
-                // List item context with a matching field — row data wins.
+                // List item context with a matching field: row data wins.
                 value = this._getValueFromItem(item, expression);
             } else if (componentInstance?.stateManager?.computed?.[expression]) {
                 // Implicit computed property (no computed: prefix)
@@ -148,7 +166,7 @@ export const ListExpressionMethods = {
                     context
                 );
             } else if (item) {
-                // List item context without a same-name computed — get from item
+                // List item context without a same-name computed: get from item
                 // (returns undefined if the item also lacks the field, matching
                 // the documented "fall back to undefined" behavior).
                 value = this._getValueFromItem(item, expression);
@@ -233,13 +251,10 @@ export const ListExpressionMethods = {
         if (!expression) return;
 
         // Pre-process attr expressions to quote unquoted hyphenated keys
-        // e.g., { data-item-id: id } → { 'data-item-id': id }
-        // This makes the expression valid JavaScript
-        // Pattern: key must start with letter/$/_,  followed by alphanumeric, then one or more -segment groups
+        // e.g., { data-item-id: id } → { 'data-item-id': id } (valid JS).
+        // Shared regex lives in TemplateSystem._quoteHyphenKeys.
         if (type === 'attr') {
-            expression = expression.replace(/(\{|,)\s*([a-zA-Z_$][a-zA-Z0-9_$]*(?:-[a-zA-Z0-9_$]+)+)\s*:/g,
-                (match, prefix, key) => `${prefix} '${key}':`
-            );
+            expression = this._quoteHyphenKeys(expression);
         }
 
         // Normalize $store.path shorthand to external() calls early
@@ -287,19 +302,19 @@ export const ListExpressionMethods = {
         //    a computed of the same name when the field is undefined."
         //
         // The framework previously checked the computed registry FIRST and
-        // returned its value without ever consulting the item — so a row
+        // returned its value without ever consulting the item, so a row
         // field whose name happened to match a component-level computed would
         // be silently shadowed (initial render AND reactive updates). The
         // PM-demo team page hit this: a project-row chip bound to
         // data-bind-style="iconStyle" rendered the parent team's color
-        // because pm-team-view had a leftover iconStyle() component computed.
-        // Surfaced 2026-05-17 (amber-otter-23).
+        // because the component had a leftover iconStyle() component computed
+        // shadowing the item field.
         if (instance && item && !expression.includes('{') && !expression.includes('.') && !expression.includes(' ')) {
             const itemHasField = Object.prototype.hasOwnProperty.call(item, expression);
             if (itemHasField) {
                 // Per the documented contract, item[path] wins. The row's
                 // field is an object literal directly applicable as a style
-                // / attr binding — no need to walk the computed registry.
+                // / attr binding; no need to walk the computed registry.
                 const resultObject = item[expression];
                 if (resultObject && typeof resultObject === 'object') {
                     this._applyObjectBinding(type, element, resultObject);
@@ -413,7 +428,7 @@ export const ListExpressionMethods = {
             // Set tracking context so getStore() calls inside the
             // computed register the component as a store dependent.
             const previousTrackingContext = this._computedTrackingContext;
-            // V8 OPT: Canonical shape — all fields always present
+            // V8 OPT: Canonical shape; all fields always present
             this._computedTrackingContext = {
                 componentId: instance.id,
                 computedName: computedName,
@@ -422,6 +437,16 @@ export const ListExpressionMethods = {
                 isItemLevelComputed: true,
                 itemIndex: itemIndex
             };
+
+            // Record (on the state manager) every component-state path this item-level
+            // computed reads, so a later change to one re-runs the per-item
+            // effects. Item-level computeds don't participate in
+            // computedDependencies (no activeComputation), and the per-item
+            // effect's own subscription is unreliable: a path hidden behind a
+            // short-circuit is never registered, and _stableDeps then freezes
+            // the dep set. Recording at eval time closes both gaps.
+            const _recSm = instance && instance.stateManager;
+            const _prevRecItemReads = _recSm ? _recSm._recordItemReads : false;
 
             try {
                 const self = this;
@@ -470,7 +495,7 @@ export const ListExpressionMethods = {
                         if (typeof prop === 'symbol') return Reflect.get(target, prop, receiver);
                         // 1. Explicit-access escape hatches first
                         if (prop in target) return target[prop];
-                        // 2. Computed (precedence over state — matches ContextProxy)
+                        // 2. Computed (precedence over state; matches ContextProxy)
                         //    Item-level computeds return a curried (item) => value fn,
                         //    zero-arg computeds return the evaluated value, both
                         //    via the existing target.computed proxy logic.
@@ -505,6 +530,9 @@ export const ListExpressionMethods = {
                     last: _listLen > 0 ? itemIndex === _listLen - 1 : false,
                     length: _listLen
                 };
+                // Record state reads only across the user computed body (not the
+                // framework's listLen/info setup above), keeping the union precise.
+                if (_recSm) _recSm._recordItemReads = true;
                 return originalFn.call(componentContext, item, itemIndex, info);
             } catch (e) {
                 if (__DEV__) console.warn(`[WF] Error evaluating computed "${computedName}" in list context:`, e.message);
@@ -512,18 +540,22 @@ export const ListExpressionMethods = {
             } finally {
                 // Restore previous tracking context
                 this._computedTrackingContext = previousTrackingContext;
+                if (_recSm) _recSm._recordItemReads = _prevRecItemReads;
             }
         }
 
         // Zero-arg computed: evaluate at component scope. Per the docs,
         // fn(item, ...) is item-level; fn() is component-level. A zero-arg
         // computed referenced inside a list-template binding is treated as
-        // component-level — same value for every row. (We do NOT runtime-warn
-        // here: legitimate component-level computeds get referenced inside
-        // list templates all the time, e.g. options arrays for dropdowns,
-        // modal-form computeds rendered through `data-list="modalStack"`, etc.
-        // The framework can't statically distinguish those from bare-form
-        // misuse, so the rule is taught via documentation, not runtime noise.)
+        // component-level, the same value for every row. Legitimate
+        // component-level computeds get referenced inside list templates all
+        // the time (options arrays for dropdowns, modal-form computeds), so a
+        // blanket zero-arg warning would be noise; WF-214 below fires only on
+        // the miss-on-this + hit-on-item conjunction, which those legitimate
+        // uses never produce.
+        if (__DEV__ && item !== null && typeof item === 'object') {
+            _warnItemComputedThisMiss(instance, computedName, originalFn, item);
+        }
         try {
             return instance.stateManager.evaluateComputed(computedName);
         } catch (e) {
@@ -609,132 +641,60 @@ export const ListExpressionMethods = {
      * @param {Object} object - Object with properties/attributes and values
      * @private
      */
+    /**
+     * Dev-mode once-per-(type, element) warning when data-bind-style/-attr gets a
+     * non-object value (e.g. a CSS string). Shared by the setup-write path
+     * (_applyObjectBinding) and the component render effect
+     * (_executeStyleBindForEffect/_executeAttrBindForEffect) so the warning fires
+     * exactly once regardless of which writer paints, without a per-binding
+     * context. No-op in production (__DEV__ folds).
+     * @private
+     */
+    _warnObjectBindingShape(type, element, value) {
+        if (!__DEV__) return;
+        // The shape mismatch is almost always a CSS-string passed to
+        // data-bind-style ('background:red' instead of {background:'red'});
+        // silently skipping it leaves the user wondering why colors never apply.
+        this._warnedBindingShape = this._warnedBindingShape || new WeakMap();
+        let perEl = this._warnedBindingShape.get(element);
+        if (!perEl) { perEl = new Set(); this._warnedBindingShape.set(element, perEl); }
+        if (perEl.has(type)) return;
+        perEl.add(type);
+        const example = type === 'style'
+            ? "{ background: '#5b8def' } or { backgroundColor: '#5b8def' }"
+            : "{ 'data-id': item.id, title: item.label }";
+        const sample = String(value).slice(0, 60);
+        const tag = element.tagName ? element.tagName.toLowerCase() : 'element';
+        const cls = element.className && typeof element.className === 'string'
+            ? '.' + element.className.split(/\s+/)[0] : '';
+        console.warn(
+            `[WildflowerJS] data-bind-${type} expected an object, got ${typeof value} ("${sample}").\n` +
+            `  Element: <${tag}${cls}>\n` +
+            `  Use object form: ${example}\n` +
+            `  CSS strings like "background:red" silently no-op.`
+        );
+    },
+
     _applyObjectBinding(type, element, object) {
         if (object == null) return; // null/undefined is intentional no-op
         if (typeof object !== 'object') {
-            if (__DEV__) {
-                // Warn once per (type, element) so list re-renders don't spam.
-                // The shape mismatch is almost always a CSS-string passed to
-                // data-bind-style ('background:red' instead of {background:'red'})
-                // — silently skipping it leaves the user wondering why colors
-                // never apply. Surface it loudly in dev, no-op in production.
-                this._warnedBindingShape = this._warnedBindingShape || new WeakMap();
-                let perEl = this._warnedBindingShape.get(element);
-                if (!perEl) { perEl = new Set(); this._warnedBindingShape.set(element, perEl); }
-                if (!perEl.has(type)) {
-                    perEl.add(type);
-                    const example = type === 'style'
-                        ? "{ background: '#5b8def' } or { backgroundColor: '#5b8def' }"
-                        : "{ 'data-id': item.id, title: item.label }";
-                    const sample = String(object).slice(0, 60);
-                    const tag = element.tagName ? element.tagName.toLowerCase() : 'element';
-                    const cls = element.className && typeof element.className === 'string'
-                        ? '.' + element.className.split(/\s+/)[0] : '';
-                    console.warn(
-                        `[WildflowerJS] data-bind-${type} expected an object, got ${typeof object} ("${sample}").\n` +
-                        `  Element: <${tag}${cls}>\n` +
-                        `  Use object form: ${example}\n` +
-                        `  CSS strings like "background:red" silently no-op.`
-                    );
-                }
-            }
+            this._warnObjectBindingShape(type, element, object);
             return;
         }
 
-        const trackProp = type === 'style' ? '_boundStyleProps' : '_boundAttrProps';
-
-        // Clear previously-bound properties that aren't in the new object.
-        // Without this, a key dropping out of the bound result (e.g. a style
-        // computed returning {} after the source value reverted to null) would
-        // leave the previously-applied inline style/attr on the element while
-        // class/text bindings update correctly — partial-reset bug.
-        const prev = element[trackProp];
-        if (prev && prev.size > 0) {
-            for (const prop of prev) {
-                if (Object.prototype.hasOwnProperty.call(object, prop)) continue;
-                try {
-                    if (type === 'attr') {
-                        if (element.hasAttribute(prop)) element.removeAttribute(prop);
-                    } else if (prop.startsWith('--')) {
-                        element.style.removeProperty(prop);
-                    } else {
-                        element.style[prop] = '';
-                    }
-                } catch (e) { /* ignore */ }
-                prev.delete(prop);
-            }
+        if (type === 'attr') {
+            // Canonical attr-object writer (blocklist, sanitize, boolean-attr semantics,
+            // stale-key cleanup), shared with the component effect path.
+            applyAttrObj(element, object, this._attrWriterHelpers || (this._attrWriterHelpers = {
+                isBlocklisted: (prop) => this._isBlocklistedAttr && this._isBlocklistedAttr(prop),
+                sanitize: (prop, value) => this._sanitizeAttrValue ? this._sanitizeAttrValue(prop, value) : value
+            }));
+            return;
         }
 
-        for (const [prop, value] of Object.entries(object)) {
-            try {
-                if (type === 'attr') {
-                    // Attribute-specific validation
-                    if (this._isBlocklistedAttr(prop)) {
-                        if (__DEV__) console.warn(`[WildflowerJS] Cannot bind blacklisted attribute: ${prop}`);
-                        continue;
-                    }
-
-                    // Attribute-specific sanitization
-                    const sanitized = this._sanitizeAttrValue(prop, value);
-
-                    const isBooleanAttr = BOOLEAN_HTML_ATTRS.has(prop.toLowerCase());
-
-                    if (sanitized === null || sanitized === undefined) {
-                        // Always remove for null/undefined
-                        if (element.hasAttribute(prop)) element.removeAttribute(prop);
-                    } else if (sanitized === false && isBooleanAttr) {
-                        // Remove boolean HTML attributes when false (presence = active)
-                        if (element.hasAttribute(prop)) element.removeAttribute(prop);
-                    } else {
-                        // Skip the write if the attribute already holds the same value —
-                        // some elements (notably <video>) reload their resource when
-                        // `src` is set even to an identical string.
-                        const strValue = String(sanitized);
-                        if (element.getAttribute(prop) !== strValue) {
-                            element.setAttribute(prop, strValue);
-                        }
-                    }
-                } else {
-                    // Style-specific handling
-                    if (value === null || value === undefined || value === false) {
-                        // Clear the style property
-                        if (prop.startsWith('--')) {
-                            element.style.removeProperty(prop);
-                        } else {
-                            element.style[prop] = '';
-                        }
-                    } else {
-                        const valueStr = String(value);
-                        const hasImportant = valueStr.includes('!important');
-
-                        if (prop.startsWith('--')) {
-                            // CSS custom properties must use setProperty
-                            if (hasImportant) {
-                                const cleanValue = valueStr.replace(/\s*!important\s*/gi, '').trim();
-                                element.style.setProperty(prop, cleanValue, 'important');
-                            } else {
-                                element.style.setProperty(prop, valueStr);
-                            }
-                        } else if (hasImportant) {
-                            // !important requires setProperty with priority parameter
-                            const kebabProp = prop.replace(/([A-Z])/g, '-$1').toLowerCase();
-                            const cleanValue = valueStr.replace(/\s*!important\s*/gi, '').trim();
-                            element.style.setProperty(kebabProp, cleanValue, 'important');
-                        } else {
-                            element.style[prop] = valueStr;
-                        }
-                    }
-                }
-            } catch (e) {
-                // Invalid property/attribute - skip silently
-            }
-        }
-
-        // Track which properties were set for potential cleanup
-        if (!element[trackProp]) {
-            element[trackProp] = new Set();
-        }
-        Object.keys(object).forEach(prop => element[trackProp].add(prop));
+        // Canonical style-object writer (prev-clear, !important parsing, custom props,
+        // stale-key cleanup), shared with the component effect path.
+        applyStyleObj(element, object);
     },
 
     /**
@@ -782,6 +742,78 @@ export const ListExpressionMethods = {
      * @param {Array} data - The current list data
      * @param {Object} context - The list context
      */
+    /**
+     * Re-evaluate a list-item text data-bind that uses list-context variables
+     * (_index/_first/_last/_length) after a structure change, straight off the
+     * row's item-proxy; no per-element binding context. Mirrors the item-based
+     * eval the sibling class/attr re-evals use (_getMergedState +
+     * evaluateExpression), then writes the value like Context._updateBindingElement.
+     * @private
+     */
+    /**
+     * Evaluate a list-item expression in item context (item-proxy + component
+     * state/computeds + _index/_first/_last/_length) without a per-element
+     * binding context. Shared by the data-bind text and data-show re-evals.
+     * @private
+     */
+    _evalItemContextExpr(element, item, expression, itemIndex, enrichedContext) {
+        let expr = expression;
+        if (expr.includes('$') && this._normalizeStoreShorthands) {
+            expr = this._normalizeStoreShorthands(expr);
+        }
+        const instance = enrichedContext?.componentInstance;
+        const listLength = enrichedContext?.listLength ?? enrichedContext?._length ?? 0;
+        const mergedState = this._getMergedState(instance, item, itemIndex, listLength);
+        const options = { cacheKey: 'bind' };
+        if (expr.includes('external(') && instance) {
+            options.additionalContext = { external: this._getExternalFn(instance) };
+        }
+        return this.evaluateExpression(expr, mergedState, options);
+    },
+    _reEvalItemContextBind(element, item, expression, itemIndex, enrichedContext) {
+        if (this._hasAttr(element, 'bind-html')) return;
+        let value;
+        try {
+            value = this._evalItemContextExpr(element, item, expression, itemIndex, enrichedContext);
+        } catch (e) {
+            if (__DEV__) console.warn(`[WF] data-bind re-eval error:`, e.message);
+            return;
+        }
+        // Apply the value (mirrors Context._updateBindingElement)
+        const tagName = element.tagName.toLowerCase();
+        if (tagName.includes('-')) {
+            const adapter = this.getAdapter?.(tagName, element);
+            if (adapter && element[adapter.prop] !== value) element[adapter.prop] = value;
+            return;
+        }
+        if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
+            const elType = element.type;
+            if (elType !== 'radio' && elType !== 'checkbox') {
+                const stringValue = value !== undefined && value !== null ? String(value) : '';
+                if (element.value !== stringValue) element.value = stringValue;
+            }
+            return;
+        }
+        applyText(element, value);
+    },
+    /**
+     * Re-evaluate a list-item data-show that uses list-context variables after a
+     * structure change, off the row's item-proxy; no per-element conditional
+     * context (so it works even for child elements that never got one, which is
+     * why a list-row data-show="_last" previously failed to update on removal).
+     * data-render in lists is re-evaluated by per-item effects, not here.
+     * @private
+     */
+    _reEvalItemContextShow(element, item, expression, itemIndex, enrichedContext) {
+        let value;
+        try {
+            value = this._evalItemContextExpr(element, item, expression, itemIndex, enrichedContext);
+        } catch (e) {
+            if (__DEV__) console.warn(`[WF] data-show re-eval error:`, e.message);
+            return;
+        }
+        applyShow(element, value);
+    },
     _updateListContextClassBindings(listElement, data, context, startIndex = 0) {
         if (!listElement) return;
 
@@ -906,13 +938,7 @@ export const ListExpressionMethods = {
                 if (itemEl.hasAttribute('data-bind')) {
                     const expr = itemEl.dataset.bind;
                     if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        const bindingContext = this._contextRegistry?.contextsByElement?.get(itemEl);
-                        if (bindingContext) {
-                            bindingContext._parentIndex = index;
-                            bindingContext._clearCache?.();
-                            const value = bindingContext.resolveData();
-                            bindingContext._updateBindingElement?.(value);
-                        }
+                        this._reEvalItemContextBind(itemEl, item, expr, index, enrichedContext);
                     }
                 }
                 for (let i = 0; i < cachedElements.length; i++) {
@@ -921,13 +947,7 @@ export const ListExpressionMethods = {
                     if (isInNestedList(el)) continue;
                     const expr = el.dataset.bind;
                     if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        const bindingContext = this._contextRegistry?.contextsByElement?.get(el);
-                        if (bindingContext) {
-                            bindingContext._parentIndex = index;
-                            bindingContext._clearCache?.();
-                            const value = bindingContext.resolveData();
-                            bindingContext._updateBindingElement?.(value);
-                        }
+                        this._reEvalItemContextBind(el, item, expr, index, enrichedContext);
                     }
                 }
             } else {
@@ -940,13 +960,7 @@ export const ListExpressionMethods = {
                     if (el !== itemEl && isInNestedList(el)) return;
                     const expr = this._getAttr(el, 'bind');
                     if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        const bindingContext = this._contextRegistry?.contextsByElement?.get(el);
-                        if (bindingContext) {
-                            bindingContext._parentIndex = index;
-                            bindingContext._clearCache?.();
-                            const value = bindingContext.resolveData();
-                            bindingContext._updateBindingElement?.(value);
-                        }
+                        this._reEvalItemContextBind(el, item, expr, index, enrichedContext);
                     }
                 });
             }
@@ -954,69 +968,159 @@ export const ListExpressionMethods = {
             // Re-evaluate data-show/data-render expressions that use list context vars
             if (cachedElements) {
                 // FAST PATH: check item element + iterate cached elements
-                const itemHasShow = itemEl.hasAttribute('data-show');
-                const itemHasRender = itemEl.hasAttribute('data-render');
-                if (itemHasShow || itemHasRender) {
-                    const expr = itemEl.dataset.show || itemEl.dataset.render;
-                    if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        const condContext = this._contextRegistry?.contextsByElement?.get(itemEl);
-                        if (condContext) {
-                            condContext._parentIndex = index;
-                            condContext._clearCache?.();
-                            const value = condContext.resolveData();
-                            if (itemHasShow) {
-                                itemEl.style.display = value ? '' : 'none';
-                            } else {
-                                this._updateConditionalRender(itemEl, value, condContext);
-                            }
-                        }
+                if (itemEl.hasAttribute('data-show')) {
+                    const expr = itemEl.dataset.show;
+                    if (this._expressionUsesListContext(expr)) {
+                        this._reEvalItemContextShow(itemEl, item, expr, index, enrichedContext);
                     }
                 }
                 for (let i = 0; i < cachedElements.length; i++) {
                     const el = cachedElements[i];
-                    if (!el) continue;
-                    const hasShow = el.hasAttribute('data-show');
-                    const hasRender = el.hasAttribute('data-render');
-                    if (!hasShow && !hasRender) continue;
+                    if (!el || !el.hasAttribute('data-show')) continue;
                     if (isInNestedList(el)) continue;
-                    const expr = el.dataset.show || el.dataset.render;
-                    if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        const condContext = this._contextRegistry?.contextsByElement?.get(el);
-                        if (condContext) {
-                            condContext._parentIndex = index;
-                            condContext._clearCache?.();
-                            const value = condContext.resolveData();
-                            if (hasShow) {
-                                el.style.display = value ? '' : 'none';
-                            } else {
-                                this._updateConditionalRender(el, value, condContext);
-                            }
-                        }
+                    const expr = el.dataset.show;
+                    if (this._expressionUsesListContext(expr)) {
+                        this._reEvalItemContextShow(el, item, expr, index, enrichedContext);
                     }
                 }
             } else {
-                // FALLBACK: querySelectorAll
+                // FALLBACK: querySelectorAll (data-show only; data-render in lists
+                // is re-evaluated by per-item effects)
                 const conditionalElements = [
-                    ...(this._hasAttr(itemEl, 'show') || this._hasAttr(itemEl, 'render') ? [itemEl] : []),
-                    ...itemEl.querySelectorAll(`${this._attrSelector('show')}, ${this._attrSelector('render')}`)
+                    ...(this._hasAttr(itemEl, 'show') ? [itemEl] : []),
+                    ...itemEl.querySelectorAll(this._attrSelector('show'))
                 ];
                 conditionalElements.forEach(el => {
                     if (el !== itemEl && isInNestedList(el)) return;
-                    const expr = this._getAttr(el, 'show') || this._getAttr(el, 'render');
-                    if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        const condContext = this._contextRegistry?.contextsByElement?.get(el);
-                        if (condContext) {
-                            condContext._parentIndex = index;
-                            condContext._clearCache?.();
-                            const value = condContext.resolveData();
-                            if (el.dataset.show !== undefined) {
-                                el.style.display = value ? '' : 'none';
-                            } else if (el.dataset.render !== undefined) {
-                                this._updateConditionalRender(el, value, condContext);
-                            }
-                        }
+                    const expr = this._getAttr(el, 'show');
+                    if (this._expressionUsesListContext(expr)) {
+                        this._reEvalItemContextShow(el, item, expr, index, enrichedContext);
                     }
                 });
+            }
+
+            // Re-evaluate data-render bindings on a bare list-position token
+            // (data-render="_last"): the row that becomes (or ceases to be) last
+            // after an add/remove must toggle its rendered element. Mirrors the
+            // data-show handling above; renders go through the stored render context
+            // (insert/remove), not applyShow. (Expression / item-computed renders are
+            // covered by the per-item effect and _reEvalListItemComputedConditionals.)
+            const renderContexts = itemEl._renderContexts;
+            if (renderContexts) {
+                for (let r = 0; r < renderContexts.length; r++) {
+                    const rc = renderContexts[r];
+                    const rpath = rc && rc.binding && rc.binding.path;
+                    if (!rpath || !this._listContextVars.has(rpath)) continue;
+                    let fv;
+                    switch (rpath) {
+                        case '_index': fv = index; break;
+                        case '_length': fv = listLength; break;
+                        case '_first': fv = index === 0; break;
+                        case '_last': fv = index === listLength - 1; break;
+                    }
+                    const shouldRender = rc.binding.negate ? !fv : !!fv;
+                    if (rc.context && shouldRender !== rc.context.isRendered) {
+                        rc.context._updateConditionalElement(shouldRender);
+                    }
+                }
+            }
+        }
+    },
+    /**
+     * Does a compiled show/render binding resolve through an item-level computed?
+     * Such a binding can read the position frame (info.first/last/length) inside
+     * the computed body, so it must be re-evaluated on a structural change even
+     * though its path carries no literal _index/_last token. Used to gate the
+     * structural re-eval below.
+     * @private
+     */
+    _conditionalRefsComputed(binding, computed) {
+        if (!binding || !computed) return false;
+        if (binding.isComputed) return true;
+        const path = binding.path;
+        if (path && path.indexOf('.') === -1 && computed[path]) return true;
+        if (binding.expressionVars) {
+            for (let i = 0; i < binding.expressionVars.length; i++) {
+                if (computed[binding.expressionVars[i]]) return true;
+            }
+        }
+        return false;
+    },
+    /**
+     * Lazily determine (and cache on the metadata) whether a list template has
+     * any data-show / data-render that resolves through an item-level computed.
+     * @private
+     */
+    _listHasComputedConditional(metadata, instance) {
+        if (!metadata) return false;
+        if (metadata._hasComputedConditional !== undefined) return metadata._hasComputedConditional;
+        const computed = instance?.stateManager?.computed;
+        let result = false;
+        if (computed) {
+            const shows = metadata.shows || [];
+            const renders = metadata.renders || [];
+            for (let i = 0; i < shows.length && !result; i++) result = this._conditionalRefsComputed(shows[i], computed);
+            for (let i = 0; i < renders.length && !result; i++) result = this._conditionalRefsComputed(renders[i], computed);
+        }
+        metadata._hasComputedConditional = result;
+        return result;
+    },
+    /**
+     * Re-evaluate list-item data-show / data-render conditionals that resolve
+     * through an item-level computed, off the row proxy + the row's CURRENT
+     * index and the list length. The literal-token sweep
+     * (_updateListContextClassBindings) only catches expressions containing
+     * _index/_last/etc.; a computed NAMED e.g. onLast carries no such token, so
+     * a structural change (add/remove/reorder) would otherwise leave its
+     * info.last/info.length frame stale. Runs after the reconcile completes.
+     * @private
+     */
+    _reEvalListItemComputedConditionals(listElement, data, context, instance) {
+        const computed = instance?.stateManager?.computed;
+        if (!computed) return;
+        const items = this._getListItems(listElement);
+        const listLength = data?.length ?? items.length;
+        { // full re-eval of every row's computed conditionals
+            for (let index = 0; index < items.length; index++) {
+                const itemEl = items[index];
+                const item = itemEl._itemData || {};
+                const meta = itemEl._compiledMetadata;
+                const ctx = {
+                    componentState: instance?.state || {},
+                    componentInstance: instance,
+                    itemIndex: index,
+                    listLength,
+                    listContext: context
+                };
+                // data-show computeds: resolve and toggle display.
+                const shows = meta?.shows;
+                if (shows && shows.length) {
+                    const elements = itemEl._cachedElementsArray || itemEl._bindingElements;
+                    if (elements) {
+                        for (let s = 0; s < shows.length; s++) {
+                            const show = shows[s];
+                            if (!this._conditionalRefsComputed(show, computed)) continue;
+                            const el = elements[show.index];
+                            if (!el) continue;
+                            const raw = this._resolveCompiledBinding(show, item, ctx);
+                            applyShow(el, show.negate ? !raw : Boolean(raw));
+                        }
+                    }
+                }
+                // data-render computeds: resolve and insert/remove via the render context.
+                const renderContexts = itemEl._renderContexts;
+                if (renderContexts && renderContexts.length) {
+                    for (let r = 0; r < renderContexts.length; r++) {
+                        const rc = renderContexts[r];
+                        if (!rc || !rc.context || !rc.binding) continue;
+                        if (!this._conditionalRefsComputed(rc.binding, computed)) continue;
+                        const raw = this._resolveCompiledBinding(rc.binding, item, ctx);
+                        const shouldRender = rc.binding.negate ? !raw : Boolean(raw);
+                        if (shouldRender !== rc.context.isRendered) {
+                            rc.context._updateConditionalElement(shouldRender);
+                        }
+                    }
+                }
             }
         }
     },
@@ -1273,7 +1377,7 @@ export const ListExpressionMethods = {
             if (item && name in item) {
                 args[v] = item[name];
             } else if (itemComputeds && itemComputeds[name] && originals && typeof originals.get(name) === 'function') {
-                // Item-level computed — both parameterised fn(item) and bare-form
+                // Item-level computed: both parameterised fn(item) and bare-form
                 // fn() reading `this.X`. Route through _evaluateComputedInListContext
                 // so each form is invoked with the right shape (the wrapped computed
                 // accessor at itemComputeds[name] always has fn.length === 0, so we

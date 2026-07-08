@@ -1090,9 +1090,9 @@ suiteRunner('Configurable Component Templates', () => {
 
       await waitForCompleteRender()
 
-      // Verify list context exists
+      // Verify list context exists (plain object on the element)
       const listElement = testContainer.querySelector('.list-wrapper')
-      const listContext = wildflower._contextRegistry.getContextForElement(listElement)
+      const listContext = listElement._listContext
       expect(listContext).toBeDefined()
       expect(listContext.type).toBe('list')
     })

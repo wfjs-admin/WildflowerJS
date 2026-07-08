@@ -172,34 +172,43 @@ _setupDynamicComponentDetection()
                 this._pendingEffectInstances = [];
             }
 
-            newComponents.forEach((element, _index) =>
-            {
-                const componentName = element.dataset.wfComponent || element.dataset.component;
-
-                if (this.componentDefinitions.has(componentName))
+            // The forEach runs user init() / prop validation, which can throw (e.g.
+            // a required-prop or validator failure in dev mode). The drain below MUST
+            // still run and reset _pendingEffectInstances even on throw; otherwise the
+            // pending array leaks non-null and every subsequent scan is misclassified as
+            // "nested", so deferred render effects are never created for any later
+            // component. Wrap in try/finally so the throw still propagates to the caller
+            // while the batch's effect bookkeeping is always settled.
+            try {
+                newComponents.forEach((element, _index) =>
                 {
-                    // Skip elements no longer in DOM (may have been removed by data-render processing)
-                    if (!document.contains(element)) {
-                        return;
+                    const componentName = element.dataset.wfComponent || element.dataset.component;
+
+                    if (this.componentDefinitions.has(componentName))
+                    {
+                        // Skip elements no longer in DOM (may have been removed by data-render processing)
+                        if (!document.contains(element)) {
+                            return;
+                        }
+
+                        // Skip components inside data-render elements with false conditions
+                        // These will be initialized when the data-render condition becomes true
+                        if (this._isInsideFalseDataRender(element)) {
+                            return;
+                        }
+
+                        this._initializeComponentElement(element, componentName);
+                        initializedCount++;
                     }
-
-                    // Skip components inside data-render elements with false conditions
-                    // These will be initialized when the data-render condition becomes true
-                    if (this._isInsideFalseDataRender(element)) {
-                        return;
+                });
+            } finally {
+                // Now all components have data-component-id; create deferred effects
+                if (isOuterScan) {
+                    const pending = this._pendingEffectInstances;
+                    this._pendingEffectInstances = null;
+                    for (let i = 0; i < pending.length; i++) {
+                        this._createComponentRenderEffect(pending[i]);
                     }
-
-                    this._initializeComponentElement(element, componentName);
-                    initializedCount++;
-                }
-            });
-
-            // Now all components have data-component-id — create deferred effects
-            if (isOuterScan) {
-                const pending = this._pendingEffectInstances;
-                this._pendingEffectInstances = null;
-                for (let i = 0; i < pending.length; i++) {
-                    this._createComponentRenderEffect(pending[i]);
                 }
             }
         }
@@ -479,19 +488,16 @@ _setupDynamicComponentDetection()
      * which fires synchronously. If a list renders before the relationships
      * are registered, _renderListWithMapArray sees hasChildLists=false and
      * never wires up nested-list integration. The result is outer-list items
-     * with their inner data-list elements left as bare templates — section
+     * with their inner data-list elements left as bare templates: section
      * headers without rows. Walking from the root once up front ensures
      * relationships are known before any render fires.
      *
      * @private
      */
     _prepopulateListRelationships() {
-        if (!this._contextRegistry || !this._contextRegistry.detectTemplateRelationships) {
+        if (!this._contextRecords || !this._contextRecords.detectTemplateRelationships) {
             this._ensureContextSystem?.();
-            if (!this._contextRegistry?.detectTemplateRelationships) return;
-        }
-        if (!this._listRelationships) {
-            this._listRelationships = new Map();
+            if (!this._contextRecords?.detectTemplateRelationships) return;
         }
         // detectTemplateRelationships calls element.getAttribute(), so we need an
         // Element. this.root may be the Document node when Wildflower auto-init
@@ -500,19 +506,7 @@ _setupDynamicComponentDetection()
             ? this.root
             : (this.root?.documentElement || document.documentElement);
         if (!walkRoot) return;
-        let relationships = [];
-        try {
-            relationships = this._contextRegistry.detectTemplateRelationships(walkRoot);
-        } catch (e) {
-            if (__DEV__) console.warn('[WF] _prepopulateListRelationships failed:', e?.message);
-            return;
-        }
-        for (const { parentPath, childPath } of relationships) {
-            if (!this._listRelationships.has(parentPath)) {
-                this._listRelationships.set(parentPath, new Set());
-            }
-            this._listRelationships.get(parentPath).add(childPath);
-        }
+        this._detectAndRegisterListRelationships(walkRoot);
     },
 
     _setupSingleInstanceFeatures(instance) {
@@ -534,7 +528,7 @@ _setupDynamicComponentDetection()
         }
         this._processComponentBindings(instance);
         this._bindComponentActions(instance);
-        // Set up entity pools (data-pool) — handles declarative pools block + population
+        // Set up entity pools (data-pool): handles declarative pools block + population
         if (this._setupPools) {
             this._setupPools(instance);
         }
@@ -556,7 +550,7 @@ _setupDynamicComponentDetection()
         if (typeof instance.context.init === 'function') {
             ctx.pendingInits.push(instance);
         } else {
-            // No user init() defined — nothing to wait for. Mark ready
+            // No user init() defined; nothing to wait for. Mark ready
             // synchronously so action handlers bound at scan time can run
             // immediately rather than being queued indefinitely by
             // _wrapMethod's action-before-init guard.
@@ -595,57 +589,16 @@ _setupDynamicComponentDetection()
         setTimeout(() => {
             for (const instance of pendingInits) {
                 if (!this.componentInstances.has(instance.id)) continue;
-                try {
-                    // Trigger plugin beforeInit hook (right before init runs)
-                    if (this._triggerHook) {
-                        this._triggerHook('component:beforeInit', instance);
-                    }
-                    if (typeof instance.context.init === 'function') {
-                        instance.context.init();
-                    }
-                    // Mark init complete and replay any queued action calls.
-                    // Must run regardless of whether init() was defined: methods
-                    // wrapped by _wrapMethod queue against !instance._initReady,
-                    // and the page-load path here is the only place that sets
-                    // it for components mounted via _scanForComponents.
-                    instance._initReady = true;
-                    if (instance._pendingActions && instance._pendingActions.length > 0) {
-                        const queued = instance._pendingActions;
-                        instance._pendingActions = null;
-                        for (let i = 0; i < queued.length; i++) {
-                            try {
-                                queued[i]();
-                            } catch (e) {
-                                // Route through _handleError so the component's
-                                // onError hook can intercept. See the matching
-                                // block in ComponentLifecycle.js for context.
-                                this._handleError(
-                                    `Error replaying queued action for component ${instance.name}`,
-                                    e,
-                                    instance,
-                                    { lifecycle: 'replay-pending-action' }
-                                );
-                            }
-                        }
-                    }
-                    // Register tick lifecycle hook if defined
-                    if (typeof instance.definition.tick === 'function') {
-                        instance._tickFn = instance.definition.tick.bind(instance.context);
-                        if (!this._tickableInstances) this._tickableInstances = [];
-                        this._tickableInstances.push(instance);
-                        this._startPoolLoop();
-                    }
-                    // Process portals created dynamically in init()
-                    if (this._processPortals) {
-                        this._processPortals(instance);
-                    }
-                    // Trigger plugin afterInit hook
-                    if (this._triggerHook) {
-                        this._triggerHook('component:afterInit', instance);
-                    }
-                } catch (error) {
-                    this._handleError(`Error in init hook for component ${instance.name}`, error, instance);
-                }
+                // Delegate to the shared init sequence used by the dynamic
+                // component path: subscribe-wait (waitForStoreReady) →
+                // beforeInit hook → init() → _initReady + queued-action
+                // replay → tick registration → portals → deferred-effect
+                // refresh → afterInit hook. Components without subscribed
+                // stores run the whole sequence synchronously here (an async
+                // function only yields at its first await); subscribing
+                // components init after their stores resolve, exactly like
+                // dynamically mounted ones.
+                this._initWithStoreWait(instance, instance.name, instance.definition);
             }
         }, 0);
     },
@@ -684,7 +637,7 @@ _setupDynamicComponentDetection()
             // so the behavior is identical regardless of which orchestrator
             // ran. Without this pre-pass, the first computed-eval microtask
             // flush can run before subscribePath registers the component as
-            // an entity-dep of its declared stores — and any store mutation
+            // an entity-dep of its declared stores; and any store mutation
             // between the two won't dirty the component's computeds, leaving
             // stale cached values that no subsequent cascade re-evaluates.
             for (const instance of ctx.instances) {
@@ -696,13 +649,17 @@ _setupDynamicComponentDetection()
                 this._setupSingleInstanceComputed(instance);
             }
 
-            // Build context hierarchy
-            this._buildComponentContextHierarchy();
-
             // Call beforeInit hooks
             for (const instance of ctx.instances) {
                 this._callSingleBeforeInitHook(instance);
             }
+
+            // Pre-populate _listRelationships from all templates BEFORE features.
+            // Same phase position as the async orchestrator (see comment there):
+            // _setupSingleInstanceFeatures creates the render effect, which may
+            // trigger _renderList before per-component _setupListContexts runs;
+            // without the relationships map, nested lists never bind.
+            this._prepopulateListRelationships();
 
             // Setup component features
             for (const instance of ctx.instances) {
@@ -727,7 +684,7 @@ _setupDynamicComponentDetection()
             }
 
             // List processing
-            this._updateLists(this.domElements.lists);
+            this._mountLists(this.domElements.lists);
 
             // Deferred init() execution via macrotask
             this._executeDeferredInits(ctx.pendingInits);
@@ -817,7 +774,7 @@ _setupDynamicComponentDetection()
             // Pre-pass: declare store subscriptions BEFORE computed setup.
             // processWithIdleYield can yield between the computed-setup loop
             // and the features loop. During those yields, the computed-eval
-            // microtask flush runs initial body evaluations — but if
+            // microtask flush runs initial body evaluations, but if
             // subscribePath hasn't registered entity-deps yet, store
             // mutations that fire between yields don't dirty the
             // component's computeds. The cached null result from that first
@@ -825,7 +782,7 @@ _setupDynamicComponentDetection()
             // own pre-pass ensures all entity-deps exist BEFORE any computed
             // body runs.
             //
-            // Synchronous loop — no yielding — so an async store init
+            // Synchronous loop (no yielding), so an async store init
             // (e.g. `await PMStorage.open()` resolving while the scanner
             // is mid-pass) can't slip a mutation through with only some
             // components subscribed.
@@ -837,9 +794,6 @@ _setupDynamicComponentDetection()
             await processWithIdleYield(ctx.instances, (instance) => {
                 this._setupSingleInstanceComputed(instance);
             });
-
-            // Build context hierarchy
-            this._buildComponentContextHierarchy();
 
             // Call beforeInit hooks (uses shared unit-of-work method)
             await processWithIdleYield(ctx.instances, (instance) => {
@@ -853,7 +807,7 @@ _setupDynamicComponentDetection()
             // If we wait for per-component _setupListContexts (which runs in the
             // next phase), the first batch of renders sees an empty map and
             // nested lists never bind. Walking the root once up-front ensures
-            // every render — early or late — sees the relationships it needs.
+            // every render (early or late) sees the relationships it needs.
             this._prepopulateListRelationships();
 
             // Setup component features (uses shared unit-of-work method)
@@ -879,7 +833,7 @@ _setupDynamicComponentDetection()
             }
 
             // List processing (async with yielding)
-            await this._updateListsAsync(this.domElements.lists, null, ctx.scanStart);
+            await this._mountListsAsync(this.domElements.lists, ctx.scanStart);
 
             // Deferred init() execution via macrotask (shared method)
             this._executeDeferredInits(ctx.pendingInits);
@@ -944,7 +898,6 @@ _setupDynamicComponentDetection()
 
         // Store instance
         this.componentInstances.set(instanceId, instance);
-        this._contextHierarchyDirty = true;
 
         // Add direct element reference for quick lookup
         Object.defineProperty(element, '_wfComponent', {
@@ -1021,74 +974,6 @@ _setupDynamicComponentDetection()
         }
 
         return result;
-    },
-    /**
-     * Rebuild component context hierarchy based on DOM structure
-     * This ensures proper parent-child relationships for event propagation
-     * @private
-     */
-    _buildComponentContextHierarchy()
-    {
-        // Get all components with DOM presence
-        const componentsWithDOM = Array.from(this.componentInstances.values())
-            .filter(instance => instance &&
-                instance.element &&
-                instance._componentContext);
-
-        // First pass - identify parent-child DOM relationships
-        const domHierarchy = new Map();
-
-        componentsWithDOM.forEach(instance =>
-        {
-            const element = instance.element;
-            const id = instance.id;
-
-            // Find parent component in DOM
-            const parentId = this._getComponentId(element.parentElement);
-            if (!parentId) return;
-            if (parentId === id) return; // Skip self-references
-
-            // Store the parent-child relationship
-            domHierarchy.set(id, parentId);
-        });
-
-        // Second pass - update context relationships to match DOM hierarchy
-        domHierarchy.forEach((parentId, childId) =>
-        {
-            const childInstance = this.componentInstances.get(childId);
-            const parentInstance = this.componentInstances.get(parentId);
-
-            if (!childInstance || !parentInstance ||
-                !childInstance._componentContext || !parentInstance._componentContext)
-            {
-                return;
-            }
-
-            const childContext = childInstance._componentContext;
-            const parentContext = parentInstance._componentContext;
-
-            // Check if the current parent is already correct
-            if (childContext.parent === parentContext)
-            {
-                return; // Already set correctly
-            }
-
-            // First remove from old parent's children if needed
-            if (childContext.parent && childContext.parent.children)
-            {
-                childContext.parent.children.delete(childId);
-            }
-
-            // Update parent reference
-            childContext.parent = parentContext;
-
-            // Add to parent's children
-            if (!parentContext.children)
-            {
-                parentContext.children = new Map();
-            }
-            parentContext.children.set(childId, childContext);
-        });
     },
     /**
      * Manually initialize the framework.

@@ -195,24 +195,12 @@ describe('Batch Update Processing', () => {
     instance.state.name = 'b'
     cancelledBatch.cancel()
 
-    // Stale entries from the cancelled batch must not leak into the
-    // next batch's _batchChanges. Verify the post-cancel Map is empty
-    // BEFORE we start the second batch.
-    expect(instance.stateManager._batchChanges?.size || 0,
-      'leftover _batchChanges entries from cancelled batch leak into next batch'
-    ).toBe(0)
-
-    // Fresh batch touches `tag` only.
+    // The cancelled batch's mutation persists in state (cancel does not roll
+    // back) but must not drive a render; the fresh batch below does. Meadow has
+    // no _batchChanges bookkeeping to probe — it discards the cancelled batch's
+    // pending scheduled effects — so this is asserted purely on the end-state.
     const realBatch = wildflower.startBatch()
     instance.state.tag = 'y'
-
-    // At this point _batchChanges should hold only `tag`, not `name`
-    // (name was cancelled). If the cancel didn't clear, we'd see both.
-    const recordedPaths = new Set(instance.stateManager._batchChanges.keys())
-    expect(recordedPaths.has('tag')).toBe(true)
-    expect(recordedPaths.has('name'),
-      'cancelled-batch path "name" must not appear in fresh batch _batchChanges'
-    ).toBe(false)
 
     await realBatch.apply()
     await waitForCompleteRender()
@@ -244,22 +232,38 @@ describe('Batch Update Processing', () => {
     const instance = wildflower.componentInstances.get(componentId)
     const bindingElement = component.querySelector('#batch-counter')
 
-    // Track DOM updates
-    let textContentSetCount = 0
+    // Track DOM text updates. The canonical text writer (__wf_txt, P6-S3)
+    // mutates a single text-node child IN PLACE via `.data` (preserving node
+    // identity) and only falls back to textContent for empty/multi-child
+    // shapes — so instrument BOTH channels and count total text writes.
+    let textWriteCount = 0
     const originalDescriptor = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent')
 
     Object.defineProperty(bindingElement, 'textContent', {
       set(value) {
-        textContentSetCount++
+        textWriteCount++
         return originalDescriptor.set.call(this, value)
       },
       get() {
         return originalDescriptor.get.call(this)
       }
     })
+    const textNode = bindingElement.firstChild
+    const dataDescriptor = Object.getOwnPropertyDescriptor(CharacterData.prototype, 'data')
+    if (textNode && textNode.nodeType === 3) {
+      Object.defineProperty(textNode, 'data', {
+        set(value) {
+          textWriteCount++
+          return dataDescriptor.set.call(this, value)
+        },
+        get() {
+          return dataDescriptor.get.call(this)
+        }
+      })
+    }
 
     // Reset counter after initial render
-    textContentSetCount = 0
+    textWriteCount = 0
 
     // Make multiple updates in batch
     const batch = wildflower.startBatch()
@@ -270,8 +274,8 @@ describe('Batch Update Processing', () => {
     await batch.apply()
     await waitForCompleteRender()
 
-    // There should only be one DOM update even with multiple state changes
-    expect(textContentSetCount).toBe(1)
+    // There should only be one DOM text write even with multiple state changes
+    expect(textWriteCount).toBe(1)
 
     // Verify the final value is correct
     expect(originalDescriptor.get.call(bindingElement)).toBe('3')

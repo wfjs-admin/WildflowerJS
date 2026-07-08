@@ -17,6 +17,10 @@ import { getCSPSafeEvaluatorWithArgs } from './CSPExpressionEvaluator.js';
 const STORE_SHORTHAND_REGEX = /^\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.]+)$/;
 const STORE_SHORTHAND_INLINE_REGEX = /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.]+)/g;
 
+// Shared frozen empty array returned by _extractExpressionPaths for expressions
+// with no dotted member chains; avoids per-call allocation in the compile path.
+const _EMPTY_PATHS = Object.freeze([]);
+
 // Block indirect eval/Function access that bypasses variable shadowing in new Function()
 // Catches: eval(), Function(), import(), ['constructor'], ['__proto__'], __defineGetter/Setter__,
 // and global object access (globalThis, window, self, frames) that could reach eval/fetch/etc.
@@ -72,7 +76,7 @@ export const ExpressionEvaluatorMethods = {
      * @returns {string[]} Deduplicated array of variable names
      * @private
      */
-    // Cache for extracted expression variables — expressions are static template strings.
+    // Cache for extracted expression variables; expressions are static template strings.
     // Initialized per-instance in WildflowerCore constructor (NOT a prototype-level Map,
     // which would be shared across instances and cause cross-instance contamination).
     _extractExpressionVars(expression) {
@@ -85,6 +89,32 @@ export const ExpressionEvaluatorMethods = {
             .filter(name => !this._expressionReservedWords.has(name));
         const result = [...new Set(varNames)];
         this._expressionVarsCache.set(expression, result);
+        return result;
+    },
+
+    /**
+     * Extract dotted member-access PATHS from an expression (e.g. "user.active",
+     * "user.profile.name"). Complements _extractExpressionVars, which returns only
+     * ROOT identifiers. Used by the list per-item effect's first-run dependency
+     * registration so a nested item prop read ONLY by an expression/class binding
+     * (with no sibling text binding registering the full path) still wakes the
+     * effect when it mutates. Returns only chains with at least one dot; single
+     * identifiers are already covered by the root-var path. Cached per-instance.
+     * @param {string} expression
+     * @returns {string[]} deduplicated dotted member paths
+     * @private
+     */
+    _extractExpressionPaths(expression) {
+        if (!expression || typeof expression !== 'string') return _EMPTY_PATHS;
+        const cache = this._expressionPathsCache || (this._expressionPathsCache = new Map());
+        const cached = cache.get(expression);
+        if (cached) return cached;
+        // Strip string literals first so dots inside strings aren't read as member access.
+        const stripped = expression.replace(/'[^']*'|"[^"]*"/g, '');
+        // Member chains: an identifier followed by one or more `.identifier` segments.
+        const matches = stripped.match(/[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+/g) || _EMPTY_PATHS;
+        const result = matches.length ? [...new Set(matches)] : _EMPTY_PATHS;
+        cache.set(expression, result);
         return result;
     },
 

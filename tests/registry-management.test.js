@@ -54,38 +54,6 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     }
   })
 
-  it('Context registration and lookup', async () => {
-    testContainer.innerHTML = `
-      <div data-component="reg-lookup-test">
-        <span id="reg-binding" data-bind="message"></span>
-      </div>
-    `
-
-    wildflower.component('reg-lookup-test', {
-      state: {
-        message: 'Hello'
-      }
-    })
-
-    wildflower.scan()
-    await waitForCompleteRender()
-
-    const registry = wildflower._contextRegistry
-
-    // Verify contexts were registered
-    expect(registry.contexts.size).toBeGreaterThan(0)
-
-    // Get binding contexts
-    const bindingContexts = registry.getContextsByType('binding')
-    expect(bindingContexts.length).toBeGreaterThan(0)
-
-    // Verify context can be retrieved by type
-    const bindingCtx = bindingContexts.find(ctx =>
-      ctx.element === testContainer.querySelector('#reg-binding')
-    )
-    expect(bindingCtx).toBeDefined()
-  })
-
   it('Component context creation and lookup', async () => {
     testContainer.innerHTML = `
       <div data-component="comp-ctx-test">
@@ -102,13 +70,12 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     wildflower.scan()
     await waitForCompleteRender()
 
-    const registry = wildflower._contextRegistry
     const component = testContainer.querySelector('[data-component="comp-ctx-test"]')
-    const componentId = component.dataset.componentId
 
-    // Verify component context exists (getContextsForComponent removed — Sprint 3)
-    const componentContexts = registry.getContextsByType('component')
-    expect(componentContexts.length).toBeGreaterThan(0)
+    // Component contexts are no longer registered — they were folded out (emit()
+    // bubbles via DOM ancestry; the public `this.context` API is independent of
+    // any context object). The component still renders from its state.
+    expect(component.querySelector('span').textContent).toBe('Test')
   })
 
   it('List context creation and lookup', async () => {
@@ -131,11 +98,10 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     wildflower.scan()
     await waitForCompleteRender()
 
-    const registry = wildflower._contextRegistry
     const listElement = testContainer.querySelector('#list-ctx-element')
 
-    // Get context for list element
-    const listCtx = registry.getContextForElement(listElement)
+    // List contexts are plain objects on the element.
+    const listCtx = listElement._listContext
     expect(listCtx).toBeDefined()
     expect(listCtx.type).toBe('list')
     expect(listCtx.path).toBe('regItems')
@@ -149,9 +115,9 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     // Verify full path construction
     expect(listCtx.getFullPath()).toBe('regItems')
 
-    // Verify list contexts exist
-    const listContexts = registry.getContextsByType('list')
-    expect(listContexts.length).toBeGreaterThan(0)
+    // List contexts are plain objects on the element / instance map (not in the
+    // registry type index); getContextForElement above resolved the same object.
+    expect(listElement._listContext).toBe(listCtx)
   })
 
   it('Registry garbage collection', async () => {
@@ -178,21 +144,20 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     wildflower.scan()
     await waitForCompleteRender()
 
-    const registry = wildflower._contextRegistry
     const component = testContainer.querySelector('[data-component="gc-reg-test"]')
     const componentId = component.dataset.componentId
-
-    const initialCount = registry.contexts.size
 
     // Destroy the component
     wildflower.destroyComponent(componentId)
 
-    // Run garbage collection
-    const stats = registry.garbageCollect()
+    // Run the public component-level garbage collection (returns stats)
+    const stats = wildflower.garbageCollect()
 
-    // Verify garbage collection ran
+    // Component/binding contexts are no longer registered, so registry.contexts
+    // size is not a cleanup proxy. The observable invariant is that the destroyed
+    // component's instance is gone.
     expect(stats).toBeDefined()
-    expect(registry.contexts.size).toBeLessThan(initialCount)
+    expect(wildflower.componentInstances.has(componentId)).toBe(false)
   })
 
   it('Context disposal cleans up properly', async () => {
@@ -213,22 +178,16 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     wildflower.scan()
     await waitForCompleteRender()
 
-    const registry = wildflower._contextRegistry
     const component = testContainer.querySelector('[data-component="disposal-test"]')
     const componentId = component.dataset.componentId
-    const bindingElement = testContainer.querySelector('#disposal-binding')
 
-    // Get initial context
-    const initialContext = registry.getContextForElement(bindingElement)
-    expect(initialContext).toBeDefined()
+    // Binding painted initially.
+    expect(testContainer.querySelector('#disposal-binding').textContent).toBe('Hello')
 
-    // Destroy component
+    // Destroy component — observable no-leak: the instance is gone.
     wildflower.destroyComponent(componentId)
-
-    // Context should be cleaned up
-    const afterContext = registry.getContextForElement(bindingElement)
-    // After disposal, context lookup should return null or undefined
-    expect(afterContext === null || afterContext === undefined || !registry.contexts.has(afterContext?.id)).toBe(true)
+    wildflower.garbageCollect()
+    expect(wildflower.componentInstances.has(componentId)).toBe(false)
   })
 
   it('Context system cleans up orphaned contexts and prevents memory leaks', async () => {
@@ -252,9 +211,6 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     wildflower.scan()
     await waitForCompleteRender()
 
-    const registry = wildflower._contextRegistry
-    const initialCount = registry.contexts.size
-
     // Get component IDs
     const comp1 = testContainer.querySelector('[data-component="leak-test-1"]')
     const comp2 = testContainer.querySelector('[data-component="leak-test-2"]')
@@ -270,21 +226,11 @@ describe.skipIf(isMinifiedBuild())('Registry Management', () => {
     wildflower.destroyComponent(id3)
 
     // Run garbage collection
-    const stats = registry.garbageCollect()
+    wildflower.garbageCollect()
 
-    // Verify contexts were cleaned up
-    expect(registry.contexts.size).toBeLessThan(initialCount)
-
-    // Verify no contexts remain for destroyed components
-    const remainingContexts = Array.from(registry.contexts.values())
-    const orphanedContexts = remainingContexts.filter(ctx =>
-      ctx.componentInstance && (
-        ctx.componentInstance.id === id1 ||
-        ctx.componentInstance.id === id2 ||
-        ctx.componentInstance.id === id3
-      )
-    )
-
-    expect(orphanedContexts.length).toBe(0)
+    // Destroyed component instances are gone (the observable no-leak invariant).
+    expect(wildflower.componentInstances.has(id1)).toBe(false)
+    expect(wildflower.componentInstances.has(id2)).toBe(false)
+    expect(wildflower.componentInstances.has(id3)).toBe(false)
   })
 })

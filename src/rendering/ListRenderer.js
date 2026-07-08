@@ -1,5 +1,69 @@
 /**
- * ListRenderer - List rendering with array operations
+ * ListRenderer - data-list rendering: mounting, row creation, updates, teardown.
+ *
+ * ARCHITECTURE MAP
+ *
+ * Mounting (one path, no arbitration):
+ *   discovery scan -> _mountLists -> _processList -> mountList -> reconcile()
+ *   (the keyed reconciler in state/reactive-graph/list-reconciler.js). The
+ *   reconciler calls back into mapFn here to create a row element per item,
+ *   and into onItemUpdate / onMove / onBulkRemove / onComplete for churn.
+ *
+ * Row creation (mapFn):
+ *   template metadata comes precompiled from TemplateSystem._compileTemplate.
+ *   A row is built either by the bulk-clone path (template cloned once, text
+ *   written through precompiled setters; used for large batch creates) or the
+ *   normal path (_bindWithCompiledMetadata for text/html/model/show plus
+ *   _applyRowDecor for class/style/attr). After binding, the row registers on
+ *   the list's update routing via registerRowLeafSinks.
+ *
+ * Update routing (per written field, decided at registration):
+ *   1. Suppressing direct writer: a field read by exactly ONE text, style, or
+ *      attr binding on one element, on a component with no computeds, watchers,
+ *      subscriptions, or autosave (_computeReactiveGraphRetireSafe), gets a
+ *      writer stamped on its graph node. The set trap performs the single DOM
+ *      write and stops; no observer wake, no onStateChange dispatch. This is
+ *      the per-frame hot path; its economy is load-bearing.
+ *   2. Per-list dispatcher sink: every other sink-covered leaf routes a write
+ *      to the list's dispatcher, which applies ONLY the arms the changed key
+ *      feeds: targeted text (the emitter spec), show/html/model executors,
+ *      class/style/attr evaluator appliers, and the render arm (which runs
+ *      first when present, because a condition flip restructures the row).
+ *      Two dispatcher flavors exist: the general one for fully static
+ *      templates (a flat, precomputed fast-touch key list), and the computed
+ *      one for templates with computeds, expressions, external reads, or
+ *      polymorphic rows. The computed dispatcher discovers dependencies at
+ *      runtime by walking each row's reads under the list frame; one stable
+ *      per-list effect re-applies all rows when a shared (non-item) dep fires.
+ *   3. Component refresh effect: root-of-row binding reads and component-state
+ *      reads stay on the component's refresh effect. Root drop-out semantics
+ *      and the cross-item selection partition live there and must not be
+ *      migrated to per-leaf stamps.
+ *
+ * Self-heal (dual-stamp): a suppressed leaf keeps its sink stamp alongside the
+ * writer. When a row is replaced or detached the stale writer self-clears on
+ * its next invocation, the write falls through to the sink, and the sink
+ * re-applies and re-stamps a fresh writer on the live element.
+ *
+ * Application kernels (exactly one writer per binding kind, every channel):
+ *   class  -> applyClass (diff-tracked via _prevBoundClasses; owns drop-out)
+ *   style  -> applyStyleObj / applyStyleProp
+ *   attr   -> applyAttrObj (blocklist + sanitizer inside)
+ *   text   -> __wf_txt / __wf_str (in-place text-node write)
+ *
+ * Invariants (load-bearing; violating any of these has produced real bugs):
+ *   - A field may be stamped for targeted updates only if EVERY binding kind
+ *     that reads it has an applier arm in the dispatcher.
+ *   - Skipping the full-row apply requires the same safety gate as write
+ *     suppression: item-level computeds are invisible to static template
+ *     classification, and the full-row apply is their only applier.
+ *   - Element arrays resolve _cachedElementsArray || _bindingElements at every
+ *     consumer; either may have been invalidated independently.
+ *   - _compileTemplate emits an evaluator entry for every style/attr binding
+ *     (bindings imply evaluators), so the evaluator appliers own all list-path
+ *     decor and the generic executors run only for slot/SSR callers.
+ *   - Detached rows that carry render contexts are live (a placeholder holds
+ *     their slot) and must keep receiving applies.
  *
  * @module
  */
@@ -10,7 +74,27 @@ import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
 import { ListNestedMethods } from './ListNestedManager.js';
 import { ListItemBindingMethods } from './ListItemBinding.js';
 import { ListExpressionMethods } from './ListExpressionEval.js';
-import { ssrAdoptedElements, ssrStateChangedElements, needsComponentInitSet, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
+import { needsComponentInitSet, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
+import { SSRListMethods } from './ssr-list.js';
+import { DIRECT_WRITERS } from '../state/bindingConstants.js';
+import { applyAttrObj, applyStyleProp, applyStyleObj, applyClass } from '../core/BindingWriters.js';
+import { __wf_str, __wf_txt } from '../core/wfUtils.js';
+import { getRowCompileMode, getTextEmitters, applyRowText, shadowCompareRow,
+    createListSinkDispatcher, applyRowTextUpdate, getPureTextSpec } from './RowCompiler.js';
+
+// Shared text directWriter. The target element lives on the graph node
+// (node.dwEl, set at stamp time) and the field name is node.key, so this single
+// module-level function replaces the per-row closure that _stampDirectText used
+// to allocate, eliminating one closure per text binding per row (20k on a
+// 10k-row create) and the detached-row reference they pinned on clear. notifyNode
+// invokes it as dw(target, node); returning false on a detached el lets
+// notifyNode clear the stale writer and fall back to the effect wake.
+const SHARED_TEXT_WRITER = (target, node) => {
+    const el = node.dwEl;
+    if (!el || !el.isConnected) return false;
+    __wf_txt(el, __wf_str(target[node.key]));
+    return true;
+};
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -19,50 +103,46 @@ export const ListRendererMethods = {
     ...ListNestedMethods,
     ...ListItemBindingMethods,
     ...ListExpressionMethods,
-_updateLists(listElements, instance = null)
-    {
-        const prepared = this._prepareLists(listElements);
-        if (!prepared) return;
+    // SSR list support (fingerprint diff, hydration adoption, one-shot SSR
+    // binders). The flag is a compile-time constant, so in the 12 non-SSR
+    // variants this spread folds away and rollup drops the whole module.
+    ...(__FEATURE_SSR__ ? SSRListMethods : {}),
+/**
+     * Discovery-time mount driver: mounts every not-yet-initialized list in the
+     * given entries via _processList (mountList gate + first render). No batch
+     * or update arbitration; a newly discovered list mounts unconditionally, and
+     * already-mounted lists no-op via mountList's _mapArrayInitialized exit.
+     * @private
+     */
+    _mountLists(listElements, instance = null) {
+        if (!listElements || listElements.length === 0) return;
 
-        const { componentEntries, restrictToChangedComponents, hasRecentArrayOperation } = prepared;
-        listElements = prepared.listElements;
-
-        for (const entry of componentEntries) {
-            this._processComponentLists(entry, instance, hasRecentArrayOperation, restrictToChangedComponents);
+        for (const entry of this._groupListsByComponent(listElements)) {
+            this._mountComponentLists(entry, instance);
         }
 
-        this._setupListEventDelegation(listElements, restrictToChangedComponents, instance);
+        this._setupListEventDelegation(listElements, false, instance);
     },
 
     /**
-     * Async version of _updateLists for initial page load.
-     * Uses Sprint/Jog strategy to reduce Total Blocking Time (TBT).
-     * Yields to main thread between component list processing during jog phase.
-     *
-     * @param {Array} listElements - List elements to process
-     * @param {Object} instance - Optional component instance
-     * @param {number} scanStart - Start time of the scan (for sprint budget calculation)
-     * @returns {Promise<void>}
+     * Async twin of _mountLists for initial page load: Sprint/Jog yielding
+     * to keep Total Blocking Time low.
+     * @private
      */
-    async _updateListsAsync(listElements, instance = null, scanStart = performance.now()) {
-        const prepared = this._prepareLists(listElements);
-        if (!prepared) return;
+    async _mountListsAsync(listElements, scanStart = performance.now()) {
+        if (!listElements || listElements.length === 0) return;
 
         const SPRINT_BUDGET = 20;
         const inSprintPhase = () => performance.now() - scanStart <= SPRINT_BUDGET;
 
-        const { componentEntries, restrictToChangedComponents, hasRecentArrayOperation } = prepared;
-        listElements = prepared.listElements;
-
+        const componentEntries = Array.from(this._groupListsByComponent(listElements).entries());
         let componentIndex = 0;
 
-        // Sprint phase: process synchronously
         while (componentIndex < componentEntries.length && inSprintPhase()) {
-            this._processComponentLists(componentEntries[componentIndex], instance, hasRecentArrayOperation, restrictToChangedComponents);
+            this._mountComponentLists(componentEntries[componentIndex]);
             componentIndex++;
         }
 
-        // Jog phase: process remaining via requestIdleCallback
         if (componentIndex < componentEntries.length) {
             await new Promise(resolve => {
                 const scheduleIdle = window.requestIdleCallback ||
@@ -70,7 +150,7 @@ _updateLists(listElements, instance = null)
 
                 const processQueue = (deadline) => {
                     while (componentIndex < componentEntries.length && deadline.timeRemaining() > 2) {
-                        this._processComponentLists(componentEntries[componentIndex], instance, hasRecentArrayOperation, restrictToChangedComponents);
+                        this._mountComponentLists(componentEntries[componentIndex]);
                         componentIndex++;
                     }
 
@@ -85,20 +165,19 @@ _updateLists(listElements, instance = null)
             });
         }
 
-        this._setupListEventDelegation(listElements, restrictToChangedComponents, instance);
+        this._setupListEventDelegation(listElements, false, null);
     },
 
     /**
-     * Helper to process all lists for a single component
+     * Mount one component's lists. The rendered-component bookkeeping feeds
+     * _hasRendered in _render; there is no batch or update arbitration. A
+     * discovered list mounts unconditionally.
      * @private
      */
-    _processComponentLists([componentId, componentLists], instance, hasRecentArrayOperation, restrictToChangedComponents) {
+    _mountComponentLists([componentId, componentLists], instance = null) {
         const currentInstance = instance || this.componentInstances.get(componentId);
         if (!currentInstance) return;
 
-        // Skip component entirely if ALL lists are already mapArray-initialized
-        // (effects handle all subsequent updates — no need for context-based processing)
-        // Exception: lists with _forceTemplateRerender need to go through _processList
         let allInitialized = true;
         for (let i = 0; i < componentLists.length; i++) {
             const el = componentLists[i].element;
@@ -109,9 +188,7 @@ _updateLists(listElements, instance = null)
         }
         if (allInitialized) return;
 
-        const shouldUpdate = this._shouldUpdateComponent(currentInstance, componentId, componentLists, restrictToChangedComponents);
-        if (!shouldUpdate) return;
-
+        this._actuallyRenderedComponents = this._actuallyRenderedComponents || new Set();
         this._actuallyRenderedComponents.add(componentId);
         if (this._componentsToUpdate) {
             this._componentsToUpdate.add(componentId);
@@ -119,81 +196,11 @@ _updateLists(listElements, instance = null)
 
         for (const list of componentLists) {
             try {
-                const { path } = list;
-                const forceUpdate = hasRecentArrayOperation &&
-                    this._currentArrayOperation?.path === path &&
-                    this._currentArrayOperation?.componentId === componentId;
-                this._processList(list, currentInstance, forceUpdate);
+                this._processList(list, currentInstance, false);
             } catch (error) {
                 this._handleError(`Error updating list: ${list.path}`, error, currentInstance);
             }
         }
-    },
-
-    /**
-     * Shared preamble for _updateLists and _updateListsAsync.
-     * Applies batch filtering, groups by component, collects change-detection state.
-     * @returns {{ listElements, componentEntries, restrictToChangedComponents, hasRecentArrayOperation }|null}
-     * @private
-     */
-    _prepareLists(listElements) {
-        if (!listElements || listElements.length === 0) return null;
-
-        this._actuallyRenderedComponents = this._actuallyRenderedComponents || new Set();
-
-        const isBatchRender = this._batchChangedComponents && this._batchChangedComponents.size > 0;
-
-        if (isBatchRender) {
-            const batchLists = listElements.filter(list =>
-                list && list.componentId && this._batchChangedComponents.has(list.componentId)
-            );
-
-            if (batchLists.length === 0) {
-                let hasUnrenderedComponent = false;
-                for (let i = 0; i < listElements.length; i++) {
-                    const list = listElements[i];
-                    if (!list || !list.componentId) continue;
-                    const listInstance = this.componentInstances.get(list.componentId);
-                    if (listInstance && listInstance._hasRendered === false) {
-                        hasUnrenderedComponent = true;
-                        break;
-                    }
-                }
-
-                if (!hasUnrenderedComponent) {
-                    let hasOperationHints = false;
-                    for (let i = 0; i < listElements.length; i++) {
-                        const list = listElements[i];
-                        if (!list || !list.componentId) continue;
-                        const listInstance = this.componentInstances.get(list.componentId);
-                        if (!listInstance?.stateManager?._arrayOperations) continue;
-                        const arrayPath = list.dataset?.list;
-                        if (arrayPath && listInstance.stateManager._arrayOperations.has(arrayPath)) {
-                            hasOperationHints = true;
-                            break;
-                        }
-                    }
-                    if (!hasOperationHints) return null;
-                }
-            } else {
-                listElements = batchLists;
-            }
-        }
-
-        const listsByComponent = this._groupListsByComponent(listElements);
-        const componentEntries = Array.from(listsByComponent.entries());
-
-        const bcc = this._batchChangedComponents;
-        const restrictToChangedComponents = bcc && bcc.size > 0;
-        const updatedPaths = this._updatedPaths || new Set();
-        if (this._batchChangedPaths && this._batchChangedPaths.size > 0) {
-            this._batchChangedPaths.forEach(path => updatedPaths.add(path));
-        }
-
-        const hasRecentArrayOperation = this._currentArrayOperation &&
-            (Date.now() - this._currentArrayOperation.timestamp < 50);
-
-        return { listElements, componentEntries, restrictToChangedComponents, hasRecentArrayOperation };
     },
 
     /**
@@ -213,11 +220,19 @@ _updateLists(listElements, instance = null)
             const currentInstance = instance || this.componentInstances.get(componentId);
             if (!currentInstance || !element) continue;
 
+            // PERF: Delegation is attached once per list element and stays valid for
+            // its lifetime; nested lists wire their own delegation when created
+            // (ListNestedManager._processNestedListsForItem). Once this element's
+            // delegation exists there is nothing left to do; skip the body. Without
+            // this guard, every update/frame ran element.querySelectorAll('[data-list]')
+            // over every row to re-discover nested lists, a full DOM walk that found
+            // nothing on flat lists (visible as querySelectorAll [data-list] in profiles).
+            if (this._hasElementDelegation(element)) continue;
+
             this._ensureListEventDelegation(element, currentInstance, path);
 
-            // PERF: Process nested lists synchronously instead of with setTimeout
-            // With effects-based rendering, nested lists are already initialized by _processNestedListsForItem
-            // The setTimeout was causing an extra browser rendering cycle (300ms overhead on 10k create)
+            // First-time setup only: discover nested lists present now and wire their
+            // delegation. Lists created later are handled by _processNestedListsForItem.
             const nestedLists = element.querySelectorAll(this._attrSelector('list'));
             for (let i = 0; i < nestedLists.length; i++) {
                 const nestedList = nestedLists[i];
@@ -226,59 +241,6 @@ _updateLists(listElements, instance = null)
                 }
             }
         }
-    },
-    // Helper to determine if component needs updates
-    _shouldUpdateComponent(instance, componentId, componentLists, restrictToChangedComponents)
-    {
-        // CRITICAL: Check if component has never been rendered FIRST (per-component tracking)
-        // This ensures dynamically loaded components get their first render regardless of timing
-        // This check must happen BEFORE batch restrictions to ensure first renders never get skipped
-        if (instance && instance._hasRendered === false)
-        {
-            return true;
-        }
-
-        // Fast-reject if not in batch changed components
-        if (restrictToChangedComponents && this._batchChangedComponents && !this._batchChangedComponents.has(componentId))
-        {
-            return false;
-        }
-
-        // Always update on first render (global optimization for initial page load)
-        if (this._renderCounter <= 1)
-        {
-            return true;
-        }
-
-        // Check for explicit update flags
-        if (this._componentsToUpdate && this._componentsToUpdate.has(componentId))
-        {
-            return true;
-        }
-
-        // Check for batch changes
-        if (this._batchChangedComponents && this._batchChangedComponents.has(componentId))
-        {
-            return true;
-        }
-
-        // Check for computed lists that always need evaluation
-        if (componentLists.some(list => list.path.startsWith('computed:')))
-        {
-            return true;
-        }
-
-        // Check for direct state updates
-        if (this._updatedPaths && this._updatedPaths.size > 0)
-        {
-            for (const path of this._updatedPaths) {
-                for (let i = 0; i < componentLists.length; i++) {
-                    if (componentLists[i].path === path) return true;
-                }
-            }
-        }
-
-        return false;
     },
     /**
      * Process a list with enhanced optimizations
@@ -290,9 +252,30 @@ _updateLists(listElements, instance = null)
      */
 
 
-    _processList(list, instance, forceUpdate = false) {
-        const {element, path} = list;
-
+    /**
+     * Resolve a top-level list's source array for the render diff without the
+     * list context's resolveData cache: external(…) through the external fn,
+     * everything else (state path / computed: / bare computed) through getValue.
+     * Returns a fresh copy (matching resolveData's snapshot semantics) so
+     * element._previousData stays a frozen snapshot for change detection.
+     * @private
+     */
+    _resolveListSourceData(path, instance) {
+        const sm = instance && instance.stateManager;
+        if (!sm) return [];
+        const normalizedPath = (path.includes('$') && this._normalizeStoreShorthands)
+            ? this._normalizeStoreShorthands(path) : path;
+        const result = normalizedPath.includes('external(')
+            ? this._evaluateExternalListPath(normalizedPath, instance)
+            : sm.getValue(normalizedPath);
+        return Array.isArray(result) ? [...result] : [];
+    },
+    // Bootstrap gate for a single data-list element: mapArray early-exit,
+    // template-child/ownership skip, then resolve-or-create the list context.
+    // Extracted from _processList so every list-discovery path can converge on
+    // one mount entry. Returns the context, or a falsy value when this caller
+    // should not (re)mount the list.
+    mountList(element, path, instance) {
         // === MAPARRAY EARLY EXIT ===
         // If this list is already initialized with mapArray, skip all processing.
         // mapArray handles all updates internally via its Effects system.
@@ -365,7 +348,7 @@ _updateLists(listElements, instance = null)
             }
 
             if (insideChildComponent) {
-                // This list belongs to the child component — skip processing
+                // This list belongs to the child component; skip processing
                 // entirely. The child component will handle it during its own
                 // initialization via _processList with the correct instance.
                 return;
@@ -382,9 +365,7 @@ _updateLists(listElements, instance = null)
 
                 if (!isNaN(itemIndex)) {
                     // Create child context using the correct parent index
-                    context = parentContext.createChildContext ?
-                        parentContext.createChildContext(itemIndex, path) :
-                        this._createNestedListContext(parentContext, itemIndex, path);
+                    context = parentContext.createChildContext(itemIndex, path);
 
                     // Store bidirectional references for easier access
                     if (context) {
@@ -430,7 +411,7 @@ _updateLists(listElements, instance = null)
                     // so that external() calls from within the computed can associate
                     // the list element with pending store dependencies
                     const previousTrackingContext = this._computedTrackingContext;
-                    // V8 OPT: Canonical shape — all fields always present
+                    // V8 OPT: Canonical shape; all fields always present
                     this._computedTrackingContext = {
                         componentId: instance.id,
                         computedName: computedName,
@@ -475,418 +456,44 @@ _updateLists(listElements, instance = null)
 
         if (!context) {
             if (__DEV__) console.warn(`Could not determine context for list: ${path}`);
+            return null;
+        }
+
+        return context;
+    },
+
+    _processList(list, instance, forceUpdate = false) {
+        const {element, path} = list;
+
+        const context = this.mountList(element, path, instance);
+        if (!context) {
             return;
         }
 
-        // Resolve data from context
-        const data = context.resolveData();
+        // Resolve the diff source. Top-level lists (the only kind that reaches
+        // here; nested lists render via the parent's mapArray) read live through
+        // getValue / the external fn, snapshot-copied like resolveData did. A
+        // nested context here would need parent-proxy resolution, so fall back to
+        // resolveData defensively (not observed in practice).
+        const data = (context.parent && context.parent.type === 'list')
+            ? context.resolveData()
+            : this._resolveListSourceData(path, instance);
 
-        // Store the data for future comparisons
-        const previousData = element._previousData;
-        const hasPreviousData = previousData && Array.isArray(previousData) && Array.isArray(data);
-
-        // _previousData is updated by _renderList at the end — NOT here.
-        // Updating early prevents fast-path removal optimization from detecting changes.
-        // Check for pending array operation optimizations
-        const arrayPath = context?.path;
-        const pendingOperation = instance?.stateManager?._arrayOperations?.get(arrayPath);
-        const hasPendingOptimization = pendingOperation &&
-            (pendingOperation.type === 'sparse-update' ||
-                pendingOperation.type === 'swap' ||
-                pendingOperation.type === 'append');
-
-        // ===== REPLACE-ALL FAST PATH =====
-        // Detect when all/most items have been replaced with completely different objects
-        // This skips the expensive property update optimization path and goes straight to bulk replacement
-        let skipPropertyOptimization = false;
-        if (!hasPendingOptimization && !forceUpdate && hasPreviousData && previousData.length === data.length && data.length > 0) {
-            // PERFORMANCE FIX: Fast path for direct mutations
-            // If first few items have same references, likely direct mutation - skip expensive sampling
-            const checkSize = Math.min(3, data.length);
-            let sameReferenceCount = 0;
-            for (let i = 0; i < checkSize; i++) {
-                if (previousData[i] === data[i]) {
-                    sameReferenceCount++;
-                }
-            }
-
-            // If all sampled items have same reference, definitely direct mutation
-            // Skip replace-all detection entirely
-            const isLikelyDirectMutation = sameReferenceCount === checkSize;
-
-            if (!isLikelyDirectMutation) {
-                // Only run full sampling for likely immutable patterns
-                const sampleSize = Math.min(20, data.length);
-                const step = Math.max(1, Math.floor(data.length / sampleSize));
-                let differentCount = 0;
-
-                for (let i = 0; i < sampleSize; i++) {
-                    const idx = Math.min(i * step, data.length - 1);
-                    if (previousData[idx] !== data[idx]) {
-                        differentCount++;
-                    }
-                }
-
-                // If >80% of sampled items are different references, treat as replace-all
-                const percentDifferent = differentCount / sampleSize;
-                if (percentDifferent > 0.8) {
-                    skipPropertyOptimization = true;
-                }
-            }
-        }
-
-        // ===== PROPERTY UPDATE OPTIMIZATION =====
-        // Sparse update optimization: detect which items have property changes and only update those
-        if (!skipPropertyOptimization && !hasPendingOptimization && !forceUpdate && hasPreviousData && previousData.length === data.length && data.length > 0) {
-            // Find which items have property changes
-            const changedIndices = [];
-            let totalChangedProps = 0;
-
-            // Analyze changes for each item
-            for (let i = 0; i < data.length; i++) {
-                const prevItem = previousData[i];
-                const newItem = data[i];
-
-                // Skip if items have different IDs
-                if (prevItem?.id !== undefined && newItem?.id !== undefined &&
-                    prevItem.id !== newItem.id) {
-                    continue;
-                }
-
-                // FAST PATH 1: Reference equality check (for immutable updates)
-                // Same reference = no changes (immutable assumption)
-                if (prevItem === newItem) {
-                    continue;
-                }
-
-                // FAST PATH 2: If both have IDs and IDs match, use reference equality on top-level properties
-                // instead of JSON.stringify (much faster for nested objects)
-                let itemHasChanges = false;
-
-                if (prevItem?.id !== undefined && newItem?.id !== undefined && prevItem.id === newItem.id) {
-                    // Check if any top-level property reference changed
-                    // Use for...in instead of Object.keys() to avoid array allocation
-                    let prevKeyCount = 0;
-                    let newKeyCount = 0;
-                    for (const key in prevItem) {
-                        prevKeyCount++;
-                        if (prevItem[key] !== newItem[key]) {
-                            itemHasChanges = true;
-                            break;
-                        }
-                    }
-                    if (!itemHasChanges) {
-                        for (const _k in newItem) newKeyCount++;
-                        if (prevKeyCount !== newKeyCount) itemHasChanges = true;
-                    }
-                } else {
-                    // Fallback: Use JSON.stringify (for items without IDs or different IDs)
-                    try {
-                        itemHasChanges = JSON.stringify(prevItem) !== JSON.stringify(newItem);
-                    } catch (e) {
-                        // Circular reference — assume changed (safe: just less optimal)
-                        itemHasChanges = prevItem !== newItem;
-                    }
-                }
-
-                if (itemHasChanges) {
-                    changedIndices.push(i);
-
-                    // Count changed properties for threshold check.
-                    // Defer building propChanges Sets to the fallback render path —
-                    // the compiled metadata fast path doesn't need them.
-                    if (prevItem) {
-                        for (const key in prevItem) {
-                            if (prevItem[key] !== newItem?.[key]) {
-                                totalChangedProps++;
-                            }
-                        }
-                    }
-                    if (newItem) {
-                        for (const key in newItem) {
-                            if (!(key in prevItem) && newItem[key] !== prevItem?.[key]) {
-                                totalChangedProps++;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Only use optimization for sparse property updates
-            if (changedIndices.length > 0 &&
-                changedIndices.length < data.length * 0.3 &&
-                totalChangedProps < data.length) {
-
-
-                // PERF: Check once if this list has nested lists
-                const hasNestedLists = this._listRelationships && this._listRelationships.has(context?.path);
-
-                // Get list items once (filtering out template elements)
-                const listItems = this._getListItems(element);
-
-                // Update only the specific properties that changed
-                changedIndices.forEach(index => {
-                        // Access list items by index from filtered array
-                        const itemEl = listItems[index];
-                        if (!itemEl || itemEl._listIndex === undefined) return;
-
-                        const item = data[index];
-
-                        // PERF: Use compiled metadata path if available (avoids querySelectorAll)
-                        const compiledMetadata = itemEl._compiledMetadata;
-                        if (compiledMetadata && itemEl._cachedElementsArray) {
-                            // FAST PATH: Use cached element references and execute functions
-                            const listContext = itemEl._listContext || context;
-                            this._bindWithCompiledMetadata(itemEl, item, compiledMetadata, listContext, index, context);
-                            return; // Skip fallback path
-                        }
-
-                        // FALLBACK PATH: Use querySelectorAll (for items without compiled metadata)
-                        if (!itemEl._warnedSlowPath) {
-                            itemEl._warnedSlowPath = true;
-                            console.warn('[WildflowerJS] List item missing compiled metadata — using querySelectorAll fallback (slower). This may happen with configurable templates or SSR-adopted lists.');
-                        }
-                        // Build propChanges on-demand (deferred from detection loop to avoid allocations on the fast path)
-                        const prevItem = previousData[index];
-                        const propsToUpdate = new Set();
-                        if (prevItem) {
-                            for (const key in prevItem) {
-                                if (prevItem[key] !== item?.[key]) propsToUpdate.add(key);
-                            }
-                        }
-                        if (item) {
-                            for (const key in item) {
-                                if (!propsToUpdate.has(key) && item[key] !== prevItem?.[key]) propsToUpdate.add(key);
-                            }
-                        }
-                        if (propsToUpdate.size === 0) return;
-
-                        propsToUpdate.forEach(prop => {
-                            // Find bindings for this property AND nested properties
-                            const allBindings = itemEl.querySelectorAll(this._attrSelector('bind'));
-
-                            // Iterate NodeList directly instead of Array.from().filter() to avoid allocations
-                            for (let bi = 0; bi < allBindings.length; bi++) {
-                                const bindingEl = allBindings[bi];
-                                const bindPath = this._getAttr(bindingEl, 'bind');
-
-                                // Filter: skip bindings that don't match this prop (unless wildcard)
-                                if (prop !== '*' && bindPath !== prop && !bindPath.startsWith(prop + '.')) continue;
-
-                                // Skip computed bindings - handled separately
-                                if (bindPath.startsWith('computed:')) continue;
-
-                                let value;
-
-                                // EXPRESSION FIX: Handle expressions like "price * qty"
-                                if (this.isExpression(bindPath)) {
-                                    // Build merged state for expression evaluation
-                                    const componentInstance = context?.componentInstance;
-                                    const componentState = componentInstance?.state || {};
-                                    const listLength = data.length;
-                                    const mergedState = {
-                                        ...componentState,
-                                        ...item,
-                                        _index: index,
-                                        _length: listLength,
-                                        _first: index === 0,
-                                        _last: index === listLength - 1
-                                    };
-                                    value = this.evaluateExpression(bindPath, mergedState, { cacheKey: 'directMutationExpr' });
-                                } else {
-                                    // Simple property path (cached resolver, zero allocation)
-                                    value = this._getValueFromItem(item, bindPath);
-                                }
-
-                                const strValue = value !== undefined && value !== null ? String(value) : '';
-
-                                if (bindingEl.tagName === 'INPUT' || bindingEl.tagName === 'TEXTAREA' || bindingEl.tagName === 'SELECT') {
-                                    if (bindingEl.value !== strValue) {
-                                        bindingEl.value = strValue;
-                                    }
-                                } else {
-                                    if (bindingEl.textContent !== strValue && !this._shouldPreventContentUpdate(bindingEl, strValue)) {
-                                        bindingEl.textContent = strValue;
-                                    }
-                                }
-                            }
-                        });
-
-                        // CRITICAL: Also process class bindings for this item
-                        // Class bindings (e.g., data-bind-class="done ? 'done' : ''") need to be re-evaluated
-                        // when the relevant property (done) changes
-                        const classBindings = itemEl.querySelectorAll(this._attrSelector('bind-class'));
-                        classBindings.forEach(classBindingEl => {
-                            const classExpr = this._getAttr(classBindingEl, 'bind-class');
-                            if (classExpr) {
-                                this._processOptimizedClassBinding(classBindingEl, item, classExpr, index, context);
-                            }
-                        });
-                        // Also check root element for class binding
-                        if (this._hasAttr(itemEl, 'bind-class')) {
-                            const rootClassExpr = this._getAttr(itemEl, 'bind-class');
-                            if (rootClassExpr) {
-                                this._processOptimizedClassBinding(itemEl, item, rootClassExpr, index, context);
-                            }
-                        }
-
-                        // CRITICAL: Also process style bindings for this item
-                        const styleBindings = itemEl.querySelectorAll(this._attrSelector('bind-style'));
-                        styleBindings.forEach(styleBindingEl => {
-                            const styleExpr = this._getAttr(styleBindingEl, 'bind-style');
-                            if (styleExpr) {
-                                this._processObjectBinding('style', styleBindingEl, item, styleExpr, index, context);
-                            }
-                        });
-                        // Also check root element for style binding
-                        if (this._hasAttr(itemEl, 'bind-style')) {
-                            const rootStyleExpr = this._getAttr(itemEl, 'bind-style');
-                            if (rootStyleExpr) {
-                                this._processObjectBinding('style', itemEl, item, rootStyleExpr, index, context);
-                            }
-                        }
-
-                        // CRITICAL: Also process attr bindings for this item
-                        const attrBindings = itemEl.querySelectorAll(this._attrSelector('bind-attr'));
-                        attrBindings.forEach(attrBindingEl => {
-                            const attrExpr = this._getAttr(attrBindingEl, 'bind-attr');
-                            if (attrExpr) {
-                                this._processObjectBinding('attr', attrBindingEl, item, attrExpr, index, context);
-                            }
-                        });
-                        // Also check root element for attr binding
-                        if (this._hasAttr(itemEl, 'bind-attr')) {
-                            const rootAttrExpr = this._getAttr(itemEl, 'bind-attr');
-                            if (rootAttrExpr) {
-                                this._processObjectBinding('attr', itemEl, item, rootAttrExpr, index, context);
-                            }
-                        }
-
-                        // CRITICAL: Process nested lists for this item (e.g., tasks array changed)
-                        // PERF: Only if this list has nested lists
-                        if (hasNestedLists && this._contextSystemInitialized) {
-                            this._processNestedListsForItem(itemEl, item, index, context, instance);
-                        }
-                });
-
-                // Update fingerprint and store current data for next comparison
-                element._lastDataFingerprint = this._getDataFingerprint(data);
-                element._previousData = data;
-
-                // Clear the metadata so it doesn't affect future updates
-                if (pendingOperation) {
-                    instance.stateManager._arrayOperations.delete(arrayPath);
-                }
-
+        // SSR builds: adopted/hydrated lists are not mapArray-backed, so a
+        // fingerprint/sparse diff arbitrates their re-renders. Lives in
+        // ssr-list.js (module dropped from the 12 non-SSR variants); returns
+        // true when the update was handled or no render is needed.
+        if (__FEATURE_SSR__) {
+            if (this._ssrListDiff(element, path, instance, context, data, forceUpdate)) {
                 return;
             }
         }
 
-        // Determine if rendering is needed
-        let needsRender = hasPendingOptimization;
-
-        // Always check fingerprint first, even for forceUpdate
-        // CRITICAL: Check for operation hints BEFORE fingerprint check
-        // Some operations (like swap) may not change the fingerprint but still need rendering
-        const hasOperationHint = instance?.stateManager?._arrayOperations?.has(arrayPath);
-
-        const fingerprint = this._getDataFingerprint(data);
-
-        if (!element._lastDataFingerprint) {
-            element._lastDataFingerprint = fingerprint;
-            needsRender = true;
-        } else if (element._lastDataFingerprint !== fingerprint) {
-            element._lastDataFingerprint = fingerprint;
-            needsRender = true;
-            // Mark SSR lists as having state changes to allow re-rendering
-            if (__FEATURE_SSR__ && (element._ssrPhase || ssrAdoptedElements.has(element))) {
-                ssrStateChangedElements.add(element);
-            }
-        } else if (hasOperationHint) {
-            // Fingerprint unchanged BUT we have an operation hint (swap, append, etc.)
-            // Force render to handle the operation
-            needsRender = true;
-        } else if (forceUpdate && element._lastDataFingerprint === fingerprint) {
-            // Data hasn't changed - skip re-render even if forceUpdate is true
-            // Commit batch mode before early return
-            if (this._contextRegistry) {
-                this._contextRegistry.commitBatch();
-            }
-            return;
-        }
-
-        // Also render if this is the first time (initial render)
-        if (!needsRender && !element._initialRenderDone) {
-            // Check if this list might have child lists based on relationships
-            const childPaths = this._listRelationships && this._listRelationships.get(path);
-            const hasChildLists = childPaths && childPaths.size > 0;
-
-            if (hasChildLists) {
-                needsRender = true;
-                element._initialRenderDone = true;
-            }
-        }
-
-        // Only render if needed
-        if (needsRender) {
-            this._renderList(element, data, context, instance);
-        }
-    },
-    _getDataFingerprint(data) {
-        if (!Array.isArray(data)) return 'not-array';
-
-        // Lightweight identity fingerprint — avoids JSON.stringify GC pressure.
-        // Uses id/key primitives when available, falls back to typeof+first-key.
-        const len = data.length;
-        if (len === 0) return 'length:0';
-
-        const _id = (item) => {
-            if (item == null) return 'null';
-            if (typeof item !== 'object') return String(item);
-            // Prefer id or key (common list item identifiers)
-            if (item.id !== undefined) return String(item.id);
-            if (item.key !== undefined) return String(item.key);
-            // Fallback: type + first own key's value for differentiation
-            const keys = Object.keys(item);
-            return keys.length > 0 ? `{${keys[0]}:${item[keys[0]]}}` : '{}';
-        };
-
-        let fingerprint;
-        if (len > 1000) {
-            // For very large arrays, accept sampling with 7 positions
-            // (first, q1, q2-1, q2, q2+1, q3, last) to catch interior-only
-            // changes far more often than 3 samples. O(1) regardless of size.
-            const q1 = len >> 2;
-            const q2 = len >> 1;
-            const q3 = len - (len >> 2);
-            const s1 = _id(data[0]);
-            const s2 = _id(data[q1]);
-            const s3 = _id(data[q2 - 1]);
-            const s4 = _id(data[q2]);
-            const s5 = _id(data[q2 + 1]);
-            const s6 = _id(data[q3]);
-            const s7 = _id(data[len - 1]);
-            fingerprint = `length:${len}|s:${s1}-${s2}-${s3}-${s4}-${s5}-${s6}-${s7}`;
-        } else {
-            // Hash all item identities for arrays up to 1000 items.
-            // Catches interior-only mutations that the 3-sample heuristic missed.
-            let hash = `length:${len}|`;
-            for (let i = 0; i < len; i++) {
-                hash += _id(data[i]);
-                if (i < len - 1) hash += ',';
-            }
-            fingerprint = hash;
-        }
-
-        let hash = 0;
-        for (let i = 0; i < fingerprint.length; i++) {
-            const char = fingerprint.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & hash; // Convert to 32-bit integer
-        }
-
-        // Convert to a fixed-length hex string
-        return Math.abs(hash).toString(16).padStart(8, '0').slice(0, 8);
+        // Non-SSR: this tail is only reached for a first mount (mapArray not
+        // yet initialized) or a forced template rerender; mounted lists
+        // return at the MAPARRAY EARLY EXIT above and update through their
+        // own effects. Both cases must render; nothing to arbitrate.
+        this._renderList(element, data, context, instance);
     },
 
     /**
@@ -915,82 +522,6 @@ _updateLists(listElements, instance = null)
     },
 
     /**
-     * SSR hydration for mapArray mode
-     * Adopts existing SSR-rendered items and sets up mapArray tracking without clearing DOM
-     *
-     * @param {HTMLElement} element - List container element
-     * @param {Array} data - Array data to bind
-     * @param {Object} context - List context
-     * @param {Object} instance - Component instance
-     * @param {Object} sm - StateManager reference
-     * @returns {boolean} true if SSR hydration handled this render
-     * @private
-     */
-    _trySSRHydrationForMapArray(element, data, context, instance, sm) {
-        this._log('debug', 'SSR: Hydrating server-rendered list with mapArray mode');
-
-        // Get existing SSR items from DOM (exclude template elements)
-        const ssrItems = this._getListItems(element, { requireDataIndex: false });
-
-        if (ssrItems.length === 0 || !Array.isArray(data)) {
-            return false; // No items to hydrate
-        }
-
-        // Get list path and key property
-        const listPath = context?.path || this._getAttr(element, 'list');
-        const keyProp = this._getAttr(element, 'key') || 'id';
-
-        // Track item elements for cleanup
-        const itemElements = new Map();
-
-        // Bind data to existing SSR items
-        for (let i = 0; i < Math.min(ssrItems.length, data.length); i++) {
-            const itemEl = ssrItems[i];
-            const item = data[i];
-
-            // Wrap item in proxy if not already (for reactivity tracking)
-            const itemProxy = sm.wrapInProxy ? sm.wrapInProxy(item) : item;
-
-            // Set metadata (same as context rendering)
-            itemEl._listContext = context;
-            itemEl._listIndex = i;
-            itemEl._itemData = itemProxy;
-
-            // Store for binding data for context creation
-            itemEl._needsContexts = true;
-            itemEl._bindItemData = itemProxy;
-            itemEl._bindItemIndex = i;
-
-            // Set up reactive bindings on existing element (same as _trySSRHydration)
-            this._bindItemData(itemEl, itemProxy, i, context);
-
-            // === CRITICAL: Create contexts for action binding ===
-            // This ensures action contexts exist for event handling
-            if (this._contextSystemInitialized && this._contextRegistry) {
-                this._ensureItemContexts(itemEl);
-            }
-
-            // Store element reference
-            const itemKey = itemProxy && itemProxy[keyProp] !== undefined ? itemProxy[keyProp] : i;
-            itemElements.set(itemKey, itemEl);
-        }
-
-        // Mark list as having completed initial render
-        element._initialRenderDone = true;
-        element._previousData = [...data];
-        element._previousDataLength = data.length;
-
-        // Store item element mapping for future updates
-        element._mapArrayItemElements = itemElements;
-        // NOTE: Do NOT set _mapArrayInitialized — SSR hydration doesn't create mapArray effects
-
-        // Set up event delegation on the container element
-        this._ensureListEventDelegation(element, instance, listPath);
-
-        return true; // SSR handled
-    },
-
-    /**
      * Batch cleanup for list items including nested component destruction
      * Used by _removeExcessElements for partial list cleanup
      * Context cleanup is deferred to requestIdleCallback
@@ -1002,7 +533,7 @@ _updateLists(listElements, instance = null)
         if (!items || items.length === 0) return;
 
         // Skip if no context system
-        const hasContextSystem = this._contextRegistry && this._contextSystemInitialized;
+        const hasContextSystem = this._contextSystemInitialized;
         const hasCustomDirectives = this._customDirectives && this._customDirectives.size > 0;
 
         // PERF: Fast path for simple lists - check if ITEM cleanup is needed
@@ -1017,40 +548,20 @@ _updateLists(listElements, instance = null)
         // Key insight: Binding contexts (type=binding) don't need explicit cleanup -
         // they're in a WeakMap and will be GC'd when elements are removed from DOM.
         // Only model/show/render/conditional contexts need explicit cleanup.
-        let itemsHaveContextsNeedingCleanup = false;
-        if (hasContextSystem && this._contextRegistry.contextsByElement && items.length > 0) {
-            // Sample check: if first item or any of its children have NON-BINDING contexts
-            const sampleItem = items[0];
-            const checkContext = (el) => {
-                const ctx = this._contextRegistry.contextsByElement.get(el);
-                // Only these context types need explicit cleanup
-                return ctx && (ctx.type === 'model' || ctx.type === 'show' ||
-                              ctx.type === 'render' || ctx.type === 'conditional');
-            };
-
-            if (checkContext(sampleItem)) {
-                itemsHaveContextsNeedingCleanup = true;
-            } else {
-                // Quick check first few descendants only (avoid full querySelectorAll)
-                const children = sampleItem.children;
-                for (let i = 0; i < children.length && i < 5; i++) {
-                    if (checkContext(children[i])) {
-                        itemsHaveContextsNeedingCleanup = true;
-                        break;
-                    }
-                }
-            }
-        }
+        // Per-item bindings/conditionals are no longer registry-tracked contexts
+        // (per-item effects + element-local records paint them, and they GC with
+        // the removed element), so list items never carry contexts needing an
+        // explicit registry sweep here.
+        const itemsHaveContextsNeedingCleanup = false;
 
         // Quick check: if no directives and no contexts needing cleanup, skip expensive element collection
         // Binding contexts don't need cleanup - they're in WeakMap and auto-GC when elements are removed
         if (!hasCustomDirectives && !itemsHaveContextsNeedingCleanup) {
-            // Dispose ItemEffects for removed items (fast path).
-            for (const item of items) {
-                if (item._wfDisposeEffect) {
-                    this._disposeItemEffect(item);
-                }
-            }
+            // NOTE: per-item effect disposal is NOT done here; the mapArray
+            // reconciler already disposed every removed row's effect (via
+            // _disposeRow) before calling onBulkRemove (this function's only
+            // caller). Nulling the elements' expandos is also unnecessary since
+            // they are about to be GC'd with the removed DOM.
 
             // PERF: Skip _listContext cleanup - elements are being removed from DOM anyway
             // The _listContext property will be GC'd when the element is orphaned.
@@ -1116,12 +627,6 @@ _updateLists(listElements, instance = null)
         // PERF: Skip _listContext cleanup - elements are being removed from DOM anyway
         // GC will handle orphaned references when elements are collected
 
-        // Dispose ItemEffects for removed items (full path).
-        for (const item of items) {
-            if (item._wfDisposeEffect) {
-                this._disposeItemEffect(item);
-            }
-        }
 
         // PERF: Destroy nested components using already-collected allElements (single pass)
         // This avoids N querySelectorAll calls in _destroyNestedComponentsInItem
@@ -1170,72 +675,12 @@ _updateLists(listElements, instance = null)
      * @private
      */
     _processDeferredCleanup(deadline) {
+        // Registry contexts no longer exist (per-item bindings/conditionals are
+        // effect-driven + element-local; they GC with the removed elements), so
+        // there is nothing to sweep; just drain the bookkeeping queues.
         this._deferredCleanupScheduled = false;
-
-        if (!this._contextRegistry || !this._contextSystemInitialized) {
-            this._deferredCleanupQueue = [];
-            this._deferredCleanupContextIds = null;
-            return;
-        }
-
-        // Resume removing rescheduled context IDs from a previous partial pass
-        if (this._deferredCleanupContextIds) {
-            const ids = this._deferredCleanupContextIds;
-            this._deferredCleanupContextIds = null;
-            for (let i = 0; i < ids.length; i++) {
-                if (deadline && i > 0 && i % 50 === 0 && deadline.timeRemaining() < 1) {
-                    this._deferredCleanupContextIds = ids.slice(i);
-                    this._deferredCleanupScheduled = true;
-                    if (typeof requestIdleCallback === 'function') {
-                        requestIdleCallback((dl) => this._processDeferredCleanup(dl), { timeout: 50 });
-                    } else {
-                        setTimeout(() => this._processDeferredCleanup(null), 0);
-                    }
-                    return;
-                }
-                if (this._contextRegistry.contexts.has(ids[i])) {
-                    this._contextRegistry.removeContext(ids[i]);
-                }
-            }
-        }
-
-        // Process all queued element sets
-        const allElements = new Set();
-        while (this._deferredCleanupQueue.length > 0) {
-            const elements = this._deferredCleanupQueue.shift();
-            for (const el of elements) {
-                allElements.add(el);
-            }
-        }
-
-        if (allElements.size === 0) return;
-
-        // Collect contexts to remove (single pass through registry)
-        const contextsToRemove = [];
-        for (const [contextId, context] of this._contextRegistry.contexts) {
-            if (context.element && allElements.has(context.element)) {
-                contextsToRemove.push(contextId);
-            }
-        }
-
-        // Remove contexts - check deadline if available for cooperative scheduling
-        for (let i = 0; i < contextsToRemove.length; i++) {
-            // Check if we're running out of idle time (every 50 contexts)
-            if (deadline && i > 0 && i % 50 === 0 && deadline.timeRemaining() < 1) {
-                // Reschedule remaining IDs directly — avoids round-tripping
-                // through element lookups that can miss already-removed contexts
-                this._deferredCleanupContextIds = contextsToRemove.slice(i);
-                this._deferredCleanupScheduled = true;
-                if (typeof requestIdleCallback === 'function') {
-                    requestIdleCallback((dl) => this._processDeferredCleanup(dl), { timeout: 50 });
-                } else {
-                    setTimeout(() => this._processDeferredCleanup(null), 0);
-                }
-                return;
-            }
-
-            this._contextRegistry.removeContext(contextsToRemove[i]);
-        }
+        this._deferredCleanupQueue = [];
+        this._deferredCleanupContextIds = null;
     },
     /**
      * Main list rendering orchestrator - initializes mapArray for reactive list rendering.
@@ -1335,7 +780,7 @@ _updateLists(listElements, instance = null)
         // Get stateManager for mapArray primitive
         const sm = instance?.stateManager;
         if (!sm || !sm.mapArray) {
-            console.error('[WildflowerJS] stateManager.mapArray not available - list rendering requires a component with stateManager');
+            if (__DEV__) console.error('[WildflowerJS] stateManager.mapArray not available - list rendering requires a component with stateManager');
             return;
         }
 
@@ -1359,7 +804,7 @@ _updateLists(listElements, instance = null)
                 const template = element.querySelector('template');
                 const ssrItems = Array.from(element.children).filter(c => c !== template && c.tagName !== 'TEMPLATE');
                 ssrItems.forEach(item => item.remove());
-                element._ssrPhase = null; // Clear phase — framework fully owns this list now
+                element._ssrPhase = null; // Clear SSR phase; framework fully owns this list now
             }
         }
 
@@ -1549,7 +994,7 @@ _updateLists(listElements, instance = null)
         // Track item elements for cleanup
         const itemElements = new Map();
 
-        // Remove <template> from DOM after extraction — it's no longer needed.
+        // Remove <template> from DOM after extraction; it's no longer needed.
         // Template content is already cached; keeping it in children causes off-by-one
         // errors in child indexing (append, moves, element.children.length).
         // Store reference on element for force-re-render edge case.
@@ -1573,6 +1018,18 @@ _updateLists(listElements, instance = null)
         const isNestedList = context && context.parent && context.parent.type === 'list';
 
         const arrayFn = () => {
+            // Forced template rerender (rescanItemTemplates): the flag is consumed
+            // on the list's next data change; re-mount through _processList after
+            // this flush so the new template is compiled. Deliberately NOT at rescan
+            // time: the documented contract is that the UI only changes when state
+            // changes. Nested lists are rebuilt by their parent's re-mount instead.
+            if (!isNestedList && element._forceTemplateRerender) {
+                queueMicrotask(() => {
+                    if (element._forceTemplateRerender && element.isConnected) {
+                        self._processList({ element, path: listPath, componentId: instance?.id }, instance, false);
+                    }
+                });
+            }
             // Nested lists: Access data through parent item proxy for reactive tracking
             if (isNestedList) {
                 // Use _parentItemProxy to access nested data reactively
@@ -1608,7 +1065,7 @@ _updateLists(listElements, instance = null)
             // Determine computed property name:
             // 1. Explicit computed: prefix (e.g., "computed:cards")
             // 2. Auto-detect: path matches a computed property name (e.g., "cards")
-            // Both paths are treated identically — computed properties just work
+            // Both paths are treated identically; computed properties just work
             // regardless of whether the prefix is used.
             const isExplicitComputed = normalizedPath.startsWith('computed:');
             const computedName = isExplicitComputed
@@ -1616,10 +1073,10 @@ _updateLists(listElements, instance = null)
                 : (sm.computed && sm.computed[normalizedPath] ? normalizedPath : null);
 
             if (computedName) {
-                // Computed property — use evaluateComputed with tracking context
+                // Computed property: use evaluateComputed with tracking context
                 // for cross-entity dependency registration (store access via external()).
                 const previousTrackingContext = self._computedTrackingContext;
-                // V8 OPT: Canonical shape — all fields always present
+                // V8 OPT: Canonical shape; all fields always present
                 self._computedTrackingContext = {
                     componentId: instance?.id || null,
                     computedName: computedName,
@@ -1646,7 +1103,7 @@ _updateLists(listElements, instance = null)
         // (e.g., `...componentState`), that would register dependencies on ALL state
         // properties for each item effect, causing them to re-run on any state change.
         // PERF: Cache component state to avoid rebuilding per-item.
-        // Invalidated when component state version changes (tracked by RSM).
+        // Invalidated when component state version changes (tracked by the state manager).
         let _cachedComponentState = null;
         let _cachedStateVersion = -1;
         const buildComponentState = () => {
@@ -1671,399 +1128,859 @@ _updateLists(listElements, instance = null)
             return componentState;
         };
 
-        // Factory function to create per-item effect
-        // Extracted so it can be called immediately or deferred via requestIdleCallback
-        const createItemEffect = (itemEl, itemProxy, precomputedItemProps, precomputedComponentDeps) => {
-            let isFirstRun = !precomputedItemProps;
-            const dispose = sm.createEffect(() => {
-                // For polymorphic lists, use per-item compiled metadata
-                const effectMeta = isPolymorphic ? (itemEl._compiledMetadata || compiledMetadata) : compiledMetadata;
-                if (effectMeta) {
-                    const currentIndex = itemEl._listIndex;
-                    const listLength = element.children.length;
+        // Row dependency walk: read every reactive dep of a row template so the
+        // ACTIVE OBSERVER acquires them. Under a per-row effect (the first-run
+        // path) this forms the row's edges exactly as the historic inline walk
+        // did; under a list tracking frame (computed/external templates) the
+        // reads PARTITION: item leaves onto the per-list sink, shared deps
+        // (component state, stores, computed internals) onto the ONE stable
+        // per-list effect. Class-only component vars stay filtered to the
+        // component refresh effect (the O(2) selection partition) either way.
+        const walkRowDeps = (effectMeta, itemProxy, currentIndex) => {
+            // Ensure each binding carries its _deps descriptor (idempotent,
+            // cached per metadata) so the unified consumer below can read it.
+            self._computeDeps(effectMeta);
 
-                    if (isFirstRun) {
-                        // PERF OPTIMIZATION: Lightweight first run
-                        // Goal: Register dependencies with MINIMAL overhead
-                        // Skip: object creation, expression evaluation, merged state
-                        // Just read properties directly from itemProxy to trigger proxy get trap
-                        isFirstRun = false;
-
-                        // Helper to read a property path from proxy to register dependency
-                        // Handles nested paths like "user.name" by traversing the proxy
-                        const touchPath = (path) => {
-                            if (!path || typeof path !== 'string') return;
-                            // Skip special paths that don't come from item data
-                            if (path.startsWith('_') || path.startsWith('computed:') || path.startsWith('props:')) return;
-                            // Handle negation
-                            if (path.startsWith('!')) path = path.slice(1);
-                            try {
-                                // PERF: Fast path for simple paths (no dots) - avoid split()
-                                // Most list item bindings use simple paths like "label", "id"
-                                if (path.indexOf('.') === -1) {
-                                    // Simple path - direct access, no array allocation
-                                    const _ = itemProxy[path];
-                                } else {
-                                    // Nested path - need to traverse
-                                    const parts = path.split('.');
-                                    let value = itemProxy;
-                                    for (let i = 0; i < parts.length && value != null; i++) {
-                                        value = value[parts[i]];
-                                    }
-                                }
-                            } catch (e) { /* ignore - property might not exist */ }
-                        };
-
-                        // Register component-level deps on per-item effects.
-                        // OPTIMIZATION: Deps used ONLY in class bindings are skipped here —
-                        // the component refresh effect handles them with O(2) key lookup.
-                        // Deps used in style/attr/show/text still need per-item registration.
-                        const touchComponentLevel = (v) => {
-                            if (v.indexOf('.') !== -1) return;
-                            if (v in itemProxy) return;
-                            if (!instance?.state || !(v in instance.state)) return;
-                            if (sm?.computed?.[v]) {
-                                sm._registerComponentDep('computed:' + v);
-                                return;
-                            }
-                            // Skip if this var is only used in class bindings
-                            // (refresh effect handles it)
-                            if (element._classOnlyCompDeps?.has(v)) return;
-                            // Register for per-item effect (used in style/attr/show/text)
-                            try { const _ = instance.state[v]; } catch (e) { /* ignore */ }
-                        };
-
-                        // Helper to extract and touch variables from an expression
-                        const touchExpressionVars = (expr, preExtractedVars) => {
-                            const vars = preExtractedVars || (expr?.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || []);
-                            for (const v of vars) {
-                                if (v.startsWith('_') || self._expressionReservedWords?.has(v)) continue;
-                                touchPath(v);           // Item-level dep (existing)
-                                touchComponentLevel(v); // Component-level dep (new)
-                            }
-                        };
-
-                        // For item-level computeds (fn(item) with fn.length > 0) referenced in
-                        // expressions, evaluate the computed so its internal state reads register
-                        // dependencies on THIS row's effect. Plain `touchExpressionVars` only reads
-                        // the names off the proxy; it never invokes the computed body.
-                        const originalComputeds = instance?.stateManager?._originalComputedFunctions;
-                        const evalItemLevelComputedsForExprVars = (expressionVars) => {
-                            if (!originalComputeds || !expressionVars) return;
-                            for (const v of expressionVars) {
-                                const fn = originalComputeds.get(v);
-                                // Both forms need invocation here so the computed's
-                                // internal state reads register as per-row deps.
-                                // Bare-form `fn()` reading `this.X` is resolved by
-                                // _evaluateComputedInListContext, whose `{...item}`
-                                // spread registers item-property reads.
-                                if (typeof fn === 'function') {
-                                    try {
-                                        self._evaluateComputedInListContext(instance, v, itemProxy, currentIndex, context);
-                                    } catch (e) { /* ignore */ }
-                                }
-                            }
-                        };
-                        const evalItemLevelComputedByName = (name) => {
-                            if (!originalComputeds || !name) return;
-                            const fn = originalComputeds.get(name);
-                            // Both forms need invocation under the active per-item
-                            // effect tracker so the computed's internal state reads
-                            // register as deps. Bare-form (fn.length === 0) reads
-                            // `this.X` which the list-context evaluator resolves to
-                            // the current item's fields.
-                            if (typeof fn === 'function') {
-                                try {
-                                    self._evaluateComputedInListContext(instance, name, itemProxy, currentIndex, context);
-                                } catch (e) { /* ignore */ }
-                            }
-                        };
-
-                        // Touch text binding properties
-                        for (const binding of (effectMeta.bindings || [])) {
-                            if (binding.isExpression && binding.expressionVars) {
-                                // Expression with pre-extracted vars - just touch those
-                                touchExpressionVars(null, binding.expressionVars);
-                                evalItemLevelComputedsForExprVars(binding.expressionVars);
-                            } else if (!binding.isExpression && !binding.isListContextVar && !binding.isPropsPath && !binding.isComputed) {
-                                // Simple property path - touch it
-                                touchPath(binding.path);
-                                touchComponentLevel(binding.path);
-                                evalItemLevelComputedByName(binding.path);
-                            }
-                            // Skip computed:, props:, and _index/_first etc - they don't need item deps
-                        }
-
-                        // Touch class binding variables
-                        // For computed class bindings, we MUST evaluate the computed to discover its deps
-                        for (const classBinding of (effectMeta.classBindings || [])) {
-                            if (classBinding.isComputed && classBinding.expression && instance) {
-                                // Computed class binding - must evaluate to register dependencies
-                                try {
-                                    const computedName = classBinding.expression.startsWith('computed:')
-                                        ? classBinding.expression.slice(9)
-                                        : classBinding.expression;
-                                    self._evaluateComputedInListContext(instance, computedName, itemProxy, currentIndex, context);
-                                } catch (e) { /* ignore */ }
-                            } else if (classBinding.isSimpleProperty && classBinding.expression) {
-                                touchPath(classBinding.expression);
-                                touchComponentLevel(classBinding.expression);
-                                // If the simple property name matches an item-level computed,
-                                // evaluate it to register the computed's transitive deps.
-                                // Both bare-form `fn()` reading `this.X` and parameterised
-                                // `fn(item)` need invocation so their internal state reads
-                                // register on this row's effect.
-                                if (originalComputeds && originalComputeds.has(classBinding.expression)) {
-                                    const fn = originalComputeds.get(classBinding.expression);
-                                    if (typeof fn === 'function') {
-                                        try {
-                                            self._evaluateComputedInListContext(instance, classBinding.expression, itemProxy, currentIndex, context);
-                                        } catch (e) { /* ignore */ }
-                                    }
-                                }
-                            } else if (classBinding.expression) {
-                                // For object/ternary expressions, identifiers may include item-level
-                                // computed names. Evaluate any such computeds so their internal state
-                                // reads register dependencies for THIS row's class effect.
-                                touchExpressionVars(classBinding.expression, classBinding.expressionVars);
-                                if (originalComputeds && classBinding.expressionVars) {
-                                    for (const v of classBinding.expressionVars) {
-                                        const fn = originalComputeds.get(v);
-                                        if (typeof fn === 'function') {
-                                            try {
-                                                self._evaluateComputedInListContext(instance, v, itemProxy, currentIndex, context);
-                                            } catch (e) { /* ignore */ }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Touch style binding variables
-                        for (const styleBinding of (effectMeta.styleBindings || [])) {
-                            if (styleBinding.expression) {
-                                touchExpressionVars(styleBinding.expression, styleBinding.expressionVars);
-                                evalItemLevelComputedsForExprVars(
-                                    styleBinding.expressionVars
-                                    || (styleBinding.expression?.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g))
-                                );
-                            }
-                        }
-                        if (effectMeta.rootBindings?.bindStyleExpr) {
-                            const rootExpr = effectMeta.rootBindings.bindStyleExpr;
-                            touchExpressionVars(rootExpr, null);
-                            evalItemLevelComputedsForExprVars(rootExpr.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g));
-                        }
-
-                        // Touch attr binding variables
-                        for (const attrBinding of (effectMeta.attrBindings || [])) {
-                            if (attrBinding.expression) {
-                                touchExpressionVars(attrBinding.expression, attrBinding.expressionVars);
-                                evalItemLevelComputedsForExprVars(
-                                    attrBinding.expressionVars
-                                    || (attrBinding.expression?.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g))
-                                );
-                            }
-                        }
-                        if (effectMeta.rootBindings?.bindAttrExpr) {
-                            const rootExpr = effectMeta.rootBindings.bindAttrExpr;
-                            touchExpressionVars(rootExpr, null);
-                            evalItemLevelComputedsForExprVars(rootExpr.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g));
-                        }
-
-                        // Touch model binding properties
-                        for (const modelBinding of (effectMeta.models || [])) {
-                            touchPath(modelBinding.path);
-                        }
-
-                        // Touch show binding properties
-                        for (const showBinding of (effectMeta.shows || [])) {
-                            if (showBinding.isExpression && showBinding.expressionVars) {
-                                touchExpressionVars(null, showBinding.expressionVars);
-                                evalItemLevelComputedsForExprVars(showBinding.expressionVars);
-                            } else {
-                                touchPath(showBinding.path);
-                                touchComponentLevel(showBinding.path);
-                                evalItemLevelComputedByName(showBinding.path);
-                            }
-                        }
-
-                        // Touch HTML binding properties
-                        for (const htmlBinding of (effectMeta.htmlBindings || [])) {
-                            touchPath(htmlBinding.path);
-                            touchComponentLevel(htmlBinding.path);
-                            evalItemLevelComputedByName(htmlBinding.path);
-                        }
-
-                        // Touch render binding properties
-                        for (const renderBinding of (effectMeta.renders || [])) {
-                            if (renderBinding.isExpression && renderBinding.expressionVars) {
-                                touchExpressionVars(null, renderBinding.expressionVars);
-                                evalItemLevelComputedsForExprVars(renderBinding.expressionVars);
-                            } else {
-                                touchPath(renderBinding.path);
-                                touchComponentLevel(renderBinding.path);
-                                evalItemLevelComputedByName(renderBinding.path);
-                            }
-                        }
-
-                        // Touch root bindings
-                        if (effectMeta.rootBindings) {
-                            if (effectMeta.rootBindings.bindPath) {
-                                touchPath(effectMeta.rootBindings.bindPath);
-                                touchComponentLevel(effectMeta.rootBindings.bindPath);
-                            }
-                            if (effectMeta.rootBindings.showPath) {
-                                touchPath(effectMeta.rootBindings.showPath);
-                                touchComponentLevel(effectMeta.rootBindings.showPath);
-                            }
-                            if (effectMeta.rootBindings.modelPath) touchPath(effectMeta.rootBindings.modelPath);
-                            if (effectMeta.rootBindings.bindClassExpr) {
-                                const rootExpr = effectMeta.rootBindings.bindClassExpr;
-                                if (rootExpr.startsWith('computed:') && instance) {
-                                    // Computed class binding on root - must evaluate
-                                    try {
-                                        const computedName = rootExpr.slice(9);
-                                        self._evaluateComputedInListContext(instance, computedName, itemProxy, currentIndex, context);
-                                    } catch (e) { /* ignore */ }
-                                } else {
-                                    touchExpressionVars(rootExpr, null);
-                                }
-                            }
-                        }
-
-                        return; // Skip DOM updates on first run
-                    }
-
-                    // Subsequent runs: full rebinding with DOM updates
-                    // CRITICAL: Use itemEl._itemData (current proxy) instead of itemProxy (stale closure)
-                    // When array is replaced, onItemUpdate updates itemEl._itemData with the new proxy
-                    // The per-item effect should use this updated proxy, not the captured one
-                    const currentItemProxy = itemEl._itemData || itemProxy;
-
-                    // TARGETED REBIND: When a single flat item prop changed,
-                    // filter DOM writes to only matching bindings.
-                    // Normal resolve/evaluate still runs for dependency re-registration.
-                    self._targetedProp = null; // Clear stale value from previous effect
-                    const _changedProp = sm._activeChangedProp;
-                    if (_changedProp && _changedProp.indexOf('.') === -1 && !effectMeta.renders?.length) {
-                        self._targetedProp = _changedProp;
-                    }
-
-                    const componentState = sm.untrack(() => buildComponentState());
-
-                    // V8 OPT: Reuse pre-allocated context
-                    _mapFnEnrichedCtx.listLength = listLength;
-                    const enrichedContext = _mapFnEnrichedCtx;
-
-                    // Execute data-render BEFORE other bindings — may insert/remove elements
-                    if (effectMeta.renders?.length > 0 && itemEl._renderContexts) {
-                        _t0 = performance.now();
-                        const renderCtx = {
-                            componentState: instance?.state || {},
-                            componentInstance: instance,
-                            itemIndex: currentIndex,
-                            listLength: listLength,
-                            listContext: context
-                        };
-                        const renderChanged = self._executeRenders(itemEl._renderContexts, currentItemProxy, renderCtx);
-                        if (renderChanged) {
-                            // DOM structure changed — invalidate cached elements array
-                            itemEl._cachedElementsArray = null;
-                        }
-                        self._perfTimers.render += performance.now() - _t0;
-                    }
-
-                    // Skip style/attr in generic path when fast-path evaluators handle them
-                    const hasFastPath = effectMeta.styleEvaluators?.length > 0 || effectMeta.attrEvaluators?.length > 0;
-
-                    self._bindWithCompiledMetadata(itemEl, currentItemProxy, effectMeta, context, currentIndex, context, hasFastPath);
-
-                    if (effectMeta.classEvaluators) {
-                        self._applyClassBindingsToRow(itemEl, currentItemProxy, currentIndex, listLength, effectMeta.classEvaluators, componentState, instance, context);
-                    }
-
-                    // Style: fast-path with lazy proxy (avoids eager spread of item + componentState)
-                    if (effectMeta.styleEvaluators?.length > 0) {
-                        self._applyStyleBindingsToRow(itemEl, currentItemProxy, currentIndex, listLength, effectMeta.styleEvaluators, componentState, instance, context);
-                    } else if (effectMeta.styleBindings?.length > 0 || effectMeta.rootBindings?.hasBindStyle) {
-                        const rootStyleExpr = effectMeta.rootBindings?.bindStyleExpr;
-                        if (rootStyleExpr) {
-                            self._processStyleBinding(itemEl, currentItemProxy, rootStyleExpr, currentIndex, enrichedContext);
-                        }
-                        const elements = itemEl._bindingElements || itemEl._cachedElementsArray;
-                        for (const styleBinding of (effectMeta.styleBindings || [])) {
-                            const targetEl = (elements && styleBinding.index !== undefined)
-                                ? elements[styleBinding.index]
-                                : itemEl;
-                            if (targetEl && styleBinding.expression) {
-                                self._processStyleBinding(targetEl, currentItemProxy, styleBinding.expression, currentIndex, enrichedContext);
-                            }
+            // Helper to read a property path from proxy to register dependency
+            // Handles nested paths like "user.name" by traversing the proxy
+            const touchPath = (path) => {
+                if (!path || typeof path !== 'string') return;
+                // Skip special paths that don't come from item data
+                if (path.startsWith('_') || path.startsWith('computed:') || path.startsWith('props:')) return;
+                // Handle negation
+                if (path.startsWith('!')) path = path.slice(1);
+                try {
+                    // PERF: Fast path for simple paths (no dots) - avoid split()
+                    // Most list item bindings use simple paths like "label", "id"
+                    if (path.indexOf('.') === -1) {
+                        // Simple path - direct access, no array allocation
+                        const _ = itemProxy[path];
+                    } else {
+                        // Nested path - need to traverse
+                        const parts = path.split('.');
+                        let value = itemProxy;
+                        for (let i = 0; i < parts.length && value != null; i++) {
+                            value = value[parts[i]];
                         }
                     }
+                } catch (e) { /* ignore - property might not exist */ }
+            };
 
-                    // Attr: fast-path with fresh component state
-                    // Attr: fast-path with lazy proxy
-                    if (effectMeta.attrEvaluators?.length > 0) {
-                        self._applyAttrBindingsToRow(itemEl, currentItemProxy, currentIndex, listLength, effectMeta.attrEvaluators, componentState, instance, context);
-                    }
-
-                    // Clear targeted rebind flag
-                    self._targetedProp = null;
+            // Register component-level deps.
+            // OPTIMIZATION: Deps used ONLY in class bindings are skipped here;
+            // the component refresh effect handles them with O(2) key lookup.
+            // Deps used in style/attr/show/text still need registration.
+            const touchComponentLevel = (v) => {
+                if (v.indexOf('.') !== -1) return;
+                // Guard the `in` against a PRIMITIVE item (a $this/$item scalar
+                // list): `'$this' in 'red'` throws. An item prop can only exist
+                // on an object item anyway.
+                if (itemProxy !== null && typeof itemProxy === 'object' && v in itemProxy) return;
+                if (!instance?.state || !(v in instance.state)) return;
+                if (sm?.computed?.[v]) {
+                    sm._registerComponentDep('computed:' + v);
+                    return;
                 }
-            }, precomputedItemProps
-                ? { skipFirstRun: true, precomputedItemProps, componentDeps: precomputedComponentDeps }
-                : undefined);
-            // Tag and register every list item effect (including cross-store
-            // lists where _itemEffectContext is null) so EntitySystem can wake
-            // them on external entity mutations. Same-RSM list effects are
-            // also in _itemEffectsByIndex; this is the union set.
-            const eff = dispose._effect;
-            if (eff) {
-                eff._isListItemEffect = true;
-                if (!sm._listItemEffects) sm._listItemEffects = new Set();
-                sm._listItemEffects.add(eff);
+                // Skip if this var is only used in class bindings
+                // (refresh effect handles it)
+                if (element._classOnlyCompDeps?.has(v)) return;
+                // Register (used in style/attr/show/text)
+                try { const _ = instance.state[v]; } catch (e) { /* ignore */ }
+            };
+
+            // Helper to extract and touch variables from an expression
+            const touchExpressionVars = (expr, preExtractedVars, preExtractedPaths) => {
+                const vars = preExtractedVars || (expr?.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || []);
+                for (const v of vars) {
+                    if (v.startsWith('_') || self._expressionReservedWords?.has(v)) continue;
+                    touchPath(v);           // Item-level dep (root identifier)
+                    touchComponentLevel(v); // Component-level dep
+                }
+                // Register full dotted member paths (e.g. "user.active") so a
+                // nested item prop read ONLY by this expression still wakes when
+                // it mutates; the root touch above registers "user", never the
+                // nested leaf "user.active".
+                if (preExtractedPaths) {
+                    for (let i = 0; i < preExtractedPaths.length; i++) touchPath(preExtractedPaths[i]);
+                }
+            };
+
+            // For item-level computeds (fn(item) with fn.length > 0) referenced in
+            // expressions, evaluate the computed so its internal state reads register
+            // as deps of the active observer. Plain `touchExpressionVars` only reads
+            // the names off the proxy; it never invokes the computed body.
+            const originalComputeds = instance?.stateManager?._originalComputedFunctions;
+            const evalItemLevelComputedsForExprVars = (expressionVars) => {
+                if (!originalComputeds || !expressionVars) return;
+                for (const v of expressionVars) {
+                    const fn = originalComputeds.get(v);
+                    // Both forms need invocation here so the computed's
+                    // internal state reads register as deps.
+                    // Bare-form `fn()` reading `this.X` is resolved by
+                    // _evaluateComputedInListContext, whose `{...item}`
+                    // spread registers item-property reads.
+                    if (typeof fn === 'function') {
+                        try {
+                            self._evaluateComputedInListContext(instance, v, itemProxy, currentIndex, context);
+                        } catch (e) { /* ignore */ }
+                    }
+                }
+            };
+            const evalItemLevelComputedByName = (name) => {
+                if (!originalComputeds || !name) return;
+                const fn = originalComputeds.get(name);
+                // Both forms need invocation under the active observer so the
+                // computed's internal state reads register as deps. Bare-form
+                // (fn.length === 0) reads `this.X` which the list-context
+                // evaluator resolves to the current item's fields.
+                if (typeof fn === 'function') {
+                    try {
+                        self._evaluateComputedInListContext(instance, name, itemProxy, currentIndex, context);
+                    } catch (e) { /* ignore */ }
+                }
+            };
+
+            // Unified per-binding dependency registration driven by _deps
+            // (see _computeDeps). touchPath / touchComponentLevel register the
+            // reactive deps; evalItemLevelComputed* invoke item-level computeds
+            // so their transitive state reads register too.
+            const consumeDep = (d) => {
+                switch (d.kind) {
+                    case 'skip': return;
+                    case 'itemPath':
+                        touchPath(d.reads[0]); // model: item field only
+                        return;
+                    case 'path':
+                        touchPath(d.reads[0]);
+                        touchComponentLevel(d.reads[0]);
+                        evalItemLevelComputedByName(d.reads[0]);
+                        return;
+                    case 'expr':
+                        touchExpressionVars(null, d.reads, d.paths);
+                        evalItemLevelComputedsForExprVars(d.reads);
+                        return;
+                    case 'computedName':
+                        evalItemLevelComputedByName(d.reads[0]);
+                        return;
+                }
+            };
+
+            const depArrays = [
+                effectMeta.bindings, effectMeta.classBindings,
+                effectMeta.styleBindings, effectMeta.attrBindings,
+                effectMeta.models, effectMeta.shows,
+                effectMeta.htmlBindings, effectMeta.renders
+            ];
+            for (const arr of depArrays) {
+                if (!arr) continue;
+                for (const b of arr) consumeDep(b._deps);
             }
-            return dispose;
+            if (effectMeta.rootBindings?._deps) {
+                for (const d of effectMeta.rootBindings._deps) consumeDep(d);
+            }
         };
+
+        // Computed/external templates (fast-touch classification bails: computed
+        // reads, component-state reads in non-class bindings, nested paths):
+        // instead of one effect per row, ONE stable per-list effect carries the
+        // shared deps and a rows-Map dispatcher carries the item leaves; both
+        // discovered at runtime by walking each row's deps under a tracking
+        // frame (sm.runInListFrame). DOM application is always UNTRACKED (the
+        // walk is the sole dep source); item-leaf writes dispatch the one row
+        // through the sink, shared-dep changes re-apply every live row.
+        const ensureComputedDispatcher = (sampleProxy) => {
+            let d = element._wfListSinkDispatcher;
+            if (d) return d.computedRows ? d : null;
+            const rows = new Map();          // raw item -> row element
+            const rawStamps = new Map();     // raw item -> Set<stamped prop> (cleanup)
+            const _rowCtx = {
+                componentState: null, componentInstance: null, itemIndex: 0,
+                listLength: 0, listContext: null, propsData: null
+            };
+            // Kind-pure leaves (one style/attr/text binding, no other STATIC
+            // reader) get a targeted one-write fast path in the sink; the
+            // per-frame style economy the retired lazy loop used to provide.
+            // NON-suppressing: notifyNode still wakes observers after the sink,
+            // so a computed/watcher reading the leaf (invisible to the static
+            // classifier) stays live; only the redundant full-row re-apply is
+            // skipped.
+            let _pure = null;
+            if (!isPolymorphic && compiledMetadata) {
+                if (compiledMetadata._reactiveGraphPureLeaves === undefined) {
+                    compiledMetadata._reactiveGraphPureLeaves = self._computeReactiveGraphPureLeaves(compiledMetadata, sampleProxy);
+                }
+                _pure = compiledMetadata._reactiveGraphPureLeaves;
+            }
+            // Suppressing direct-writer upgrade for kind-pure leaves, under the
+            // same retire-safe gate the fast-touch dispatcher uses
+            // (no computeds/item-computeds/watchers/subscriptions/autoSave; the
+            // dynamic readers the static classifier can't see). Without the
+            // upgrade every per-frame write re-pays the full per-write
+            // onStateChange dispatch the sink's fall-through triggers.
+            let _safe = false;
+            if (compiledMetadata) {
+                _safe = compiledMetadata._reactiveGraphStyleSafe;
+                if (_safe === undefined) {
+                    _safe = self._computeReactiveGraphRetireSafe(sm, instance);
+                    compiledMetadata._reactiveGraphStyleSafe = _safe;
+                }
+            }
+            // Applies the one targeted DOM write; returns the written element,
+            // or null when the leaf can't be handled (unresolvable/custom/multi
+            // target) and the caller must fall through to the full-row apply.
+            const applyPureLeaf = (rowEl, rowProxy, key, entry) => {
+                const els = rowEl._cachedElementsArray || rowEl._bindingElements;
+                if (entry.kind === 'text') {
+                    const el = els && els[entry.elIdx];
+                    if (!el || el._isCustomEl === true) return null;
+                    const v = rowProxy[key];
+                    el.textContent = v == null ? '' : String(v);
+                    return el;
+                }
+                // style | attr: every target must resolve to ONE non-custom element.
+                let el = null;
+                const ts = entry.targets;
+                for (let t = 0; t < ts.length; t++) {
+                    const tg = ts[t];
+                    let te;
+                    if (tg.isRoot) te = rowEl;
+                    else if (els && tg.elIndex !== undefined) te = els[tg.elIndex];
+                    else if (tg.elementPath && tg.elementPath.length) {
+                        te = rowEl;
+                        for (const ix of tg.elementPath) {
+                            if (!te || !te.children) { te = null; break; }
+                            te = te.children[ix];
+                        }
+                    }
+                    if (!te) return null;
+                    if (el === null) el = te;
+                    else if (el !== te) return null;
+                }
+                if (!el || el._isCustomEl === true) return null;
+                if (entry.kind === 'style') {
+                    applyStyleProp(el.style, entry.cssProp, rowProxy[key]);
+                    return el;
+                }
+                const v = rowProxy[key];
+                if (v === null || v === undefined || v === false) {
+                    el.removeAttribute(entry.attrName);
+                } else {
+                    const s = self._sanitizeAttrValue(entry.attrName, v);
+                    if (s !== null) el.setAttribute(entry.attrName, String(s));
+                }
+                return el;
+            };
+            // Full generic row application: renders first (structure), then the
+            // generic executor chain, then the class/style/attr fast paths.
+            // Runs untracked.
+            const applyRowFull = (rowEl, rowProxy) => {
+                // Polymorphic rows carry their own compiled metadata; a row
+                // without any metadata has nothing to apply (parity with the
+                // effect path's `if (effectMeta)` gate).
+                const md = (isPolymorphic && rowEl._compiledMetadata) || compiledMetadata;
+                if (!md) return;
+                const idx = rowEl._listIndex | 0;
+                const dataLen = element.children.length;
+                if (md.renders?.length > 0 && rowEl._renderContexts) {
+                    _rowCtx.componentState = instance?.state || {};
+                    _rowCtx.componentInstance = instance;
+                    _rowCtx.itemIndex = idx;
+                    _rowCtx.listLength = dataLen;
+                    _rowCtx.listContext = context;
+                    _rowCtx.propsData = instance?._propsData;
+                    const changed = self._executeRenders(rowEl._renderContexts, rowProxy, _rowCtx);
+                    if (changed) {
+                        rowEl._cachedElementsArray = null;
+                        rowEl._bindingElements = null;
+                    }
+                }
+                self._bindWithCompiledMetadata(rowEl, rowProxy, md, context, idx, context, true);
+                const cs = sm.untrack(() => buildComponentState());
+                self._applyRowDecor(rowEl, rowProxy, md, idx, dataLen, cs, instance, context);
+            };
+            const dispatcher = {
+                rows,
+                spec: { emitters: [], rootProp: null },
+                stampProps: null,
+                computedRows: true,
+                rawStamps,
+                listEffect: null,
+                frame: null,
+                sink: null,
+                stampLeaf: () => { /* runtime stamps only (frame.stamp) */ },
+                // Both slots live on the same node (dual-stamp): the pure-leaf
+                // fast path may have upgraded a stamped leaf to a suppressing
+                // direct writer.
+                clearLeaf: (proxy, prop) => { sm.clearDirectWriter(proxy, prop); sm.clearListSink(proxy, prop); },
+                clearRowStamps: (raw) => {
+                    const u = dispatcher.uniformStamps;
+                    if (u) {
+                        for (let i = 0; i < u.length; i++) { sm.clearDirectWriter(raw, u[i]); sm.setListSink(raw, u[i], null); }
+                    }
+                    const set = rawStamps.get(raw);
+                    if (set) {
+                        for (const k of set) { sm.clearDirectWriter(raw, k); sm.setListSink(raw, k, null); }
+                        rawStamps.delete(raw);
+                    }
+                },
+                registerWalk: (rowEl, rowProxy) => {
+                    // FAST-TOUCH template routed here for heavy fields (e.g. a
+                    // root-binding read such as a selection class on the row
+                    // root): every reactive dep is a flat item prop, so
+                    // registration is a direct UNIFORM stamp: no dep walk, no
+                    // tracking frame, no per-row stamp Set. Walk-based
+                    // registration here measurably regresses bulk create time
+                    // and per-row heap (~+8% create, +300 B/row). Class-only
+                    // component vars stay with the refresh effect; other
+                    // component-state reads bail the fast-touch classification,
+                    // so no shared-dep edges are lost.
+                    if (!isPolymorphic && compiledMetadata && compiledMetadata._reactiveGraphFastTouch) {
+                        const u = compiledMetadata._reactiveGraphFastTouch;
+                        const raw = sm.toRaw(rowProxy);
+                        for (let i = 0; i < u.length; i++) sm.setListSink(raw, u[i], dispatcher.sink);
+                        dispatcher.uniformStamps = u;
+                        return;
+                    }
+                    const md = (isPolymorphic && rowEl._compiledMetadata) || compiledMetadata;
+                    if (!md) return;
+                    sm.runInListFrame(dispatcher.listEffect, dispatcher.frame, () => {
+                        walkRowDeps(md, rowProxy, rowEl._listIndex | 0);
+                    });
+                },
+                dispose: null
+            };
+            dispatcher.frame = {
+                observer: null, // wired by sm.runInListFrame
+                owns: (raw) => rows.has(raw),
+                stamp: (raw, key) => {
+                    sm.setListSink(raw, key, dispatcher.sink);
+                    let set = rawStamps.get(raw);
+                    if (!set) { set = new Set(); rawStamps.set(raw, set); }
+                    set.add(key);
+                }
+            };
+            dispatcher.sink = (rawItem, key) => {
+                const rowEl = rows.get(rawItem);
+                if (!rowEl) return;
+                // A DETACHED row with render contexts is a live row whose
+                // root-level data-render currently resolves false (a placeholder
+                // holds its slot) and the apply may re-insert it. Only rows with
+                // no way back are skipped.
+                if (!rowEl.isConnected && !rowEl._renderContexts) return;
+                const rowProxy = rowEl._itemData;
+                if (!rowProxy) return;
+                // Kind-pure leaf: one targeted DOM write, skip the full-row
+                // re-apply, and upgrade the leaf to a SUPPRESSING direct writer
+                // (dual-stamp: the sink stays for self-heal, so a stale writer
+                // self-clears, falls through here, and this re-stamp puts a
+                // fresh writer on the live element). BOTH the skip and the
+                // suppression require the retire-safe gate: an item computed
+                // reading the field is invisible to the static classifier AND
+                // is not a graph observer (its reads partition to sink stamps
+                // under the frame), so on an unsafe component the full-row
+                // apply is the ONLY thing that re-evaluates it, and skipping it
+                // leaves the computed's binding permanently stale
+                // (list-item-computed-pure-leaf-shared-read tests pin this).
+                // Detached (render-placeholder) rows apply targeted but stay on
+                // the non-suppressing sink until reattached.
+                if (_pure && _safe) {
+                    const entry = _pure.get(key);
+                    if (entry) {
+                        const wEl = applyPureLeaf(rowEl, rowProxy, key, entry);
+                        if (wEl !== null) {
+                            if (rowEl.isConnected) {
+                                if (entry.kind === 'text') self._stampDirectText(sm, rowProxy, key, wEl);
+                                else if (entry.kind === 'style') self._stampDirectStyle(sm, rowProxy, key, wEl, entry.cssProp);
+                                else self._stampDirectAttr(sm, rowProxy, key, wEl, entry.attrName);
+                            }
+                            return;
+                        }
+                    }
+                }
+                // Uniform (fast-touch) templates: apply UNTRACKED. The dep set
+                // is the static flat fastTouch list (no drift, no item
+                // computeds), and a tracked apply would re-grow per-row stamp
+                // Sets through frame.stamp for nothing.
+                if (dispatcher.uniformStamps) {
+                    sm.untrack(() => applyRowFull(rowEl, rowProxy));
+                    return;
+                }
+                // Apply UNDER the frame: reads partition as they go (item leaves
+                // re-stamp, new shared deps link), which is dep-drift handling
+                // with the exact evaluation economy of the old per-row effect's
+                // tracked rebind: one evaluation per update, no separate walk.
+                sm.runInListFrame(dispatcher.listEffect, dispatcher.frame, () => applyRowFull(rowEl, rowProxy));
+            };
+            // The ONE stable per-list effect. Its first run is empty (edges
+            // accumulate from frame walks, and STABLE effects never retrack, so
+            // those edges survive every wake). A wake means a SHARED dep
+            // changed: re-apply every live row.
+            let firstSharedRun = true;
+            dispatcher.listEffect = sm.createEffect(() => {
+                if (firstSharedRun) { firstSharedRun = false; return; }
+                for (const [raw, rowEl] of rows) {
+                    // Detached-with-render-contexts rows stay live (see sink).
+                    if (!rowEl.isConnected && !rowEl._renderContexts) continue;
+                    const rowProxy = rowEl._itemData;
+                    if (!rowProxy) continue;
+                    sm.runInListFrame(dispatcher.listEffect, dispatcher.frame, () => applyRowFull(rowEl, rowProxy));
+                }
+            }, { stable: true, name: 'wf-list-shared-deps' });
+            dispatcher.dispose = () => {
+                try { dispatcher.listEffect(); } catch (e) { /* already disposed */ }
+                for (const raw of rawStamps.keys()) dispatcher.clearRowStamps(raw);
+                rows.clear();
+            };
+            element._wfListSinkDispatcher = dispatcher;
+            return dispatcher;
+        };
+
+        const registerComputedRow = (itemEl, itemProxy) => {
+            if (!sm.runInListFrame) return false;
+            const d = ensureComputedDispatcher(itemProxy);
+            if (!d) return false;
+            const raw = sm.toRaw(itemProxy);
+            d.rows.set(raw, itemEl);
+            d.registerWalk(itemEl, itemProxy);
+            return true;
+        };
+
+        // Register a row's sink-covered leaves on the per-list dispatcher at
+        // CREATION: pure text/style/attr leaves (exclusive, one element; may
+        // take a suppressing direct writer under the retire-safe gate),
+        // decorative shared leaves (class/style/attr via the evaluator fast
+        // paths), and show/html/model leaves (via the per-kind executors).
+        // Reuses the list's existing dispatcher when one is present, so
+        // single-added rows join the same routing as bulk-created ones. The
+        // onRemove/onBulkRemove/onItemUpdate dispatcher bookkeeping is generic
+        // over stampProps.
+        const registerRowLeafSinks = (itemEl, itemProxy) => {
+            if (!sm.setListSink) return;
+            if (!compiledMetadata && !isPolymorphic) return;
+            let dispatcher = element._wfListSinkDispatcher;
+            if (dispatcher && dispatcher.computedRows) {
+                registerComputedRow(itemEl, itemProxy);
+                return;
+            }
+            // Polymorphic lists: per-row metadata through the computed
+            // dispatcher (applyRowFull/registerWalk resolve
+            // rowEl._compiledMetadata; the kind-pure fast path is skipped, as
+            // the list-level classifier caches don't describe any one row).
+            if (isPolymorphic) {
+                registerComputedRow(itemEl, itemProxy);
+                return;
+            }
+            if (!dispatcher) {
+                if (compiledMetadata._reactiveGraphFastTouch === undefined) {
+                    compiledMetadata._reactiveGraphFastTouch = self._computeReactiveGraphFastTouch(compiledMetadata, instance, itemProxy);
+                }
+                if (!compiledMetadata._reactiveGraphFastTouch) {
+                    // Computed/external template: runtime-discovered dependency
+                    // surface via the tracking frame + ONE stable per-list effect.
+                    registerComputedRow(itemEl, itemProxy);
+                    return;
+                }
+                // Retire-ELIGIBLE templates build the same general dispatcher
+                // here: a path census showed eligible templates rendered through
+                // the normal (non-bulk) path never reached the onDeferredEffects
+                // retire branch and fell to full per-row effects. The retire
+                // branch reuses this dispatcher when it runs first, and vice
+                // versa; whichever path sees the list first constructs it.
+                // Kind-pure leaves: text/style/attr fields bound to exactly one
+                // element and read by no other binding.
+                if (compiledMetadata._reactiveGraphPureLeaves === undefined) {
+                    compiledMetadata._reactiveGraphPureLeaves = self._computeReactiveGraphPureLeaves(compiledMetadata, itemProxy);
+                }
+                if (compiledMetadata._reactiveGraphPureText === undefined) {
+                    compiledMetadata._reactiveGraphPureText = self._computeReactiveGraphPureText(compiledMetadata);
+                }
+                const pureLeaves = compiledMetadata._reactiveGraphPureLeaves;
+                const pureText = compiledMetadata._reactiveGraphPureText;
+                // Sink-covered shared leaves: flat item props whose every reader
+                // is a kind the dispatcher applier owns: class/style/attr
+                // (decorative, via the evaluator fast paths) and show/html/model
+                // (via the per-kind executors under untrack). A field also read
+                // by a render, by ANY text binding, or by any root binding stays
+                // HEAVY and routes the template through the computed dispatcher:
+                // the sink's text spec covers only PURE text leaves (a text+class
+                // shared field stamped here would leave its text node permanently
+                // stale; list-text-class-shared-field.test.js pins this), renders
+                // can restructure the row, and row-root binding semantics
+                // (including root class drop-out) live in the full-rebind
+                // executor chain (list-class-binding-reactivity pins that a
+                // stamped root class misses drop-out).
+                if (compiledMetadata._decoStampProps === undefined) {
+                    let deco = null;
+                    let smh = null;
+                    let smhReads = null;
+                    let rndr = null;
+                    let renderReads = null;
+                    if (compiledMetadata._reactiveGraphFastTouch) {
+                        const heavy = new Set();
+                        const collectHeavy = (deps) => {
+                            if (!deps || deps.kind === 'skip') return;
+                            const reads = deps.reads || [];
+                            for (let i = 0; i < reads.length; i++) heavy.add(reads[i]);
+                            if (deps.paths) for (let i = 0; i < deps.paths.length; i++) heavy.add(deps.paths[i]);
+                        };
+                        for (const arr of [compiledMetadata.bindings]) {
+                            if (!arr) continue; for (const b of arr) collectHeavy(b._deps);
+                        }
+                        // ALL root-binding reads are heavy, INCLUDING the root
+                        // class: row-root class drop-out routes through the
+                        // full-rebind executor chain
+                        // (_executeClassBindings/_toggleBoundClass), and a
+                        // stamped root class would miss removals
+                        // (list-class-binding-reactivity pins this).
+                        if (compiledMetadata.rootBindings?._deps) {
+                            for (const d of compiledMetadata.rootBindings?._deps) collectHeavy(d);
+                        }
+                        const fastSet = new Set(compiledMetadata._reactiveGraphFastTouch);
+                        // Flat root-name read set for a group of binding arrays
+                        // (skips positionals/computed:/props:, strips negation,
+                        // roots dotted paths; nested reads cannot survive the
+                        // fast-touch classification anyway).
+                        const collectFlatReads = (arrays) => {
+                            let set = null;
+                            for (const arr of arrays) {
+                                if (!arr || !arr.length) continue;
+                                for (const b of arr) {
+                                    const d = b._deps;
+                                    if (!d || d.kind === 'skip') continue;
+                                    const all = d.paths ? (d.reads || []).concat(d.paths) : (d.reads || []);
+                                    for (let i = 0; i < all.length; i++) {
+                                        let p = all[i];
+                                        if (!p || typeof p !== 'string') continue;
+                                        if (p.startsWith('_') || p.startsWith('computed:') || p.startsWith('props:')) continue;
+                                        if (p.startsWith('!')) p = p.slice(1);
+                                        if (!p) continue;
+                                        const dot = p.indexOf('.');
+                                        if (dot !== -1) p = p.slice(0, dot);
+                                        (set || (set = new Set())).add(p);
+                                    }
+                                }
+                            }
+                            return set;
+                        };
+                        // Decorative (class/style/attr) leaves. Class-read
+                        // fields are deco-stampable because every class channel
+                        // applies through the applyClass kernel (diff-tracked,
+                        // drop-out correct), so the deco arm's class re-apply
+                        // removes dropped classes; the drop-out matrix in
+                        // list-applier-contracts.test.js pins this. Applier
+                        // coverage guard: only stamp when the evaluator fast
+                        // paths cover every decorative binding present.
+                        const decoReadsAll = self._extractDecorativeReadProps(compiledMetadata);
+                        if (decoReadsAll) {
+                            const covered =
+                                (!(compiledMetadata.styleBindings && compiledMetadata.styleBindings.length) || (compiledMetadata.styleEvaluators && compiledMetadata.styleEvaluators.length)) &&
+                                (!(compiledMetadata.attrBindings && compiledMetadata.attrBindings.length) || (compiledMetadata.attrEvaluators && compiledMetadata.attrEvaluators.length)) &&
+                                (!(compiledMetadata.classBindings && compiledMetadata.classBindings.length) || (compiledMetadata.classEvaluators && compiledMetadata.classEvaluators.length));
+                            if (covered) {
+                                for (const p of decoReadsAll) {
+                                    if (!heavy.has(p) && fastSet.has(p) && !(pureLeaves && pureLeaves.has(p))) {
+                                        (deco || (deco = [])).push(p);
+                                    }
+                                }
+                            }
+                        }
+                        const stampable = (readSet, out) => {
+                            if (!readSet) return out;
+                            for (const p of readSet) {
+                                if (!heavy.has(p) && fastSet.has(p) && !(pureLeaves && pureLeaves.has(p))) {
+                                    (out || (out = [])).push(p);
+                                }
+                            }
+                            return out;
+                        };
+                        // Show/html/model leaves (non-root: root reads are heavy
+                        // above). The executors need no compiled evaluators, so
+                        // there is no coverage guard.
+                        smhReads = collectFlatReads([compiledMetadata.shows, compiledMetadata.htmlBindings, compiledMetadata.models]);
+                        smh = stampable(smhReads, smh);
+                        // data-render leaves (non-root). On a condition flip the
+                        // applier's render arm re-applies the WHOLE row generically
+                        // (the revealed subtree needs every binding kind at current
+                        // values), so render coverage does not depend on the other
+                        // fields being sink-covered.
+                        renderReads = collectFlatReads([compiledMetadata.renders]);
+                        rndr = stampable(renderReads, rndr);
+                    }
+                    compiledMetadata._decoStampProps = deco;
+                    compiledMetadata._smhStampProps = smh;
+                    compiledMetadata._smhReads = smhReads;
+                    compiledMetadata._renderStampProps = rndr;
+                    compiledMetadata._renderReads = renderReads;
+                }
+                const decoProps = compiledMetadata._decoStampProps;
+                const smhProps = compiledMetadata._smhStampProps;
+                const smhReads = compiledMetadata._smhReads;
+                const renderProps = compiledMetadata._renderStampProps;
+                const renderReads = compiledMetadata._renderReads;
+                // Nothing sink-stampable at all (e.g. every text binding is an
+                // expression): the whole template is heavy, so route it through
+                // the computed dispatcher like any other heavy template (the
+                // per-row effect fallback this used to rely on is gone).
+                if ((!pureLeaves || pureLeaves.size === 0) && (!decoProps || decoProps.length === 0)
+                    && (!smhProps || smhProps.length === 0) && (!renderProps || renderProps.length === 0)) {
+                    registerComputedRow(itemEl, itemProxy);
+                    return;
+                }
+                const spec = getPureTextSpec(pureText || new Map()) || { emitters: [], rootProp: null };
+                // Kind-armed applier (mirrors the retire branch): targeted text,
+                // then show/html/model through the per-kind executors, then
+                // decorative re-apply through the evaluator fast paths; each arm
+                // skipped when the changed leaf feeds none of its bindings.
+                const classEvals = compiledMetadata.classEvaluators;
+                const styleEvals = compiledMetadata.styleEvaluators;
+                const attrEvals = compiledMetadata.attrEvaluators;
+                const hasClass = !!(classEvals && classEvals.length);
+                const hasStyle = !!(styleEvals && styleEvals.length);
+                const hasAttr = !!(attrEvals && attrEvals.length);
+                const hasDeco = hasClass || hasStyle || hasAttr;
+                const decoReads = hasDeco
+                    ? self._extractDecorativeReadProps(compiledMetadata) : null;
+                const smhShows = compiledMetadata.shows;
+                const smhHtmls = compiledMetadata.htmlBindings;
+                const smhModels = compiledMetadata.models;
+                const hasSmh = !!(smhProps && smhProps.length);
+                const hasRenders = !!(renderProps && renderProps.length);
+                // Reusable executor ctx (per dispatcher; sink applies are
+                // synchronous, mirroring ListItemBinding's _reusableBindCtx).
+                const _armCtx = (hasSmh || hasRenders) ? {
+                    componentState: null, componentInstance: null, itemIndex: 0,
+                    listLength: 0, listContext: null, propsData: null
+                } : null;
+                const applyRow = (hasDeco || hasSmh || hasRenders)
+                    ? (rowEl, rawItem, key) => {
+                        const applyAll = key == null || key === '__ALL__';
+                        // data-render arm FIRST (it can restructure the row).
+                        // Skipped when the row carries no render contexts; the
+                        // effect path skips those rows the same way. On a flip,
+                        // re-apply the WHOLE row through the generic executor
+                        // chain (the revealed subtree needs every binding kind
+                        // at current values, the exact post-render sequence of
+                        // the per-row effect), then return: the arms below would
+                        // be redundant.
+                        if (hasRenders && (applyAll || renderReads.has(key)) && rowEl._renderContexts) {
+                            let structureChanged = false;
+                            sm.untrack(() => {
+                                const rowProxy = rowEl._itemData || rawItem;
+                                _armCtx.componentState = instance?.state || {};
+                                _armCtx.componentInstance = instance;
+                                _armCtx.itemIndex = rowEl._listIndex | 0;
+                                _armCtx.listLength = element.children.length;
+                                _armCtx.listContext = context;
+                                _armCtx.propsData = instance?._propsData;
+                                structureChanged = self._executeRenders(rowEl._renderContexts, rowProxy, _armCtx);
+                                if (structureChanged) {
+                                    // DOM structure changed: invalidate BOTH cached
+                                    // element arrays (consumers read either), then
+                                    // rebind generically so every binding applies
+                                    // (the full-rebind chain has no targeted filter
+                                    // (only the smh executors filter, and only
+                                    // inside their own scoped window).
+                                    rowEl._cachedElementsArray = null;
+                                    rowEl._bindingElements = null;
+                                    const idx = rowEl._listIndex | 0;
+                                    const dataLen = element.children.length;
+                                    self._bindWithCompiledMetadata(rowEl, rowProxy, compiledMetadata, context, idx, context, true);
+                                    const cs = buildComponentState();
+                                    self._applyRowDecor(rowEl, rowProxy, compiledMetadata, idx, dataLen, cs, instance, context);
+                                }
+                            });
+                            if (structureChanged) return;
+                        }
+                        applyRowTextUpdate(spec, rowEl._cachedElementsArray || rowEl._bindingElements, rawItem, rowEl, key);
+                        if (hasSmh && (applyAll || smhReads.has(key))) {
+                            sm.untrack(() => {
+                                const els = rowEl._cachedElementsArray || rowEl._bindingElements;
+                                if (!els) return;
+                                const rowProxy = rowEl._itemData || rawItem;
+                                _armCtx.componentState = instance?.state || {};
+                                _armCtx.componentInstance = instance;
+                                _armCtx.itemIndex = rowEl._listIndex | 0;
+                                _armCtx.listLength = element.children.length;
+                                _armCtx.listContext = context;
+                                _armCtx.propsData = instance?._propsData;
+                                // Scope the executors' targeted-rebind filter to the
+                                // changed key so non-matching bindings skip their DOM
+                                // writes (an unrelated innerHTML rewrite is not
+                                // idempotent-cheap). Keys here are flat item props
+                                // (fast-touch), so prop === root.
+                                const prevTP = self._targetedProp, prevTPR = self._targetedPropRoot;
+                                if (!applyAll) { self._targetedProp = key; self._targetedPropRoot = key; }
+                                try {
+                                    if (smhHtmls && smhHtmls.length) self._executeHtmlBindings(els, smhHtmls, rowProxy, _armCtx);
+                                    if (smhModels && smhModels.length) self._executeModels(els, smhModels, rowProxy);
+                                    if (smhShows && smhShows.length) self._executeShows(els, smhShows, rowProxy, _armCtx);
+                                } finally {
+                                    self._targetedProp = prevTP; self._targetedPropRoot = prevTPR;
+                                }
+                            });
+                        }
+                        if (hasDeco && (applyAll || !decoReads || decoReads.has(key))) {
+                            sm.untrack(() => {
+                                const rowProxy = rowEl._itemData || rawItem;
+                                const idx = rowEl._listIndex | 0;
+                                const dataLen = element.children.length;
+                                const cs = buildComponentState();
+                                if (hasClass) self._applyClassBindingsToRow(rowEl, rowProxy, idx, dataLen, classEvals, cs, instance, context);
+                                if (hasStyle) self._applyStyleBindingsToRow(rowEl, rowProxy, idx, dataLen, styleEvals, cs, instance, context);
+                                if (hasAttr) self._applyAttrBindingsToRow(rowEl, rowProxy, idx, dataLen, attrEvals, cs, instance, context);
+                            });
+                        }
+                    }
+                    : undefined;
+                // Field -> stamp descriptor for kind dispatch. 'deco' marks a
+                // plain non-suppressing sink stamp (decorative or smh-covered
+                // leaf), never a direct writer.
+                const leafKinds = new Map();
+                if (pureLeaves) for (const [f, entry] of pureLeaves) leafKinds.set(f, entry);
+                if (decoProps) for (const f of decoProps) leafKinds.set(f, { kind: 'deco' });
+                if (smhProps) for (const f of smhProps) { if (!leafKinds.has(f)) leafKinds.set(f, { kind: 'deco' }); }
+                if (renderProps) for (const f of renderProps) { if (!leafKinds.has(f)) leafKinds.set(f, { kind: 'deco' }); }
+                // HEAVY residue: fast-touch fields the general dispatcher does
+                // NOT own (expression/shared text, root-binding reads). Such
+                // templates route through the COMPUTED dispatcher instead of
+                // keeping a per-row effect for the residue: every write to a
+                // heavy field takes the tracked full generic row apply (the old
+                // effect's rebind economy), kind-pure leaves keep the targeted
+                // fast path, and no per-row effect is ever created. The general
+                // dispatcher below is therefore only ever built FULLY covering.
+                if (compiledMetadata._reactiveGraphHeavyTouch === undefined) {
+                    compiledMetadata._reactiveGraphHeavyTouch =
+                        compiledMetadata._reactiveGraphFastTouch.filter(f => !leafKinds.has(f));
+                }
+                if (compiledMetadata._reactiveGraphHeavyTouch.length > 0) {
+                    registerComputedRow(itemEl, itemProxy);
+                    return;
+                }
+                dispatcher = createListSinkDispatcher(spec, applyRow, Array.from(leafKinds.keys()));
+                dispatcher.leafKinds = leafKinds;
+                dispatcher.ownedProps = new Set(leafKinds.keys());
+                let _safe = compiledMetadata._reactiveGraphStyleSafe;
+                if (_safe === undefined) {
+                    _safe = self._computeReactiveGraphRetireSafe(sm, instance);
+                    compiledMetadata._reactiveGraphStyleSafe = _safe;
+                }
+                // A suppressing direct writer is stamped where the
+                // retire-safe gate allows. Kind-pure style/attr targets must all
+                // resolve to ONE non-custom element or the leaf falls back to
+                // the sink.
+                const resolveSingleTarget = (rowEl, els, targets) => {
+                    let el = null;
+                    for (let t = 0; t < targets.length; t++) {
+                        const tg = targets[t];
+                        let te;
+                        if (tg.isRoot) te = rowEl;
+                        else if (els && tg.elIndex !== undefined) te = els[tg.elIndex];
+                        else if (tg.elementPath && tg.elementPath.length) {
+                            te = rowEl;
+                            for (const ix of tg.elementPath) {
+                                if (!te || !te.children) { te = null; break; }
+                                te = te.children[ix];
+                            }
+                        }
+                        if (!te) return null;
+                        if (el === null) el = te;
+                        else if (el !== te) return null;
+                    }
+                    return el;
+                };
+                // Dual-stamp: a suppressed (directWriter) leaf ALSO carries the
+                // listSink. notifyNode consults the writer first (suppression
+                // intact); when the writer self-clears against a stale element
+                // it falls THROUGH to the sink, which applies against the live
+                // row from the rows-Map and re-stamps; the dispatcher-native
+                // self-heal that replaces the per-row effect's edge wake.
+                const baseSink = dispatcher.sink;
+                dispatcher.sink = (rawItem, key) => {
+                    baseSink(rawItem, key);
+                    if (_safe) {
+                        const entry = leafKinds.get(key);
+                        if (entry && entry.kind !== 'deco') {
+                            const rowEl = dispatcher.rows.get(rawItem);
+                            if (rowEl && rowEl.isConnected && rowEl._itemData) {
+                                dispatcher.stampLeaf(rowEl._itemData, rowEl, key);
+                            }
+                        }
+                    }
+                };
+                dispatcher.stampLeaf = (proxy, rowEl, prop) => {
+                    const entry = leafKinds.get(prop);
+                    if (!entry) return;
+                    sm.setListSink(proxy, prop, dispatcher.sink);
+                    if (_safe && entry.kind !== 'deco') {
+                        const _els = rowEl._cachedElementsArray || rowEl._bindingElements;
+                        if (entry.kind === 'text') {
+                            const tEl = _els && _els[entry.elIdx];
+                            if (tEl && tEl._isCustomEl !== true) { self._stampDirectText(sm, proxy, prop, tEl); return; }
+                        } else {
+                            const el = resolveSingleTarget(rowEl, _els, entry.targets);
+                            if (el && el._isCustomEl !== true) {
+                                if (entry.kind === 'style') { self._stampDirectStyle(sm, proxy, prop, el, entry.cssProp); return; }
+                                self._stampDirectAttr(sm, proxy, prop, el, entry.attrName); return;
+                            }
+                        }
+                    }
+                };
+                dispatcher.clearLeaf = (proxy, prop) => {
+                    // Both slots live on the same node (dual-stamp).
+                    sm.clearDirectWriter(proxy, prop);
+                    sm.clearListSink(proxy, prop);
+                };
+                element._wfListSinkDispatcher = dispatcher;
+            }
+            const raw = sm.toRaw(itemProxy);
+            dispatcher.rows.set(raw, itemEl);
+            const props = dispatcher.stampProps;
+            if (props) for (let p = 0; p < props.length; p++) dispatcher.stampLeaf(itemProxy, itemEl, props[p]);
+        };
+
 
         // Compute which component-level vars are used ONLY in class bindings.
         // These can be skipped in per-item effects (refresh effect handles them).
         if (compiledMetadata && instance?.state && !element._classOnlyCompDeps) {
+            self._computeDeps(compiledMetadata);
             const reservedWords = self._expressionReservedWords;
             const classVars = new Set();
             const otherVars = new Set();
 
-            const addVarsFrom = (expr, targetSet) => {
-                if (!expr) return;
-                const vars = expr.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || [];
-                for (const v of vars) {
-                    if (v.startsWith('_') || reservedWords?.has(v)) continue;
+            const addReads = (reads, targetSet) => {
+                for (let i = 0; i < reads.length; i++) {
+                    const v = reads[i];
+                    if (!v || v.startsWith('_') || reservedWords?.has(v)) continue;
                     targetSet.add(v);
                 }
             };
 
-            // Class binding vars
+            // Class binding vars (exclude whole-binding computed references; those
+            // are gated separately below). Root class expression included.
             for (const cb of (compiledMetadata.classBindings || [])) {
-                if (cb.expression && !cb.isComputed) addVarsFrom(cb.expression, classVars);
-            }
-            if (compiledMetadata.rootBindings?.bindClassExpr && !compiledMetadata.rootBindings.bindClassExpr.startsWith('computed:')) {
-                addVarsFrom(compiledMetadata.rootBindings.bindClassExpr, classVars);
+                if (cb._deps && cb._deps.kind !== 'computedName') addReads(cb._deps.reads, classVars);
             }
 
-            // Non-class binding vars (text, style, attr, show, render, model)
-            for (const b of (compiledMetadata.bindings || [])) {
-                if (b.isExpression && b.expressionVars) { for (const v of b.expressionVars) otherVars.add(v); }
-                else if (b.path) otherVars.add(b.path);
+            // Non-class binding vars (text, style, attr, model, show, html, render).
+            const otherArrays = [
+                compiledMetadata.bindings, compiledMetadata.styleBindings,
+                compiledMetadata.attrBindings, compiledMetadata.models,
+                compiledMetadata.shows, compiledMetadata.htmlBindings,
+                compiledMetadata.renders
+            ];
+            for (const arr of otherArrays) {
+                if (!arr) continue;
+                for (const b of arr) { if (b._deps) addReads(b._deps.reads, otherVars); }
             }
-            for (const sb of (compiledMetadata.styleBindings || [])) { if (sb.expression) addVarsFrom(sb.expression, otherVars); }
-            if (compiledMetadata.rootBindings?.bindStyleExpr) addVarsFrom(compiledMetadata.rootBindings.bindStyleExpr, otherVars);
-            for (const ab of (compiledMetadata.attrBindings || [])) { if (ab.expression) addVarsFrom(ab.expression, otherVars); }
-            if (compiledMetadata.rootBindings?.bindAttrExpr) addVarsFrom(compiledMetadata.rootBindings.bindAttrExpr, otherVars);
-            for (const sh of (compiledMetadata.shows || [])) { if (sh.path) otherVars.add(sh.path); }
-            for (const rb of (compiledMetadata.renders || [])) {
-                if (rb.isExpression && rb.expressionVars) { for (const v of rb.expressionVars) otherVars.add(v); }
-                else if (rb.path) otherVars.add(rb.path);
+
+            // Root bindings: the class expression feeds classVars; every other root
+            // field feeds otherVars.
+            if (compiledMetadata.rootBindings?._deps) {
+                for (const d of compiledMetadata.rootBindings._deps) {
+                    if (d.kind === 'computedName') continue; // gated below
+                    if (d.field === 'bindClassExpr') addReads(d.reads, classVars);
+                    else addReads(d.reads, otherVars);
+                }
             }
 
             // Class-only = in classVars but NOT in otherVars, and IS component state (not item)
@@ -2074,14 +1991,8 @@ _updateLists(listElements, instance = null)
                 }
             }
             element._classOnlyCompDeps = classOnly;
-        }
 
-        // V8 OPT: Reusable enrichedContext for mapFn path — avoids per-item spread allocation
-        const _mapFnEnrichedCtx = {
-            ...context,
-            componentInstance: instance,
-            listLength: 0
-        };
+        }
 
         // Map function - creates DOM element for each item
         // Third parameter isBulkCreation: when true, defer effect creation for better performance
@@ -2158,50 +2069,13 @@ _updateLists(listElements, instance = null)
             // Apply initial bindings using compiled metadata
             if (itemCompiledMetadata) {
                 const componentState = buildComponentState();
-                // V8 OPT: Reuse pre-allocated context, just update listLength
-                _mapFnEnrichedCtx.listLength = data?.length || 0;
-                const enrichedContext = _mapFnEnrichedCtx;
 
-                // Apply text bindings
-                self._bindWithCompiledMetadata(itemEl, itemProxy, itemCompiledMetadata, context, index, context);
-
-                // Apply class bindings
-                if (itemCompiledMetadata.classEvaluators) {
-                    self._applyClassBindingsToRow(itemEl, itemProxy, index, data?.length || 0, itemCompiledMetadata.classEvaluators, componentState, instance, context);
-                }
-
-                // Apply style bindings
-                const elements = itemEl._bindingElements || itemEl._cachedElementsArray;
-                if (itemCompiledMetadata.styleBindings?.length > 0 || itemCompiledMetadata.rootBindings?.hasBindStyle) {
-                    const rootStyleExpr = itemCompiledMetadata.rootBindings?.bindStyleExpr;
-                    if (rootStyleExpr) {
-                        self._processStyleBinding(itemEl, itemProxy, rootStyleExpr, index, enrichedContext);
-                    }
-                    for (const styleBinding of (itemCompiledMetadata.styleBindings || [])) {
-                        const targetEl = (elements && styleBinding.index !== undefined)
-                            ? elements[styleBinding.index]
-                            : itemEl;
-                        if (targetEl && styleBinding.expression) {
-                            self._processStyleBinding(targetEl, itemProxy, styleBinding.expression, index, enrichedContext);
-                        }
-                    }
-                }
-
-                // Apply attr bindings
-                if (itemCompiledMetadata.attrBindings?.length > 0 || itemCompiledMetadata.rootBindings?.hasBindAttr) {
-                    const rootAttrExpr = itemCompiledMetadata.rootBindings?.bindAttrExpr;
-                    if (rootAttrExpr) {
-                        self._processAttrBinding(itemEl, itemProxy, rootAttrExpr, index, enrichedContext);
-                    }
-                    for (const attrBinding of (itemCompiledMetadata.attrBindings || [])) {
-                        const targetEl = (elements && attrBinding.index !== undefined)
-                            ? elements[attrBinding.index]
-                            : itemEl;
-                        if (targetEl && attrBinding.expression) {
-                            self._processAttrBinding(targetEl, itemProxy, attrBinding.expression, index, enrichedContext);
-                        }
-                    }
-                }
+                // Text + generic bindings; the decor sequence below owns every
+                // style/attr binding (evaluator coverage is total; see
+                // _applyRowDecor).
+                self._bindWithCompiledMetadata(itemEl, itemProxy, itemCompiledMetadata, context, index, context, true);
+                self._applyRowDecor(itemEl, itemProxy, itemCompiledMetadata, index, data?.length || 0,
+                    componentState, instance, context);
             }
 
             // === INTEGRATION: Handle root element model/show bindings ===
@@ -2212,13 +2086,11 @@ _updateLists(listElements, instance = null)
 
             // Store binding data for context creation
             itemEl._needsContexts = true;
-            itemEl._bindItemData = itemProxy;
-            itemEl._bindItemIndex = index;
 
-            // === INTEGRATION: Create contexts eagerly for action binding ===
-            // This ensures action contexts exist BEFORE any click events,
+            // === INTEGRATION: Create action records eagerly for action binding ===
+            // This ensures action records exist BEFORE any click events,
             // which is required for proper event delegation and test compatibility
-            if (self._contextSystemInitialized && self._contextRegistry) {
+            if (self._contextSystemInitialized) {
                 self._ensureItemContexts(itemEl);
             }
 
@@ -2271,11 +2143,13 @@ _updateLists(listElements, instance = null)
                 };
             }
 
-            // Normal path: create effect immediately
-            const disposeEffect = createItemEffect(itemEl, itemProxy);
-            // Set on element for API consistency with _createItemEffect
-            itemEl._wfDisposeEffect = disposeEffect;
-            return { element: insertEl, disposeEffect };
+            // Normal path: every row registers on a per-list dispatcher,
+            // general (fully sink-covered fast-touch) or computed (heavy /
+            // computed / external / polymorphic). Per-row effects no longer
+            // exist; the dispatcher is the whole update mechanism.
+            registerRowLeafSinks(itemEl, itemProxy);
+            itemEl._wfDisposeEffect = null;
+            return { element: insertEl, disposeEffect: null };
         };
 
         // Set up mapArray with callbacks
@@ -2284,8 +2158,11 @@ _updateLists(listElements, instance = null)
             mapFn,
             {
                 key: keyProp,
-                // OPTIMIZATION: innerHTML fast path for bulk creation
-                // Uses existing _generateRowsHTML instead of 1000 cloneNode calls
+                // OPTIMIZATION: bulk create fast path; clone a cached row prototype
+                // + direct textContent setter writes (see _buildRowsCloneSetter),
+                // instead of N cloneNode calls or a serialize+reparse. Non-qualifying
+                // templates (polymorphic / custom-element / no innerHTML parts) return
+                // null and fall back to the per-item mapFn loop.
                 onBulkCreate: (newArray, keyProp, startIndex = 0) => {
                     // Polymorphic lists: different items use different templates,
                     // so innerHTML fast path cannot be used
@@ -2303,24 +2180,20 @@ _updateLists(listElements, instance = null)
                     }
 
                     const parts = compiledMetadata.innerHTMLParts;
-                    const accessors = compiledMetadata.textAccessors;
                     const classEvaluators = compiledMetadata.classEvaluators || [];
 
                     // Build component state for class evaluators
                     const componentState = buildComponentState();
 
-                    // Generate HTML for items (supports both full creation and append)
-                    const htmlString = self._generateRowsHTML(instance, newArray, parts, accessors, startIndex, newArray.length);
-
-                    if (startIndex === 0) {
-                        // FULL CREATION: Replace innerHTML
-                        // Template was already removed from DOM during setup,
-                        // so innerHTML won't destroy it
-                        element.innerHTML = htmlString;
-                    } else {
-                        // APPEND MODE: Insert new rows at end without destroying existing
-                        // Template was removed during setup, so no off-by-one interference
-                        element.insertAdjacentHTML('beforeend', htmlString);
+                    // Build the rows by cloning a cached row prototype and writing
+                    // each text binding straight to textContent, batched into one
+                    // DocumentFragment (replacing the old serialize-to-HTML-string +
+                    // element.innerHTML reparse, which was ~85% of create script).
+                    // Returns false only for a degenerate template with no single
+                    // root element (unreachable for a normal list item); fall back to
+                    // the per-item mapFn path in that case.
+                    if (!self._buildRowsCloneSetter(compiledMetadata, instance, newArray, startIndex, element, parts)) {
+                        return null;
                     }
 
                     // Build results array from created rows
@@ -2412,14 +2285,38 @@ _updateLists(listElements, instance = null)
                             row.dataset.wfUsedTemplate = usedTemplateName;
                         }
 
-                        // Build and cache elements array for sparse updates
-                        row._bindingElements = self._buildElementsArrayFromMetadata(row, compiledMetadata);
+                        // Build and cache elements array for sparse updates.
+                        // The clone+setter create path already built and stashed
+                        // this array (to run text setters), so reuse it instead of
+                        // walking the element paths a second time.
+                        row._bindingElements = row._bindingElements || self._buildElementsArrayFromMetadata(row, compiledMetadata);
                         row._compiledMetadata = compiledMetadata;
 
                         // Apply class bindings (skip call entirely when no evaluators)
                         if (classEvaluators.length > 0) {
                             if (reusableMergedCtx) {
-                                Object.assign(reusableMergedCtx, itemProxy);
+                                // Copy item props into the reused class context from the
+                                // RAW target, not the proxy: Object.assign on a reactive
+                                // proxy pays ownKeys + per-key descriptor + get traps;
+                                // the raw object is a plain copy. Create-time apply isn't
+                                // dependency-tracking (the per-item effect wires reactivity
+                                // separately), so the copied values are identical.
+                                const rawT = sm._proxyTargets?.get(itemProxy) || itemProxy;
+                                const copyVars = compiledMetadata._classCopyVars;
+                                if (copyVars) {
+                                    // Targeted copy: only the props the class expressions
+                                    // reference (O(class-expr vars) vs O(item width)). Vars
+                                    // absent from the raw item are component-state (or list-
+                                    // context) and are skipped, keeping the pre-loaded value.
+                                    for (let cvi = 0; cvi < copyVars.length; cvi++) {
+                                        const v = copyVars[cvi];
+                                        if (v in rawT) reusableMergedCtx[v] = rawT[v];
+                                    }
+                                } else {
+                                    // Full copy: a null class evaluator's fallback reads
+                                    // Object.keys(mergedCtx), so it needs every item prop.
+                                    Object.assign(reusableMergedCtx, rawT);
+                                }
                                 reusableMergedCtx._index = i;
                                 reusableMergedCtx._first = i === 0;
                                 reusableMergedCtx._last = i === newArray.length - 1;
@@ -2467,14 +2364,13 @@ _updateLists(listElements, instance = null)
 
                         // Store binding data for context creation
                         row._needsContexts = true;
-                        row._bindItemData = itemProxy;
-                        row._bindItemIndex = i;
 
                         // Wire data-event-outside on row-template children.
                         // Must happen eagerly: clicks land outside the row, so
                         // the lazy context-creation path won't trigger. The
-                        // PropsSystem registry is idempotent so repeat row
-                        // mounts (template re-renders, key reuse) are safe.
+                        // EventSystem._setupOutsideClickHandler registry is
+                        // idempotent so repeat row mounts (template re-renders,
+                        // key reuse) are safe.
                         if (outsideClickActions) {
                             const rowElements = row._bindingElements;
                             for (let oi = 0; oi < outsideClickActions.length; oi++) {
@@ -2566,8 +2462,35 @@ _updateLists(listElements, instance = null)
                     if (self._cleanupCustomDirectivesInSubtree) {
                         self._cleanupCustomDirectivesInSubtree(el);
                     }
+                    // Tear down nested data-list mapArrays in the removed row (their
+                    // effects survive DOM removal otherwise) and prune their
+                    // _listContexts entries. Gated on this list actually having
+                    // child lists so the common (flat-row) remove hot path skips
+                    // the subtree walk entirely. MUST run before
+                    // _cleanupContextsInSubtree, which deletes el._listContext on
+                    // descendants; the prune keys off that reference.
+                    if (hasChildLists) {
+                        self._disposeNestedListsInItem(el, instance);
+                    }
                     self._cleanupContextsInSubtree(el);
                     self._destroyNestedComponentsInItem(el);
+                    // Release the removed row's dispatcher entry + stamped
+                    // leaves so the detached element + item object are not pinned
+                    // by the rows Map. clearLeaf dispatches directWriter vs listSink.
+                    const _d = element._wfListSinkDispatcher;
+                    if (_d && _d.stampLeaf && el._itemData) {
+                        const _proxy = el._itemData;
+                        const _raw = sm.toRaw(_proxy);
+                        _d.rows.delete(_raw);
+                        if (_d.computedRows) {
+                            // Runtime-discovered stamps: clear + unpin (rawStamps
+                            // holds the raw strongly for cleanup bookkeeping).
+                            _d.clearRowStamps(_raw);
+                        } else {
+                            const _props = _d.stampProps;
+                            if (_props) for (let p = 0; p < _props.length; p++) _d.clearLeaf(_proxy, _props[p]);
+                        }
+                    }
                     el.remove();
                     itemElements.delete(key);
                 },
@@ -2576,14 +2499,59 @@ _updateLists(listElements, instance = null)
                 onBulkRemove: (elements, items) => {
                     if (!elements || elements.length === 0) return;
 
+                    // PERF: Check if this is a full clear using itemElements map size
+                    // instead of _getListItems DOM query (avoids Array.from on 10K children + 2 filter passes)
+                    const isFullClear = elements.length >= itemElements.size;
+
+                    // Release removed rows' dispatcher entries + stamped
+                    // leaves so detached elements + item objects are not pinned
+                    // by the rows Map. On a FULL clear the entire item-proxy
+                    // subgraph is discarded, so the only thing that must happen is
+                    // dropping the rows Map's raw->element pins; a single
+                    // rows.clear() replaces the O(n) toRaw + delete + clearLeaf
+                    // loop. The per-leaf stamps live on the about-to-be-GC'd item
+                    // proxies (and the directWriter self-guards on el.isConnected),
+                    // so clearing them is wasted work on full clear. Partial
+                    // removals still walk only the removed rows.
+                    const _d = element._wfListSinkDispatcher;
+                    if (_d && _d.stampLeaf) {
+                        if (isFullClear) {
+                            _d.rows.clear();
+                            // Computed dispatchers must also unpin the raws their
+                            // stamp bookkeeping holds strongly (the sinks on the
+                            // discarded item subgraph GC with it).
+                            if (_d.computedRows) _d.rawStamps.clear();
+                        } else {
+                            const _props = _d.stampProps;
+                            for (let i = 0; i < elements.length; i++) {
+                                const _proxy = elements[i] && elements[i]._itemData;
+                                if (!_proxy) continue;
+                                const _raw = sm.toRaw(_proxy);
+                                _d.rows.delete(_raw);
+                                if (_d.computedRows) {
+                                    _d.clearRowStamps(_raw);
+                                } else if (_props) {
+                                    for (let p = 0; p < _props.length; p++) _d.clearLeaf(_proxy, _props[p]);
+                                }
+                            }
+                        }
+                    }
+
                     // Use optimized batch cleanup (same as context mode)
                     // This does: batched directive cleanup, batched component destruction,
                     // deferred context cleanup - all with minimal querySelectorAll calls
                     self._batchCleanupListItemsWithNestedComponents(elements);
 
-                    // PERF: Check if this is a full clear using itemElements map size
-                    // instead of _getListItems DOM query (avoids Array.from on 10K children + 2 filter passes)
-                    const isFullClear = elements.length >= itemElements.size;
+                    // Tear down nested data-list mapArrays in each removed row (the
+                    // batch cleanup destroys nested components + item effects but not
+                    // nested-list effects). Gated on this list having child lists so
+                    // flat lists skip the per-row subtree walk. Runs before DOM
+                    // removal so the wrappedDispose walk still sees the subtree.
+                    if (hasChildLists) {
+                        for (let i = 0; i < elements.length; i++) {
+                            self._disposeNestedListsInItem(elements[i], instance);
+                        }
+                    }
 
                     if (isFullClear) {
                         // Full clear: single DOM operation
@@ -2591,6 +2559,21 @@ _updateLists(listElements, instance = null)
                         element.replaceChildren();
                         // Clear all from map
                         itemElements.clear();
+                        // Release scope-captured references to the now-empty list's
+                        // PRIOR populated array. These caches live in this list's
+                        // mapArray setup closure (shared V8 context with the long-lived
+                        // dispose/refresh/effect closures), so a stale reference here
+                        // pins the entire prior item-proxy subgraph; each item's graph
+                        // node still carries a directWriter that captures its (now
+                        // detached) row element, so the rows + their <tr>/<td> DOM never
+                        // GC after clear. `_cachedComponentState` spreads the rows proxy
+                        // via `{...instance.state}`; `_previousData` is an SSR-only diff
+                        // snapshot unused on the mapArray path. Dropping both lets the
+                        // emptied array (and its items, nodes, directWriters, DOM) collect.
+                        _cachedComponentState = null;
+                        _cachedStateVersion = -1;
+                        element._previousData = null;
+                        element._previousDataLength = 0;
                     } else {
                         // Partial removal: remove specific elements
                         // Batch DOM removals together (browser can optimize)
@@ -2615,63 +2598,26 @@ _updateLists(listElements, instance = null)
                         }
                     }
 
-                    // Always update index metadata (even if DOM position unchanged)
+                    // Always update the canonical row index (even if DOM position
+                    // unchanged). List-item action dispatch + per-item effects read
+                    // _listIndex directly. This runs once per shifted row in the
+                    // single-remove renumber, so it is the remove hot path; keep it
+                    // to one write (_bindItemIndex was a redundant mirror, retired).
                     el._listIndex = newIdx;
-                    el._bindItemIndex = newIdx; // CRITICAL: Update for context system
-
-                    // CRITICAL: Also update _parentIndex on all contexts within this item
-                    // This is needed for data-show, data-bind-class, and other bindings to resolve correctly
-                    // Even when onItemUpdate is skipped (proxy unchanged), contexts need updated indices
-                    if (self._contextRegistry?.contextsByElement) {
-                        const ctx = self._contextRegistry.contextsByElement.get(el);
-                        if (ctx && ctx._parentIndex !== undefined) {
-                            ctx._parentIndex = newIdx;
-                        }
-                        // PERF: Use cached _bindingElements instead of querySelectorAll('*')
-                        // This changes O(n) DOM query to O(1) property access per item
-                        const cachedElements = el._bindingElements || el._cachedElementsArray;
-                        if (cachedElements) {
-                            for (let i = 0; i < cachedElements.length; i++) {
-                                const childEl = cachedElements[i];
-                                if (!childEl) continue;
-                                const childCtx = self._contextRegistry.contextsByElement.get(childEl);
-                                if (childCtx && childCtx._parentIndex !== undefined) {
-                                    childCtx._parentIndex = newIdx;
-                                }
-                            }
-                        }
-                        // Fallback only for items without cached elements (rare edge case)
-                        else if (el._needsContexts !== false) {
-                            const descendants = el.querySelectorAll('*');
-                            for (let i = 0; i < descendants.length; i++) {
-                                const childCtx = self._contextRegistry.contextsByElement.get(descendants[i]);
-                                if (childCtx && childCtx._parentIndex !== undefined) {
-                                    childCtx._parentIndex = newIdx;
-                                }
-                            }
-                        }
-                    }
                 },
                 // Synchronous effect creation for immediate reactivity
                 // Effects must be created before scan() returns so they can respond to mutations
                 // that happen immediately after scan() completes
                 onDeferredEffects: (deferredItems, currentItems, arrPath) => {
                     if (!deferredItems || deferredItems.length === 0) return;
-
-                    // PERF: Extract and cache static item props once per template
-                    // This allows skipping the first-run proxy reads (touchPath) for bulk-created items
-                    if (compiledMetadata && compiledMetadata._staticItemProps === undefined) {
-                        compiledMetadata._staticItemProps = self._extractStaticItemProps(compiledMetadata, instance);
-                    }
-                    const precomputedProps = compiledMetadata?._staticItemProps || null;
-
-                    // Component-level deps (selectedId, etc.) are handled by the
-                    // component refresh effect — NOT per-item effects. Extract deps
-                    // for the refresh effect but don't pass to createItemEffect.
+                    // Component-level deps are extracted here for the component
+                    // refresh effect when the initial bulk render runs before the
+                    // refresh-effect setup below (mapArray renders synchronously
+                    // inside sm.mapArray). The deferred items provide the sample
+                    // item the classifier needs.
                     if (compiledMetadata && compiledMetadata._componentDeps === undefined) {
                         const sampleItem = deferredItems[0]?.itemProxy;
                         compiledMetadata._componentDeps = self._extractComponentDeps(compiledMetadata, sampleItem, instance, sm);
-
                         // Seed computedDependencies for computed component deps.
                         if (compiledMetadata._componentDeps && sm) {
                             for (const dep of compiledMetadata._componentDeps) {
@@ -2681,58 +2627,17 @@ _updateLists(listElements, instance = null)
                             }
                         }
                     }
-                    // Filter out class-only deps from per-item effects.
-                    // Keep computed deps + state vars used in non-class bindings.
-                    let componentDeps = null;
-                    if (compiledMetadata._componentDeps) {
-                        const filtered = new Set();
-                        for (const dep of compiledMetadata._componentDeps) {
-                            if (dep.startsWith('computed:')) {
-                                filtered.add(dep);
-                            } else if (!element._classOnlyCompDeps?.has(dep)) {
-                                filtered.add(dep);
-                            }
-                        }
-                        componentDeps = filtered.size > 0 ? filtered : null;
-                    }
-
-                    // PERF: Build a Map for O(1) lookup instead of O(n) Array.find per item
-                    // This changes complexity from O(n²) to O(n) for large lists
-                    const itemsByKey = new Map();
-                    for (let j = 0; j < currentItems.length; j++) {
-                        itemsByKey.set(currentItems[j].key, currentItems[j]);
-                    }
-
-                    // Create effects synchronously to ensure they exist before any user code runs
+                    // Every deferred row registers on the per-list dispatcher
+                    // (general or computed), the same routing as the normal
+                    // path. Per-row effects no longer exist; sink stamps live on
+                    // the graph's global node table, so store-item writes reach
+                    // them without any _effectDependents registration.
                     for (let i = 0; i < deferredItems.length; i++) {
                         const data = deferredItems[i];
                         if (!data || !data.element || !data.itemProxy) continue;
-
-                        // Skip if element was removed (e.g., component destroyed)
                         if (!data.element.parentNode) continue;
-
-                        // Set _itemEffectContext so createEffect tags this as an item effect
-                        const itemEntry = itemsByKey.get(data.key);
-                        if (arrPath) {
-                            sm._itemEffectContext = { prefix: arrPath + '.', index: itemEntry ? itemEntry.index : i, arrayPath: arrPath };
-                        }
-
-                        // Create the effect — pass precomputed props to skip first-run proxy reads
-                        // Only when arrPath is truthy (same-RSM list with index-based tracking).
-                        // Cross-store lists (arrPath is null) need the first run to register
-                        // deps in the store's _effectDependents for notification to work.
-                        const disposeEffect = createItemEffect(data.element, data.itemProxy,
-                            arrPath ? precomputedProps : null, componentDeps);
-                        sm._itemEffectContext = null;
-
-                        // Set on element for API consistency with _createItemEffect
-                        data.element._wfDisposeEffect = disposeEffect;
-
-                        // Update the currentItems entry with the dispose function
-                        // PERF: O(1) Map lookup instead of O(n) Array.find
-                        if (itemEntry) {
-                            itemEntry.disposeEffect = disposeEffect;
-                        }
+                        registerRowLeafSinks(data.element, data.itemProxy);
+                        data.element._wfDisposeEffect = null;
                     }
                 },
                 // === CRITICAL: Handle existing item proxy updates ===
@@ -2741,41 +2646,50 @@ _updateLists(listElements, instance = null)
                 onItemUpdate: (itemEl, newItemProxy, oldItemProxy, index) => {
                     // Update element's item data reference
                     itemEl._itemData = newItemProxy;
-                    itemEl._bindItemData = newItemProxy;
                     itemEl._listIndex = index;
-                    itemEl._bindItemIndex = index; // CRITICAL: Update for context system
 
-                    // Update _parentIndex on all contexts within this item
-                    // This ensures ConditionalContexts (data-show) resolve the correct item data
-                    if (self._contextRegistry?.contextsByElement) {
-                        // Update context on itemEl itself
-                        const rootCtx = self._contextRegistry.contextsByElement.get(itemEl);
-                        if (rootCtx && rootCtx._parentIndex !== undefined) {
-                            rootCtx._parentIndex = index;
+                    // Same-key replace: when a row keeps its element but its
+                    // item object changes, the listSink stamped on the old object's
+                    // leaves no longer points reactivity at this row. Move the rows
+                    // entry, clear the old leaves, re-stamp the new ones, and refresh
+                    // the row text (the per-item effect's mRefresh re-track has no node
+                    // for retired rows).
+                    const _dispatcher = element._wfListSinkDispatcher;
+                    if (_dispatcher && _dispatcher.computedRows) {
+                        // Runtime-discovered surface: move the rows entry, drop the
+                        // old raw's stamps, and re-walk the NEW proxy's deps under
+                        // the frame (stamping its leaves + linking any new shared
+                        // deps). DOM application is the !willRefresh apply below.
+                        const newRaw = sm.toRaw(newItemProxy);
+                        const oldRaw = oldItemProxy != null ? sm.toRaw(oldItemProxy) : null;
+                        if (oldRaw && oldRaw !== newRaw) {
+                            _dispatcher.rows.delete(oldRaw);
+                            _dispatcher.clearRowStamps(oldRaw);
                         }
-                        // PERF: Use cached _bindingElements instead of querySelectorAll('*')
-                        const cachedElements = itemEl._bindingElements || itemEl._cachedElementsArray;
-                        if (cachedElements) {
-                            for (let i = 0; i < cachedElements.length; i++) {
-                                const el = cachedElements[i];
-                                if (!el) continue;
-                                const ctx = self._contextRegistry.contextsByElement.get(el);
-                                if (ctx && ctx._parentIndex !== undefined) {
-                                    ctx._parentIndex = index;
-                                }
+                        _dispatcher.rows.set(newRaw, itemEl);
+                        _dispatcher.registerWalk(itemEl, newItemProxy);
+                    } else if (_dispatcher && _dispatcher.stampLeaf) {
+                        const spec = _dispatcher.spec;
+                        const props = _dispatcher.stampProps || spec.emitters.map(e => e.reads[0]);
+                        const newRaw = sm.toRaw(newItemProxy);
+                        const oldRaw = oldItemProxy != null ? sm.toRaw(oldItemProxy) : null;
+                        if (oldRaw && oldRaw !== newRaw) {
+                            _dispatcher.rows.delete(oldRaw);
+                            for (let p = 0; p < props.length; p++) {
+                                _dispatcher.clearLeaf(oldItemProxy, props[p]);
                             }
                         }
-                        // Fallback only for items without cached elements
-                        else if (itemEl._needsContexts !== false) {
-                            const descendants = itemEl.querySelectorAll('*');
-                            for (let i = 0; i < descendants.length; i++) {
-                                const ctx = self._contextRegistry.contextsByElement.get(descendants[i]);
-                                if (ctx && ctx._parentIndex !== undefined) {
-                                    ctx._parentIndex = index;
-                                }
-                            }
+                        _dispatcher.rows.set(newRaw, itemEl);
+                        for (let p = 0; p < props.length; p++) {
+                            _dispatcher.stampLeaf(newItemProxy, itemEl, props[p]);
                         }
+                        // Text refresh; class (if any) is re-applied by the existing
+                        // onItemUpdate apply sequence below.
+                        applyRowTextUpdate(spec, itemEl._cachedElementsArray || itemEl._bindingElements, newRaw, itemEl, null);
                     }
+
+                    // No registry contexts to reindex here: per-item data-show/data-bind
+                    // resolve through the row's item proxy + the per-item effect.
 
                     // Update nested list contexts with the new parent proxy
                     const childListPaths = self._listRelationships.get(context.path) || new Set();
@@ -2791,73 +2705,60 @@ _updateLists(listElements, instance = null)
                                 // Get the new nested data from the new proxy
                                 const nestedData = newItemProxy[childPath];
 
-                                // Re-render the nested list with the new data
+                                // Refresh the nested list against the new parent item.
                                 if (Array.isArray(nestedData)) {
-                                    // CRITICAL: Dispose old mapArray before re-initializing
-                                    // The nested mapArray's arrayFn reads from _parentItemProxy
-                                    // which is a plain variable - updating it doesn't trigger effects
-                                    // We need to dispose and re-initialize with the new data
-                                    if (nestedListEl._mapArrayInitialized && nestedListEl._disposeMapArray) {
-                                        nestedListEl._disposeMapArray();
-                                        nestedListEl._mapArrayInitialized = false;
-                                        nestedListEl._disposeMapArray = null;
-                                        // Clear existing children before re-render
-                                        nestedListEl.innerHTML = '';
+                                    // The nested mapArray's arrayFn reads its data live
+                                    // through childContext._parentItemProxy[childPath],
+                                    // which we just repointed to newItemProxy above. So
+                                    // refreshing the existing nested reconcile effect
+                                    // re-diffs the new array against the preserved prev
+                                    // (reusing/moving keyed children) instead of disposing
+                                    // and rebuilding the whole nested subtree (which
+                                    // re-created every nested row on each parent update).
+                                    if (nestedListEl._mapArrayInitialized && nestedListEl._refreshMapArray) {
+                                        nestedListEl._refreshMapArray();
+                                    } else {
+                                        self._renderList(nestedListEl, nestedData, childContext, instance);
                                     }
-                                    self._renderList(nestedListEl, nestedData, childContext, instance);
                                 }
                             }
                         });
                     });
 
-                    // Rebind the element with the new proxy
+                    // Rebind the element with the new proxy. This is the row's
+                    // sole binding application on a same-key replace (per-row
+                    // effects no longer exist).
                     if (compiledMetadata) {
                         const componentState = buildComponentState();
                         const listLength = element.children.length;
-                        // V8 OPT: Reuse pre-allocated context
-                        _mapFnEnrichedCtx.listLength = listLength;
-                        const enrichedContext = _mapFnEnrichedCtx;
 
-                        // Apply text bindings
-                        self._bindWithCompiledMetadata(itemEl, newItemProxy, compiledMetadata, context, index, context);
-
-                        // Apply class bindings
-                        if (compiledMetadata.classEvaluators) {
-                            self._applyClassBindingsToRow(itemEl, newItemProxy, index, listLength, compiledMetadata.classEvaluators, componentState, instance, context);
-                        }
-
-                        // Apply style bindings
-                        const elements = itemEl._bindingElements || itemEl._cachedElementsArray;
-                        if (compiledMetadata.styleBindings?.length > 0 || compiledMetadata.rootBindings?.hasBindStyle) {
-                            const rootStyleExpr = compiledMetadata.rootBindings?.bindStyleExpr;
-                            if (rootStyleExpr) {
-                                self._processStyleBinding(itemEl, newItemProxy, rootStyleExpr, index, enrichedContext);
-                            }
-                            for (const styleBinding of (compiledMetadata.styleBindings || [])) {
-                                const targetEl = (elements && styleBinding.index !== undefined)
-                                    ? elements[styleBinding.index]
-                                    : itemEl;
-                                if (targetEl && styleBinding.expression) {
-                                    self._processStyleBinding(targetEl, newItemProxy, styleBinding.expression, index, enrichedContext);
-                                }
+                        // Renders FIRST, through the ROW's own records (mirrors
+                        // the per-row effect's rebind order). Without this an
+                        // effect-less row's RenderRecords go stale on a same-key
+                        // replace (nothing re-evaluates them against the new
+                        // item) and a later targeted render write then sees
+                        // "no change" against an inverted isRendered.
+                        if (compiledMetadata.renders?.length > 0 && itemEl._renderContexts) {
+                            const renderCtx = {
+                                componentState: instance?.state || {},
+                                componentInstance: instance,
+                                itemIndex: index,
+                                listLength: listLength,
+                                listContext: context
+                            };
+                            const renderChanged = self._executeRenders(itemEl._renderContexts, newItemProxy, renderCtx);
+                            if (renderChanged) {
+                                itemEl._cachedElementsArray = null;
+                                itemEl._bindingElements = null;
                             }
                         }
 
-                        // Apply attr bindings
-                        if (compiledMetadata.attrBindings?.length > 0 || compiledMetadata.rootBindings?.hasBindAttr) {
-                            const rootAttrExpr = compiledMetadata.rootBindings?.bindAttrExpr;
-                            if (rootAttrExpr) {
-                                self._processAttrBinding(itemEl, newItemProxy, rootAttrExpr, index, enrichedContext);
-                            }
-                            for (const attrBinding of (compiledMetadata.attrBindings || [])) {
-                                const targetEl = (elements && attrBinding.index !== undefined)
-                                    ? elements[attrBinding.index]
-                                    : itemEl;
-                                if (targetEl && attrBinding.expression) {
-                                    self._processAttrBinding(targetEl, newItemProxy, attrBinding.expression, index, enrichedContext);
-                                }
-                            }
-                        }
+                        // Text + generic bindings, then the shared decor
+                        // sequence (same composition as mapFn initial render and
+                        // the computed dispatcher's applyRowFull).
+                        self._bindWithCompiledMetadata(itemEl, newItemProxy, compiledMetadata, context, index, context, true);
+                        self._applyRowDecor(itemEl, newItemProxy, compiledMetadata, index, listLength,
+                            componentState, instance, context);
                     }
                 },
                 // === CRITICAL: Handle list length changes ===
@@ -2870,6 +2771,14 @@ _updateLists(listElements, instance = null)
                         // Update class bindings for all items
                         self._updateListContextClassBindings(element, newArray, context);
                     }
+                    // Re-evaluate position-frame conditionals that resolve through an
+                    // item-level computed (e.g. data-show="onLast"). These carry no
+                    // literal _last token, so the sweep above misses them; without
+                    // this the row that becomes last after an add/remove keeps a
+                    // stale info.last/info.length frame.
+                    if (self._listHasComputedConditional(compiledMetadata, instance)) {
+                        self._reEvalListItemComputedConditionals(element, newArray, context, instance);
+                    }
                 }
             }
         );
@@ -2877,13 +2786,17 @@ _updateLists(listElements, instance = null)
         // Store dispose function and mark as initialized
         element._mapArrayInitialized = true;
         element._disposeMapArray = disposeMapArray;
+        // In-place refresh handle (set by reconcile): lets a parent list that
+        // reuses this element on a parent-item-identity change re-diff this list
+        // against its preserved prev instead of tearing it down and rebuilding.
+        element._refreshMapArray = disposeMapArray && disposeMapArray.__refresh;
         element._mapArrayItemElements = itemElements;
 
         // === COMPONENT REFRESH EFFECT ===
         // Single effect that watches component-level deps (e.g., selectedId) and
         // refreshes only the affected binding types on existing items.
         // Per-item effects only register COMPUTED deps (via touchComponentLevel above).
-        // Simple state vars are handled here — O(2) key lookup for selection patterns,
+        // Simple state vars are handled here: O(2) key lookup for selection patterns,
         // O(n) lightweight fallback for other patterns. Either way, avoids 1000 full
         // per-item effect re-runs that each rebuild componentState + all bindings.
         if (compiledMetadata && compiledMetadata._componentDeps === undefined) {
@@ -2921,74 +2834,46 @@ _updateLists(listElements, instance = null)
                 }
 
                 // FAST PATH: For simple component state changes (like selectedId),
-                // only update the items whose class actually changes — O(2) not O(n).
+                // only update the items whose class actually changes: O(2) not O(n).
                 // Track previous dep values to find old + new affected items.
                 const children = element.children;
                 const dataLen = children.length;
                 const classEvals = compiledMetadata?.classEvaluators;
 
-                // Build current component state once
-                const componentState = sm.untrack(() => {
-                    let cs = { ...(instance?.state || {}) };
-                    if (sm?.computed) {
-                        for (const key of Object.keys(sm.computed)) {
-                            try { cs[key] = sm.evaluateComputed(key); } catch (e) {}
-                        }
-                    }
-                    return cs;
-                });
+                // Build current component state once (same cached builder the
+                // per-row effects and the dispatcher applier use).
+                const componentState = sm.untrack(() => buildComponentState());
 
                 if (classEvals) {
-                    // Helper: evaluate class for a single row and apply diff
-                    const refreshRowClass = (row, itemProxy, idx) => {
-                        for (const evaluator of classEvals) {
-                            const targetEl = evaluator.isRoot ? row :
-                                ((row._bindingElements || row._cachedElementsArray)?.[evaluator.index]);
-                            if (!targetEl) continue;
-                            let classValue = '';
-                            try {
-                                if (evaluator.evaluator) {
-                                    if (evaluator.isSimpleProperty || evaluator.evaluator._isPropertyAccessor) {
-                                        const prop = evaluator.expression || evaluator.property;
-                                        if (prop && instance?.stateManager?.computed?.[prop]) {
-                                            classValue = self._evaluateComputedInListContext(instance, prop, itemProxy, idx, context);
-                                        } else {
-                                            classValue = evaluator.evaluator(itemProxy);
-                                        }
-                                    } else if (evaluator.evaluator._usesMergedContext) {
-                                        // Build minimal merged context for this one item
-                                        const merged = { ...componentState, _index: idx, _length: dataLen, _first: idx === 0, _last: idx === dataLen - 1 };
-                                        if (itemProxy) {
-                                            const keys = Object.keys(itemProxy);
-                                            for (let k = 0; k < keys.length; k++) merged[keys[k]] = itemProxy[keys[k]];
-                                        }
-                                        classValue = evaluator.evaluator(merged);
-                                    } else {
-                                        classValue = evaluator.evaluator(itemProxy);
-                                    }
-                                }
-                            } catch (e) { /* keep empty */ }
-                            let classNames = [];
-                            if (classValue) {
-                                if (typeof classValue === 'string') classNames = classValue.split(/\s+/).filter(Boolean);
-                                else if (Array.isArray(classValue)) classNames = classValue.filter(Boolean);
-                                else if (typeof classValue === 'object') {
-                                    for (const k in classValue) { if (classValue[k]) classNames.push(k); }
-                                }
-                            }
-                            const newSet = new Set(classNames);
-                            if (targetEl._prevBoundClasses) {
-                                for (const cls of targetEl._prevBoundClasses) {
-                                    if (!newSet.has(cls)) targetEl.classList.remove(cls);
-                                }
-                            }
-                            for (const cls of classNames) targetEl.classList.add(cls);
-                            targetEl._prevBoundClasses = newSet;
+                    // Refresh one row's classes through the shared row applier in
+                    // diff-and-remove mode; this channel owns drop-out for
+                    // component-dep-driven changes (deselect removes the class).
+                    // Merged-context evaluators get an EAGER per-row ctx
+                    // (componentState + positionals + item keys, item wins):
+                    // the applier's lazy-proxy ctx routes every read through the
+                    // reactive item proxy's traps, which measured +19% script
+                    // time on selection-heavy updates vs this plain-object build.
+                    let refreshNeedsMerged = false;
+                    for (const ev of classEvals) {
+                        if ((ev.evaluator && ev.evaluator._usesMergedContext) || (!ev.evaluator && ev.expression)) {
+                            refreshNeedsMerged = true;
+                            break;
                         }
+                    }
+                    const refreshRowClass = (row, itemProxy, idx) => {
+                        let merged = null;
+                        if (refreshNeedsMerged) {
+                            merged = { ...componentState, _index: idx, _length: dataLen, _first: idx === 0, _last: idx === dataLen - 1 };
+                            if (itemProxy) {
+                                const keys = Object.keys(itemProxy);
+                                for (let k = 0; k < keys.length; k++) merged[keys[k]] = itemProxy[keys[k]];
+                            }
+                        }
+                        self._applyClassBindingsToRow(row, itemProxy, idx, dataLen, classEvals, componentState, instance, context, merged);
                     };
 
                     // For each changed dep, find the items that reference the old and new values.
-                    // Common pattern: id === selectedId — find rows by key lookup.
+                    // Common pattern: id === selectedId; find rows by key lookup.
                     // General fallback: iterate all items (still faster than per-item effects).
                     let handled = false;
 
@@ -3004,29 +2889,24 @@ _updateLists(listElements, instance = null)
                             if (!element._prevCompDepValues) element._prevCompDepValues = {};
                             element._prevCompDepValues[dep] = newVal;
 
-                            // Find and refresh old selection row (by key)
+                            // O(1) key->row lookup for the old + new selection rows
+                            // (itemElements is keyed by the row's key value, which is
+                            // what selectedId-style deps hold). Replaces an O(n) scan
+                            // of every row per selection change. Falls through to the
+                            // full refresh below if a key isn't found (handled stays
+                            // false), preserving correctness for non-key dep values.
                             if (oldVal != null) {
-                                for (let i = 0; i < dataLen; i++) {
-                                    const row = children[i];
-                                    if (!row || !row._itemData) continue;
-                                    if (row._itemData.id === oldVal || row._itemData[element._keyProp || 'id'] === oldVal) {
-                                        refreshRowClass(row, row._itemData, row._listIndex ?? i);
-                                        handled = true;
-                                        break;
-                                    }
+                                const row = itemElements.get(oldVal);
+                                if (row && row._itemData) {
+                                    refreshRowClass(row, row._itemData, row._listIndex ?? 0);
+                                    handled = true;
                                 }
                             }
-
-                            // Find and refresh new selection row (by key)
                             if (newVal != null) {
-                                for (let i = 0; i < dataLen; i++) {
-                                    const row = children[i];
-                                    if (!row || !row._itemData) continue;
-                                    if (row._itemData.id === newVal || row._itemData[element._keyProp || 'id'] === newVal) {
-                                        refreshRowClass(row, row._itemData, row._listIndex ?? i);
-                                        handled = true;
-                                        break;
-                                    }
+                                const row = itemElements.get(newVal);
+                                if (row && row._itemData) {
+                                    refreshRowClass(row, row._itemData, row._listIndex ?? 0);
+                                    handled = true;
                                 }
                             }
                         }
@@ -3080,6 +2960,14 @@ _updateLists(listElements, instance = null)
             }
             if (disposeRefreshEffect) {
                 try { disposeRefreshEffect(); } catch (e) { /* ignore */ }
+            }
+            // Computed-template dispatcher: dispose its stable shared-dep effect
+            // and drop the dispatcher so a re-render rebuilds against the fresh
+            // closure world (static dispatchers hold no effect and can persist).
+            const _cd = element._wfListSinkDispatcher;
+            if (_cd && _cd.computedRows) {
+                try { _cd.dispose(); } catch (e) { /* ignore */ }
+                element._wfListSinkDispatcher = null;
             }
             baseDisposeMapArray();
         };
@@ -3195,18 +3083,20 @@ _updateLists(listElements, instance = null)
 
             // For data-render, we need to handle initial state
             if (isRenderMode) {
-                instance._hasNonListDataRender = true;
-                this._processDataRenderElement(conditionalElement, condPath, instance);
+                const renderCtx = this._processDataRenderElement(conditionalElement, condPath, instance);
+                // Drive non-list data-render through the component render effect:
+                // track the context so a post-insert effect rescan can re-add it,
+                // and push its render meta so the effect observes the condition's
+                // computed/state directly (establishing the graph edge).
+                if (renderCtx && instance._effectMeta) {
+                    (instance._renderContexts || (instance._renderContexts = [])).push(renderCtx);
+                    instance._effectMeta.push(this._buildRenderMeta(renderCtx, instance));
+                }
             } else {
-                // Use the existing helper method for data-show
-                this._contextRegistry._createItemLevelContext({
-                    element: conditionalElement,
-                    contextType: 'conditional',
-                    path: condPath,
-                    instance,
-                    createMethod: this._contextRegistry.createConditionalContext.bind(this._contextRegistry)
-                });
-
+                // data-show: no registry-tracked conditional context. The component
+                // render effect owns initial paint and every update via this 'show'
+                // meta (_executeShowForEffect → applyShow, transitions included); the
+                // setup-time context paint was a redundant parallel build.
                 if (instance._effectMeta) {
                     const negate = condPath.startsWith('!');
                     const cleanPath = negate ? condPath.slice(1) : condPath;
@@ -3238,17 +3128,16 @@ _updateLists(listElements, instance = null)
         // Strip data-cloak from template so re-insertions don't inherit it
         templateClone.removeAttribute('data-cloak');
 
-        // Create the context with render mode
-        const context = this._contextRegistry.createConditionalContext(
+        // Create the render record (plain object, not registered; the render
+        // effect holds it directly via its type:'render' meta).
+        const context = this._contextRecords.createRenderRecord(
             path,
             instance,
-            element,
-            null // parent
+            element
         );
 
         if (context) {
             // Add render-specific properties
-            context.mode = 'render';
             context.templateClone = templateClone;
             context.isRendered = conditionValue;
 
@@ -3263,6 +3152,8 @@ _updateLists(listElements, instance = null)
                 context.placeholder = null; // No placeholder needed when rendered
             }
         }
+
+        return context;
     },
     /**
      * Evaluate a condition path for data-show/data-render
@@ -3293,7 +3184,9 @@ _updateLists(listElements, instance = null)
     },
 
     /**
-     * Escape HTML special characters to prevent XSS
+     * Escape HTML special characters to prevent XSS.
+     * Retained as a standalone HTML-escape utility (the create path now writes
+     * textContent directly and needs no escaping); still covered by tests.
      * @param {*} val - Value to escape
      * @returns {string} Escaped string safe for HTML insertion
      */
@@ -3303,7 +3196,7 @@ _updateLists(listElements, instance = null)
 
     _escapeHTML(val) {
         if (val == null) return '';
-        // PERF: Numbers can't contain &<>"' — skip String() and regex entirely
+        // PERF: Numbers can't contain &<>"', so skip String() and regex entirely
         if (typeof val === 'number') return '' + val;
         const str = typeof val === 'string' ? val : String(val);
         // PERF: charCodeAt loop beats regex for short strings (no engine startup cost)
@@ -3318,41 +3211,72 @@ _updateLists(listElements, instance = null)
     },
 
     /**
-     * Generate HTML string for multiple rows using pre-compiled template
-     * Consolidates the HTML building loop used by _fastInitialRender, _fastAppendRender, _fastBulkReplace
+     * Bulk create fast path: build rows by cloning a cached row prototype and
+     * writing each text binding straight to el.textContent, batched into one
+     * DocumentFragment insert. (Replaced the older serialize-to-HTML-string +
+     * element.innerHTML reparse, which was ~85% of create script; cloneNode +
+     * direct setter writes is the ~4.4us/row ceiling-test approach.)
      *
+     * Output is DOM-identical to the old innerHTML path: every text binding in a
+     * qualifying template is a plain (non-expression/computed/props/listvar) path,
+     * textContent coercion is null -> '', numbers via '' + n, else String, and
+     * textContent is inherently injection-safe so no HTML-escape pass is needed
+     * (the old path escaped into an HTML string; this writes text directly). Root
+     * text bindings (whole-row textContent) are handled here too.
+     *
+     * Class bindings, the per-row effect, integrations, and the elements array
+     * are applied UNCHANGED by the caller's downstream loop (which reuses the
+     * row._bindingElements stashed here).
+     *
+     * @param {Object} compiledMetadata - Template metadata (bindings, elementPaths, innerHTMLParts)
      * @param {Object} instance - Component instance for state/computed access
-     * @param {Array} data - Full data array
-     * @param {Array} parts - Pre-split template parts
-     * @param {Array} accessors - Pre-compiled accessor functions
-     * @param {number} startIndex - First item index to render
-     * @param {number} endIndex - One past last item index to render
-     * @returns {string} HTML string for all rows joined together
+     * @param {Array} data - Full data array (item proxies)
+     * @param {number} startIndex - First item index to render (0 = full create, >0 = append)
+     * @param {HTMLElement} element - List container (also the prototype parse context)
+     * @param {Array} parts - Pre-split template parts (token-free row HTML = parts.join(''))
+     * @returns {boolean} true if rows were built; false only for a degenerate
+     *   template with no single root element (caller falls back to the mapFn path).
+     * @private
      */
-    _generateRowsHTML(instance, data, parts, accessors, startIndex, endIndex) {
-        // PERF: Keep array.push + join for large N - more memory efficient than string concat
-        const htmlParts = [];
+    _buildRowsCloneSetter(compiledMetadata, instance, data, startIndex, element, parts) {
+        // Lazily build + cache the row prototype. parts.join('') is the row HTML
+        // with empty bind sites (tokens already removed), whitespace already
+        // collapsed, framework attrs already stripped. Parsing it inside a clone
+        // of the list element reproduces element.innerHTML's parse context, so
+        // table-section rows (<tr>/<td>) survive exactly as the innerHTML path
+        // would build them.
+        let proto = compiledMetadata._rowPrototype;
+        if (proto === undefined) {
+            const shell = element.cloneNode(false);
+            shell.innerHTML = parts.join('');
+            proto = shell.firstElementChild || null;
+            compiledMetadata._rowPrototype = proto;
+        }
+        if (!proto) return false; // no single-element row prototype; caller falls back
+
+        const bindings = compiledMetadata.bindings;
+        const bcount = bindings.length;
+        const endIndex = data.length;
         const listLength = data.length;
-        const accessorCount = accessors.length;
         const state = instance?.state || {};
         const computed = instance?.stateManager?.computed || {};
         const stateManager = instance?.stateManager;
 
-        // PERF: Classify accessors once before the loop.
-        // "simple" accessors read a single flat property from the item — the vast majority.
-        // By reading directly from item[path] we bypass the Proxy GET trap entirely
-        // (~50-100ns per call × 2 accessors × 10K rows = 1-2ms saved + reduced GC).
-        // Only fall back to the Proxy for accessors that need list context vars,
-        // component state, or computed properties.
-        const needsProxy = accessors.some(a =>
-            !a.path || a.path.includes('.') || a.path.startsWith('_') || a.path === '$item' ||
-            (a.path in state) || (a.path in computed)
-        );
+        // Root text binding (data-bind on the row root): its value becomes the whole
+        // row's textContent. Such templates have no surviving child bindings (root
+        // textContent replaces children), so bcount is 0 in that case.
+        const rootBindPath = (compiledMetadata.rootBindings && compiledMetadata.rootBindings.hasBind)
+            ? compiledMetadata.rootBindings.bindPath : null;
 
-        let mergedContext = null;
+        // needsProxy: simple flat item props are read directly (bypassing the Proxy
+        // GET trap); dotted / context / state / computed paths go through a shared
+        // merged-context proxy.
+        const _isComplex = p => !p || p.includes('.') || p.startsWith('_') || p === '$item' || (p in state) || (p in computed);
+        const needsProxy = bindings.some(b => _isComplex(b.path)) || (rootBindPath != null && _isComplex(rootBindPath));
+
         let currentItem = null;
         let currentIndex = 0;
-
+        let mergedContext = null;
         if (needsProxy) {
             mergedContext = new Proxy({}, {
                 get(target, prop) {
@@ -3372,35 +3296,93 @@ _updateLists(listElements, instance = null)
                 }
             });
         }
+        const rootAccessor = rootBindPath ? this._createPropertyAccessor(rootBindPath) : null;
 
+        // PERF: read items off the RAW array, not the reactive proxy. data[i] would
+        // fire the array GET trap (creating/caching a per-row proxy) and each
+        // item[path] read would fire an object GET trap (~3 trap dispatches/row over
+        // 10k rows is the bulk of the create "(program)" cost. Create-time text/value
+        // reads are not dependency-tracking (the per-item effect wires reactivity
+        // separately from the proxy), so the raw values are identical. Mirrors the
+        // raw-target reads already used by the class-copy path and the remove fast path.
+        const rawData = stateManager?._proxyTargets?.get(data) || data;
+
+        // Compiled (composed-emitter) text path: for the flat item-prop shape
+        // (the !needsProxy fast path), run a per-template emitter set instead of
+        // the inline loop. Output is byte-identical by construction (same raw
+        // reads, same shared __wf_str writer); class/style/attr and the per-row
+        // update effect are applied later by the caller, untouched. A dev
+        // shadow-compare verifies the first row against the generic build and
+        // disables the path on any mismatch. Force-generic mode or the proxy
+        // path opt out.
+        const _compileMode = getRowCompileMode();
+        const _textSpec = (_compileMode !== 'generic' && !needsProxy && !compiledMetadata._rowCompileDisabled)
+            ? getTextEmitters(compiledMetadata) : null;
+        let _shadowChecked = compiledMetadata._rowCompileShadowChecked === true;
+
+        const fragment = document.createDocumentFragment();
         for (let i = startIndex; i < endIndex; i++) {
-            const item = data[i];
+            const item = rawData[i];
             if (!item) continue;
 
-            currentItem = item;
-            currentIndex = i;
-
-            let rowHTML = parts[0];
+            const row = proto.cloneNode(true);
+            const els = this._buildElementsArrayFromMetadata(row, compiledMetadata);
 
             if (needsProxy) {
-                for (let j = 0; j < accessorCount; j++) {
-                    let value = accessors[j].accessor(mergedContext);
-                    value = this._escapeHTML(value);
-                    rowHTML += value + parts[j + 1];
+                currentItem = item;
+                currentIndex = i;
+                for (let j = 0; j < bcount; j++) {
+                    const b = bindings[j];
+                    const el = els[b.index];
+                    if (!el) continue;
+                    const acc = b._textAccessor || (b._textAccessor = this._createPropertyAccessor(b.path));
+                    const v = acc(mergedContext);
+                    el.textContent = __wf_str(v);
+                }
+                if (rootBindPath) {
+                    const rv = rootAccessor(mergedContext);
+                    row.textContent = __wf_str(rv);
+                }
+            } else if (_textSpec) {
+                // COMPILED PATH: run the per-template text-emitter set.
+                applyRowText(_textSpec, els, item, row);
+                if (__DEV__ && !_shadowChecked) {
+                    _shadowChecked = true;
+                    compiledMetadata._rowCompileShadowChecked = true;
+                    shadowCompareRow(compiledMetadata, row, item, proto,
+                        (r) => this._buildElementsArrayFromMetadata(r, compiledMetadata));
                 }
             } else {
-                // FAST PATH: All accessors are simple item properties — direct read
-                for (let j = 0; j < accessorCount; j++) {
-                    let value = item[accessors[j].path];
-                    value = this._escapeHTML(value);
-                    rowHTML += value + parts[j + 1];
+                // FAST PATH: all bindings are simple item properties; direct read,
+                // direct textContent write, no calls (the flat text-row shape).
+                for (let j = 0; j < bcount; j++) {
+                    const b = bindings[j];
+                    const el = els[b.index];
+                    if (!el) continue;
+                    const v = item[b.path];
+                    el.textContent = __wf_str(v);
+                }
+                if (rootBindPath) {
+                    const rv = item[rootBindPath];
+                    row.textContent = __wf_str(rv);
                 }
             }
 
-            htmlParts.push(rowHTML);
+            // Stash the elements array so the caller's downstream per-row loop
+            // reuses it instead of walking the element paths a second time.
+            row._bindingElements = els;
+            fragment.appendChild(row);
         }
 
-        return htmlParts.join('');
+        if (startIndex === 0) {
+            // FULL CREATION: clear then insert (the container is normally already
+            // empty at full create), mirroring the old element.innerHTML = ...
+            element.replaceChildren(fragment);
+        } else {
+            // APPEND MODE: insert new rows at end without disturbing existing ones.
+            element.appendChild(fragment);
+        }
+        return true;
     },
 
     /**
@@ -3521,6 +3503,10 @@ _updateLists(listElements, instance = null)
     _applyClassBindingsToRow(row, item, index, dataLen, classEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
         const elements = row._bindingElements || row._cachedElementsArray;
         let mergedCtx = prebuiltMergedCtx || null;
+        // Lazy ctx for compiled (_usesMergedContext) evaluators, which consume the
+        // context GET-only. Kept separate from the eager `mergedCtx` so it never
+        // reaches the fallback path's Object.keys(). Built on first need only.
+        let lazyMergedCtx = null;
 
         // Item-level computeds (fn(item) with fn.length > 0) must be evaluated
         // per item, so they can't be in any cached/prebuilt mergedCtx. They go
@@ -3528,7 +3514,7 @@ _updateLists(listElements, instance = null)
         // `isShared ? 'on' : ''` resolve correctly.
         //
         // Skip the eager evaluation entirely when no evaluator on this row
-        // needs the merged context — every simple-property class binding
+        // needs the merged context; every simple-property class binding
         // (`data-bind-class="rowClass"`) resolves the computed directly via
         // _evaluateComputedInListContext inside the per-evaluator loop below.
         // Eagerly evaluating ALL item-level computeds in that case allocates
@@ -3603,6 +3589,24 @@ _updateLists(listElements, instance = null)
 
             if (!targetEl) continue;
 
+            // Runtime-resolved forms (computed:NAME, external(), $store
+            // shorthand): the compiled merged-ctx evaluator cannot express
+            // these (it compiles to garbage and returns falsy, which the
+            // diff-tracking applyClass kernel would honor as a clear).
+            // Delegate to the attribute-path resolver: the same strategies the
+            // executor path uses, applied through the same kernel. Classified
+            // once per evaluator (this loop runs per row).
+            let _rtForm = evaluator._rtForm;
+            if (_rtForm === undefined) {
+                const e = evaluator.expression;
+                _rtForm = !!(e && (e.startsWith('computed:')
+                    || e.indexOf('external(') !== -1 || /\$[a-zA-Z]/.test(e)));
+                evaluator._rtForm = _rtForm;
+            }
+            if (_rtForm) {
+                this._processOptimizedClassBinding(targetEl, item, evaluator.expression, index, listContext);
+                continue;
+            }
             let classValue;
             try {
                 if (evaluator.evaluator) {
@@ -3615,10 +3619,22 @@ _updateLists(listElements, instance = null)
                             classValue = evaluator.evaluator(item);
                         }
                     } else if (evaluator.evaluator._usesMergedContext) {
-                        if (!mergedCtx) {
-                            mergedCtx = this._buildClassMergedCtx(item, componentState, instance, index, dataLen);
+                        // Compiled evaluator consumes the ctx GET-only, so use the cheap
+                        // lazy proxy instead of the {...item, ...componentState} spread.
+                        // The proxy spread triggers ownKeys + a GET for every item
+                        // property (V8); on a same-key replace that is ~9% of update
+                        // time for a class that never changes. Mirrors the lazy ctx
+                        // already used by _applyStyleBindingsToRow/_applyAttrBindingsToRow.
+                        // Prefer an eager mergedCtx if one was already built above (it
+                        // carries the seeded item-level computed values).
+                        let ctx = mergedCtx;
+                        if (!ctx) {
+                            if (!lazyMergedCtx) {
+                                lazyMergedCtx = this._buildClassMergedCtxLazy(item, componentState, instance, index, dataLen);
+                            }
+                            ctx = lazyMergedCtx;
                         }
-                        classValue = evaluator.evaluator(mergedCtx);
+                        classValue = evaluator.evaluator(ctx);
                     } else {
                         classValue = evaluator.evaluator(item);
                     }
@@ -3657,40 +3673,17 @@ _updateLists(listElements, instance = null)
                 classValue = '';
             }
 
-            // Targeted rebind: skip DOM class manipulation for non-matching evaluators.
-            // Bypass when the evaluator references a registered computed by name —
-            // the computed body may read the changed prop transitively.
-            if (this._targetedProp) {
-                const expr = evaluator.expression || evaluator.property || '';
-                if (expr && !expr.includes(this._targetedProp)
-                    && !this._evaluatorRefsComputed(evaluator, instance)) continue;
-            }
-
-            // Apply class (add to existing static classes, don't replace them).
-            // NOTE: this path is intentionally additive — a "diff and remove
-            // dropped keys" version was attempted and broke 14 tests because
-            // _executeClassBindings also writes to _prevBoundClasses for the
-            // same element. Class drop-out semantics are owned by
-            // _executeClassBindings, which uses _toggleBoundClass correctly.
-            if (classValue) {
-                let classNames;
-                if (Array.isArray(classValue)) {
-                    classNames = classValue.filter(c => c && typeof c === 'string');
-                } else if (typeof classValue === 'object' && classValue !== null) {
-                    classNames = [];
-                    for (const key in classValue) {
-                        if (classValue[key]) classNames.push(key);
-                    }
-                } else {
-                    classNames = String(classValue).split(/\s+/).filter(c => c);
-                }
-
-                if (classNames.length > 0) {
-                    targetEl.classList.add(...classNames);
-                }
-                // CRITICAL: Initialize _prevBoundClasses for _toggleBoundClass tracking
-                targetEl._prevBoundClasses = new Set(classNames);
-            }
+            // ONE application semantics for every class channel: the
+            // BindingWriters applyClass kernel (diff-tracked via
+            // _prevBoundClasses, early-exit on unchanged set, string/array/
+            // object normalization, falsy clears). _executeClassBindings and
+            // every fallback route through the same kernel
+            // (_toggleBoundClass -> applyClass), so mixed writers on one
+            // element agree byte-for-byte; two writers with different
+            // semantics sharing _prevBoundClasses is a known hazard. The
+            // refresh channel's diff-and-remove (deselect) is the kernel's
+            // native behavior.
+            applyClass(targetEl, classValue);
         }
     },
 
@@ -3699,7 +3692,7 @@ _updateLists(listElements, instance = null)
      *
      * Includes: item properties, component state, list-context vars, AND
      * item-level computed VALUES (computeds defined as `fn(item) { ... }` with
-     * fn.length > 0 — called once per row with the current item).
+     * fn.length > 0, called once per row with the current item).
      *
      * Without item-level computeds in the merged context, expressions like
      * `{ shared: isShared }` and `isShared ? 'on' : ''` see `isShared` as
@@ -3708,6 +3701,42 @@ _updateLists(listElements, instance = null)
      *
      * @private
      */
+    // Lazy equivalent of _buildClassMergedCtx for GET-only (compiled-evaluator)
+    // consumption. Resolves the same precedence as the eager builder
+    // (item-level computed not shadowed by an item key > componentState > item,
+    // plus the _index/_length/_first/_last positionals) but without the
+    // {...item, ...componentState} spread and without eagerly evaluating every
+    // computed; each is resolved on access. Not Object.keys-safe (no ownKeys
+    // trap), so it is used only where the consumer reads named properties.
+    _buildClassMergedCtxLazy(item, componentState, instance, index, dataLen) {
+        const _idx = index, _len = dataLen;
+        const origComputeds = instance?.stateManager?._originalComputedFunctions;
+        const self = this;
+        return new Proxy(item, {
+            get(target, prop) {
+                if (prop === '_index') return _idx;
+                if (prop === '_length') return _len;
+                if (prop === '_first') return _idx === 0;
+                if (prop === '_last') return _idx === _len - 1;
+                // Item-level computed whose name is NOT an own item key overrides
+                // componentState and item (matches the eager loop's `!(key in item)`
+                // guard). Use _evaluateComputedInListContext so dependency tracking
+                // sees the reads (direct fn.call bypasses tracking).
+                if (origComputeds && !(prop in target)) {
+                    const fn = origComputeds.get(prop);
+                    if (fn && typeof fn === 'function') {
+                        try {
+                            return self._evaluateComputedInListContext(instance, prop, item, _idx, null);
+                        } catch (e) { return undefined; }
+                    }
+                }
+                // componentState wins over item (eager spread order: item then componentState)
+                if (componentState && prop in componentState) return componentState[prop];
+                return target[prop];
+            }
+        });
+    },
+
     _buildClassMergedCtx(item, componentState, instance, index, dataLen) {
         const ctx = {
             ...item,
@@ -3723,7 +3752,7 @@ _updateLists(listElements, instance = null)
         // breaks reactive updates). Override the stale value the componentState
         // spread placed in ctx for bare-form computeds (component-level eval
         // produces wrong value when the body reads item state via `this.X`).
-        // Item own-properties win — if item has a key matching a computed name,
+        // Item own-properties win: if item has a key matching a computed name,
         // keep the item value.
         const originals = instance?.stateManager?._originalComputedFunctions;
         if (originals) {
@@ -3746,9 +3775,9 @@ _updateLists(listElements, instance = null)
      */
     _applyStyleBindingsToRow(row, item, index, dataLen, styleEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
         const elements = row._bindingElements || row._cachedElementsArray;
-        // PERF: Reusable lazy proxy — avoids spreading item + componentState per evaluator.
+        // PERF: Reusable lazy proxy; avoids spreading item + componentState per evaluator.
         // Destructuring `const {x, y} = ctx` only calls GET for needed properties (no ownKeys).
-        // V8 proxy spread ({...proxy}) triggers ownKeys + ALL property GETs — extremely slow.
+        // V8 proxy spread ({...proxy}) triggers ownKeys + ALL property GETs; extremely slow.
         let lazyCtx = prebuiltMergedCtx || null;
         if (!lazyCtx) {
             const _idx = index, _len = dataLen;
@@ -3794,6 +3823,19 @@ _updateLists(listElements, instance = null)
             }
             if (!targetEl) continue;
             let resultObject;
+            // Runtime-resolved forms (external()/$store): the compiled
+            // evaluator cannot express them; delegate to the generic
+            // processor, classified once per evaluator.
+            let _rtForm = evaluator._rtForm;
+            if (_rtForm === undefined) {
+                const e = evaluator.expression;
+                _rtForm = !!(e && (e.indexOf('external(') !== -1 || /\$[a-zA-Z]/.test(e)));
+                evaluator._rtForm = _rtForm;
+            }
+            if (_rtForm) {
+                this._processStyleBinding(targetEl, item, evaluator.expression, index, listContext);
+                continue;
+            }
             try {
                 if (evaluator.isComputed && evaluator.computedName && instance) {
                     resultObject = this._evaluateComputedInListContext(instance, evaluator.computedName, item, index, listContext);
@@ -3804,47 +3846,49 @@ _updateLists(listElements, instance = null)
                     continue;
                 }
             } catch (e) { continue; }
-            // Targeted rebind: skip DOM style manipulation for non-matching evaluators.
-            // Bypass when the evaluator references a registered computed by name —
-            // the computed body may read the changed prop transitively.
-            if (this._targetedProp && evaluator.expression
-                && !evaluator.expression.includes(this._targetedProp)
-                && !this._evaluatorRefsComputed(evaluator, instance)) continue;
-
             if (resultObject && typeof resultObject === 'object') {
-                const style = targetEl.style;
-                // Clear previously-bound keys that aren't in the new object
-                // (otherwise an `assigneeStyle` returning `{}` after unassign
-                // leaves the prior background:color on the element).
-                const prev = targetEl._boundStyleProps;
-                if (prev && prev.size > 0) {
-                    for (const prevProp of prev) {
-                        if (Object.prototype.hasOwnProperty.call(resultObject, prevProp)) continue;
-                        if (prevProp.startsWith('--')) style.removeProperty(prevProp);
-                        else style[prevProp] = '';
-                        prev.delete(prevProp);
-                    }
-                }
-                for (const prop in resultObject) {
-                    const val = resultObject[prop];
-                    style[prop] = (val === null || val === undefined) ? '' : val;
-                }
-                if (!targetEl._boundStyleProps) targetEl._boundStyleProps = new Set();
-                for (const k in resultObject) targetEl._boundStyleProps.add(k);
+                // The BindingWriters kernel owns object-form style application
+                // (stale-key cleanup via _boundStyleProps + applyStyleProp
+                // per prop).
+                applyStyleObj(targetEl, resultObject);
             }
+        }
+    },
+
+    /**
+     * The ONE decorative (class/style/attr) row-apply sequence, shared by
+     * every full-row composition (mapFn initial render, the computed
+     * dispatcher's applyRowFull, onItemUpdate's same-key rebind, the render
+     * arm's post-flip re-apply). The evaluator fast paths own each kind:
+     * they cover indexed AND root targets, and fall back per-evaluator to
+     * the generic processors for runtime-resolved expression forms.
+     * @private
+     */
+    _applyRowDecor(rowEl, item, md, index, dataLen, componentState, instance, listContext) {
+        // No root fallbacks needed: _compileTemplate unshifts a root evaluator
+        // entry whenever rootBindings carry a style/attr expression, so the
+        // evaluator arrays cover every decorative binding present.
+        if (md.classEvaluators?.length) {
+            this._applyClassBindingsToRow(rowEl, item, index, dataLen, md.classEvaluators, componentState, instance, listContext);
+        }
+        if (md.styleEvaluators?.length) {
+            this._applyStyleBindingsToRow(rowEl, item, index, dataLen, md.styleEvaluators, componentState, instance, listContext);
+        }
+        if (md.attrEvaluators?.length) {
+            this._applyAttrBindingsToRow(rowEl, item, index, dataLen, md.attrEvaluators, componentState, instance, listContext);
         }
     },
 
     /**
      * Whether the component instance has ANY registered computed properties.
      * Used to fast-path past the binding-reactivity bypass logic for
-     * components that declare no computeds — every per-binding
+     * components that declare no computeds; every per-binding
      * `computeds[name]` lookup would miss, so the bypass can be skipped
      * entirely.
      *
      * Checked live (no cache) because caching breaks if a computed is
      * registered AFTER the first list-binding evaluation queries the
-     * cache — the stale `false` would make all subsequent bypass checks
+     * cache; the stale `false` would make all subsequent bypass checks
      * silently skip computed-name bindings, producing partial updates
      * (style updates but class/text don't).
      * @private
@@ -3854,38 +3898,6 @@ _updateLists(listElements, instance = null)
         if (!c) return false;
         for (const _k in c) return true;
         return false;
-    },
-
-    /**
-     * Decide whether a list-binding evaluator's expression depends on any
-     * registered computed by name. Cached per-evaluator. Used to bypass the
-     * targeted-rebind path-equality filter for bindings whose value comes
-     * from a computed — the computed's body may read the changed prop
-     * transitively.
-     * @private
-     */
-    _evaluatorRefsComputed(evaluator, instance) {
-        if (evaluator._computedRefsCache !== undefined) return evaluator._computedRefsCache;
-        if (!this._instanceHasComputeds(instance)) {
-            evaluator._computedRefsCache = false;
-            return false;
-        }
-        const computed = instance.stateManager.computed;
-        let found = false;
-        if (evaluator.expression) {
-            if (evaluator.isComputed && evaluator.computedName && computed[evaluator.computedName]) {
-                found = true;
-            } else {
-                const matches = evaluator.expression.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*\b/g);
-                if (matches) {
-                    for (let i = 0; i < matches.length; i++) {
-                        if (computed[matches[i]]) { found = true; break; }
-                    }
-                }
-            }
-        }
-        evaluator._computedRefsCache = found;
-        return found;
     },
 
     /**
@@ -3935,6 +3947,19 @@ _updateLists(listElements, instance = null)
                 }
             }
             if (!targetEl) continue;
+            // Runtime-resolved forms (external()/$store): the compiled
+            // evaluator cannot express them; delegate to the generic
+            // processor, classified once per evaluator.
+            let _rtForm = evaluator._rtForm;
+            if (_rtForm === undefined) {
+                const e = evaluator.expression;
+                _rtForm = !!(e && (e.indexOf('external(') !== -1 || /\$[a-zA-Z]/.test(e)));
+                evaluator._rtForm = _rtForm;
+            }
+            if (_rtForm) {
+                this._processAttrBinding(targetEl, item, evaluator.expression, index, listContext);
+                continue;
+            }
             let resultObject;
             try {
                 if (evaluator.isComputed && evaluator.computedName && instance) {
@@ -3946,37 +3971,15 @@ _updateLists(listElements, instance = null)
                     continue;
                 }
             } catch (e) { continue; }
-            // Targeted rebind: skip DOM attr manipulation for non-matching evaluators.
-            // Bypass when the evaluator references a registered computed by name —
-            // the computed body may read the changed prop transitively.
-            if (this._targetedProp && evaluator.expression
-                && !evaluator.expression.includes(this._targetedProp)
-                && !this._evaluatorRefsComputed(evaluator, instance)) continue;
-
             if (resultObject && typeof resultObject === 'object') {
-                // Clear previously-bound attrs that aren't in the new object
-                // (matches the parallel fix in _applyStyleBindingsToRow).
-                const prev = targetEl._boundAttrProps;
-                if (prev && prev.size > 0) {
-                    for (const prevAttr of prev) {
-                        if (Object.prototype.hasOwnProperty.call(resultObject, prevAttr)) continue;
-                        if (targetEl.hasAttribute(prevAttr)) targetEl.removeAttribute(prevAttr);
-                        prev.delete(prevAttr);
-                    }
-                }
-                for (const attr in resultObject) {
-                    if (this._isBlocklistedAttr(attr)) continue;
-                    const val = resultObject[attr];
-                    if (val === null || val === undefined || val === false) {
-                        targetEl.removeAttribute(attr);
-                    } else {
-                        const sanitized = this._sanitizeAttrValue(attr, val);
-                        if (sanitized === null) continue;
-                        targetEl.setAttribute(attr, String(sanitized));
-                    }
-                }
-                if (!targetEl._boundAttrProps) targetEl._boundAttrProps = new Set();
-                for (const k in resultObject) targetEl._boundAttrProps.add(k);
+                // Canonical attr-object writer (blocklist / sanitize / boolean-attr
+                // semantics + stale-key cleanup), the same path the expression and
+                // component bindings use, so the compiled-evaluator fast path can't
+                // drift from them.
+                applyAttrObj(targetEl, resultObject, this._attrWriterHelpers || (this._attrWriterHelpers = {
+                    isBlocklisted: (prop) => this._isBlocklistedAttr && this._isBlocklistedAttr(prop),
+                    sanitize: (prop, v) => this._sanitizeAttrValue ? this._sanitizeAttrValue(prop, v) : v
+                }));
             }
         }
     },
@@ -3998,6 +4001,8 @@ _updateLists(listElements, instance = null)
         const deps = new Set();
         const reservedWords = this._expressionReservedWords;
 
+        this._computeDeps(compiledMetadata);
+
         const addVar = (v) => {
             if (!v || typeof v !== 'string') return;
             if (v.indexOf('.') !== -1) return;           // Only simple names
@@ -4014,42 +4019,36 @@ _updateLists(listElements, instance = null)
             }
         };
 
-        const addExprVars = (expr, preExtracted) => {
-            const vars = preExtracted || (expr?.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || []);
-            for (const v of vars) addVar(v);
+        // Unified per-binding consumer driven by _deps. Partitions reads into
+        // component-level deps (addVar skips item-level names). A whole-binding
+        // computed reference registers the computed if it is a known computed.
+        const consume = (d) => {
+            switch (d.kind) {
+                case 'skip':
+                case 'itemPath':
+                    return; // model binds an item field; no component dep
+                case 'computedName':
+                    if (sm?.computed?.[d.reads[0]]) deps.add('computed:' + d.reads[0]);
+                    return;
+                case 'path':
+                case 'expr':
+                    for (let i = 0; i < d.reads.length; i++) addVar(d.reads[i]);
+                    return;
+            }
         };
 
-        // Same iteration as _extractStaticItemProps — all binding types
-        for (const b of (compiledMetadata.bindings || [])) {
-            if (b.isExpression && b.expressionVars) addExprVars(null, b.expressionVars);
-            else if (!b.isExpression && !b.isListContextVar && !b.isPropsPath && !b.isComputed) addVar(b.path);
+        const arrays = [
+            compiledMetadata.bindings, compiledMetadata.classBindings,
+            compiledMetadata.styleBindings, compiledMetadata.attrBindings,
+            compiledMetadata.models, compiledMetadata.shows,
+            compiledMetadata.htmlBindings, compiledMetadata.renders
+        ];
+        for (const arr of arrays) {
+            if (!arr) continue;
+            for (const b of arr) consume(b._deps);
         }
-        for (const cb of (compiledMetadata.classBindings || [])) {
-            if (cb.isComputed && cb.expression) {
-                const name = cb.expression.startsWith('computed:') ? cb.expression.slice(9) : cb.expression;
-                if (sm?.computed?.[name]) deps.add('computed:' + name);
-            } else if (cb.expression) addExprVars(cb.expression, null);
-        }
-        for (const sb of (compiledMetadata.styleBindings || [])) { if (sb.expression) addExprVars(sb.expression, null); }
-        if (compiledMetadata.rootBindings?.bindStyleExpr) addExprVars(compiledMetadata.rootBindings.bindStyleExpr, null);
-        for (const ab of (compiledMetadata.attrBindings || [])) { if (ab.expression) addExprVars(ab.expression, null); }
-        if (compiledMetadata.rootBindings?.bindAttrExpr) addExprVars(compiledMetadata.rootBindings.bindAttrExpr, null);
-        for (const sh of (compiledMetadata.shows || [])) addVar(sh.path);
-        for (const hb of (compiledMetadata.htmlBindings || [])) addVar(hb.path);
-        for (const rb of (compiledMetadata.renders || [])) {
-            if (rb.isExpression && rb.expressionVars) addExprVars(null, rb.expressionVars);
-            else addVar(rb.path);
-        }
-        if (compiledMetadata.rootBindings) {
-            if (compiledMetadata.rootBindings.bindPath) addVar(compiledMetadata.rootBindings.bindPath);
-            if (compiledMetadata.rootBindings.showPath) addVar(compiledMetadata.rootBindings.showPath);
-            if (compiledMetadata.rootBindings.bindClassExpr) {
-                const expr = compiledMetadata.rootBindings.bindClassExpr;
-                if (expr.startsWith('computed:')) {
-                    const name = expr.slice(9);
-                    if (sm?.computed?.[name]) deps.add('computed:' + name);
-                } else addExprVars(expr, null);
-            }
+        if (compiledMetadata.rootBindings?._deps) {
+            for (const d of compiledMetadata.rootBindings._deps) consume(d);
         }
 
         // Also include _computedsWithExternalDeps (store-backed computeds that need per-item refresh)
@@ -4063,191 +4062,536 @@ _updateLists(listElements, instance = null)
     },
 
     /**
-     * Extract item dependency property names from compiled metadata.
-     * Called once per template, result cached on compiledMetadata._staticItemProps.
-     * Returns null if template has computed class bindings (can't statically resolve deps).
+     * Single source of truth for per-binding dependency classification.
+     *
+     * Attaches `_deps = { kind, reads, paths }` to every binding in the compiled
+     * metadata (and a normalized `rootBindings._deps` array). The four dependency
+     * consumers (_extractStaticItemProps, _extractComponentDeps, the per-item
+     * first-run walk, and the class-only classifier) all read this instead of
+     * re-deriving the per-type branching from the raw flags. Idempotent and
+     * cached via metadata._depsComputed, so the cost is one-time per template
+     * (amortized over every row created from it).
+     *
+     * kind:
+     *   'skip'         - no item/component deps (computed:/props:/list-context var)
+     *   'itemPath'     - touch item path only; no component reg, never bails (model)
+     *   'path'         - single identifier that may name a computed
+     *   'expr'         - expression; reads = identifiers, paths = dotted member paths
+     *   'computedName' - the whole binding is a computed reference (always bail/eval)
+     *
+     * `reads` are raw identifiers; consumers apply their own _/computed:/props:
+     * filtering and item-vs-component partitioning. `paths` are full dotted member
+     * paths for nested-leaf registration (expr only; null otherwise).
      * @private
      */
-    _extractStaticItemProps(compiledMetadata, instance) {
+    _computeDeps(metadata) {
+        if (!metadata || metadata._depsComputed) return;
+        metadata._depsComputed = true;
+
+        const skip = { kind: 'skip', reads: [], paths: null };
+        const exprDeps = (b) => ({
+            kind: 'expr',
+            reads: b.expressionVars || (b.expression ? this._extractExpressionVars(b.expression) : []),
+            paths: b.expressionPaths || (b.expression ? this._extractExpressionPaths(b.expression) : null)
+        });
+        // show / html / render: an expression (with vars) is 'expr', else a path.
+        // Applying this uniformly to html is the drift fix; the old static
+        // extractors treated html as path-only and ignored html expressions.
+        const exprOrPath = (b) => (b.isExpression && b.expressionVars)
+            ? { kind: 'expr', reads: b.expressionVars, paths: b.expressionPaths || null }
+            : { kind: 'path', reads: [b.path], paths: null };
+
+        for (const b of (metadata.bindings || [])) {
+            if (b.isExpression) {
+                b._deps = b.expressionVars ? exprDeps(b) : skip;
+            } else if (b.isComputed || b.isPropsPath || b.isListContextVar) {
+                b._deps = skip;
+            } else {
+                b._deps = { kind: 'path', reads: [b.path], paths: null };
+            }
+        }
+
+        for (const cb of (metadata.classBindings || [])) {
+            if (cb.isComputed && cb.expression) {
+                const name = cb.expression.startsWith('computed:') ? cb.expression.slice(9) : cb.expression;
+                cb._deps = { kind: 'computedName', reads: [name], paths: null };
+            } else if (cb.isSimpleProperty && cb.expression) {
+                cb._deps = { kind: 'path', reads: [cb.expression], paths: null };
+            } else if (cb.expression) {
+                cb._deps = exprDeps(cb);
+            } else {
+                cb._deps = skip;
+            }
+        }
+
+        for (const sb of (metadata.styleBindings || [])) {
+            sb._deps = sb.expression ? exprDeps(sb) : skip;
+        }
+        for (const ab of (metadata.attrBindings || [])) {
+            ab._deps = ab.expression ? exprDeps(ab) : skip;
+        }
+
+        for (const mb of (metadata.models || [])) {
+            mb._deps = { kind: 'itemPath', reads: [mb.path], paths: null };
+        }
+
+        for (const sh of (metadata.shows || [])) sh._deps = exprOrPath(sh);
+        for (const hb of (metadata.htmlBindings || [])) hb._deps = exprOrPath(hb);
+        for (const rb of (metadata.renders || [])) rb._deps = exprOrPath(rb);
+
+        const rbm = metadata.rootBindings;
+        if (rbm) {
+            const rootDeps = [];
+            if (rbm.bindPath) rootDeps.push({ field: 'bindPath', kind: 'path', reads: [rbm.bindPath], paths: null });
+            if (rbm.showPath) rootDeps.push({ field: 'showPath', kind: 'path', reads: [rbm.showPath], paths: null });
+            if (rbm.modelPath) rootDeps.push({ field: 'modelPath', kind: 'itemPath', reads: [rbm.modelPath], paths: null });
+            if (rbm.bindClassExpr) {
+                const e = rbm.bindClassExpr;
+                rootDeps.push(e.startsWith('computed:')
+                    ? { field: 'bindClassExpr', kind: 'computedName', reads: [e.slice(9)], paths: null }
+                    : { field: 'bindClassExpr', kind: 'expr', reads: this._extractExpressionVars(e), paths: this._extractExpressionPaths(e) });
+            }
+            if (rbm.bindStyleExpr) {
+                rootDeps.push({ field: 'bindStyleExpr', kind: 'expr', reads: this._extractExpressionVars(rbm.bindStyleExpr), paths: this._extractExpressionPaths(rbm.bindStyleExpr) });
+            }
+            if (rbm.bindAttrExpr) {
+                rootDeps.push({ field: 'bindAttrExpr', kind: 'expr', reads: this._extractExpressionVars(rbm.bindAttrExpr), paths: this._extractExpressionPaths(rbm.bindAttrExpr) });
+            }
+            rbm._deps = rootDeps;
+        }
+    },
+
+    /**
+     * Item props read by the row's class/style/attr bindings (the "decorative"
+     * read set), used by the effect-retire dispatcher to decide whether a changed
+     * item leaf requires re-applying class/style/attr; a text-only change skips
+     * that work (otherwise update-10th-style benchmarks re-run class eval per row
+     * for nothing). Class always lives in classBindings (even on the row root), so
+     * it is captured here; root STYLE/ATTR (rootBindings.bindStyle/AttrExpr) cannot
+     * be separated from root text in rootBindings._deps, so their presence returns
+     * null = "always re-apply" (correct, just not update-optimized). Flat props
+     * only (eligible templates have no nested reads). Cached on the metadata.
+     * @private
+     */
+    _extractDecorativeReadProps(compiledMetadata) {
+        let cached = compiledMetadata._decorativeReadProps;
+        if (cached !== undefined) return cached;
+        this._computeDeps(compiledMetadata);
+        const rb = compiledMetadata.rootBindings;
+        if (rb && (rb.hasBindStyle || rb.hasBindAttr)) {
+            compiledMetadata._decorativeReadProps = null;
+            return null;
+        }
         const props = new Set();
-        const reservedWords = this._expressionReservedWords;
-        // Item-level computed names whose transitive deps can't be statically resolved.
-        // If any binding expression references one, we must bail to the full first-run
-        // path so reads inside the computed register against the per-item effect.
-        // Only parameterised (fn.length > 0) qualifies — zero-arg computeds are
-        // component-level and tracked by the component refresh effect, not per-item.
-        const itemLevelComputedNames = new Set();
-        const _origComputeds = instance?.stateManager?._originalComputedFunctions;
-        if (_origComputeds) {
-            for (const [name, fn] of _origComputeds) {
-                if (typeof fn === 'function' && fn.length > 0) itemLevelComputedNames.add(name);
+        const add = (p) => {
+            if (!p || typeof p !== 'string') return;
+            if (p.startsWith('_') || p.startsWith('computed:') || p.startsWith('props:')) return;
+            if (p.startsWith('!')) p = p.slice(1);
+            if (p) props.add(p.indexOf('.') !== -1 ? p.slice(0, p.indexOf('.')) : p);
+        };
+        const arrays = [compiledMetadata.classBindings, compiledMetadata.styleBindings, compiledMetadata.attrBindings];
+        for (const arr of arrays) {
+            if (!arr) continue;
+            for (const b of arr) {
+                const d = b._deps;
+                if (!d) continue;
+                if (d.reads) for (let i = 0; i < d.reads.length; i++) add(d.reads[i]);
+                if (d.paths) for (let i = 0; i < d.paths.length; i++) add(d.paths[i]);
             }
         }
+        compiledMetadata._decorativeReadProps = props;
+        return props;
+    },
 
-        const addPath = (path) => {
-            if (!path || typeof path !== 'string') return;
-            if (path.startsWith('_') || path.startsWith('computed:') || path.startsWith('props:')) return;
-            if (path.startsWith('!')) path = path.slice(1);
-            if (!path) return;
-            // For nested paths like "user.name", add both "user" and "user.name"
-            // to match what proxy traversal would register
-            if (path.indexOf('.') !== -1) {
-                const parts = path.split('.');
-                let prefix = '';
-                for (let i = 0; i < parts.length; i++) {
-                    prefix = prefix ? prefix + '.' + parts[i] : parts[i];
-                    props.add(prefix);
+    /**
+     * Classify a row template for the ReactiveGraph fast first-run (touchItemLeaves).
+     * Returns the flat list of item-prop paths to edge-link IF every reactive dep
+     * is a flat property present on the row's own item, i.e. _extractStaticItemProps
+     * resolved statically (no computeds, returns non-null) AND no read is nested or
+     * a component-state field. In that case forming the leaf edges directly is
+     * EQUIVALENT to the consumeDep first run (which, for an item prop, only does the
+     * one item touchPath; touchComponentLevel returns early on `v in itemProxy`).
+     * Returns null to fall back to the full first run for anything richer (nested
+     * paths, component-state/computed reads, expressions over component state).
+     * Cached by the caller on metadata._reactiveGraphFastTouch.
+     * @private
+     */
+    _computeReactiveGraphFastTouch(metadata, instance, sampleItem) {
+        if (!sampleItem || typeof sampleItem !== 'object') return null;
+        this._computeDeps(metadata);
+        const reserved = this._expressionReservedWords;
+        const itemProps = new Set();
+        // ANY computed read (item- OR component-level) forces the full first run:
+        // the generic path EVALUATES the computed under this row's effect (via
+        // evalItemLevelComputed*), which forms the edges to whatever the computed
+        // reads: component state, a store (cross-entity), or other item fields.
+        // Fast-touch only forms flat item-prop edges, so it would drop those and
+        // the binding would stop reacting (e.g. a class reading a store-backed
+        // computed). Note the component refresh effect does NOT cover computed
+        // class deps under ReactiveGraph (_registerComponentDep is a no-op), so the
+        // per-item effect's computed eval is load-bearing -> bail on any computed.
+        let computedNames = null;
+        const _addC = (name) => { (computedNames || (computedNames = new Set())).add(name); };
+        const _oc = instance?.stateManager?._originalComputedFunctions;
+        if (_oc) for (const [name, fn] of _oc) { if (typeof fn === 'function') _addC(name); }
+        const _cm = instance?.stateManager?.computed;
+        if (_cm) for (const name in _cm) _addC(name);
+        const refsComputed = (v) => computedNames !== null && computedNames.has(v);
+        // A read is usable iff it is a flat property present on the row's own item.
+        // In a NON-class binding, any non-item read is a real per-item component
+        // dep (or computed) that consumeDep would register but fast-touch can't form
+        // -> bail. In a CLASS binding, a non-item read is class-only (the component
+        // refresh effect owns it; the per-item effect never registers it), so it is
+        // simply skipped. Nested paths and computed-name bindings always bail.
+        const collect = (deps, isClass) => {
+            if (!deps) return true;
+            switch (deps.kind) {
+                case 'skip': return true;
+                case 'computedName': return false;
+                case 'itemPath':
+                case 'path': {
+                    const r = deps.reads[0];
+                    if (!r) return true;
+                    if (r.indexOf('.') !== -1 || refsComputed(r)) return false;
+                    if (r in sampleItem) { itemProps.add(r); return true; }
+                    return isClass; // non-item read: ok (skip) only in a class binding
                 }
-            } else {
-                props.add(path);
-            }
-        };
-
-        const addExpressionVars = (expr, preExtractedVars) => {
-            if (preExtractedVars) {
-                for (const v of preExtractedVars) {
-                    addPath(v);
-                }
-            } else if (expr && typeof expr === 'string') {
-                const stripped = expr.replace(/'[^']*'|"[^"]*"/g, '');
-                const vars = stripped.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || [];
-                for (const v of vars) {
-                    if (!v.startsWith('_') && (!reservedWords || !reservedWords.has(v))) {
-                        addPath(v);
+                case 'expr': {
+                    const reads = deps.reads || [];
+                    for (let i = 0; i < reads.length; i++) {
+                        const v = reads[i];
+                        if (!v || (reserved && reserved.has(v)) || v.charAt(0) === '_') continue;
+                        if (v.indexOf('.') !== -1 || refsComputed(v)) return false;
+                        if (v in sampleItem) itemProps.add(v);
+                        else if (!isClass) return false;
                     }
-                }
-            }
-        };
-
-        // Helper: bail when an expression's identifiers reference an item-level
-        // computed. Such bindings need the first-run dep-registration path to
-        // run the computed body and register its transitive state reads.
-        const exprRefsItemLevelComputed = (expression, expressionVars) => {
-            if (itemLevelComputedNames.size === 0) return false;
-            if (expressionVars) {
-                for (const v of expressionVars) {
-                    if (itemLevelComputedNames.has(v)) return true;
-                }
-                return false;
-            }
-            if (!expression || typeof expression !== 'string') return false;
-            const stripped = expression.replace(/'[^']*'|"[^"]*"/g, '');
-            const vars = stripped.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g) || [];
-            for (const v of vars) {
-                if (itemLevelComputedNames.has(v)) return true;
-            }
-            return false;
-        };
-
-        // Bindings
-        for (const binding of (compiledMetadata.bindings || [])) {
-            if (binding.isExpression && binding.expressionVars) {
-                if (exprRefsItemLevelComputed(null, binding.expressionVars)) return null;
-                addExpressionVars(null, binding.expressionVars);
-            } else if (!binding.isExpression && !binding.isListContextVar && !binding.isPropsPath && !binding.isComputed) {
-                if (itemLevelComputedNames.has(binding.path)) return null;
-                addPath(binding.path);
-            }
-        }
-
-        // Class bindings — bail out if any are computed (can't statically resolve)
-        for (const classBinding of (compiledMetadata.classBindings || [])) {
-            if (classBinding.isComputed) {
-                return null; // Bail — fall back to touchPath first run
-            } else if (classBinding.isSimpleProperty && classBinding.expression) {
-                addPath(classBinding.expression);
-                // Item-level computed referenced as a bare property — transitive deps
-                // (state reads inside the computed) need first-run registration.
-                if (itemLevelComputedNames.has(classBinding.expression)) return null;
-            } else if (classBinding.expression) {
-                // If the expression references any item-level computed, the per-item
-                // effect's transitive deps can only be discovered by evaluating the
-                // computed with the actual item — which only happens on first-run.
-                if (classBinding.expressionVars) {
-                    for (const v of classBinding.expressionVars) {
-                        if (itemLevelComputedNames.has(v)) return null;
+                    if (deps.paths) for (let i = 0; i < deps.paths.length; i++) {
+                        if (deps.paths[i].indexOf('.') !== -1) return false;
                     }
+                    return true;
                 }
-                addExpressionVars(classBinding.expression, null);
+            }
+            return true;
+        };
+        const nonClass = [metadata.bindings, metadata.styleBindings, metadata.attrBindings,
+                          metadata.models, metadata.shows, metadata.htmlBindings, metadata.renders];
+        for (const arr of nonClass) { if (!arr) continue; for (const b of arr) if (!collect(b._deps, false)) return null; }
+        for (const cb of (metadata.classBindings || [])) if (!collect(cb._deps, true)) return null;
+        if (metadata.rootBindings?._deps) {
+            for (const d of metadata.rootBindings._deps) {
+                if (!collect(d, d.field === 'bindClassExpr')) return null;
             }
         }
+        return itemProps.size ? Array.from(itemProps) : null;
+    },
 
-        // Style bindings
-        for (const styleBinding of (compiledMetadata.styleBindings || [])) {
-            if (styleBinding.expression) {
-                if (exprRefsItemLevelComputed(styleBinding.expression, styleBinding.expressionVars)) return null;
-                addExpressionVars(styleBinding.expression, null);
-            }
-        }
-        if (compiledMetadata.rootBindings?.bindStyleExpr) {
-            const rootExpr = compiledMetadata.rootBindings.bindStyleExpr;
-            if (exprRefsItemLevelComputed(rootExpr, null)) return null;
-            addExpressionVars(rootExpr, null);
-        }
+    /**
+     * Classify a row template's "pure single-text" fields for the ReactiveGraph targeted
+     * text-write fast path. Returns Map<field, elementIndex> for each flat field
+     * that is bound to exactly one plain text node (singleTextProp) AND is read by
+     * NO other binding (class/style/attr/show/html/render/model/expr-text/root);
+     * so a write to that field can update its one text node alone, leaving every
+     * other binding untouched (they don't depend on it). Returns null if the
+     * template has no such field. Cached by the caller on metadata._reactiveGraphPureText.
+     * @private
+     */
+    // Stamp a direct TEXT writer on a row field's graph node: subsequent writes to
+    // that field set the bound text node directly, skipping the per-item effect wake
+    // and the onStateChange dispatch (notifyNode returns DIRECT_HANDLED). The closure
+    // is built HERE (a DOM concern) and stamped through the generic facade
+    // stampDirectWriter; the isConnected guard travels with it so a detached row's
+    // stale writer self-clears and falls back to the effect wake. Gated by the
+    // caller to _reactiveGraphPureText fields (read by no computed/other binding).
+    _stampDirectText(sm, itemProxy, key, el) {
+        // Shared writer (module-level) + el stored on the node; no per-row closure.
+        sm.stampDirectWriter(itemProxy, key, SHARED_TEXT_WRITER, el);
+    },
 
-        // Attr bindings
-        for (const attrBinding of (compiledMetadata.attrBindings || [])) {
-            if (attrBinding.expression) {
-                if (exprRefsItemLevelComputed(attrBinding.expression, attrBinding.expressionVars)) return null;
-                addExpressionVars(attrBinding.expression, null);
-            }
-        }
-        if (compiledMetadata.rootBindings?.bindAttrExpr) {
-            const rootExpr = compiledMetadata.rootBindings.bindAttrExpr;
-            if (exprRefsItemLevelComputed(rootExpr, null)) return null;
-            addExpressionVars(rootExpr, null);
-        }
+    /**
+     * Retire-safety gate for ALL direct-writer kinds (text/style/attr). A direct
+     * writer suppresses BOTH the graph observer wake and the per-write
+     * onStateChange dispatch (notifyNode DIRECT_HANDLED), so stamping is only
+     * sound when nothing besides the row's own binding can read the leaf:
+     *   - no component computeds (an aggregate over item fields forms real graph
+     *     edges the writer would starve);
+     *   - no watchers and no imperative subscriptions (both ride the suppressed
+     *     onStateChange dispatch);
+     *   - no autoSave persistence (also rides the dispatch).
+     * The template-static gates (_reactiveGraphPureText / _fastTouch) cannot see
+     * any of these; they only prove no OTHER TEMPLATE BINDING reads the field.
+     * Constant per component; callers cache it on metadata._reactiveGraphStyleSafe.
+     * @private
+     */
+    _computeReactiveGraphRetireSafe(sm, instance) {
+        const _oc = instance?.stateManager?._originalComputedFunctions;
+        return Object.keys((sm && sm.computed) || {}).length === 0
+            && (!_oc || _oc.size === 0)
+            && !(instance && instance._watcherHandlers && instance._watcherHandlers.size > 0)
+            && !(sm && sm._subscriptions && sm._subscriptions.size > 0)
+            && !(sm && sm.autoSave && sm.storageKey);
+    },
 
-        // Model bindings
-        for (const modelBinding of (compiledMetadata.models || [])) {
-            addPath(modelBinding.path);
-        }
+    // Style analog of _stampDirectText, for one CSS property of a pure
+    // data-bind-style object literal (`{ transform: tf }`) whose value is a bare
+    // item field. Same suppression + detach-guard contract.
+    _stampDirectStyle(sm, itemProxy, key, el, cssProp) {
+        sm.stampDirectWriter(itemProxy, key, (target) => {
+            if (!el.isConnected) return false;
+            applyStyleProp(el.style, cssProp, target[key]);
+            return true;
+        });
+    },
 
-        // Show bindings
-        for (const showBinding of (compiledMetadata.shows || [])) {
-            if (showBinding.isExpression && showBinding.expressionVars) {
-                if (exprRefsItemLevelComputed(null, showBinding.expressionVars)) return null;
-                addExpressionVars(null, showBinding.expressionVars);
+    // Attr analog: one attribute of a pure data-bind-attr object literal whose
+    // value is a bare item field. Same suppression + detach-guard contract.
+    _stampDirectAttr(sm, itemProxy, key, el, attrName) {
+        const self = this;
+        sm.stampDirectWriter(itemProxy, key, (target) => {
+            if (!el.isConnected) return false;
+            const v = target[key];
+            if (v === null || v === undefined || v === false) {
+                el.removeAttribute(attrName);
             } else {
-                if (itemLevelComputedNames.has(showBinding.path)) return null;
-                addPath(showBinding.path);
+                const s = self._sanitizeAttrValue(attrName, v);
+                if (s !== null) el.setAttribute(attrName, String(s));
+            }
+            return true;
+        });
+    },
+
+    _computeReactiveGraphPureText(metadata) {
+        const stp = metadata.singleTextProp;
+        if (!stp || stp.size === 0) return null;
+        this._computeDeps(metadata);
+        // Vars referenced by any binding OTHER than a plain single-ref text binding.
+        const usedElsewhere = new Set();
+        const collect = (deps) => {
+            if (!deps || deps.kind === 'skip') return;
+            const reads = deps.reads || [];
+            for (let i = 0; i < reads.length; i++) usedElsewhere.add(reads[i]);
+            if (deps.paths) for (let i = 0; i < deps.paths.length; i++) usedElsewhere.add(deps.paths[i]);
+        };
+        for (const arr of [metadata.classBindings, metadata.styleBindings, metadata.attrBindings,
+                           metadata.shows, metadata.htmlBindings, metadata.renders, metadata.models]) {
+            if (!arr) continue; for (const b of arr) collect(b._deps);
+        }
+        // Expression text bindings count as "other" use too (only single-ref text
+        // bindings qualify a field as pure).
+        for (const b of (metadata.bindings || [])) { if (b.isExpression) collect(b._deps); }
+        if (metadata.rootBindings?._deps) for (const d of metadata.rootBindings._deps) collect(d);
+        let pure = null;
+        for (const [field, idx] of stp) {
+            if (field.indexOf('.') !== -1) continue;   // flat fields only (leaf key == path)
+            if (usedElsewhere.has(field)) continue;    // referenced elsewhere -> not pure
+            (pure || (pure = new Map())).set(field, idx);
+        }
+        return pure;
+    },
+
+    /**
+     * Parse a `data-bind-style` expression as a PURE object literal mapping CSS
+     * properties to bare item-field identifiers, e.g. `{ transform: tf, background: bg }`
+     * -> [{cssProp:'transform', field:'tf'}, {cssProp:'background', field:'bg'}].
+     * Returns null for anything that is not exactly that shape (member access,
+     * calls, ternaries, literals, nested objects, spreads, computed keys) so the
+     * caller falls back to the general evaluator. Conservative by construction:
+     * each value must be a single bare identifier; keys may be identifiers or
+     * quoted strings (kebab CSS names).
+     * @private
+     */
+    _parsePureStyleObjectLiteral(expr) {
+        if (typeof expr !== 'string') return null;
+        const s = expr.trim();
+        if (s.length < 2 || s.charCodeAt(0) !== 123 /* { */ || s.charCodeAt(s.length - 1) !== 125 /* } */) return null;
+        const inner = s.slice(1, -1).trim();
+        if (inner.length === 0) return null;
+        // Bare values only -> no nesting/operators. Reject anything that could make
+        // a comma-split unsafe or imply a non-trivial value expression.
+        if (/[(){}\[\]?]/.test(inner)) return null;
+        const parts = inner.split(',');
+        const out = [];
+        const identRe = /^[A-Za-z_$][\w$]*$/;
+        for (let i = 0; i < parts.length; i++) {
+            const part = parts[i].trim();
+            if (part.length === 0) return null; // trailing comma / empty entry
+            const colon = part.indexOf(':');
+            if (colon === -1) return null;      // shorthand / no value
+            let key = part.slice(0, colon).trim();
+            const val = part.slice(colon + 1).trim();
+            if (!identRe.test(val)) return null; // value must be a single bare identifier
+            // Key: identifier (camelCase CSS prop) or quoted string (kebab CSS name).
+            if (key.length >= 2 && (key.charCodeAt(0) === 39 || key.charCodeAt(0) === 34)
+                && key.charCodeAt(key.length - 1) === key.charCodeAt(0)) {
+                key = key.slice(1, -1);
+                if (key.length === 0) return null;
+            } else if (!identRe.test(key)) {
+                return null;
+            }
+            out.push({ cssProp: key, field: val });
+        }
+        return out.length ? out : null;
+    },
+
+    /**
+     * Classify a row template's `data-bind-style` bindings for the ReactiveGraph
+     * direct-style-writer fast path. Returns an array of per-field specs
+     * `{cssProp, field, isRoot, elIndex}` when EVERY style evaluator is a pure
+     * object literal of bare item fields, each field is a flat property present on
+     * the item, maps to exactly one CSS prop, and is read by NO other binding
+     * (text/class/attr/show/html/render/model/other-style). Returns null otherwise.
+     * A write to such a field can set its one CSS property directly and suppress
+     * the effect wake + onStateChange dispatch (notifyNode DIRECT_HANDLED), leaving
+     * every other binding untouched. The caller gates on _reactiveGraphFastTouch
+     * (no binding references a computed) before stamping. Cached on
+     * metadata._reactiveGraphPureStyle.
+     * @private
+     */
+    _computeReactiveGraphPureStyle(metadata, sampleItem) {
+        if (!sampleItem || typeof sampleItem !== 'object') return null;
+        const styleEvals = metadata.styleEvaluators;
+        if (!styleEvals || styleEvals.length === 0) return null;
+        this._computeDeps(metadata);
+        // Group per item field -> { cssProp, targets[] }. A field may appear in more
+        // than one evaluator (a root `data-bind-style` is registered both as an
+        // isRoot evaluator AND an indexed one that resolve to the same element); the
+        // caller resolves each target's element and stamps a single writer iff they
+        // all land on the same element. A field mapping to two DIFFERENT CSS props
+        // can't use one writer -> bail.
+        const byField = new Map();
+        for (const ev of styleEvals) {
+            if (ev.isComputed || !ev.expression) return null;
+            const decomp = this._parsePureStyleObjectLiteral(ev.expression);
+            if (!decomp) return null;
+            for (let d = 0; d < decomp.length; d++) {
+                const field = decomp[d].field, cssProp = decomp[d].cssProp;
+                if (field.indexOf('.') !== -1) return null;     // flat fields only
+                if (field.charCodeAt(0) === 95 /* _ */) return null; // _index/_first etc.
+                if (!(field in sampleItem)) return null;        // must be an item prop
+                let entry = byField.get(field);
+                if (!entry) { entry = { cssProp, targets: [] }; byField.set(field, entry); }
+                else if (entry.cssProp !== cssProp) return null; // same field -> 2 css props
+                entry.targets.push({ isRoot: !!ev.isRoot, elIndex: ev.index, elementPath: ev.elementPath });
             }
         }
-
-        // HTML bindings
-        for (const htmlBinding of (compiledMetadata.htmlBindings || [])) {
-            if (itemLevelComputedNames.has(htmlBinding.path)) return null;
-            addPath(htmlBinding.path);
+        if (byField.size === 0) return null;
+        // Each field must be read by NO binding other than these style evaluators;
+        // otherwise suppressing its effect wake would stop that other binding from
+        // updating. Mirrors _computeReactiveGraphPureText's usedElsewhere analysis,
+        // excluding styleBindings/the root style dep (those ARE our fields).
+        const usedElsewhere = new Set();
+        const collect = (deps) => {
+            if (!deps || deps.kind === 'skip') return;
+            const reads = deps.reads || [];
+            for (let i = 0; i < reads.length; i++) usedElsewhere.add(reads[i]);
+            if (deps.paths) for (let i = 0; i < deps.paths.length; i++) usedElsewhere.add(deps.paths[i]);
+        };
+        for (const arr of [metadata.bindings, metadata.classBindings, metadata.attrBindings,
+                           metadata.shows, metadata.htmlBindings, metadata.renders, metadata.models]) {
+            if (!arr) continue; for (const b of arr) collect(b._deps);
         }
-
-        // Render bindings — same bail-out as shows/binds: an item-level computed
-        // referenced in a render expression needs first-run evaluation so its
-        // sibling-state reads register against the per-item effect.
-        for (const renderBinding of (compiledMetadata.renders || [])) {
-            if (renderBinding.isExpression && renderBinding.expressionVars) {
-                if (exprRefsItemLevelComputed(null, renderBinding.expressionVars)) return null;
-                addExpressionVars(null, renderBinding.expressionVars);
-            } else if (renderBinding.path) {
-                if (itemLevelComputedNames.has(renderBinding.path)) return null;
-                addPath(renderBinding.path);
+        if (metadata.rootBindings?._deps) {
+            for (const d of metadata.rootBindings._deps) {
+                if (d.field === 'bindStyleExpr') continue; // our root style binding
+                collect(d);
             }
         }
+        for (const field of byField.keys()) if (usedElsewhere.has(field)) return null;
+        return byField;
+    },
 
-        // Root bindings
-        if (compiledMetadata.rootBindings) {
-            if (compiledMetadata.rootBindings.bindPath) addPath(compiledMetadata.rootBindings.bindPath);
-            if (compiledMetadata.rootBindings.showPath) addPath(compiledMetadata.rootBindings.showPath);
-            if (compiledMetadata.rootBindings.modelPath) addPath(compiledMetadata.rootBindings.modelPath);
-            if (compiledMetadata.rootBindings.bindClassExpr) {
-                const rootExpr = compiledMetadata.rootBindings.bindClassExpr;
-                if (rootExpr.startsWith('computed:')) {
-                    return null; // Bail — computed class on root, can't statically resolve
-                }
-                addExpressionVars(rootExpr, null);
+    /**
+     * Classify a row template's `data-bind-attr` bindings for the direct-writer
+     * fast path, the structural twin of _computeReactiveGraphPureStyle. Returns
+     * Map<field, {attrName, targets[]}> when every attr evaluator is a pure object
+     * literal of bare item fields, each a flat item prop mapped 1:1 to one
+     * non-blocklisted attribute and read by NO other binding (text/class/style/
+     * show/html/render/model). The caller resolves targets to a single element and
+     * stamps a writer matching the list attr path's semantics (false/null/undefined
+     * -> removeAttribute; else setAttribute(name, String(sanitize(value)))). Returns
+     * null otherwise. Cached via _computeReactiveGraphPureLeaves.
+     * @private
+     */
+    _computeReactiveGraphPureAttr(metadata, sampleItem) {
+        if (!sampleItem || typeof sampleItem !== 'object') return null;
+        const attrEvals = metadata.attrEvaluators;
+        if (!attrEvals || attrEvals.length === 0) return null;
+        this._computeDeps(metadata);
+        const byField = new Map();
+        for (const ev of attrEvals) {
+            if (ev.isComputed || !ev.expression) return null;
+            const decomp = this._parsePureStyleObjectLiteral(ev.expression); // generic {key: bareField} parse
+            if (!decomp) return null;
+            for (let d = 0; d < decomp.length; d++) {
+                const field = decomp[d].field, attrName = decomp[d].cssProp;
+                if (field.indexOf('.') !== -1) return null;
+                if (field.charCodeAt(0) === 95 /* _ */) return null;
+                if (!(field in sampleItem)) return null;
+                if (this._isBlocklistedAttr(attrName)) continue; // never direct-write a blocklisted attr
+                let entry = byField.get(field);
+                if (!entry) { entry = { attrName, targets: [] }; byField.set(field, entry); }
+                else if (entry.attrName !== attrName) return null; // same field -> 2 attrs
+                entry.targets.push({ isRoot: !!ev.isRoot, elIndex: ev.index, elementPath: ev.elementPath });
             }
         }
+        if (byField.size === 0) return null;
+        // Each field read by NO binding other than these attr evaluators; exclude
+        // attrBindings/the root attr dep (those ARE our fields), include everything else.
+        const usedElsewhere = new Set();
+        const collect = (deps) => {
+            if (!deps || deps.kind === 'skip') return;
+            const reads = deps.reads || [];
+            for (let i = 0; i < reads.length; i++) usedElsewhere.add(reads[i]);
+            if (deps.paths) for (let i = 0; i < deps.paths.length; i++) usedElsewhere.add(deps.paths[i]);
+        };
+        for (const arr of [metadata.bindings, metadata.classBindings, metadata.styleBindings,
+                           metadata.shows, metadata.htmlBindings, metadata.renders, metadata.models]) {
+            if (!arr) continue; for (const b of arr) collect(b._deps);
+        }
+        if (metadata.rootBindings?._deps) {
+            for (const d of metadata.rootBindings._deps) {
+                if (d.field === 'bindAttrExpr') continue; // our root attr binding
+                collect(d);
+            }
+        }
+        for (const field of byField.keys()) if (usedElsewhere.has(field)) return null;
+        return byField;
+    },
 
-        return props.size > 0 ? props : null;
+    /**
+     * Unified per-row direct-writer classifier: composes the pure-text and
+     * pure-style classifiers into ONE Map<field, spec> the per-item effect's
+     * single stamp loop consumes. spec = {kind:'text', elIdx} | {kind:'style',
+     * cssProp, targets[]}. Each sub-classifier already excludes fields used by
+     * the OTHER kind's bindings (pureText's usedElsewhere includes styleBindings;
+     * pureStyle's includes text bindings), so a field can be at most one kind;
+     * the collision guard is belt-and-suspenders. Returns null when no field
+     * qualifies. Cached by the caller on metadata._reactiveGraphPureLeaves.
+     * Extension point: add a kind here (attr/show) by composing its classifier.
+     * @private
+     */
+    _computeReactiveGraphPureLeaves(metadata, sampleItem) {
+        let leaves = null;
+        const text = this._computeReactiveGraphPureText(metadata);
+        if (text) {
+            for (const [field, elIdx] of text) {
+                (leaves || (leaves = new Map())).set(field, { kind: 'text', elIdx });
+            }
+        }
+        const style = this._computeReactiveGraphPureStyle(metadata, sampleItem);
+        if (style) {
+            for (const [field, entry] of style) {
+                if (leaves && leaves.has(field)) { leaves.delete(field); continue; } // ambiguous: drop
+                (leaves || (leaves = new Map())).set(field, { kind: 'style', cssProp: entry.cssProp, targets: entry.targets });
+            }
+        }
+        const attr = this._computeReactiveGraphPureAttr(metadata, sampleItem);
+        if (attr) {
+            for (const [field, entry] of attr) {
+                if (leaves && leaves.has(field)) { leaves.delete(field); continue; } // ambiguous: drop
+                (leaves || (leaves = new Map())).set(field, { kind: 'attr', attrName: entry.attrName, targets: entry.targets });
+            }
+        }
+        return leaves;
     },
 
     /**
@@ -4355,7 +4699,7 @@ _updateLists(listElements, instance = null)
         element._polyInsertBeforeRef = insertionRef;
         element._polyGeneratedNodes = [];
 
-        // Render initial template — uses _resolveComponentValue for computed-first resolution
+        // Render initial template; uses _resolveComponentValue for computed-first resolution
         const initialValue = this._resolveComponentValue(templateKeyProp, instance);
         const typeStr = String(initialValue ?? '');
         this._swapPolymorphicTemplate(instance, typeStr);
@@ -4368,6 +4712,14 @@ _updateLists(listElements, instance = null)
             self._swapPolymorphicTemplate(instance, newType);
         };
         instance._watcherHandlers.set(templateKeyProp, watchHandler);
+        // The template key may be a computed; this watcher rides its
+        // `computed:NAME` pulse, so install that computed's notifier (lazy by
+        // default; harmless if templateKeyProp is plain state). Record the bare
+        // name whether or not the key carries an explicit `computed:` prefix.
+        if (instance.stateManager._ensureComputedNotifier) {
+            instance.stateManager._ensureComputedNotifier(
+                templateKeyProp.startsWith('computed:') ? templateKeyProp.slice(9) : templateKeyProp);
+        }
     },
 
     /**
@@ -4437,7 +4789,7 @@ _updateLists(listElements, instance = null)
             this._bindComponentActions(instance);
         }
 
-        // Always scan for nested components — on initial render the async scan phase
+        // Always scan for nested components; on initial render the async scan phase
         // already completed before this template content was inserted into the DOM
         if (this.scan) {
             this.scan(element);
@@ -4497,6 +4849,44 @@ _updateLists(listElements, instance = null)
     // `this` is the WildflowerJS instance after mixin assembly.
     // ========================================================================
 
+    // Single shared writer for the _listRelationships registry. All three
+    // discovery paths (scan-time prepopulate, per-component context setup,
+    // nested-template caching) funnel through here. Census 2026-07-02: all
+    // three paths produce novel writes (dynamic mounts and external
+    // data-use-template children are invisible to the scan-time walk), so
+    // every call site is load-bearing.
+    _registerListRelationships(relationships)
+    {
+        if (!this._listRelationships)
+        {
+            this._listRelationships = new Map();
+        }
+        for (const {parentPath, childPath} of relationships)
+        {
+            let children = this._listRelationships.get(parentPath);
+            if (!children)
+            {
+                children = new Set();
+                this._listRelationships.set(parentPath, children);
+            }
+            children.add(childPath);
+        }
+    },
+
+    // Detect template relationships under rootEl and register them.
+    _detectAndRegisterListRelationships(rootEl)
+    {
+        if (!this._contextRecords || !this._contextRecords.detectTemplateRelationships)
+        {
+            return;
+        }
+        try {
+            this._registerListRelationships(this._contextRecords.detectTemplateRelationships(rootEl));
+        } catch (error) {
+            if (__DEV__) console.warn('[WF] detectTemplateRelationships failed:', error?.message);
+        }
+    },
+
     // Set up list contexts when a component is initialized
     _setupListContexts(instance)
     {
@@ -4514,25 +4904,7 @@ _updateLists(listElements, instance = null)
             instance._listContexts = new Map();
         }
 
-        let relationships = [];
-        try {
-            if (this._contextRegistry && this._contextRegistry.detectTemplateRelationships) {
-                relationships = this._contextRegistry.detectTemplateRelationships(instance.element);
-            }
-        } catch (error) {
-            if (__DEV__) console.error('ERROR detecting template relationships:', error);
-        }
-
-        // Register these relationships in our registry
-        relationships.forEach(({parentPath, childPath}) =>
-        {
-            if (!this._listRelationships.has(parentPath))
-            {
-                this._listRelationships.set(parentPath, new Set());
-            }
-
-            this._listRelationships.get(parentPath).add(childPath);
-        });
+        this._detectAndRegisterListRelationships(instance.element);
 
         // Find ALL list elements including those in templates for proper discovery
         // First find all templates
@@ -4642,22 +5014,10 @@ _updateLists(listElements, instance = null)
             return false;
         }
 
-        // Handle computed property changes that directly affect lists
-        // When a computed property like 'computed:cartItems' changes, update the corresponding list context
+        // computed:-sourced lists are mapArray-backed and react through their
+        // own structural effect; a computed: notification has no list context
+        // to update on this path.
         if (path.startsWith('computed:')) {
-            if (instance._listContexts && instance._listContexts.has(path)) {
-                const context = instance._listContexts.get(path);
-                if (context) {
-                    // Update the list with the new computed value
-                    context.updateData(Array.isArray(newValue) ? newValue : []);
-
-                    // Queue for render
-                    this._contextsToUpdate.add(context);
-                    this._scheduleRender();
-                    return true;
-                }
-            }
-            // No list bound to this computed property
             return false;
         }
 
@@ -4671,28 +5031,6 @@ _updateLists(listElements, instance = null)
         // Track affected contexts
         let contextsAffected = false;
         const affectedContexts = new Set();
-
-        // Check if this path change affects any computed property that a list depends on
-        // This enables reactive updates for computed lists when their internal dependencies change
-        if (instance._listContexts && instance.stateManager) {
-            instance._listContexts.forEach((context, contextPath) => {
-                // Only check computed lists
-                if (contextPath.startsWith('computed:')) {
-                    const computedName = contextPath.slice(9); // Remove 'computed:' prefix
-
-                    // Check if this computed property depends on the changed path
-                    const deps = instance.stateManager.computedDependencies?.get(path);
-                    if (deps && deps.has(computedName)) {
-                        // The changed path is a dependency of this computed property
-                        // Re-evaluate the computed property and update the list
-                        const freshData = instance.stateManager.evaluateComputed(computedName);
-                        context.updateData(Array.isArray(freshData) ? freshData : []);
-                        contextsAffected = true;
-                        affectedContexts.add(context);
-                    }
-                }
-            });
-        }
 
         // Check component's contexts
         if (instance._listContexts && instance._listContexts.size > 0)
@@ -4714,20 +5052,6 @@ _updateLists(listElements, instance = null)
                     affectedContexts.add(context);
                 }
                 // PERFORMANCE FIX: Precise nested list matching (replacing broad path.endsWith())
-                else if (this._isNestedListUpdate(path, contextPath))
-                {
-                    // This handles nested lists like categories[0].items
-                    // Get fresh data directly from component state instead of stale context resolution
-                    const fullContextPath = context.getFullPath();
-
-                    const dotNotationPath = fullContextPath.replace(/\[(\d+)]/g, '.$1');
-
-                    const freshData = instance.stateManager.getValue(dotNotationPath);
-
-                    context.updateData(Array.isArray(freshData) ? freshData : []);
-                    contextsAffected = true;
-                    affectedContexts.add(context);
-                }
                 else if (path.startsWith(`${contextPath}.`))
                 {
                     // Only update for structural changes, not property changes
@@ -4789,43 +5113,6 @@ _updateLists(listElements, instance = null)
         }
 
         return contextsAffected;
-    },
-
-    // Helper method for precise nested list update detection
-    // PERF: Uses string operations instead of regex allocation (hot path optimization)
-    _isNestedListUpdate(path, contextPath) {
-        // Check for patterns like: "categories.0.items" where contextPath is "items"
-        // This should match parent[index].contextPath but NOT unrelated paths
-        // Pattern: .<digit(s)>.<contextPath> at end of path
-
-        // Fast fail: path must end with contextPath
-        if (!path.endsWith(contextPath)) return false;
-
-        // Get the position before contextPath
-        const prefixLength = path.length - contextPath.length;
-        if (prefixLength < 3) return false; // Need at least ".0."
-
-        // Check for dot before contextPath (charCode 46 = '.')
-        if (path.charCodeAt(prefixLength - 1) !== 46) return false;
-
-        // Find where the index digits end and scan backwards for digits
-        let indexEnd = prefixLength - 2;
-        let indexStart = indexEnd;
-
-        // Scan backwards for digits (charCodes 48-57 = '0'-'9')
-        while (indexStart >= 0) {
-            const charCode = path.charCodeAt(indexStart);
-            if (charCode < 48 || charCode > 57) break;
-            indexStart--;
-        }
-
-        // Must have at least one digit
-        if (indexStart === indexEnd) return false;
-
-        // Must have a dot before the digits
-        if (indexStart < 0 || path.charCodeAt(indexStart) !== 46) return false;
-
-        return true;
     }
 };
 

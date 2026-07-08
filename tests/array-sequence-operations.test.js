@@ -489,6 +489,69 @@ describe('Array Sequence Operations', () => {
   })
 
   // =========================================================================
+  // GROUP 3b: Single-row move via index-reassignment rotation
+  // Exercises the structural fast path's move matcher: a contiguous run of
+  // index writes that rotates a range by one (one row moved end-to-end). Asserts
+  // both DOM order and that per-item bindings survive (edges kept intact).
+  // =========================================================================
+  describe('Move (single-row rotation)', () => {
+
+    // Read the rendered id sequence (by DOM order)
+    function renderedIds() {
+      return Array.from(getRows()).map(r => Number(r.querySelector('.id').textContent))
+    }
+
+    it('left-rotation move: row dragged from a low index to a higher one', async () => {
+      setupFlatComponent('move-left')
+      const ctx = getInstance('move-left')
+      ctx.state.rows = generateRows(10) // ids 1..10
+      await waitForUpdate()
+
+      // Move the item at index 2 (id 3) to index 6, shifting 3..6 down by one.
+      const rows = ctx.state.rows
+      const moved = rows[2]
+      for (let i = 2; i < 6; i++) rows[i] = rows[i + 1]
+      rows[6] = moved
+      await waitForUpdate()
+
+      // Expected DOM order: id 3 now sits at index 6; 4..7 shifted to 2..5.
+      expect(renderedIds()).toEqual([1, 2, 4, 5, 6, 7, 3, 8, 9, 10])
+
+      // Per-item bindings must still be live after the targeted move: update the
+      // moved row and a shifted row, expect the DOM cells (at their NEW positions)
+      // to reflect it — proving the row effects kept their edges.
+      ctx.state.rows[6].label += ' MOVED'   // the row that moved (id 3)
+      ctx.state.rows[2].label += ' SHIFTED' // a shifted row (id 4)
+      await waitForUpdate()
+      expect(getRows()[6].querySelector('.label').textContent).toContain('MOVED')
+      expect(getRows()[2].querySelector('.label').textContent).toContain('SHIFTED')
+    })
+
+    it('right-rotation move: row dragged from a high index to a lower one', async () => {
+      setupFlatComponent('move-right')
+      const ctx = getInstance('move-right')
+      ctx.state.rows = generateRows(10) // ids 1..10
+      await waitForUpdate()
+
+      // Move the item at index 6 (id 7) to index 2, shifting 2..5 up by one.
+      const rows = ctx.state.rows
+      const moved = rows[6]
+      for (let i = 6; i > 2; i--) rows[i] = rows[i - 1]
+      rows[2] = moved
+      await waitForUpdate()
+
+      // Expected DOM order: id 7 now at index 2; 3..6 shifted to 3..6.
+      expect(renderedIds()).toEqual([1, 2, 7, 3, 4, 5, 6, 8, 9, 10])
+
+      ctx.state.rows[2].label += ' MOVED'   // the row that moved (id 7)
+      ctx.state.rows[3].label += ' SHIFTED' // a shifted row (id 3)
+      await waitForUpdate()
+      expect(getRows()[2].querySelector('.label').textContent).toContain('MOVED')
+      expect(getRows()[3].querySelector('.label').textContent).toContain('SHIFTED')
+    })
+  })
+
+  // =========================================================================
   // GROUP 4: Swap then Update
   // =========================================================================
   describe('Swap then Update', () => {

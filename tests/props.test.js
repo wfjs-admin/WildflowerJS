@@ -759,6 +759,57 @@ describe('Props System', () => {
             wf.debug = originalDebug;
         });
 
+        it('a scan that throws does not break render effects for later components (regression)', async () => {
+            // Regression: a scan whose batch throws mid-init (here, a required-prop
+            // validation failure in dev mode) must not strand the deferred-effect
+            // bookkeeping. Previously the throw escaped the scan before the drain
+            // step ran, leaving _pendingEffectInstances non-null forever; every
+            // subsequent component was then misclassified as "nested" and never
+            // received its render effect, so its bindings stopped reacting.
+            const originalDebug = wf.debug;
+            wf.debug = true;
+
+            const observer = wf._mutationObserver;
+            if (observer) observer.disconnect();
+
+            wf.component('leak-throwy', {
+                props: { id: { type: String, required: true } }
+            });
+            wf.component('leak-later', {
+                state: { msg: 'first' },
+                bump() { this.state.msg = 'second'; }
+            });
+
+            // First scan: throws partway through the batch.
+            container.innerHTML = `<div data-component="leak-throwy"></div>`;
+            expect(() => wf.scan()).toThrow(/Missing required prop/);
+
+            // Second, independent scan: a normal component must still receive its
+            // render effect and remain reactive (ongoing updates ride the effect).
+            const el = document.createElement('div');
+            el.setAttribute('data-component', 'leak-later');
+            el.innerHTML = `<span class="m" data-bind="msg"></span>`;
+            container.appendChild(el);
+            wf.scan();
+            await waitForInit();
+
+            if (observer && document.body) {
+                observer.observe(document.body, { childList: true, subtree: true });
+            }
+            wf.debug = originalDebug;
+
+            const inst = wf.componentInstances.get(el.dataset.componentId);
+            const span = el.querySelector('.m');
+            expect(span.textContent).toBe('first');
+
+            // The decisive check: mutate state and confirm the DOM repaints. This
+            // only happens if the render effect was created — the initial paint
+            // alone would pass even with the leak.
+            inst.context.bump();
+            await waitForInit();
+            expect(span.textContent).toBe('second');
+        });
+
         itIfWarnings('warns on missing required prop in prod mode', async () => {
             const originalDebug = wf.debug;
             wf.debug = false;

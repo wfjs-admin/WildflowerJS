@@ -8,6 +8,7 @@
 import { getCSPSafeMergedContextEvaluator, getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
 import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
 import { slotDataCache } from '../core/DomMetadata.js';
+import { applyShow, applyText } from '../core/BindingWriters.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -316,6 +317,8 @@ export const TemplateSystemMethods = {
 
                 // Mark this list to force full re-render on next state update
                 // This bypasses element reuse optimization so new template is applied
+                // (consumed by the arrayFn hook in _renderListWithMapArray when the
+                // list's data next changes, not by an immediate re-render here)
                 listContainer._forceTemplateRerender = true;
             }
         }
@@ -558,43 +561,27 @@ export const TemplateSystemMethods = {
         slotDataCache.set(element, { data: dataValue, path: slotContext.dataWithPath });
         element._slotContext = slotContext;
 
-        // Process all binding types within the slot content
-        this._processSlotDataBindings(instance, element, dataValue, slotContext);
+        // READ bindings (data-bind / -html / -show / -class / -style / -attr) reuse
+        // the main list applicator: compile the live slot root once and apply against
+        // it. A scoped slot is a single "row" whose item is the data-with object.
+        // innerHTML stripping is disabled (isConfigurableTemplate) because the slot
+        // root is a live, already-rendered, in-DOM subtree; element paths are
+        // element-index based, so they align with the live element. The compiled
+        // metadata is cached on the slot context for cheap re-apply on update.
+        const meta = this._compileTemplate(element, slotContext.dataWithPath, { isConfigurableTemplate: true });
+        if (meta) {
+            const slotCtx = { componentInstance: instance, data: [dataValue], path: slotContext.dataWithPath };
+            this._bindWithCompiledMetadata(element, dataValue, meta, slotCtx, 0, slotCtx);
+            (slotContext._compiledMeta || (slotContext._compiledMeta = [])).push({ element, meta, slotCtx });
+        }
+
+        // Models (two-way write-back to the using component's data object) and
+        // actions (bound to the USING component, with slot details) keep their
+        // slot-specific semantics; the main applicator's _executeModels only sets
+        // values, and _handleInputChange would write to component state, not the
+        // data-with object. These attach their own listeners.
         this._processSlotActions(instance, element, dataValue, slotContext);
         this._processSlotModels(instance, element, dataValue, slotContext);
-        this._processSlotConditionals(instance, element, dataValue, slotContext);
-        this._processSlotClassBindings(instance, element, dataValue, slotContext);
-    },
-
-    /**
-     * Process data-bind elements within a slot
-     * @private
-     */
-    _processSlotDataBindings(instance, rootElement, dataValue, slotContext) {
-        // Find all data-bind elements (including root if it has binding)
-        const bindElements = this._collectSlotElements(rootElement, 'bind');
-
-        for (const el of bindElements) {
-            const bindPath = this._getAttr(el, 'bind');
-            if (!bindPath) continue;
-
-            // Resolve value from the data object
-            const value = this._resolveSlotValue(bindPath, dataValue, instance);
-
-            // Update element content
-            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
-                el.value = value ?? '';
-            } else {
-                el.textContent = value ?? '';
-            }
-
-            // Track binding for updates
-            slotContext.bindings.push({
-                type: 'bind',
-                element: el,
-                path: bindPath
-            });
-        }
     },
 
     /**
@@ -698,70 +685,6 @@ export const TemplateSystemMethods = {
     },
 
     /**
-     * Process data-show elements within a slot
-     * @private
-     */
-    _processSlotConditionals(instance, rootElement, dataValue, slotContext) {
-        const showElements = this._collectSlotElements(rootElement, 'show');
-
-        for (const el of showElements) {
-            const showPath = this._getAttr(el, 'show');
-            if (!showPath) continue;
-
-            // Handle negation
-            const negate = showPath.startsWith('!');
-            const actualPath = negate ? showPath.slice(1) : showPath;
-
-            // Resolve value
-            const value = this._resolveSlotValue(actualPath, dataValue, instance);
-            const shouldShow = negate ? !value : !!value;
-
-            // Apply visibility
-            el.style.display = shouldShow ? '' : 'none';
-
-            // Track for updates
-            slotContext.bindings.push({
-                type: 'show',
-                element: el,
-                path: actualPath,
-                negate
-            });
-        }
-    },
-
-    /**
-     * Process data-bind-class elements within a slot
-     * @private
-     */
-    _processSlotClassBindings(instance, rootElement, dataValue, slotContext) {
-        const classElements = this._collectSlotElements(rootElement, 'bind-class');
-
-        for (const el of classElements) {
-            const classExpr = this._getAttr(el, 'bind-class');
-            if (!classExpr) continue;
-
-            // Evaluate class expression
-            const classValue = this._evaluateSlotExpression(classExpr, dataValue, instance);
-
-            // Apply class (handle string result from ternary expressions)
-            if (typeof classValue === 'string' && classValue) {
-                el.classList.add(...classValue.split(' ').filter(c => c));
-            } else if (classValue === true) {
-                // For simple boolean bindings
-                el.classList.add(classExpr);
-            }
-
-            // Track for updates
-            slotContext.bindings.push({
-                type: 'bind-class',
-                element: el,
-                expression: classExpr,
-                appliedClasses: typeof classValue === 'string' ? classValue : ''
-            });
-        }
-    },
-
-    /**
      * Collect elements with a specific data attribute within a slot
      * Includes the root element if it has the attribute
      * @private
@@ -833,49 +756,6 @@ export const TemplateSystemMethods = {
     },
 
     /**
-     * Evaluate an expression in slot context
-     * @private
-     */
-    _evaluateSlotExpression(expr, dataValue, instance) {
-        try {
-            // Simple ternary expression evaluation
-            if (expr.includes('?')) {
-                const varNames = this._extractExpressionVars(expr);
-
-                // Build context object with data values
-                const context = {};
-                for (const varName of varNames) {
-                    context[varName] = dataValue[varName];
-                }
-
-                // Evaluate expression - use CSP-safe path if enabled
-                const contextKeys = Object.keys(context);
-                const contextValues = Object.values(context);
-
-                if (this._useCSPSafeEvaluation) {
-                    const fn = getCSPSafeEvaluatorWithArgs(
-                        expr,
-                        contextKeys,
-                        this._astCache,
-                        'slot'
-                    );
-                    return fn ? fn(...contextValues) : '';
-                } else {
-                    if (_UNSAFE_EXPR_RE.test(expr)) return '';
-                    const fn = new Function(...contextKeys, `"use strict"; return ${expr};`);
-                    return fn(...contextValues);
-                }
-            }
-
-            // Simple property access
-            return dataValue[expr];
-        } catch (e) {
-            if (typeof __DEV__ !== 'undefined' && __DEV__) console.warn(`[WildflowerJS] Error evaluating slot expression '${expr}':`, e);
-            return '';
-        }
-    },
-
-    /**
      * Update bindings when slot data changes
      * @private
      */
@@ -891,62 +771,15 @@ export const TemplateSystemMethods = {
             if (existing) { existing.data = dataValue; } else { slotDataCache.set(slotContext.renderedElement, { data: dataValue, path: null }); }
         }
 
-        for (const binding of slotContext.bindings) {
-            switch (binding.type) {
-                case 'bind': {
-                    const value = this._resolveSlotValue(binding.path, dataValue, instance);
-                    if (binding.element.tagName === 'INPUT' ||
-                        binding.element.tagName === 'TEXTAREA' ||
-                        binding.element.tagName === 'SELECT') {
-                        binding.element.value = value ?? '';
-                    } else {
-                        binding.element.textContent = value ?? '';
-                    }
-                    break;
-                }
-
-                case 'model': {
-                    const value = this._resolveSlotValue(binding.path, dataValue, instance);
-                    if (binding.element.type === 'checkbox') {
-                        binding.element.checked = !!value;
-                    } else if (binding.element.type === 'radio') {
-                        binding.element.checked = binding.element.value === String(value);
-                    } else {
-                        binding.element.value = value ?? '';
-                    }
-                    break;
-                }
-
-                case 'show': {
-                    const value = this._resolveSlotValue(binding.path, dataValue, instance);
-                    const shouldShow = binding.negate ? !value : !!value;
-                    binding.element.style.display = shouldShow ? '' : 'none';
-                    break;
-                }
-
-                case 'bind-class': {
-                    // Remove previously applied classes
-                    if (binding.appliedClasses) {
-                        binding.element.classList.remove(
-                            ...binding.appliedClasses.split(' ').filter(c => c)
-                        );
-                    }
-
-                    // Evaluate and apply new classes
-                    const classValue = this._evaluateSlotExpression(
-                        binding.expression, dataValue, instance
-                    );
-
-                    if (typeof classValue === 'string' && classValue) {
-                        binding.element.classList.add(...classValue.split(' ').filter(c => c));
-                        binding.appliedClasses = classValue;
-                    } else {
-                        binding.appliedClasses = '';
-                    }
-                    break;
-                }
-
-                // Actions don't need updating - they reference the data object directly
+        // Re-apply READ bindings via the cached compiled metadata. This also
+        // refreshes model-displayed values (_executeModels). Model write-back
+        // listeners and action listeners persist on the elements across updates;
+        // they reference the data object directly and need no re-binding.
+        if (slotContext._compiledMeta) {
+            for (let i = 0; i < slotContext._compiledMeta.length; i++) {
+                const entry = slotContext._compiledMeta[i];
+                entry.slotCtx.data = [dataValue];
+                this._bindWithCompiledMetadata(entry.element, dataValue, entry.meta, entry.slotCtx, 0, entry.slotCtx);
             }
         }
     },
@@ -962,6 +795,8 @@ export const TemplateSystemMethods = {
             }
         }
         slotContext.bindings = [];
+        // Drop cached compiled-read metadata (its elements are about to be removed).
+        slotContext._compiledMeta = null;
     },
 
     /**
@@ -1236,6 +1071,7 @@ export const TemplateSystemMethods = {
                 // PERF: For expressions, pre-extract variables and pre-compile
                 if (isExpression) {
                     binding.expressionVars = this._extractExpressionVars(bindPath);
+                    binding.expressionPaths = this._extractExpressionPaths(bindPath);
                     binding.compiledFn = this._getCompiledExpression(bindPath, binding.expressionVars, 'listBinding');
                 }
 
@@ -1265,6 +1101,7 @@ export const TemplateSystemMethods = {
                 // PERF: For expressions, pre-extract variables and pre-compile
                 if (isExpression) {
                     htmlBinding.expressionVars = this._extractExpressionVars(bindHtmlPath);
+                    htmlBinding.expressionPaths = this._extractExpressionPaths(bindHtmlPath);
                     htmlBinding.compiledFn = this._getCompiledExpression(bindHtmlPath, htmlBinding.expressionVars, 'listHtmlBinding');
                 }
 
@@ -1310,6 +1147,7 @@ export const TemplateSystemMethods = {
                 // PERF: For expressions, pre-extract variables and pre-compile
                 if (isExpression) {
                     showBinding.expressionVars = this._extractExpressionVars(actualPath);
+                    showBinding.expressionPaths = this._extractExpressionPaths(actualPath);
                     showBinding.compiledFn = this._getCompiledExpression(actualPath, showBinding.expressionVars, 'listShowBinding');
                 }
 
@@ -1320,27 +1158,7 @@ export const TemplateSystemMethods = {
             // Enhanced to match show binding structure for _resolveCompiledBinding compatibility
             const renderPath = this._getAttr(el, 'render');
             if (renderPath) {
-                const negate = renderPath.startsWith('!');
-                const actualRenderPath = negate ? renderPath.slice(1) : renderPath;
-                const isRenderComputed = actualRenderPath.includes('computed:');
-                const isRenderExpression = this.isExpression(actualRenderPath);
-
-                const renderBinding = {
-                    index: i,
-                    path: actualRenderPath,
-                    negate,
-                    isComputed: isRenderComputed,
-                    computedName: isRenderComputed ? actualRenderPath.slice(9) : null,
-                    elementPath,
-                    isExpression: isRenderExpression
-                };
-
-                if (isRenderExpression) {
-                    renderBinding.expressionVars = this._extractExpressionVars(actualRenderPath);
-                    renderBinding.compiledFn = this._getCompiledExpression(actualRenderPath, renderBinding.expressionVars, 'listRenderBinding');
-                }
-
-                metadata.renders.push(renderBinding);
+                metadata.renders.push(this._compileRenderBinding(renderPath, i, elementPath));
             }
 
             // Extract data-action metadata (support both prefixes)
@@ -1371,7 +1189,7 @@ export const TemplateSystemMethods = {
                 // no-op: the list-row context-creation path doesn't read it,
                 // and the regular _setupActions path skips list-row children.
                 // The flag is consumed by ListItemBinding and onBulkCreate to
-                // register PropsSystem._setupOutsideClickHandler eagerly.
+                // register EventSystem._setupOutsideClickHandler eagerly.
                 const hasEventOutside = this._hasAttr(el, 'event-outside');
 
                 metadata.actions.push({
@@ -1410,6 +1228,7 @@ export const TemplateSystemMethods = {
                 if (!isSimpleProperty && !isComputed) {
                     const uniqueVars = this._extractExpressionVars(bindClassExpr);
                     classBinding.expressionVars = uniqueVars;
+                    classBinding.expressionPaths = this._extractExpressionPaths(bindClassExpr);
                     classBinding.usesListContext = uniqueVars.some(v => this._listContextVars.has(v));
                     classBinding.needsComponentState = uniqueVars.some(v => !this._listContextVars.has(v));
                     // Pre-compile if it's a pure item expression (no component state needed, no list context)
@@ -1444,6 +1263,7 @@ export const TemplateSystemMethods = {
                 if (!isComputed) {
                     const uniqueVars = this._extractExpressionVars(bindStyleExpr);
                     styleBinding.expressionVars = uniqueVars;
+                    styleBinding.expressionPaths = this._extractExpressionPaths(bindStyleExpr);
                     styleBinding.usesListContext = uniqueVars.some(v => this._listContextVars.has(v));
                     // Pre-compile if no list context variables (those need special handling at runtime)
                     if (uniqueVars.length > 0 && !styleBinding.usesListContext) {
@@ -1477,6 +1297,7 @@ export const TemplateSystemMethods = {
                 if (!isComputed) {
                     const uniqueVars = this._extractExpressionVars(bindAttrExpr);
                     attrBinding.expressionVars = uniqueVars;
+                    attrBinding.expressionPaths = this._extractExpressionPaths(bindAttrExpr);
                     attrBinding.usesListContext = uniqueVars.some(v => this._listContextVars.has(v));
                     // Pre-compile if no list context variables (those need special handling at runtime)
                     if (uniqueVars.length > 0 && !attrBinding.usesListContext) {
@@ -1500,6 +1321,53 @@ export const TemplateSystemMethods = {
             metadata.renders.some(b => listContextVars.some(v => b.path.includes(v)));
 
         metadata.usesListContextVariables = usesListContextVariables;
+
+        // PERF: Precompute the single-text-prop fast-path map. A flat item prop
+        // bound to exactly ONE plain (isSimplePath, non-input) text node, and
+        // referenced by NO other binding (text/html/model/show/render/class/
+        // style/attr/root), can be updated on a targeted single-prop change with
+        // a direct textContent write, skipping the generic per-item bind dispatch
+        // (reusable-ctx setup + binding-type checks + filter loop). Conservative:
+        // any prop referenced elsewhere, more than once, or via an expression's
+        // vars is excluded and falls back to the full bind path.
+        const _refCount = new Map();
+        const _bumpId = (id) => { if (id) _refCount.set(id, (_refCount.get(id) || 0) + 1); };
+        const _bumpDep = (str, isExpr, preVars) => {
+            if (!str) return;
+            if (isExpr) {
+                const vars = preVars || this._extractExpressionVars(str);
+                for (let k = 0; k < vars.length; k++) _bumpId(vars[k]);
+            } else {
+                const d = str.indexOf('.');
+                _bumpId(d === -1 ? str : str.slice(0, d));
+            }
+        };
+        for (const b of metadata.bindings)      _bumpDep(b.path, b.isExpression, b.expressionVars);
+        for (const b of metadata.htmlBindings)  _bumpDep(b.path, b.isExpression, b.expressionVars);
+        for (const b of metadata.models)        _bumpDep(b.path, false);
+        for (const b of metadata.shows)         _bumpDep(b.path, b.isExpression, b.expressionVars);
+        for (const b of metadata.renders)       _bumpDep(b.path, b.isExpression, b.expressionVars);
+        for (const b of metadata.classBindings) _bumpDep(b.expression, !b.isSimpleProperty, b.expressionVars);
+        for (const b of metadata.styleBindings) _bumpDep(b.expression, true, b.expressionVars);
+        for (const b of metadata.attrBindings)  _bumpDep(b.expression, true, b.expressionVars);
+        const _rb = metadata.rootBindings;
+        if (_rb) {
+            _bumpDep(_rb.bindPath, _rb.bindPath ? this.isExpression(_rb.bindPath) : false);
+            _bumpDep(_rb.bindHtmlPath, _rb.bindHtmlPath ? this.isExpression(_rb.bindHtmlPath) : false);
+            _bumpDep(_rb.modelPath, false);
+            _bumpDep(_rb.showPath, _rb.showPath ? this.isExpression(_rb.showPath) : false);
+            _bumpDep(_rb.renderPath, _rb.renderPath ? this.isExpression(_rb.renderPath) : false);
+            _bumpDep(_rb.bindClassExpr, true);
+            _bumpDep(_rb.bindStyleExpr, true);
+            _bumpDep(_rb.bindAttrExpr, true);
+        }
+        let _singleTextProp = null;
+        for (const b of metadata.bindings) {
+            if (b.isSimplePath && !b.isInput && _refCount.get(b.path) === 1) {
+                (_singleTextProp || (_singleTextProp = new Map())).set(b.path, b.index);
+            }
+        }
+        metadata.singleTextProp = _singleTextProp;
 
         // =======================================================================
         // TWO-PASS innerHTML OPTIMIZATION
@@ -1653,15 +1521,15 @@ export const TemplateSystemMethods = {
             // benchmark reasons (10K rows × per-row data-action adds up).
             // The runtime click delegation in EventSystem reads the action
             // name back from compiled metadata when the DOM attribute is
-            // missing — see _handleDelegatedActionWithListItem's metadata
+            // missing; see _handleDelegatedActionWithListItem's metadata
             // fallback. If you reorder or touch the strip path, make sure
             // the metadata fallback still resolves the action name; the
-            // silent dead-click bug fixed 2026-05-17 (amber-otter-23) was
-            // exactly this attribute/metadata desync.
+            // silent dead-click bug this guards against was exactly this
+            // attribute/metadata desync.
             const attrsToStrip = [
                 // Text binding attributes
                 'data-bind', 'data-wf-bind',
-                // Action attributes — contexts looked up via compiled metadata
+                // Action attributes: contexts looked up via compiled metadata
                 'data-action', 'data-wf-action',
                 // Verbose attributes with expressions
                 'data-bind-class', 'data-wf-bind-class',
@@ -1672,7 +1540,7 @@ export const TemplateSystemMethods = {
                 'data-render', 'data-wf-render',
                 'data-if', 'data-wf-if',
                 'data-key', 'data-wf-key',
-                // Anti-FOUC marker — must be stripped from the cached
+                // Anti-FOUC marker: must be stripped from the cached
                 // template (and innerHTML parts), not just from the
                 // initial DOM scan. Otherwise rows added later (or moved
                 // between sibling data-lists) inherit data-cloak from
@@ -1719,12 +1587,17 @@ export const TemplateSystemMethods = {
             metadata.textAccessors = textAccessors;
         }
 
-        // Pre-compile class evaluators unconditionally — they're needed by both
+        // Pre-compile class evaluators unconditionally; they're needed by both
         // the innerHTML fast path AND the mapFn DOM-cloning path.
         // Previously inside canUseInnerHTML block, which meant class bindings
         // silently failed when style/attr/model/show bindings disabled innerHTML.
         const classEvaluators = [];
         for (const classBinding of metadata.classBindings) {
+            // The root element is both walked (indexed entry here) AND handled by
+            // the isRoot unshift below, so its class binding would be evaluated
+            // twice per entity per frame in the pool flush. Skip the indexed
+            // duplicate; the isRoot entry covers the root in every consumer.
+            if (metadata.rootBindings.hasBindClass && classBinding.elementPath && classBinding.elementPath.length === 0) continue;
             const expr = classBinding.expression;
             let evalFn;
 
@@ -1734,41 +1607,11 @@ export const TemplateSystemMethods = {
                 evalFn = this._createPropertyAccessor(expr);
                 evalFn._isPropertyAccessor = true; // Mark so _fastInitialRender uses it correctly
             } else {
-                // Extract all unique variables from the expression
-                const vars = classBinding.expressionVars || [];
-                const allVars = [...new Set(vars)];
-
-                // Create evaluator function that takes a merged context object
-                // This handles item properties, component state, and list context variables
-                // without needing to know which is which at compile time
-                try {
-                    if (this._useCSPSafeEvaluation) {
-                        // CSP-safe path: use AST evaluator
-                        evalFn = getCSPSafeMergedContextEvaluator(
-                            expr,
-                            allVars,
-                            this._astCache,
-                            'class-eval'
-                        );
-                        if (evalFn) evalFn._usesMergedContext = true;
-                    } else if (!_UNSAFE_EXPR_RE.test(expr)) {
-                        // Standard path: use new Function()
-                        // Auto-wrap object-literal expressions in parens. JS ASI parses
-                        // `return { x: y }` as `return; { x: y }` (block) → undefined.
-                        // Parens force object-literal interpretation. Safe no-op for
-                        // non-object expressions.
-                        const trimmedExpr = expr.trim();
-                        const exprForReturn = (trimmedExpr.startsWith('{') && trimmedExpr.endsWith('}'))
-                            ? `(${trimmedExpr})`
-                            : expr;
-                        const destructure = allVars.length > 0 ? `const {${allVars.join(',')}} = ctx;` : '';
-                        evalFn = new Function('ctx', `"use strict"; ${destructure} return ${exprForReturn};`);
-                        evalFn._usesMergedContext = true;
-                    }
-                } catch (e) {
-                    // Fallback: null means use standard evaluation
-                    evalFn = null;
-                }
+                // Merged-context evaluator: handles item properties, component
+                // state, and list context variables without needing to know
+                // which is which at compile time.
+                const allVars = [...new Set(classBinding.expressionVars || [])];
+                evalFn = this._compileMergedCtxEvaluator(expr, allVars, 'class-eval', true);
             }
 
             classEvaluators.push({
@@ -1783,32 +1626,8 @@ export const TemplateSystemMethods = {
         // Also handle root class binding
         if (metadata.rootBindings.hasBindClass && metadata.rootBindings.bindClassExpr) {
             const expr = metadata.rootBindings.bindClassExpr;
-            const allVars = this._extractExpressionVars(expr);
-
-            let evalFn;
-            try {
-                if (this._useCSPSafeEvaluation) {
-                    // CSP-safe path: use AST evaluator
-                    evalFn = getCSPSafeMergedContextEvaluator(
-                        expr,
-                        allVars,
-                        this._astCache,
-                        'root-class-eval'
-                    );
-                    if (evalFn) evalFn._usesMergedContext = true;
-                } else if (!_UNSAFE_EXPR_RE.test(expr)) {
-                    // Standard path: use new Function() with object-literal auto-wrap
-                    const trimmedExpr = expr.trim();
-                    const exprForReturn = (trimmedExpr.startsWith('{') && trimmedExpr.endsWith('}'))
-                        ? `(${trimmedExpr})`
-                        : expr;
-                    const destructure = allVars.length > 0 ? `const {${allVars.join(',')}} = ctx;` : '';
-                    evalFn = new Function('ctx', `"use strict"; ${destructure} return ${exprForReturn};`);
-                    evalFn._usesMergedContext = true;
-                }
-            } catch (e) {
-                evalFn = null;
-            }
+            const evalFn = this._compileMergedCtxEvaluator(
+                expr, this._extractExpressionVars(expr), 'root-class-eval', true);
 
             classEvaluators.unshift({
                 elementPath: [], // Root element
@@ -1820,9 +1639,37 @@ export const TemplateSystemMethods = {
 
         metadata.classEvaluators = classEvaluators;
 
+        // Precompute the union of class-expression variables for the create-path
+        // targeted copy. onBulkCreate's per-row class apply otherwise Object.assigns
+        // EVERY item prop into the reused merged context (O(item width) per row);
+        // copying only the props the class expressions reference is O(class-expr vars),
+        // and the win scales with row width. Only safe when every class evaluator is
+        // non-null: a null evaluator falls back to a path that reads Object.keys(
+        // mergedCtx), which needs the full item-prop copy. Component-state vars in the
+        // set are absent from the raw item (the runtime `in` check skips them), so the
+        // pre-loaded componentState value is preserved, identical to the full Object.assign.
+        let classCopyVars = null;
+        if (classEvaluators.length > 0 && classEvaluators.every(ev => ev.evaluator)) {
+            const varSet = new Set();
+            for (const cb of metadata.classBindings) {
+                const vars = cb.expressionVars;
+                if (vars) for (let vi = 0; vi < vars.length; vi++) varSet.add(vars[vi]);
+            }
+            if (metadata.rootBindings.hasBindClass && metadata.rootBindings.bindClassExpr) {
+                const rv = this._extractExpressionVars(metadata.rootBindings.bindClassExpr);
+                if (rv) for (let vi = 0; vi < rv.length; vi++) varSet.add(rv[vi]);
+            }
+            classCopyVars = Array.from(varSet);
+        }
+        metadata._classCopyVars = classCopyVars;
+
         // Pre-compile style evaluators for fast-path rendering
         const styleEvaluators = [];
         for (const styleBinding of metadata.styleBindings) {
+            // Skip the root's indexed duplicate; the isRoot unshift below covers it.
+            // Without this, the root data-bind-style object literal is allocated and
+            // string-coerced twice per entity per frame in the pool flush.
+            if (metadata.rootBindings.hasBindStyle && styleBinding.elementPath && styleBinding.elementPath.length === 0) continue;
             const expr = styleBinding.expression;
             if (styleBinding.isComputed) {
                 styleEvaluators.push({ index: styleBinding.index, elementPath: styleBinding.elementPath, evaluator: null, expression: expr, isComputed: true, computedName: styleBinding.computedName });
@@ -1832,36 +1679,16 @@ export const TemplateSystemMethods = {
             // styleBinding.compiledFn uses positional args (from _getCompiledExpression)
             // which is incompatible with the fast-path's merged context pattern.
             let evalFn = null;
-            const vars = styleBinding.expressionVars || [];
-            const allVars = [...new Set(vars)];
+            const allVars = [...new Set(styleBinding.expressionVars || [])];
             if (allVars.length > 0) {
-                try {
-                    if (this._useCSPSafeEvaluation) {
-                        evalFn = getCSPSafeMergedContextEvaluator(expr, allVars, this._astCache, 'style-eval');
-                        if (evalFn) evalFn._usesMergedContext = true;
-                    } else if (!_UNSAFE_EXPR_RE.test(expr)) {
-                        const destructure = `const {${allVars.join(',')}} = ctx;`;
-                        evalFn = new Function('ctx', `"use strict"; ${destructure} return ${expr};`);
-                        evalFn._usesMergedContext = true;
-                    }
-                } catch (e) { evalFn = null; }
+                evalFn = this._compileMergedCtxEvaluator(expr, allVars, 'style-eval', false);
             }
             styleEvaluators.push({ index: styleBinding.index, elementPath: styleBinding.elementPath, evaluator: evalFn, expression: expr, isComputed: false });
         }
         if (metadata.rootBindings.hasBindStyle && metadata.rootBindings.bindStyleExpr) {
             const expr = metadata.rootBindings.bindStyleExpr;
-            const allVars = this._extractExpressionVars(expr);
-            let evalFn;
-            try {
-                if (this._useCSPSafeEvaluation) {
-                    evalFn = getCSPSafeMergedContextEvaluator(expr, allVars, this._astCache, 'root-style-eval');
-                    if (evalFn) evalFn._usesMergedContext = true;
-                } else if (!_UNSAFE_EXPR_RE.test(expr)) {
-                    const destructure = allVars.length > 0 ? `const {${allVars.join(',')}} = ctx;` : '';
-                    evalFn = new Function('ctx', `"use strict"; ${destructure} return ${expr};`);
-                    evalFn._usesMergedContext = true;
-                }
-            } catch (e) { evalFn = null; }
+            const evalFn = this._compileMergedCtxEvaluator(
+                expr, this._extractExpressionVars(expr), 'root-style-eval', false);
             styleEvaluators.unshift({ elementPath: [], evaluator: evalFn, expression: expr, isRoot: true, isComputed: false });
         }
         metadata.styleEvaluators = styleEvaluators;
@@ -1869,6 +1696,9 @@ export const TemplateSystemMethods = {
         // Pre-compile attr evaluators for fast-path rendering
         const attrEvaluators = [];
         for (const attrBinding of metadata.attrBindings) {
+            // Skip the root's indexed duplicate; the isRoot unshift below covers it
+            // (root is both walked and unshifted, else evaluated twice per frame).
+            if (metadata.rootBindings.hasBindAttr && attrBinding.elementPath && attrBinding.elementPath.length === 0) continue;
             const expr = attrBinding.expression;
             if (attrBinding.isComputed) {
                 attrEvaluators.push({ index: attrBinding.index, elementPath: attrBinding.elementPath, evaluator: null, expression: expr, isComputed: true, computedName: attrBinding.computedName });
@@ -1876,45 +1706,102 @@ export const TemplateSystemMethods = {
             }
             // Always compile context-object evaluator (same reason as style evaluators)
             let evalFn = null;
-            const vars = attrBinding.expressionVars || [];
-            const allVars = [...new Set(vars)];
+            const allVars = [...new Set(attrBinding.expressionVars || [])];
             if (allVars.length > 0) {
-                try {
-                    let safeExpr = expr.replace(/(\{|,)\s*([a-zA-Z_$][a-zA-Z0-9_$]*(?:-[a-zA-Z0-9_$]+)+)\s*:/g,
-                        (match, prefix, key) => `${prefix} '${key}':`);
-                    if (this._useCSPSafeEvaluation) {
-                        evalFn = getCSPSafeMergedContextEvaluator(safeExpr, allVars, this._astCache, 'attr-eval');
-                        if (evalFn) evalFn._usesMergedContext = true;
-                    } else if (!_UNSAFE_EXPR_RE.test(safeExpr)) {
-                        const destructure = `const {${allVars.join(',')}} = ctx;`;
-                        evalFn = new Function('ctx', `"use strict"; ${destructure} return ${safeExpr};`);
-                        evalFn._usesMergedContext = true;
-                    }
-                } catch (e) { evalFn = null; }
+                evalFn = this._compileMergedCtxEvaluator(
+                    this._quoteHyphenKeys(expr), allVars, 'attr-eval', false);
             }
             attrEvaluators.push({ index: attrBinding.index, elementPath: attrBinding.elementPath, evaluator: evalFn, expression: expr, isComputed: false });
         }
         if (metadata.rootBindings.hasBindAttr && metadata.rootBindings.bindAttrExpr) {
             const expr = metadata.rootBindings.bindAttrExpr;
-            let safeExpr = expr.replace(/(\{|,)\s*([a-zA-Z_$][a-zA-Z0-9_$]*(?:-[a-zA-Z0-9_$]+)+)\s*:/g,
-                (match, prefix, key) => `${prefix} '${key}':`);
-            const allVars = this._extractExpressionVars(safeExpr);
-            let evalFn;
-            try {
-                if (this._useCSPSafeEvaluation) {
-                    evalFn = getCSPSafeMergedContextEvaluator(safeExpr, allVars, this._astCache, 'root-attr-eval');
-                    if (evalFn) evalFn._usesMergedContext = true;
-                } else if (!_UNSAFE_EXPR_RE.test(safeExpr)) {
-                    const destructure = allVars.length > 0 ? `const {${allVars.join(',')}} = ctx;` : '';
-                    evalFn = new Function('ctx', `"use strict"; ${destructure} return ${safeExpr};`);
-                    evalFn._usesMergedContext = true;
-                }
-            } catch (e) { evalFn = null; }
+            const safeExpr = this._quoteHyphenKeys(expr);
+            const evalFn = this._compileMergedCtxEvaluator(
+                safeExpr, this._extractExpressionVars(safeExpr), 'root-attr-eval', false);
             attrEvaluators.unshift({ elementPath: [], evaluator: evalFn, expression: expr, isRoot: true, isComputed: false });
         }
         metadata.attrEvaluators = attrEvaluators;
 
         return metadata;
+    },
+    /**
+     * Quote bare hyphenated object keys so attr expressions are valid JS:
+     * { data-item-id: id } → { 'data-item-id': id }
+     * Shared by the attr evaluator builders here and the list attr-binding
+     * path in ListExpressionEval.
+     * @private
+     */
+    _quoteHyphenKeys(expr) {
+        return expr.replace(/(\{|,)\s*([a-zA-Z_$][a-zA-Z0-9_$]*(?:-[a-zA-Z0-9_$]+)+)\s*:/g,
+            (match, prefix, key) => `${prefix} '${key}':`);
+    },
+    /**
+     * Compile a merged-context evaluator for a binding expression: the shared
+     * core of the class/style/attr evaluator builders (list and root variants).
+     * The evaluator receives ONE ctx object (item props + component state +
+     * list context vars merged) and destructures the expression's variables
+     * from it. Returns null when compilation isn't possible (CSP parse failure,
+     * unsafe expression, syntax error); callers fall back to standard evaluation.
+     * @param {string} expr - Final expression source (pre-quoted for attr)
+     * @param {string[]} allVars - Variables to destructure from ctx
+     * @param {string} cacheTag - AST-cache tag for the CSP path
+     * @param {boolean} wrapObjectLiteral - Paren-wrap a `{...}` expression so
+     *   `return {...}` can't be misparsed (class-family behavior)
+     * @returns {Function|null}
+     * @private
+     */
+    _compileMergedCtxEvaluator(expr, allVars, cacheTag, wrapObjectLiteral) {
+        let evalFn = null;
+        try {
+            if (this._useCSPSafeEvaluation) {
+                evalFn = getCSPSafeMergedContextEvaluator(expr, allVars, this._astCache, cacheTag);
+                if (evalFn) evalFn._usesMergedContext = true;
+            } else if (!_UNSAFE_EXPR_RE.test(expr)) {
+                let exprForReturn = expr;
+                if (wrapObjectLiteral) {
+                    const trimmed = expr.trim();
+                    if (trimmed.startsWith('{') && trimmed.endsWith('}')) exprForReturn = `(${trimmed})`;
+                }
+                const destructure = allVars.length > 0 ? `const {${allVars.join(',')}} = ctx;` : '';
+                evalFn = new Function('ctx', `"use strict"; ${destructure} return ${exprForReturn};`);
+                evalFn._usesMergedContext = true;
+            }
+        } catch (e) {
+            evalFn = null;
+        }
+        return evalFn;
+    },
+    /**
+     * Extract data-render binding metadata for one element: shared verbatim
+     * by the list-template compiler and the component compiler. The negate
+     * strip, computed: detection, and expression precompile must stay
+     * identical in both so _resolveCompiledBinding treats either source the
+     * same way.
+     * @private
+     */
+    _compileRenderBinding(renderPath, i, elementPath) {
+        const negate = renderPath.startsWith('!');
+        const actualRenderPath = negate ? renderPath.slice(1) : renderPath;
+        const isRenderComputed = actualRenderPath.includes('computed:');
+        const isRenderExpression = this.isExpression(actualRenderPath);
+
+        const renderBinding = {
+            index: i,
+            path: actualRenderPath,
+            negate,
+            isComputed: isRenderComputed,
+            computedName: isRenderComputed ? actualRenderPath.slice(9) : null,
+            elementPath,
+            isExpression: isRenderExpression
+        };
+
+        if (isRenderExpression) {
+            renderBinding.expressionVars = this._extractExpressionVars(actualRenderPath);
+            renderBinding.expressionPaths = this._extractExpressionPaths(actualRenderPath);
+            renderBinding.compiledFn = this._getCompiledExpression(actualRenderPath, renderBinding.expressionVars, 'listRenderBinding');
+        }
+
+        return renderBinding;
     },
     /**
      * Create a property accessor function for a dot-notation path
@@ -2031,7 +1918,7 @@ export const TemplateSystemMethods = {
             }
         }
 
-        // Also find data-pool elements (entity pools — high-performance rendering)
+        // Also find data-pool elements (entity pools for high-performance rendering)
         const poolElements = element.querySelectorAll(this._attrSelector('pool'));
         for (const poolEl of poolElements) {
             let parent = poolEl.parentElement;
@@ -2149,27 +2036,7 @@ export const TemplateSystemMethods = {
             // Extract data-render (enhanced for _resolveCompiledBinding compatibility)
             const renderPath = this._getAttr(el, 'render');
             if (renderPath) {
-                const negate = renderPath.startsWith('!');
-                const actualRenderPath = negate ? renderPath.slice(1) : renderPath;
-                const isRenderComputed = actualRenderPath.includes('computed:');
-                const isRenderExpression = this.isExpression(actualRenderPath);
-
-                const renderBinding = {
-                    index: i,
-                    path: actualRenderPath,
-                    negate,
-                    isComputed: isRenderComputed,
-                    computedName: isRenderComputed ? actualRenderPath.slice(9) : null,
-                    elementPath,
-                    isExpression: isRenderExpression
-                };
-
-                if (isRenderExpression) {
-                    renderBinding.expressionVars = this._extractExpressionVars(actualRenderPath);
-                    renderBinding.compiledFn = this._getCompiledExpression(actualRenderPath, renderBinding.expressionVars, 'listRenderBinding');
-                }
-
-                metadata.renders.push(renderBinding);
+                metadata.renders.push(this._compileRenderBinding(renderPath, i, elementPath));
             }
 
             // Extract data-action

@@ -38,6 +38,8 @@ import { DomAbstractionMethods } from './dom/DomAbstraction.js';
 import { PropsSystemMethods } from './features/PropsSystem.js';
 import { ErrorBoundariesMethods } from './features/ErrorBoundaries.js';
 import { PluginSystemMethods } from './features/PluginSystem.js';
+import { DirectiveSystemMethods } from './features/DirectiveSystem.js';
+import { HookSystemMethods } from './features/HookSystem.js';
 
 // Optional features (included in full)
 import { PortalSystemMethods } from './features/PortalSystem.js';
@@ -82,6 +84,8 @@ Object.assign(WildflowerJS.prototype,
     PropsSystemMethods,
     ErrorBoundariesMethods,
     PluginSystemMethods,
+    DirectiveSystemMethods,
+    HookSystemMethods,
 
     // Optional features
     PortalSystemMethods,

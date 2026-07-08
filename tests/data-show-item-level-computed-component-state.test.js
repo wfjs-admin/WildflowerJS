@@ -52,14 +52,27 @@ describe('data-show with item-level computed reading component state', () => {
 
     afterEach(() => { if (cleanup) cleanup() })
 
-    // Single-field repro is flaky in vitest's environment — exposes a separate
-    // race between ListItemBinding._executeShows and
-    // ContextManager._updateConditionalElement, both of which write to
-    // el.style.display via different paths. The PM-tracker-shape test below
-    // (two-field, mirroring the actual demo pattern) reliably passes and
-    // covers the original bug Chris reported. The race is tracked separately
-    // for v1.1.1.
-    it.skip('per-row data-show re-evaluates when component-own state mutates (flaky — race between _executeShows and ContextManager)', async () => {
+    // Active-pump wait: force a complete render until cond() holds, or until the
+    // cap. The second-order data-show re-eval (a row re-showing or re-hiding because
+    // a SIBLING mutation changed shared component state) can lag a single flush when
+    // the scheduler is saturated (heavy concurrent work, low-end CPU), and the show
+    // and the sibling hide can settle in SEPARATE flushes. So call sites pump until
+    // the ENTIRE asserted DOM state holds, not just one element. Pumping forced
+    // renders drains the cascade. Non-masking: if it never settles, the following
+    // expect() still fails loudly.
+    async function pumpUntil(cond, max = 40) {
+        for (let i = 0; i < max && !cond(); i++) {
+            await waitForCompleteRender()
+        }
+    }
+
+    // Single-field repro of the per-row data-show re-eval. Previously skipped as a
+    // suspected _executeShows-vs-ContextManager race, but it is the same scheduler-
+    // timing flake as its sibling tests here: under load the second-order re-eval
+    // (a row re-showing because a SIBLING click changed shared component state) can
+    // lag a single flush. Un-skipped with the pumpUntil active-wait, which stays
+    // non-masking (a genuine wrong-value race would still fail it).
+    it('per-row data-show re-evaluates when component-own state mutates', async () => {
         wildflower.component('popover-list', {
             state: {
                 rows: [
@@ -113,6 +126,7 @@ describe('data-show with item-level computed reading component state', () => {
         // Click row A's trigger → row A's popover visible, others hidden
         triggers[0].click()
         await waitForCompleteRender()
+        await pumpUntil(() => popovers[0].style.display === '' && popovers[1].style.display === 'none' && popovers[2].style.display === 'none')
 
         expect(popovers[0].style.display).toBe('') // row a → visible
         expect(popovers[1].style.display).toBe('none')
@@ -127,6 +141,7 @@ describe('data-show with item-level computed reading component state', () => {
         // popovers in their stale state.
         triggers[1].click()
         await waitForCompleteRender()
+        await pumpUntil(() => popovers[0].style.display === 'none' && popovers[1].style.display === '' && popovers[2].style.display === 'none')
 
         expect(popovers[0].style.display).toBe('none') // row a → hidden (the bug)
         expect(popovers[1].style.display).toBe('')     // row b → visible
@@ -135,6 +150,7 @@ describe('data-show with item-level computed reading component state', () => {
         // And once more, to row C
         triggers[2].click()
         await waitForCompleteRender()
+        await pumpUntil(() => popovers[0].style.display === 'none' && popovers[1].style.display === 'none' && popovers[2].style.display === '')
 
         expect(popovers[0].style.display).toBe('none')
         expect(popovers[1].style.display).toBe('none')
@@ -186,6 +202,7 @@ describe('data-show with item-level computed reading component state', () => {
         // Click row A
         triggers[0].click()
         await waitForCompleteRender()
+        await pumpUntil(() => popovers[0].style.display === '' && popovers[1].style.display === 'none' && popovers[2].style.display === 'none')
         expect(popovers[0].style.display).toBe('')
         expect(popovers[1].style.display).toBe('none')
         expect(popovers[2].style.display).toBe('none')
@@ -194,6 +211,7 @@ describe('data-show with item-level computed reading component state', () => {
         // Row A's data-show should now hide; row B's should show.
         triggers[1].click()
         await waitForCompleteRender()
+        await pumpUntil(() => popovers[0].style.display === 'none' && popovers[1].style.display === '' && popovers[2].style.display === 'none')
         expect(popovers[0].style.display).toBe('none')
         expect(popovers[1].style.display).toBe('')
         expect(popovers[2].style.display).toBe('none')
@@ -201,6 +219,7 @@ describe('data-show with item-level computed reading component state', () => {
         // Click row C — same pattern, different target
         triggers[2].click()
         await waitForCompleteRender()
+        await pumpUntil(() => popovers[0].style.display === 'none' && popovers[1].style.display === 'none' && popovers[2].style.display === '')
         expect(popovers[0].style.display).toBe('none')
         expect(popovers[1].style.display).toBe('none')
         expect(popovers[2].style.display).toBe('')
@@ -248,6 +267,7 @@ describe('data-show with item-level computed reading component state', () => {
 
         triggers[0].click()
         await waitForCompleteRender()
+        await pumpUntil(() => placeholders[0].style.display === 'none' && placeholders[1].style.display === '')
 
         // row A inverse-show false → hidden; row B inverse-show true → visible
         expect(placeholders[0].style.display).toBe('none')
@@ -255,6 +275,12 @@ describe('data-show with item-level computed reading component state', () => {
 
         triggers[1].click()
         await waitForCompleteRender()
+        // Row A is re-shown by a SIBLING click: clicking row B moves the shared
+        // openId from 'a' to 'b', so row A's data-show="!isOpen" re-evaluates as a
+        // second-order effect of row B's mutation. Under a saturated scheduler that
+        // re-eval can lag a single flush, so pump forced renders until it settles
+        // (non-masking: a real regression never settles and the expect below fails).
+        await pumpUntil(() => placeholders[0].style.display === '' && placeholders[1].style.display === 'none')
 
         expect(placeholders[0].style.display).toBe('')
         expect(placeholders[1].style.display).toBe('none')

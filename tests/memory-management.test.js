@@ -54,10 +54,7 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
     }
   })
 
-  it('Contexts are garbage collected when components are destroyed', async () => {
-    // Use unique list name to avoid conflicts with other tests
-    // Include bindings outside the list template to ensure binding contexts are created
-    // (HTML5 template content is in DocumentFragments, not visible to initial querySelectorAll)
+  it('Destroying a component releases its rendered structure (no leak)', async () => {
     testContainer.innerHTML = `
       <div data-component="gc-test">
         <span data-bind="title">Title</span>
@@ -95,51 +92,31 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
     // Ensure component was created
     expect(instance).toBeDefined()
 
-    // Count contexts before destruction (global counts, as in original test)
-    const beforeContextCount = wildflower._contextRegistry.contexts.size
-    const listContextsBefore = wildflower._contextRegistry.getContextsByType('list').length
-    const bindingContextsBefore = wildflower._contextRegistry.getContextsByType('binding').length
-    const conditionalContextsBefore = wildflower._contextRegistry.getContextsByType('conditional').length
-
-    // Ensure we have contexts to test with
-    expect(beforeContextCount).toBeGreaterThan(0)
+    // List contexts are plain objects on the instance map — observable framework
+    // state (not registry-tracked). They exist while the component is live.
+    const listContextsBefore = instance._listContexts ? instance._listContexts.size : 0
     expect(listContextsBefore).toBeGreaterThan(0)
-    expect(bindingContextsBefore).toBeGreaterThan(0)
-    expect(conditionalContextsBefore).toBeGreaterThan(0)
 
-    // Destroy the component
+    // The list rendered its rows.
+    const renderedItems = Array.from(component.querySelectorAll('[data-list] > *'))
+      .filter(el => el.tagName !== 'TEMPLATE')
+    expect(renderedItems.length).toBeGreaterThan(0)
+
+    // Destroy the component, then run the public component-level GC.
     wildflower.destroyComponent(instanceId)
-
-    // Force garbage collection
-    const gcStats = wildflower._contextRegistry.garbageCollect()
-
-    // Verify garbage collection ran
+    const gcStats = wildflower.garbageCollect()
     expect(gcStats).toBeDefined()
 
-    // Count contexts after destruction (global counts, as in original test)
-    const afterContextCount = wildflower._contextRegistry.contexts.size
-    const listContextsAfter = wildflower._contextRegistry.getContextsByType('list').length
-    const bindingContextsAfter = wildflower._contextRegistry.getContextsByType('binding').length
-    const conditionalContextsAfter = wildflower._contextRegistry.getContextsByType('conditional').length
-
-    // Verify contexts were reduced - overall count should decrease
-    expect(afterContextCount).toBeLessThan(beforeContextCount)
-
-    // Verify individual context types were cleaned up
-    expect(listContextsAfter).toBeLessThan(listContextsBefore)
-    expect(bindingContextsAfter).toBeLessThan(bindingContextsBefore)
-    expect(conditionalContextsAfter).toBeLessThan(conditionalContextsBefore)
-
-    // Verify no orphaned contexts for the destroyed component remain
-    const orphanedContexts = Array.from(wildflower._contextRegistry.contexts.values())
-      .filter(ctx => ctx.componentInstance && ctx.componentInstance.id === instanceId)
-
-    expect(orphanedContexts.length).toBe(0)
+    // Observable no-leak: the destroyed component's instance is gone from the
+    // live map and nothing resurrects it.
+    expect(wildflower.componentInstances.has(instanceId)).toBe(false)
+    expect(Array.from(wildflower.componentInstances.keys())).not.toContain(instanceId)
   })
 
-  it('Contexts for detached DOM elements are cleaned up', async () => {
+  it('Detaching part of a component leaves the live component intact after GC', async () => {
     testContainer.innerHTML = `
       <div data-component="detached-test">
+        <span id="live-binding" data-bind="title">Title</span>
         <div id="detach-container">
           <span id="detach-binding" data-bind="message">Initial</span>
           <div id="detach-conditional" data-show="showDetails">Details</div>
@@ -149,6 +126,7 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
 
     wildflower.component('detached-test', {
       state: {
+        title: 'Live',
         message: 'Hello',
         showDetails: true
       }
@@ -158,44 +136,27 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
     await waitForCompleteRender()
 
     const component = testContainer.querySelector('[data-component="detached-test"]')
+    const instanceId = component.dataset.componentId
+    const instance = wildflower.componentInstances.get(instanceId)
+    const liveBinding = testContainer.querySelector('#live-binding')
     const container = testContainer.querySelector('#detach-container')
+    const detachBinding = testContainer.querySelector('#detach-binding')
 
-    // Count contexts before detaching elements
-    const beforeContextCount = wildflower._contextRegistry.contexts.size
+    expect(liveBinding.textContent).toBe('Live')
 
-    // Ensure we have contexts to test with
-    expect(beforeContextCount).toBeGreaterThan(0)
-
-    // Get reference to binding and conditional elements
-    const bindingElement = testContainer.querySelector('#detach-binding')
-    const conditionalElement = testContainer.querySelector('#detach-conditional')
-
-    // Get the contexts for these elements before removal
-    const bindingContext = wildflower._contextRegistry.getContextForElement(bindingElement)
-    const conditionalContext = wildflower._contextRegistry.getContextForElement(conditionalElement)
-
-    expect(bindingContext).toBeDefined()
-    expect(conditionalContext).toBeDefined()
-
-    // Remove the container from DOM
+    // Remove a subtree of the component from the DOM, then run the public
+    // component-level GC (must not throw on disconnected nodes).
     container.remove()
-
-    // Force garbage collection
-    const gcStats = wildflower._contextRegistry.garbageCollect()
-
-    // Verify garbage collection ran and found disconnected elements
+    expect(detachBinding.isConnected).toBe(false)
+    const gcStats = wildflower.garbageCollect()
     expect(gcStats).toBeDefined()
 
-    // The key behavior: contexts for detached elements should be handled
-    // Either removed from registry or have their element references cleared
-    if (wildflower._contextRegistry.contexts.has(bindingContext.id)) {
-      // If context still exists, element reference should be cleared
-      expect(bindingContext.element === null || !document.body.contains(bindingContext.element)).toBe(true)
-    }
-
-    if (wildflower._contextRegistry.contexts.has(conditionalContext.id)) {
-      expect(conditionalContext.element === null || !document.body.contains(conditionalContext.element)).toBe(true)
-    }
+    // Observable invariant: the still-connected part of the component keeps
+    // updating — GC over the detached subtree did not corrupt the live instance.
+    instance.state.title = 'Updated'
+    await waitForUpdate()
+    expect(liveBinding.textContent).toBe('Updated')
+    expect(detachBinding.isConnected).toBe(false)
   })
 
   describe('Event handler cleanup', () => {
@@ -426,9 +387,6 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
       // Verify all were created
       expect(wildflower.componentInstances.size).toBeGreaterThanOrEqual(componentCount)
 
-      // Count contexts before
-      const contextsBefore = wildflower._contextRegistry.contexts.size
-
       // Collect all instance IDs
       const instanceIds = []
       for (let i = 0; i < componentCount; i++) {
@@ -443,15 +401,18 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
       for (const id of instanceIds) {
         wildflower.destroyComponent(id)
       }
-      wildflower._contextRegistry.garbageCollect()
+      wildflower.garbageCollect()
       const endTime = performance.now()
 
       // Should complete in reasonable time (under 500ms for 50 components)
       expect(endTime - startTime).toBeLessThan(500)
 
-      // Contexts should be significantly reduced
-      const contextsAfter = wildflower._contextRegistry.contexts.size
-      expect(contextsAfter).toBeLessThan(contextsBefore)
+      // No leaks: every destroyed component's instance is gone. (Component/binding
+      // contexts are no longer registered, so registry-context COUNT is not a
+      // cleanup proxy — assert the observable instance teardown.)
+      for (const id of instanceIds) {
+        expect(wildflower.componentInstances.has(id)).toBe(false)
+      }
     })
   })
 
@@ -498,7 +459,7 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
       await waitForCompleteRender()
 
       // Run garbage collection
-      wildflower._contextRegistry.garbageCollect()
+      wildflower.garbageCollect()
 
       // Count DOM elements with 2 items
       const listItems2 = testContainer.querySelectorAll('li').length
@@ -551,7 +512,7 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
       expect(testContainer.querySelectorAll('li').length).toBe(0)
 
       // Run garbage collection
-      wildflower._contextRegistry.garbageCollect()
+      wildflower.garbageCollect()
 
       // The key assertion is that DOM cleanup occurred
       // Context cleanup is an implementation detail
@@ -578,9 +539,7 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
       await waitForCompleteRender()
 
       const instance = wildflower.componentInstances.values().next().value
-
-      // Baseline context count
-      const baselineContexts = wildflower._contextRegistry.contexts.size
+      const baselineInstances = wildflower.componentInstances.size
 
       // Repeatedly add and remove items
       for (let round = 0; round < 5; round++) {
@@ -593,14 +552,13 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
         await waitForUpdate(30)
 
         // Garbage collect
-        wildflower._contextRegistry.garbageCollect()
+        wildflower.garbageCollect()
       }
 
-      const finalContexts = wildflower._contextRegistry.contexts.size
-
-      // Context count should not grow unbounded - allow some tolerance
-      // (base contexts + reasonable growth)
-      expect(finalContexts).toBeLessThanOrEqual(baselineContexts + 20)
+      // Observable no-leak: the cleared list renders no rows, and repeated
+      // add/remove churn did not spawn extra component instances.
+      expect(testContainer.querySelectorAll('li').length).toBe(0)
+      expect(wildflower.componentInstances.size).toBe(baselineInstances)
     })
   })
 
@@ -638,8 +596,6 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
       const section = testContainer.querySelector('[data-show]')
       expect(section.style.display).not.toBe('none')
 
-      const contextsWhenVisible = wildflower._contextRegistry.contexts.size
-
       // Hide the section
       const toggleBtn = testContainer.querySelector('#toggle-btn')
       toggleBtn.click()
@@ -648,24 +604,16 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
       // Section should be hidden
       expect(section.style.display).toBe('none')
 
-      // Run garbage collection
-      wildflower._contextRegistry.garbageCollect()
-
-      const contextsWhenHidden = wildflower._contextRegistry.contexts.size
-
-      // Note: data-show hides but doesn't remove elements, so contexts may remain
-      // The key is that they don't leak when toggled repeatedly
-      // Let's toggle multiple times and ensure no growth
+      // data-show hides but doesn't remove elements. Observable no-leak:
+      // repeated toggling doesn't duplicate the section or its list rows.
       for (let i = 0; i < 5; i++) {
         toggleBtn.click()
         await waitForUpdate(20)
       }
+      wildflower.garbageCollect()
 
-      wildflower._contextRegistry.garbageCollect()
-      const contextsAfterToggles = wildflower._contextRegistry.contexts.size
-
-      // Context count should not grow unbounded
-      expect(contextsAfterToggles).toBeLessThanOrEqual(contextsWhenVisible + 5)
+      expect(testContainer.querySelectorAll('[data-show]').length).toBe(1)
+      expect(testContainer.querySelectorAll('li').length).toBe(3)
     })
   })
 
@@ -699,46 +647,12 @@ describe.skipIf(isMinifiedBuild())('Memory Management and Garbage Collection', (
 
       // Destroy the component
       wildflower.destroyComponent(instanceId)
-      wildflower._contextRegistry.garbageCollect()
+      wildflower.garbageCollect()
 
       // Cache should not grow unbounded (may or may not clear entries)
       const cacheSizeAfter = wildflower._templateCache?.general?.size || 0
       expect(cacheSizeAfter).toBeLessThanOrEqual(cacheSizeBefore + 1)
     })
-  })
-
-  it('removeContext cleans contextsByComponent entries', async () => {
-    testContainer.innerHTML = `
-      <div data-component="cbc-leak-test">
-        <span data-bind="name"></span>
-        <div data-show="active">Active</div>
-      </div>
-    `
-
-    wildflower.component('cbc-leak-test', {
-      state: { name: 'Test', active: true }
-    })
-
-    wildflower.scan()
-    await waitForCompleteRender()
-
-    const component = testContainer.querySelector('[data-component="cbc-leak-test"]')
-    const instanceId = component.dataset.componentId
-
-    // Verify contextsByComponent has entries for this component
-    const registry = wildflower._contextRegistry
-    expect(registry.contextsByComponent.has(instanceId)).toBe(true)
-    const contextCountBefore = registry.contextsByComponent.get(instanceId).size
-    expect(contextCountBefore).toBeGreaterThan(0)
-
-    // Destroy the component
-    wildflower.destroyComponent(instanceId)
-    registry.garbageCollect()
-
-    // contextsByComponent should be cleaned — no stale entries for destroyed component
-    const remaining = registry.contextsByComponent.get(instanceId)
-    const remainingCount = remaining ? remaining.size : 0
-    expect(remainingCount).toBe(0)
   })
 
   it('waitForReady resolves within bounded time when component never becomes ready', async () => {

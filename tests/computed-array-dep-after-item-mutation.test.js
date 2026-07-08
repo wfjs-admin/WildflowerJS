@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, isMinifiedBuild } from './helpers/load-framework.js'
+import { loadFramework } from './helpers/load-framework.js'
 
 async function waitForUpdate(ms = 50) {
     await new Promise(resolve => setTimeout(resolve, ms))
@@ -265,83 +265,6 @@ describe('Computed re-evaluation: array-root dep after item-property mutation', 
         expect(countEvals).toBeGreaterThan(countAfter)
         expect(completedEvals).toBeGreaterThan(completedAfter)
         expect(testContainer.querySelector('.js-count').textContent).toBe('4')
-    })
-
-    // Reads internal state-manager Maps (computedDependencies, _computedDependsOn,
-    // _computedNodes, _effectDependents) via their unmangled names; min builds
-    // rename those properties so the lookups return undefined. The test contains
-    // only console.warn diagnostics (no assertions), so it adds no behavior
-    // coverage. Skipped on min builds where it cannot run; remains useful on
-    // dev/raw builds when investigating dep-tracking regressions.
-    it.skipIf(isMinifiedBuild())('diagnostic: dep state with item-level bindings present', async () => {
-        wildflower.component('arr-dep-diag2', {
-            state: {
-                tasks: [
-                    { id: 1, text: 'a', done: false },
-                    { id: 2, text: 'b', done: true }
-                ]
-            },
-            computed: {
-                count() { return this.tasks.length },
-                completed() { return this.tasks.filter(t => t.done).length }
-            },
-            toggleTask(event, element, details) { details.item.done = !details.item.done }
-        })
-
-        const component = await setupComponent(wildflower, testContainer, `
-            <div data-component="arr-dep-diag2">
-                <ul data-list="tasks" data-key="id">
-                    <template>
-                        <li class="js-item" data-bind-class="{ done: done }">
-                            <span class="js-checkbox" data-action="toggleTask"></span>
-                            <span class="js-text" data-bind="text"></span>
-                        </li>
-                    </template>
-                </ul>
-                <span class="js-count" data-bind="count"></span>
-                <span class="js-completed" data-bind="completed"></span>
-            </div>
-        `)
-
-        const sm = component.stateManager
-
-        // Snapshot before toggle
-        const countDepsBefore = sm._computedDependsOn.get('count')
-        const completedDepsBefore = sm._computedDependsOn.get('completed')
-        const lengthDepsBefore = sm.computedDependencies.get('tasks.length')
-        const tasksDepsBefore = sm.computedDependencies.get('tasks')
-        console.warn('[diag2] BEFORE toggle:')
-        console.warn('  count deps:', countDepsBefore ? Array.from(countDepsBefore) : null)
-        console.warn('  completed deps:', completedDepsBefore ? Array.from(completedDepsBefore) : null)
-        console.warn('  tasks.length is dep of:', lengthDepsBefore ? Array.from(lengthDepsBefore) : null)
-        console.warn('  tasks is dep of:', tasksDepsBefore ? Array.from(tasksDepsBefore) : null)
-
-        // Toggle
-        testContainer.querySelector('.js-item:first-child .js-checkbox').click()
-        await waitForUpdate()
-
-        // Snapshot after toggle
-        const countDepsAfter = sm._computedDependsOn.get('count')
-        const completedDepsAfter = sm._computedDependsOn.get('completed')
-        const lengthDepsAfter = sm.computedDependencies.get('tasks.length')
-        const tasksDepsAfter = sm.computedDependencies.get('tasks')
-        console.warn('[diag2] AFTER toggle:')
-        console.warn('  count deps:', countDepsAfter ? Array.from(countDepsAfter) : null)
-        console.warn('  completed deps:', completedDepsAfter ? Array.from(completedDepsAfter) : null)
-        console.warn('  tasks.length is dep of:', lengthDepsAfter ? Array.from(lengthDepsAfter) : null)
-        console.warn('  tasks is dep of:', tasksDepsAfter ? Array.from(tasksDepsAfter) : null)
-
-        const countNode = sm._computedNodes.get('count')
-        console.warn('[diag2] count node flags before splice:', countNode.flags, 'value:', countNode.value)
-
-        component.state.tasks.splice(0, 1)
-        await waitForUpdate()
-
-        console.warn('[diag2] AFTER splice:')
-        console.warn('  count node flags:', countNode.flags, 'value:', countNode.value)
-        console.warn('  count DOM:', testContainer.querySelector('.js-count').textContent, 'expected: 1')
-        console.warn('  effects on computed:count:', sm._effectDependents.get('computed:count')?.size)
-        console.warn('  effects on tasks.length:', sm._effectDependents.get('tasks.length')?.size)
     })
 
     it('FAILING: add then remove with watcher + order field (full demo shape)', async () => {

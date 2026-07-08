@@ -372,10 +372,10 @@ export class SSRManager {
     /**
      * Create protection context instead of normal context
      */
-    createSSRContext(type, id, data, realContextManager) {
+    createSSRContext(type, id, data) {
         this._log(`Creating SSR protection context: ${type}/${id}`);
 
-        const protectionContext = new SSRProtectionContext(type, id, data, realContextManager);
+        const protectionContext = new SSRProtectionContext(type, id, data);
 
         return protectionContext;
     }
@@ -439,7 +439,7 @@ export class SSRManager {
         // Activate all lists within this component for full list operations
         this._activateListsInComponent(element);
 
-        // Clean up references — component is now fully activated
+        // Clean up references; component is now fully activated
         this.protectedElements.delete(element);
         this.ssrComponents.delete(element);
 
@@ -494,7 +494,7 @@ export class SSRManager {
 
         let activatedCount = 0;
 
-        // Snapshot protected elements before activation — activateComponent() removes
+        // Snapshot protected elements before activation; activateComponent() removes
         // each element from this.protectedElements as part of its cleanup, so by the
         // time the post-activation steps run, the live set would be empty.
         const elementsToActivate = Array.from(this.protectedElements);
@@ -551,41 +551,38 @@ export class SSRManager {
         const actionElements = instance.element.querySelectorAll('[data-action]');
 
         actionElements.forEach(el => {
-            if (this.wildflower._contextRegistry) {
-                const context = this.wildflower._contextRegistry.getContextForElement(el);
-                if (context) {
-                    // CRITICAL: Remove event handlers before removing context
-                    const actionName = el.dataset.action;
-                    const eventHandlersToRemove = [];
+            // Action records are element-local (el._actionContext), not registered.
+            if (el._actionContext) {
+                // CRITICAL: Remove event handlers before clearing the record
+                const actionName = el.dataset.action;
+                const eventHandlersToRemove = [];
 
-                    // Find matching event handlers in the framework's eventHandlers Map
-                    // Key format: "action-{instanceId}-{methodName}-{eventType}-{timestamp}"
-                    this.wildflower.eventHandlers.forEach((handler, key) => {
-                        if (key.includes(instance.id) && key.includes(actionName)) {
-                            // Extract event type from key (4th segment)
-                            const parts = key.split('-');
-                            const eventType = parts.length >= 4 ? parts[parts.length - 2] : 'click';
-                            eventHandlersToRemove.push({ key, handler, element: el, eventType });
-                        }
-                    });
-
-                    // Remove the event listeners and handler references
-                    eventHandlersToRemove.forEach(({ key, handler, element, eventType }) => {
-                        const fn = typeof handler === 'function' ? handler : handler?.handler;
-                        if (fn) element.removeEventListener(eventType, fn);
-                        this.wildflower.eventHandlers.delete(key);
-                    });
-
-                    // CRITICAL: Clear bound actions so re-binding can add new handlers
-                    const elBoundActions = boundActionsCache.get(el);
-                    if (elBoundActions) {
-                        elBoundActions.clear();
+                // Find matching event handlers in the framework's eventHandlers Map
+                // Key format: "action-{instanceId}-{methodName}-{eventType}-{timestamp}"
+                this.wildflower.eventHandlers.forEach((handler, key) => {
+                    if (key.includes(instance.id) && key.includes(actionName)) {
+                        // Extract event type from key (4th segment)
+                        const parts = key.split('-');
+                        const eventType = parts.length >= 4 ? parts[parts.length - 2] : 'click';
+                        eventHandlersToRemove.push({ key, handler, element: el, eventType });
                     }
+                });
 
-                    // Remove by context ID, not element
-                    this.wildflower._contextRegistry.removeContext(context.id);
-                    this.wildflower._contextRegistry.contextsByElement.delete(el);
+                // Remove the event listeners and handler references
+                eventHandlersToRemove.forEach(({ key, handler, element, eventType }) => {
+                    const fn = typeof handler === 'function' ? handler : handler?.handler;
+                    if (fn) element.removeEventListener(eventType, fn);
+                    this.wildflower.eventHandlers.delete(key);
+                });
+
+                // CRITICAL: Clear bound actions so re-binding can add new handlers
+                const elBoundActions = boundActionsCache.get(el);
+                if (elBoundActions) {
+                    elBoundActions.clear();
                 }
+
+                // Drop the element-local action record so re-binding recreates it
+                el._actionContext = null;
             }
         });
     }
@@ -653,35 +650,62 @@ export class SSRManager {
         const listElements = element.querySelectorAll('[data-list]');
 
         listElements.forEach(listEl => {
-            const listPath = listEl.dataset.list;
-            const listItems = [];
+            // Only parse TOP-LEVEL lists here. A nested list (one with a [data-list]
+            // ancestor inside this component) is parsed recursively into its parent
+            // item's state by _parseListElement, NOT flattened into top-level state.
+            if (listEl.parentElement && listEl.parentElement.closest('[data-list]')) {
+                return;
+            }
+            pathResolver.set(state, listEl.dataset.list, this._parseListElement(listEl));
+        });
+    }
 
-            // Find all rendered items (excluding templates)
-            const template = listEl.querySelector('template');
-            const itemElements = Array.from(listEl.children).filter(child =>
-                child !== template && child.tagName !== 'TEMPLATE'
-            );
+    /**
+     * Parse one SSR list element into an array of item-state objects, recursing
+     * into nested lists so a server-rendered nested structure round-trips into
+     * the parent item's state (e.g. categories[i].items). Without this, the parent
+     * item loses its nested array and a post-activation re-render of the parent
+     * list draws the inner lists empty.
+     */
+    _parseListElement(listEl) {
+        const listItems = [];
+        const template = listEl.querySelector('template');
+        const itemElements = Array.from(listEl.children).filter(child =>
+            child !== template && child.tagName !== 'TEMPLATE'
+        );
 
-            // Parse each list item into state object
-            itemElements.forEach((itemEl, index) => {
-                const itemState = {};
-                const itemBindings = itemEl.querySelectorAll('[data-bind], [data-model]');
+        itemElements.forEach(itemEl => {
+            const itemState = {};
 
-                itemBindings.forEach(bindEl => {
-                    const path = bindEl.dataset.bind || bindEl.dataset.model;
-                    if (path.startsWith('computed:')) return;
-
-                    const value = this._parseValueFromElement(bindEl);
-
-                    pathResolver.set(itemState, path, value);
-                });
-
-                listItems.push(itemState);
+            // Direct bindings only: a binding whose NEAREST [data-list] ancestor is
+            // THIS list (not a deeper nested list inside the item). Mirrors the
+            // top-level _parseSSRState skip so an inner <li data-bind="title"> does
+            // not clobber the parent item's fields. The item element ITSELF may carry
+            // the binding (e.g. <li data-bind="title">); querySelectorAll only matches
+            // descendants, so include the item element explicitly.
+            const itemBindings = [
+                ...(itemEl.matches('[data-bind], [data-model]') ? [itemEl] : []),
+                ...itemEl.querySelectorAll('[data-bind], [data-model]')
+            ];
+            itemBindings.forEach(bindEl => {
+                const path = bindEl.dataset.bind || bindEl.dataset.model;
+                if (path.startsWith('computed:')) return;
+                if (bindEl.closest('[data-list]') !== listEl) return;
+                pathResolver.set(itemState, path, this._parseValueFromElement(bindEl));
             });
 
-            // Set the list in state
-            pathResolver.set(state, listPath, listItems);
+            // First-level nested lists inside this item → recurse into item state.
+            const nestedLists = itemEl.querySelectorAll('[data-list]');
+            nestedLists.forEach(nl => {
+                if (nl.parentElement && nl.parentElement.closest('[data-list]') === listEl) {
+                    pathResolver.set(itemState, nl.dataset.list, this._parseListElement(nl));
+                }
+            });
+
+            listItems.push(itemState);
         });
+
+        return listItems;
     }
 
     /**
@@ -718,7 +742,7 @@ export class SSRManager {
             return element.innerHTML;
         }
 
-        // For form inputs, textContent is always empty — read .value instead
+        // For form inputs, textContent is always empty; read .value instead
         // so SSR-rendered <input value="..."> survives hydration rather than
         // clobbering the component's default state with ''.
         const tag = element.tagName;
@@ -821,12 +845,11 @@ export class SSRManager {
  * @class SSRProtectionContext
  */
 export class SSRProtectionContext {
-    constructor(type, id, data, realContextManager) {
+    constructor(type, id, data) {
         this.type = type;
         this.id = id;
         this.data = data;
         this.element = data.element;
-        this.realContextManager = realContextManager;
 
         // Protection state using phase
         this._phase = SSRPhase.PROTECTED;

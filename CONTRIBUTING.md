@@ -20,6 +20,34 @@ npm run build
 npm test
 ```
 
+## Running the Tests
+
+The suite runs in a real browser (Chromium via Playwright):
+
+```bash
+npm test                          # full suite, single run
+npm test -- tests/lists.test.js   # one file
+```
+
+### If you see "Browser connection was closed"
+
+On machines with many CPU cores, a run can occasionally abort with
+`Browser connection was closed while running tests. Was the page closed
+unexpectedly?` and **zero test failures**. This is a known upstream vitest
+browser-mode issue ([vitest-dev/vitest #10300]) where a Chromium renderer
+reaches its memory ceiling and the page is killed mid-run. It is transient and
+not caused by your change; a clean re-run passes.
+
+If you hit it, re-run the affected file, or use the resilient runner, which
+retries automatically on that exact signature (and only that signature, never on
+a run with real test failures):
+
+```bash
+npm run test:retry
+```
+
+[vitest-dev/vitest #10300]: https://github.com/vitest-dev/vitest/pull/10300
+
 ## Pull Requests
 
 1. Fork the repo and create a feature branch

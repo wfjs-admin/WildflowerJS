@@ -8,6 +8,8 @@
  * @module
  */
 
+import { WF_ERRORS, wfError, __wf_txt } from '../core/wfUtils.js';
+
 // Static blocklist for pool attr binding security (O(1) lookup, no allocation per flush)
 const _POOL_BLOCKED_ATTRS = new Set([
     'class', 'style', 'srcdoc',
@@ -33,11 +35,16 @@ const _POOL_ATTRS_TO_STRIP = [
     'data-show', 'data-wf-show',
     'data-render', 'data-wf-render',
     'data-if', 'data-wf-if',
-    'data-key', 'data-wf-key'
+    'data-key', 'data-wf-key',
+    // Anti-FOUC marker: must be stripped from the compiled pool template,
+    // not just the initial DOM scan. Otherwise entities spawned post-scan
+    // inherit data-cloak from the template and stay [data-cloak]{display:none}
+    // forever. Mirrors TemplateSystem's list-template strip.
+    'data-cloak', 'data-wf-cloak'
 ];
 const _POOL_STRIP_SELECTOR = _POOL_ATTRS_TO_STRIP.map(a => `[${a}]`).join(',');
 // data:image/svg+xml / data:image/xml can execute inline scripts via
-// <object>/<iframe>/<embed> — narrow the allowlist to raster formats only.
+// <object>/<iframe>/<embed>: narrow the allowlist to raster formats only.
 const _POOL_DANGEROUS_PROTO_RE = /^(javascript|vbscript):|^data:(?!image\/(png|jpe?g|gif|webp|avif|bmp|ico|tiff?|x-icon)[,;])/i;
 
 // Boolean DOM properties whose attribute and JS-property desync after user
@@ -72,7 +79,7 @@ function _readPath(ctx, path) {
 }
 
 /**
- * Pool handle — returned by component.pool(name).
+ * Pool handle: returned by component.pool(name).
  * Manages a collection of plain objects and their DOM representations.
  */
 class PoolHandle {
@@ -116,15 +123,15 @@ class PoolHandle {
         /** @type {number} Default entity height (measured from template) */
         this._defaultEntityHeight = options.defaultEntityHeight || 0;
 
-        /** @type {string|null} Entity property name — if truthy, skip per-frame binding updates */
+        /** @type {string|null} Entity property name; if truthy, skip per-frame binding updates */
         this._staticProp = options.staticProp || null;
 
-        /** @type {boolean} Passive pool — skip rAF flush entirely, apply bindings on add()/update() only */
+        /** @type {boolean} Passive pool: skip rAF flush entirely, apply bindings on add()/update() only */
         this._isPassive = options.isPassive || false;
 
-        /** @type {Object} Shared props — parent-injected data available to all items via `props.` prefix */
+        /** @type {Object} Shared props: parent-injected data available to all items via `props.` prefix */
         this.props = options.props || {};
-        /** @type {boolean} Cached flag — true if props has any keys */
+        /** @type {boolean} Cached flag: true if props has any keys */
         this._hasProps = this.props && Object.keys(this.props).length > 0;
         /** @type {Object|null} Reusable context buffer for props merging (avoids per-entity allocation) */
         this._ctxBuffer = this._hasProps ? { props: this.props } : null;
@@ -134,7 +141,7 @@ class PoolHandle {
         /** @type {boolean} Sort descending (higher value = lower z-index) */
         this._sortDesc = options.sortDesc || false;
 
-        /** @type {Array<Object>} The raw entity array — mutate freely */
+        /** @type {Array<Object>} The raw entity array; mutate freely */
         this.items = [];
 
         /** @type {Map<*, {el: Element, elementsArray: Array}>} entity key → DOM info */
@@ -143,9 +150,9 @@ class PoolHandle {
         /** @type {Array<{el: Element, item: Object}>} flat array for zero-allocation flush iteration */
         this._entitiesArray = [];
 
-        /** @type {Array} Dynamic entities — flushed every frame */
+        /** @type {Array} Dynamic entities: flushed every frame */
         this._dynamicArray = [];
-        /** @type {Array} Static entities — only re-culled when camera moves */
+        /** @type {Array} Static entities: only re-culled when camera moves */
         this._staticArray = [];
 
         /** @type {Set} Keys of entities that need re-evaluation on next flush. */
@@ -158,11 +165,11 @@ class PoolHandle {
         /** @type {Function|null} Callback on add/remove/clear */
         this.onChange = null;
 
-        /** @type {Function|null} Lifecycle hook — called after item added */
+        /** @type {Function|null} Lifecycle hook: called after item added */
         this._onAdd = options.onAdd || null;
-        /** @type {Function|null} Lifecycle hook — called before individual item removed */
+        /** @type {Function|null} Lifecycle hook: called before individual item removed */
         this._onRemove = options.onRemove || null;
-        /** @type {Function|null} Lifecycle hook — called once before bulk clear */
+        /** @type {Function|null} Lifecycle hook: called once before bulk clear */
         this._onClear = options.onClear || null;
 
         /**
@@ -243,7 +250,7 @@ class PoolHandle {
                 if (typeof fn !== 'function') continue;
                 // Arrow functions don't bind `this` to the entity at call time,
                 // so the method would silently fail to mutate. Fail loudly at
-                // registration — there is no legitimate use case for an arrow
+                // registration: there is no legitimate use case for an arrow
                 // as an entity method, so throw rather than warn.
                 if (PoolHandle._isArrowFunction(fn)) {
                     throw new Error('[WildflowerJS Pool] entity method "' + key + '" is an arrow function. ' +
@@ -315,7 +322,7 @@ class PoolHandle {
             return obj;
         }
         if (this._entities.has(key)) {
-            if (__DEV__) console.warn(`[WF Pool "${this.name}"] Duplicate key "${key}" — ignoring`);
+            if (__DEV__) console.warn(`[WF Pool "${this.name}"] Duplicate key "${key}", ignoring`);
             return obj;
         }
 
@@ -372,8 +379,10 @@ class PoolHandle {
         // Append to DOM
         this._container.appendChild(el);
 
-        // Start the rAF loop if not already running
-        this._framework._startPoolLoop();
+        // Start the rAF loop if not already running. Passive pools never flush
+        // on rAF (see _flush's early return), so they skip the loop; mirrors
+        // the guard on the bulk-add path.
+        if (!this._isPassive) this._framework._startPoolLoop();
 
         // Lifecycle hook
         if (this._onAdd) this._onAdd(obj);
@@ -404,7 +413,7 @@ class PoolHandle {
                 continue;
             }
             if (this._entities.has(key)) {
-                if (__DEV__) console.warn(`[WF Pool "${this.name}"] Duplicate key "${key}" — ignoring`);
+                if (__DEV__) console.warn(`[WF Pool "${this.name}"] Duplicate key "${key}", ignoring`);
                 continue;
             }
 
@@ -474,7 +483,7 @@ class PoolHandle {
         const entry = this._entities.get(key);
         if (!entry) return false;
 
-        // Lifecycle hook — before removal, item still accessible
+        // Lifecycle hook: before removal, item still accessible
         if (this._onRemove) this._onRemove(entry.item);
 
         // Detach from DOM and recycle if free list has capacity
@@ -537,7 +546,7 @@ class PoolHandle {
         // Guard against post-destroy calls (e.g., from onDestroy hooks)
         if (!this._freeList || !this._container) return;
 
-        // Lifecycle hooks — onClear gets bulk call, otherwise onRemove per item
+        // Lifecycle hooks: onClear gets bulk call, otherwise onRemove per item
         if (this._onClear) {
             this._onClear(this.items);
         } else if (this._onRemove) {
@@ -571,7 +580,7 @@ class PoolHandle {
 
     /**
      * Update an entity's properties by key.
-     * Patches via Object.assign — the rAF flush picks up changes automatically.
+     * Patches via Object.assign; the rAF flush picks up changes automatically.
      *
      * @param {*} key - The key value identifying the entity
      * @param {Object} props - Properties to merge into the entity
@@ -638,7 +647,7 @@ class PoolHandle {
 
     /**
      * Get an entity by DOM position (visual order).
-     * Mirrors Array.at() — returns the item at the given index in DOM order.
+     * Mirrors Array.at(): returns the item at the given index in DOM order.
      * Unlike pool.items (which uses swap-with-last), this always reflects
      * the visual order of elements in the container.
      *
@@ -651,7 +660,7 @@ class PoolHandle {
     }
 
     /**
-     * Mark an entity as dirty — its bindings will be re-evaluated on the next flush.
+     * Mark an entity as dirty; its bindings will be re-evaluated on the next flush.
      * When any entity is marked dirty, the flush switches to targeted mode:
      * only dirty entities are processed, instead of the full O(n) scan.
      * When no entities are dirty, the flush runs in animation mode (all entities).
@@ -659,7 +668,7 @@ class PoolHandle {
      * @param {*} key - The key value identifying the entity
      */
     markDirty(key) {
-        // Apply bindings immediately — synchronous update like static pools.
+        // Apply bindings immediately: synchronous update like static pools.
         // This avoids rAF latency for data-mode pools where changes are sparse.
         // Also sets targeted mode: rAF flush skips full scan, only processes
         // any remaining dirty-set entries (from swap/update).
@@ -667,7 +676,11 @@ class PoolHandle {
         if (entry) {
             this._applyBindings(entry.el, entry.item);
         }
-        this._dirtySet.delete(key); // Already processed — don't re-flush
+        this._dirtySet.delete(key); // Already processed, don't re-flush
+        // One-way latch (intentional, no reset path): once a pool calls
+        // markDirty() it is a data-mode pool for its lifetime, so the rAF flush
+        // stays targeted rather than re-sweeping every entity. A pool is either
+        // an animation pool or a data pool; it does not switch back.
         this._targetedMode = true;
     }
 
@@ -704,6 +717,17 @@ class PoolHandle {
      * @returns {number}
      */
     get size() {
+        if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._aggregateReadWarned) {
+            const tc = this._framework && this._framework._computedTrackingContext;
+            if (tc) {
+                this._aggregateReadWarned = true;
+                wfError(WF_ERRORS.POOL_AGGREGATE_NONREACTIVE, {
+                    context: `computed "${tc.computedName || '?'}" on "${tc.componentId || '?'}"`,
+                    suggestion: 'Pool aggregates bypass reactivity. Mirror the count into state inside a tick: if (this.count !== pool.size) this.count = pool.size; then bind that state.',
+                    warn: true
+                });
+            }
+        }
         return this._entities.size;
     }
 
@@ -713,6 +737,17 @@ class PoolHandle {
      * @returns {number}
      */
     get length() {
+        if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._aggregateReadWarned) {
+            const tc = this._framework && this._framework._computedTrackingContext;
+            if (tc) {
+                this._aggregateReadWarned = true;
+                wfError(WF_ERRORS.POOL_AGGREGATE_NONREACTIVE, {
+                    context: `computed "${tc.computedName || '?'}" on "${tc.componentId || '?'}"`,
+                    suggestion: 'Pool aggregates bypass reactivity. Mirror the count into state inside a tick: if (this.count !== pool.length) this.count = pool.length; then bind that state.',
+                    warn: true
+                });
+            }
+        }
         return this._entities.size;
     }
 
@@ -742,7 +777,7 @@ class PoolHandle {
     //
     // Index-dependent methods (splice, pop, indexOf, slice) are intentionally
     // omitted. Pools use swap-with-last removal, so an entity's position in
-    // items[] is reshuffled by any remove() elsewhere in the pool — any
+    // items[] is reshuffled by any remove() elsewhere in the pool; any
     // "remove at index i" operation silently refers to a different entity
     // than the caller likely intended. Use remove(key) to delete, and at(i)
     // when you need positional access in DOM order (stable).
@@ -766,7 +801,7 @@ class PoolHandle {
     /**
      * Apply the entity state template to a new entity.
      * Shallow merge: template fills in keys the spawn omitted. Spawn values
-     * always win. Nested objects are shared by reference — documented behavior.
+     * always win. Nested objects are shared by reference; documented behavior.
      * @private
      */
     _applyEntityStateTemplate(obj) {
@@ -795,7 +830,7 @@ class PoolHandle {
         const descriptors = this._entityComputedDescriptors;
         for (let i = 0; i < names.length; i++) {
             const name = names[i];
-            // If the entity has its own data property with this name, skip —
+            // If the entity has its own data property with this name, skip;
             // literal values always win to prevent surprising override.
             if (Object.prototype.hasOwnProperty.call(obj, name)) continue;
             Object.defineProperty(obj, name, descriptors[name]);
@@ -829,7 +864,7 @@ class PoolHandle {
     _restoreRecycledElement(el, elementsArray) {
         const snap = this._templateSnapshot;
         if (snap) {
-            // Restore root element — use removeAttribute for empty values to avoid
+            // Restore root element: use removeAttribute for empty values to avoid
             // adding class="" or style="" attributes that weren't on the original template.
             // Bootstrap and other CSS frameworks may style elements differently when
             // the attribute is present-but-empty vs absent.
@@ -906,11 +941,13 @@ class PoolHandle {
                 // INPUT/TEXTAREA/SELECT: write .value, not textContent
                 if (target.value !== strValue) target.value = strValue;
             } else {
-                target.textContent = strValue;
+                // In-place text-node mutation when possible (see __wf_txt); avoids
+                // replacing the text node on every flush, cutting update script churn.
+                __wf_txt(target, strValue);
             }
         }
 
-        // ── data-show — direct property read ──
+        // ── data-show: direct property read ──
         const shows = meta.shows;
         for (let i = 0; i < shows.length; i++) {
             const show = shows[i];
@@ -922,7 +959,7 @@ class PoolHandle {
             if (target.style.display !== display) target.style.display = display;
         }
 
-        // ── data-bind-class — skip DOM if class string unchanged ──
+        // ── data-bind-class: skip DOM if class string unchanged ──
         const classEvals = meta.classEvaluators;
         if (classEvals) {
             for (let i = 0; i < classEvals.length; i++) {
@@ -945,7 +982,7 @@ class PoolHandle {
                             classStr = parts;
                         }
                     }
-                } catch (e) { /* keep classStr empty */ }
+                } catch (e) { this._warnBindingError('data-bind-class', ev, e); /* keep classStr empty */ }
 
                 // PERF: Only touch DOM if class actually changed
                 if (target._poolPrevClass === classStr) continue;
@@ -967,7 +1004,7 @@ class PoolHandle {
             }
         }
 
-        // ── data-bind-style — skip unchanged props, cache prev values on element ──
+        // ── data-bind-style: skip unchanged props, cache prev values on element ──
         const styleEvals = meta.styleEvaluators;
         if (styleEvals) {
             for (let i = 0; i < styleEvals.length; i++) {
@@ -977,7 +1014,7 @@ class PoolHandle {
                 let result;
                 try {
                     result = ev.evaluator ? ev.evaluator(ctx) : null;
-                } catch (e) { continue; }
+                } catch (e) { this._warnBindingError('data-bind-style', ev, e); continue; }
                 if (result && typeof result === 'object') {
                     const style = target.style;
                     // Cache previous style values to avoid reading from DOM
@@ -995,7 +1032,7 @@ class PoolHandle {
             }
         }
 
-        // ── data-bind-attr — cache prev values, skip unchanged ──
+        // ── data-bind-attr: cache prev values, skip unchanged ──
         const attrEvals = meta.attrEvaluators;
         if (attrEvals) {
             for (let i = 0; i < attrEvals.length; i++) {
@@ -1005,7 +1042,7 @@ class PoolHandle {
                 let result;
                 try {
                     result = ev.evaluator ? ev.evaluator(ctx) : null;
-                } catch (e) { continue; }
+                } catch (e) { this._warnBindingError('data-bind-attr', ev, e); continue; }
                 if (result && typeof result === 'object') {
                     // Cache previous attr values to avoid DOM getAttribute calls
                     if (!target._poolPrevAttr) target._poolPrevAttr = {};
@@ -1020,7 +1057,7 @@ class PoolHandle {
                         // Boolean DOM properties: also write the JS property,
                         // not just the attribute. Once a user interacts with
                         // a checkbox, the attribute and the .checked property
-                        // desync — removeAttribute alone won't uncheck it.
+                        // desync; removeAttribute alone won't uncheck it.
                         if (_POOL_BOOLEAN_PROPS.has(lower)) {
                             const boolVal = !!val && val !== 'false';
                             const propName = _POOL_BOOLEAN_PROP_NAMES[lower] || lower;
@@ -1072,18 +1109,32 @@ class PoolHandle {
                 const args = new Array(n);
                 for (let i = 0; i < n; i++) args[i] = item[vars[i]];
                 return binding.compiledFn.apply(null, args);
-            } catch (e) { return ''; }
+            } catch (e) { this._warnBindingError('expression', binding, e); return ''; }
         }
         return item[binding.path] ?? '';
     }
 
     /**
-     * Flush all entities — re-apply bindings for every entity in the pool.
+     * Dev-only: warn once per binding when its evaluator throws during a flush,
+     * so a typo'd pool expression does not fail invisibly every frame. The flag
+     * lives on the evaluator/binding object (compiled once, reused), so each
+     * distinct binding warns at most once. __DEV__-stripped from production.
+     * @private
+     */
+    _warnBindingError(kind, ref, e) {
+        if (typeof __DEV__ === 'undefined' || !__DEV__) return;
+        if (!ref || ref._poolBindingWarned) return;
+        ref._poolBindingWarned = true;
+        console.warn(`[WF Pool "${this.name}"] ${kind} binding threw and was skipped: ${(e && e.message) || e}. Check the expression in this pool's template.`);
+    }
+
+    /**
+     * Flush all entities: re-apply bindings for every entity in the pool.
      * Called by the rAF loop.
      * @private
      */
     _flush(now) {
-        // Passive pools skip the rAF flush entirely — updates via add()/update() only
+        // Passive pools skip the rAF flush entirely; updates via add()/update() only
         if (this._isPassive) return;
 
         if (this._frameInterval > 0) {
@@ -1183,7 +1234,7 @@ class PoolHandle {
 
             this._applyBindings(entry.el, entry.item);
 
-            // getBoundingClientRect culling — must run AFTER bindings update position
+            // getBoundingClientRect culling: must run AFTER bindings update position
             if (cullRect) {
                 const elRect = entry.el.getBoundingClientRect();
                 const visible = !(
@@ -1217,7 +1268,7 @@ class PoolHandle {
     }
 
     /**
-     * Tear down the pool — remove all DOM, clear references.
+     * Tear down the pool: remove all DOM, clear references.
      * Called on component destroy.
      * @private
      */
@@ -1322,7 +1373,7 @@ export const PoolRendererMethods = {
                 }
             }
 
-            // Strip framework attributes from template content — bindings are
+            // Strip framework attributes from template content; bindings are
             // already compiled into metadata, so these just add DOM bloat.
             const stripRoot = templateContent.firstElementChild;
             if (stripRoot) {
@@ -1373,18 +1424,18 @@ export const PoolRendererMethods = {
                 if (poolDef.props && typeof poolDef.props === 'object') {
                     poolProps = poolDef.props;
                 }
-                // entity.computed — per-entity derived values
+                // entity.computed: per-entity derived values
                 if (poolDef.entity && poolDef.entity.computed && typeof poolDef.entity.computed === 'object') {
                     entityComputed = poolDef.entity.computed;
                 }
-                // entity.state — default-state template merged into new entities
+                // entity.state: default-state template merged into new entities
                 if (poolDef.entity && poolDef.entity.state && typeof poolDef.entity.state === 'object') {
                     entityStateTemplate = poolDef.entity.state;
                 }
                 // Entity methods live at the top level of the entity block
                 // (matching component/store shape, where methods are also top-level).
                 // Any function property on the entity block that isn't a reserved
-                // key — state, computed — becomes an entity method.
+                // key (state, computed) becomes an entity method.
                 if (poolDef.entity && typeof poolDef.entity === 'object') {
                     const collected = {};
                     let hasAny = false;
@@ -1410,7 +1461,7 @@ export const PoolRendererMethods = {
             this._activePoolHandles.push(handle);
 
             // Set up event delegation for data-action in pool templates.
-            // Uses element index matching from compiled metadata — faster and more
+            // Uses element index matching from compiled metadata; faster and more
             // robust than CSS selector matching. First-match-wins: walk from
             // event.target up to entity root, fire the first data-action found.
             if (compiledMetadata && compiledMetadata.actions && compiledMetadata.actions.length > 0) {
@@ -1448,7 +1499,7 @@ export const PoolRendererMethods = {
                         const cachedElements = entityRoot._cachedElementsArray;
                         if (!cachedElements) return;
 
-                        // Walk from event.target up to entity root — first match wins
+                        // Walk from event.target up to entity root: first match wins
                         let el = event.target;
                         while (el && el !== element) {
                             const idx = cachedElements.indexOf(el);
@@ -1461,7 +1512,7 @@ export const PoolRendererMethods = {
                                 } else if (typeof ctx[method] === 'function') {
                                     ctx[method](item, event);
                                 }
-                                return; // First match wins — don't continue walking
+                                return; // First match wins, don't continue walking
                             }
                             el = el.parentElement;
                         }
@@ -1523,7 +1574,7 @@ export const PoolRendererMethods = {
             }
         }
 
-        // Flush all active pools — flat array, zero iterator allocation
+        // Flush all active pools: flat array, zero iterator allocation
         const handles = this._activePoolHandles;
         if (handles) {
             for (let i = 0; i < handles.length; i++) {
@@ -1547,10 +1598,10 @@ export const PoolRendererMethods = {
         for (const instance of this.componentInstances.values()) {
             if (!instance._pools) continue;
             for (const pool of instance._pools.values()) {
-                if (pool.size > 0) return; // At least one pool has entities — keep running
+                if (pool.size > 0) return; // At least one pool has entities, keep running
             }
         }
-        // No entities in any pool and no tickables — stop the loop
+        // No entities in any pool and no tickables: stop the loop
         this._poolLoopRunning = false;
         if (this._poolLoopId) {
             cancelAnimationFrame(this._poolLoopId);

@@ -6,6 +6,8 @@
 
 import { listBoundElements, ssrAdoptedElements } from '../core/DomMetadata.js';
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { recording as __tlOn, timelineNoteFrame as __tlFrame } from '../state/TimelineRecorder.js';
+import { applyShow, applyAttrObj, applyStyleObj, applyText, applyModel, applyClass } from '../core/BindingWriters.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -37,11 +39,12 @@ export const RenderingCoreMethods = {
 
         this._lastRenderScheduled = now;
 
-        // Cancel any existing render
-        if (this._renderScheduled)
-        {
-            cancelAnimationFrame(this._renderScheduled);
-        }
+        // Render dedup is handled by the `_renderScheduled` boolean flag: the
+        // queued microtask below early-returns when it has been cleared, and a
+        // repeat schedule within the same turn just re-folds pending changes. No
+        // rAF handle is involved (the old cancelAnimationFrame(this._renderScheduled)
+        // here was dead: the flag is a boolean, and cancelAnimationFrame coerces
+        // it to handle 1, risking cancellation of an unrelated frame).
 
         if (this._batchChangedPaths && this._batchChangedPaths.size > 0)
         {
@@ -76,14 +79,23 @@ export const RenderingCoreMethods = {
         // and processed in the next render cycle
         this._pendingStateChanges.clear();
 
-        // Schedule a new render
-        this._renderScheduled = requestAnimationFrame(() =>
+        // Schedule a new render. EXPERIMENT: microtask instead of rAF so the
+        // commit isn't gated behind a fireAnimationFrame (j-f-b penalty). Under
+        // ReactiveGraph the DOM is mutated by graph effects (also microtasks);
+        // _render is bookkeeping that just needs to run after them.
+        this._renderScheduled = true;
+        queueMicrotask(() =>
         {
+            if (!this._renderScheduled) return;
+            const __tlT0 = (__DEV__ && __tlOn) ? performance.now() : 0;
+
             // Call the render
             this._render();
 
             // Clear scheduled flag
             this._renderScheduled = null;
+
+            if (__DEV__ && __tlOn) __tlFrame(performance.now() - __tlT0);
         });
 
     },
@@ -95,55 +107,21 @@ export const RenderingCoreMethods = {
 
     _render()
     {
-        // Collect list contexts that need DOM updates (binding contexts handled by effects)
-        const listContexts = new Set();
-
-        if (this._contextsToUpdate && this._contextsToUpdate.size > 0) {
-            this._contextsToUpdate.forEach(context => {
-                if (context.type === 'list') {
-                    listContexts.add(context);
-                }
-            });
-        }
+        // SSR-hydrated lists are not mapArray-backed; their context-driven
+        // re-renders run through this collect/sweep pair, which lives in
+        // ssr-list.js and drops out of the 12 non-SSR variants. Collection
+        // happens BEFORE deferred dependencies (matching the historical
+        // ordering); the sweep runs after.
+        const ssrListContexts = __FEATURE_SSR__ ? this._ssrCollectListContexts() : null;
 
         if (this._contextSystemInitialized && this._deferredDependencies && this._deferredDependencies.length > 0)
         {
             this._processDeferredDependencies();
         }
 
-        // Process list contexts
-        if (this._contextSystemInitialized && listContexts.size > 0)
+        if (__FEATURE_SSR__ && ssrListContexts)
         {
-            // Process each list context that needs updating
-            listContexts.forEach(context =>
-            {
-                // Skip if context has no element reference
-                if (!context.element) return;
-
-                // mapArray handles all structural updates via effects — skip context-based processing
-                if (context.element._mapArrayInitialized) return;
-
-                // Skip if element is no longer in DOM
-                if (!document.body.contains(context.element))
-                {
-                    return;
-                }
-
-                // Get component instance
-                const instance = context.componentInstance;
-                if (!instance) return;
-
-                // Process list using the context
-                this._processList(
-                    {
-                        element: context.element,
-                        path: context.path,
-                        componentId: instance.id
-                    },
-                    instance,
-                    false // Don't force update - let detection work
-                );
-            });
+            this._ssrSweepListContexts(ssrListContexts);
         }
 
         // Clear update tracking after processing both types
@@ -234,11 +212,14 @@ export const RenderingCoreMethods = {
             });
         }
 
-        // Run update methods (bindings/HTML/class/models handled by effects)
-        // _updateLists still needed for initial mapArray setup; _processList early-exits
-        // for already-initialized lists via _mapArrayInitialized check
-        this._updateLists(this.domElements.lists);
-        this._updateConditionals();
+        // Bindings/HTML/class/models are handled by effects. List bootstrap is
+        // handled at discovery time (_mountLists at every scan/reveal path), so
+        // the render cycle no longer sweeps domElements.lists.
+        // List-item data-show/data-render conditionals are resolved natively: the
+        // per-item effect handles data-driven changes, and the list reconcile's
+        // onComplete re-evaluates position-frame conditionals (literal _last via
+        // _updateListContextClassBindings, item-level computeds via
+        // _reEvalListItemComputedConditionals). No component-level sweep needed.
 
         // Mark components that were actually rendered in this cycle as having been rendered
         // CRITICAL: Only mark components whose lists were actually processed, not just queued for update
@@ -338,59 +319,6 @@ export const RenderingCoreMethods = {
 
 
 
-        if (this._contextSystemInitialized && this._contextHierarchyDirty && componentsToProcess.size > 0)
-        {
-            this._contextHierarchyDirty = false;
-            // Use a tick delay to ensure DOM is fully updated before rebuilding
-            setTimeout(() =>
-            {
-
-                this._buildComponentContextHierarchy();
-
-            }, 0);
-        }
-    },
-    /**
-     * Update all data bindings
-     * @private
-     */
-
-    _updateConditionals() {
-        if (!this._contextSystemInitialized || !this._contextRegistry) return;
-
-        const conditionalContexts = this._contextRegistry.getContextsByType('conditional');
-        if (!conditionalContexts || conditionalContexts.length === 0) return;
-
-        for (const context of conditionalContexts) {
-            if (!context.componentInstance) continue;
-
-            const isRenderMode = context.mode === 'render';
-
-            // Effects handle data-show for effect-backed components
-            if (!isRenderMode && context.componentInstance._renderEffect) continue;
-
-            if (!context.element && !isRenderMode) continue;
-
-            const componentId = context.componentInstance.id;
-            if (this._componentsToUpdate && !this._componentsToUpdate.has(componentId)) continue;
-
-            try {
-                const isVisible = context.resolveData();
-
-                if (__FEATURE_TRANSITIONS__) {
-                    const element = context.element || (isRenderMode ? context.templateClone : null);
-                    if (this._handleTransitionedVisibilityChange && element?.dataset?.transition) {
-                        this._handleTransitionedVisibilityChange(element, context, isVisible, context.componentInstance);
-                    } else {
-                        context._updateConditionalElement(isVisible);
-                    }
-                } else {
-                    context._updateConditionalElement(isVisible);
-                }
-            } catch (error) {
-                if (__DEV__) console.error(`Error updating conditional context: ${context.path}`, error);
-            }
-        }
     },
     /**
      * Process binding elements and create binding contexts
@@ -429,13 +357,10 @@ export const RenderingCoreMethods = {
             const bindPath = this._getAttr(bindingElement, 'bind');
             if (!bindPath) return;
 
-            this._contextRegistry._createItemLevelContext({
-                element: bindingElement,
-                contextType: 'binding',
-                path: bindPath,
-                instance,
-                createMethod: this._contextRegistry.createBindingContext.bind(this._contextRegistry)
-            });
+            // Non-list text data-bind no longer creates a per-binding context:
+            // the render effect owns paint + updates via the meta below.
+            // These elements are pre-filtered to non-list, so there is nothing else
+            // for a context to do here.
 
             if (instance._effectMeta) {
                 const needsExprEval = this.isExpression(bindPath) || bindPath.includes('$');
@@ -463,22 +388,19 @@ export const RenderingCoreMethods = {
             const listElement = this._findDirectParentList(listItem);
             if (listElement && listElement._listContext) {
                 const itemIndex = listItem._listIndex;
-                const context = this._contextRegistry.createBindingContext(
-                    bindPath, instance, bindingElement,
-                    listElement._listContext, itemIndex
-                );
-                if (context) {
-                    context._parentIndex = itemIndex;
-                }
-                return { context, inList: true, itemIndex, listItem, listElement };
+                // In-list per-binding CM context removed (probe: 0 hits; in-list
+                // binding elements are filtered by _isOwnedBindingElement before
+                // reaching here, so this branch never created a context). Callers
+                // guard on a null context and push effect-meta off the inList shape.
+                return { context: null, inList: true, itemIndex, listItem, listElement };
             }
             return null;
         }
 
-        const context = this._contextRegistry.createBindingContext(
-            bindPath, instance, bindingElement
-        );
-        return { context, inList: false, itemIndex: 0, listItem: null, listElement: null };
+        // Non-list binding types ride the component render effect; no per-binding
+        // CM context is created (it would only carry a redundant one-shot setup
+        // write). Callers push effect-meta on the inList=false shape.
+        return { context: null, inList: false, itemIndex: 0, listItem: null, listElement: null };
     },
     /**
      * Process HTML binding elements
@@ -509,13 +431,10 @@ export const RenderingCoreMethods = {
             const result = this._createListAwareBindingContext(bindingElement, bindPath, instance);
             if (!result) return;
 
-            const { context: bindingContext } = result;
-            if (bindingContext) {
-                bindingContext._isHTMLBinding = true;
-                markHtmlReady(bindPath);
-            } else if (!result.inList) {
-                if (__DEV__) console.error('CONTEXT SYSTEM: Failed to create HTML binding context for path:', bindPath);
-            }
+            // The render effect owns the HTML write; mark readiness so any queued
+            // initial HTML flushes. Called regardless of whether a per-binding
+            // context exists; non-list bind-html no longer creates one.
+            markHtmlReady(bindPath);
 
             if (instance._effectMeta) {
                 instance._effectMeta.push({
@@ -546,13 +465,8 @@ export const RenderingCoreMethods = {
             const result = this._createListAwareBindingContext(bindingElement, bindPath, instance);
             if (!result) return;
 
-            const bindingContext = result.context ||
-                (result.inList ? this._contextRegistry.getContextForElement(bindingElement) : null);
-            if (bindingContext) {
-                bindingContext._isClassBinding = true;
-                const value = bindingContext.resolveData();
-                bindingContext._updateClassBindingElement(value);
-            }
+            // Initial class paint is owned by the render effect (non-list) and the
+            // list-row machinery (in-list); no per-binding context paint here.
 
             // See the matching guard in _processObjectBindingElements for the
             // rationale: don't register a component-level effect for in-list
@@ -578,8 +492,8 @@ export const RenderingCoreMethods = {
         if (!this._contextSystemInitialized) return;
 
         const config = {
-            style: { attrName: 'bind-style', flag: '_isStyleBinding', processMethod: '_processStyleBinding' },
-            attr: { attrName: 'bind-attr', flag: '_isAttrBinding', processMethod: '_processAttrBinding' }
+            style: { attrName: 'bind-style' },
+            attr: { attrName: 'bind-attr' }
         };
 
         const cfg = config[type];
@@ -596,16 +510,7 @@ export const RenderingCoreMethods = {
             const result = this._createListAwareBindingContext(bindingElement, expr, instance);
             if (!result) return;
 
-            const { context: bindingContext, inList, itemIndex, listItem, listElement } = result;
-            if (bindingContext) {
-                bindingContext[cfg.flag] = true;
-                if (inList) {
-                    const item = listItem._itemData || {};
-                    this[cfg.processMethod](bindingElement, item, expr, itemIndex, listElement._listContext);
-                } else {
-                    this[cfg.processMethod](bindingElement, null, expr, 0, null);
-                }
-            }
+            const { inList } = result;
 
             // Only register a component-level effect for elements that are NOT
             // inside a data-list. List-row elements are updated by the list-row
@@ -614,14 +519,14 @@ export const RenderingCoreMethods = {
             // resolves item[expr] first per the documented contract). Pushing
             // a component-effect meta for an in-list element causes a second
             // writer (the component-level computed of the same name) to race
-            // the list-row writer — initial render usually shows the
+            // the list-row writer; initial render usually shows the
             // component-computed value (race winner) and the list-row's per-row
-            // field is silently shadowed. Surfaced 2026-05-17 (amber-otter-23)
-            // via PM-demo team page: project chips bound to data-bind-style="iconStyle"
+            // field is silently shadowed. Surfaced on a team page where
+            // project chips bound to data-bind-style="iconStyle"
             // rendered the parent team's color most of the time, alternating
-            // with the project's own color on reload (3/10 in Chrome, 2/10 in
-            // Firefox). Sibling guard: see the listBoundElements check on
-            // data-bind text in _processComponentBindingsFromCompiled — text
+            // with the project's own color on reload (intermittent in both
+            // Chrome and Firefox). Sibling guard: see the listBoundElements check on
+            // data-bind text in _processComponentBindingsFromCompiled; text
             // binds already had this guard; style/attr did not.
             if (instance._effectMeta && !inList) {
                 instance._effectMeta.push({
@@ -698,7 +603,7 @@ export const RenderingCoreMethods = {
                 });
             }
 
-            // Skip context creation for custom elements — they are handled by
+            // Skip context creation for custom elements: they are handled by
             // _bindWebComponentModel in FormHandling.js for DOM→state event wiring.
             // The effect handles state→DOM sync via the meta entry above.
             if (modelElement.tagName.toLowerCase().includes('-')) return;
@@ -706,40 +611,42 @@ export const RenderingCoreMethods = {
             const result = this._createListAwareBindingContext(modelElement, modelPath, instance);
             if (!result) return;
 
-            const { context: bindingContext } = result;
-            if (bindingContext) {
-                bindingContext._isModelBinding = true;
-                this._cacheModelModifiers(modelElement, bindingContext);
+            const { inList } = result;
+            if (!inList) {
+                // Non-list data-model no longer creates a per-binding CM context.
+                // Stash a slim element-local record carrying everything the live
+                // input path needs (owning instance, model path, modifiers, element
+                // meta). _handleInputChange / _updateModelValue accept any object of
+                // this shape, so the existing write-back logic is reused verbatim.
+                modelElement._wfModel = this._buildModelRecord(modelElement, modelPath, instance);
             }
         });
     },
     /**
-     * Set up event handling for model elements
-     * @param {HTMLElement} element - The input element
-     * @param {Context} context - The binding context
+     * Build the element-local model record for a non-list data-model binding.
+     * Shaped to match what _handleInputChange / _updateModelValue read off a CM
+     * context (path, componentInstance, modelModifiers, elementMeta), so neither
+     * needs a per-binding context.
      * @private
      */
-    _cacheModelModifiers(element, context)
-    {
-        // Cache model modifiers once at bind time so the document-level
-        // _handleInputChange handler can read them from context without DOM access
-        if (!context.modelModifiers) {
-            const inputType = context.elementMeta?.inputType ?? element.type;
-            context.modelModifiers = {
+    _buildModelRecord(element, path, instance) {
+        const inputType = element.type;
+        return {
+            element,
+            path,
+            componentInstance: instance,
+            _isModelBinding: true,
+            modelModifiers: {
                 trim: element.hasAttribute('data-model-trim'),
                 number: element.hasAttribute('data-model-number'),
                 lazy: element.hasAttribute('data-model-lazy'),
                 event: (inputType === 'checkbox' || inputType === 'radio') ? 'change' : 'input'
-            };
-        }
-        if (!context.elementMeta) {
-            context.elementMeta = {
+            },
+            elementMeta: {
                 inputType: element.type,
                 tagName: element.tagName
-            };
-        }
-        // No element-level event listeners — document-level _handleInputChange
-        // handles all standard model events via capture phase delegation
+            }
+        };
     },
     /**
      * Process slots for component composition
@@ -811,7 +718,7 @@ export const RenderingCoreMethods = {
      */
     _isOwnedBindingElement(el, componentElement) {
         if (el.closest('[data-use-template-rendered]')) return false;
-        // Only exclude elements INSIDE a list — the list root itself owns its own bindings
+        // Only exclude elements INSIDE a list: the list root itself owns its own bindings
         // (bind-style, bind-class, bind-attr on the container are authored by the component,
         // not by the list renderer, which only manages children).
         const ancestorList = el.parentElement?.closest('[data-list]');
@@ -926,7 +833,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     get _bindingTypeConfigs() {
-        // classBindings/styleBindings removed — effects handle class and style binding updates
+        // classBindings/styleBindings removed; effects handle class and style binding updates
         return [
             { attribute: 'data-bind', altAttribute: 'data-wf-bind', collectionName: 'bindings' },
             { attribute: 'data-bind-html', altAttribute: 'data-wf-bind-html', collectionName: 'htmlBindings', datasetKey: 'bindHtml', altDatasetKey: 'wfBindHtml' },
@@ -973,7 +880,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _cleanupContextsInSubtree(rootElement) {
-        if (!this._contextRegistry || !this._contextSystemInitialized) return;
+        if (!this._contextRecords || !this._contextSystemInitialized) return;
 
         // Skip cleanup for SSR-adopted lists - they have special lifecycle management
         if (__FEATURE_SSR__) {
@@ -1036,7 +943,7 @@ export const RenderingCoreMethods = {
         if (this._contextSystemInitialized)
         {
             // Validate bindings BEFORE conditional processing (data-render removes elements)
-            this._validateComponentBindings(instance);
+            if (__DEV__) this._validateComponentBindings(instance);
 
             // Collect effect metadata during context creation (eliminates duplicate DOM scan)
             instance._effectMeta = [];
@@ -1051,26 +958,6 @@ export const RenderingCoreMethods = {
 
             this._processModelElements(instance);
         }
-
-        // Register all bindings with the state manager for dependency tracking
-        this.domElements.bindings.forEach(binding =>
-        {
-            if (binding.componentId === instance.id)
-            {
-                const path = binding.path;
-
-                // Handle expressions with property references
-                if (path.includes(' '))
-                {
-                    // This is an expression that needs to be parsed
-                    this._registerExpressionDependencies(instance, path);
-                } else
-                {
-                    // Direct property reference
-                    instance.stateManager.registerBindingDependency(path);
-                }
-            }
-        });
 
         // Create Render Effect for component bindings
         // During scan batches, defer effect creation so all components in the batch
@@ -1125,7 +1012,7 @@ export const RenderingCoreMethods = {
             }
         }
 
-        // data-bind-class and data-bind-style — effects handle these, no domElements tracking needed
+        // data-bind-class and data-bind-style: effects handle these, no domElements tracking needed
 
         // Process data-show elements (conditionals)
         for (const binding of compiled.shows) {
@@ -1139,7 +1026,7 @@ export const RenderingCoreMethods = {
             }
         }
 
-        // Process data-model elements (event listeners + validation tracking — state→DOM sync handled by effects)
+        // Process data-model elements (event listeners + validation tracking; state→DOM sync handled by effects)
         for (const binding of compiled.models) {
             const el = this._getElementByPath(element, binding.elementPath);
             if (el) {
@@ -1222,12 +1109,13 @@ export const RenderingCoreMethods = {
      * @private
      */
     _validateComponentBindings(instance) {
+        if (!__DEV__) return; // compile-time: bodies in this region are stripped from prod builds
         if (!this.debug) return;
 
         const { state, name: componentName, id: componentId, element: componentElement } = instance;
         const stateKeys = Object.keys(state);
 
-        // Include computed property names — they're valid binding targets
+        // Include computed property names; they're valid binding targets
         if (instance.stateManager && instance.stateManager.computed) {
             const computedKeys = Object.keys(instance.stateManager.computed);
             for (const key of computedKeys) {
@@ -1259,7 +1147,7 @@ export const RenderingCoreMethods = {
 
         // Scan component DOM for data-render and data-bind-class attributes
         // These are not stored in global domElements, so we scan directly
-        // IMPORTANT: Skip elements inside nested data-component scopes — those
+        // IMPORTANT: Skip elements inside nested data-component scopes; those
         // belong to child components and will be validated when those initialize
         if (componentElement) {
             const isOwnedByThisComponent = (el) => {
@@ -1321,6 +1209,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _validateBindingPath(path, stateKeys, componentName, bindingType, state) {
+        if (!__DEV__) return;
         // Skip validation for special paths
         if (!path || typeof path !== 'string') return;
 
@@ -1346,7 +1235,7 @@ export const RenderingCoreMethods = {
         }
 
         // If the path contains expression operators, it's not a simple property
-        // reference — delegate to the expression-variable validator so each
+        // reference: delegate to the expression-variable validator so each
         // identifier in the expression is checked individually. Without this,
         // `data-show="activePattern === 'intro'"` would be treated as a single
         // property name `"activePattern === 'intro'"` and always report
@@ -1439,21 +1328,22 @@ export const RenderingCoreMethods = {
      * @private
      */
     _validateExpressionVariables(expression, stateKeys, componentName, bindingType) {
+        if (!__DEV__) return;
         // Skip $entity.path shorthand (normalized to external() at bind time)
         if (expression && expression.includes('$')) return;
 
-        // Strip computed: prefix before validation — it's a runtime hint, not a variable
+        // Strip computed: prefix before validation; it's a runtime hint, not a variable
         const cleanExpression = expression.replace(/\bcomputed:/g, '');
 
-        // Remove string literals before extracting identifiers — words inside
+        // Remove string literals before extracting identifiers; words inside
         // quotes ('priority-option high') are not variable references
         const noStrings = cleanExpression.replace(/'[^']*'|"[^"]*"/g, '');
 
-        // Extract variable names — only ROOT identifiers, not property accesses.
+        // Extract variable names: only ROOT identifiers, not property accesses.
         // `(?<!\.)` lookbehind excludes identifiers preceded by a dot so that
         // `events.length` produces `['events']` not `['events', 'length']`.
         // Without this, built-in props like .length/.includes/.toLowerCase()
-        // appear as "undefined state property" — noisy false positives.
+        // appear as "undefined state property": noisy false positives.
         const propertyRegex = /(?<!\.)\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
         const matches = noStrings.match(propertyRegex);
 
@@ -1492,7 +1382,7 @@ export const RenderingCoreMethods = {
     },
     /**
      * Validate variables in a data-bind-style expression
-     * Style bindings use { cssProperty: stateVar } format — only validate VALUE-side identifiers
+     * Style bindings use { cssProperty: stateVar } format; only validate VALUE-side identifiers
      * @param {string} expression - The style expression (e.g., "{ color: textColor }")
      * @param {Array<string>} stateKeys - Available state property names
      * @param {string} componentName - Name of the component for error messages
@@ -1500,6 +1390,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _validateStyleExpression(expression, stateKeys, componentName, state) {
+        if (!__DEV__) return;
         const trimmed = expression.trim();
 
         // Object syntax: { cssProperty: stateVar, ... }
@@ -1513,7 +1404,7 @@ export const RenderingCoreMethods = {
                 const colonIdx = pair.indexOf(':');
                 if (colonIdx === -1) continue;
 
-                // Only validate the VALUE side (after the colon) — the KEY side is a CSS property name
+                // Only validate the VALUE side (after the colon); the KEY side is a CSS property name
                 const valuePart = pair.substring(colonIdx + 1).trim();
                 if (!valuePart) continue;
 
@@ -1534,6 +1425,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _validateActionMethods(actionAttr, instance, componentName) {
+        if (!__DEV__) return;
         // Parse action definitions using the framework's parser if available
         const actionDefs = typeof this._parseActions === 'function'
             ? this._parseActions(actionAttr)
@@ -1568,6 +1460,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _parseActionDefsSimple(actionAttr) {
+        if (!__DEV__) return [];
         const results = [];
         const parts = actionAttr.trim().split(/\s+/);
 
@@ -1601,6 +1494,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _findSimilarPropertyNames(name, candidates) {
+        if (!__DEV__) return [];
         const maxDistance = Math.max(2, Math.floor(name.length / 3));
         const similar = [];
 
@@ -1621,6 +1515,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _levenshteinDistance(a, b) {
+        if (!__DEV__) return 0;
         if (a.length === 0) return b.length;
         if (b.length === 0) return a.length;
 
@@ -1663,6 +1558,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _inferTypesFromState(state) {
+        if (!__DEV__) return {};
         if (!state || typeof state !== 'object') {
             return {};
         }
@@ -1682,6 +1578,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _inferTypeFromValue(value) {
+        if (!__DEV__) return 'any';
         if (value === null || value === undefined) {
             return 'any'; // Can't infer type from null/undefined
         }
@@ -1721,6 +1618,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _checkTypeMatch(component, prop, value) {
+        if (!__DEV__) return true;
         // Only check in debug mode
         if (!this.debug && !this.options?.debug) {
             return true;
@@ -1756,29 +1654,6 @@ export const RenderingCoreMethods = {
     },
     // #endregion FEATURE_BINDING_VALIDATION
 
-    // Add a new method to handle expression dependencies
-    _registerExpressionDependencies(instance, expression)
-    {
-        // Simple expression parser to find property references
-        const propertyRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\b/g;
-        const matches = expression.match(propertyRegex);
-
-        if (matches)
-        {
-            // Register each property found in the expression
-            matches.forEach(prop =>
-            {
-                // Skip JavaScript keywords and operators
-                const keywords = ['true', 'false', 'null', 'undefined', 'this', 'function',
-                    'return', 'if', 'else', 'for', 'while', 'var', 'let', 'const'];
-                if (!keywords.includes(prop))
-                {
-                    instance.stateManager.registerBindingDependency(prop);
-                }
-            });
-        }
-    },
-
     // =========================================================================
     // Effect-Based Component Binding Rendering
     // =========================================================================
@@ -1803,6 +1678,12 @@ export const RenderingCoreMethods = {
         if (!bindingMeta || bindingMeta.length === 0) {
             return null;
         }
+
+        // data-render writers may insert a cloned subtree and recreate THIS effect
+        // (see _executeRenderForEffect → _insertRenderElement). Process render metas
+        // last so the recreate-and-bail guard only short-circuits bindings already
+        // applied this run; the freshly created effect owns the rest.
+        this._sortRenderMetaLast(bindingMeta);
 
         const self = this;
 
@@ -1832,8 +1713,8 @@ export const RenderingCoreMethods = {
 
     /**
      * Collect binding metadata by scanning the component's DOM.
-     * Called by data-render re-insertion (ContextManager._reinsertContent)
-     * where the full component needs a fresh scan — init-time _effectMeta
+     * Called by data-render re-insertion (RenderRecord._insertRenderElement)
+     * where the full component needs a fresh scan: init-time _effectMeta
      * can't be reused because only a subtree was re-inserted.
      *
      * During normal init, _process*Elements populate _effectMeta instead,
@@ -1853,7 +1734,7 @@ export const RenderingCoreMethods = {
             if (el.closest('[data-use-template-rendered]')) return false; // Skip slot template bindings
             // SSR lists: Skip elements inside data-list containers within SSR components
             // (SSR list items exist as real DOM elements before the list renderer runs,
-            // so listBoundElements won't catch them yet — use DOM check instead)
+            // so listBoundElements won't catch them yet; use DOM check instead)
             const listAncestor = el.closest('[data-list], [data-wf-list]');
             if (listAncestor && listAncestor.closest('[data-ssr="true"]')) return false;
             // Use data-component (not data-component-id) to detect component boundaries.
@@ -1873,12 +1754,12 @@ export const RenderingCoreMethods = {
         // object literals, and $store.path references.
         const needsExprEval = (path) => this.isExpression(path) || path.includes('$');
 
-        // Collect data-bind elements
-        const bindSelector = this._attrSelector('bind');
-        this._querySelfAndDescendants(element, bindSelector).forEach(el => {
-            if (!belongsToComponent(el)) return;
-            const path = this._getAttr(el, 'bind');
-            if (path) {
+        // One spec per binding type: [attr key, meta-entry builder]. Entry
+        // shapes mirror what the init-time _process*Elements push into
+        // _effectMeta: the effect executor reads both interchangeably, so
+        // any field change here must be made there too.
+        const specs = [
+            ['bind', (el, path) => {
                 const entry = {
                     element: el,
                     type: 'bind',
@@ -1887,98 +1768,48 @@ export const RenderingCoreMethods = {
                     isExpression: needsExprEval(path)
                 };
                 if (el.tagName.includes('-')) entry.isWebComponent = true;
-                meta.push(entry);
-            }
-        });
-
-        // Collect data-bind-html elements
-        const htmlSelector = this._attrSelector('bind-html');
-        this._querySelfAndDescendants(element, htmlSelector).forEach(el => {
-            if (!belongsToComponent(el)) return;
-            const path = this._getAttr(el, 'bind-html');
-            if (path) {
-                meta.push({
-                    element: el,
-                    type: 'html',
-                    path: path,
-                    isExpression: needsExprEval(path)
-                });
-            }
-        });
-
-        // Collect data-show elements
-        const showSelector = this._attrSelector('show');
-        this._querySelfAndDescendants(element, showSelector).forEach(el => {
-            if (!belongsToComponent(el)) return;
-            const path = this._getAttr(el, 'show');
-            if (path) {
+                return entry;
+            }],
+            ['bind-html', (el, path) => ({
+                element: el,
+                type: 'html',
+                path: path,
+                isExpression: needsExprEval(path)
+            })],
+            ['show', (el, path) => {
                 const negate = path.startsWith('!');
                 const cleanPath = negate ? path.slice(1) : path;
-                meta.push({
+                return {
                     element: el,
                     type: 'show',
                     path: cleanPath,
                     negate: negate,
                     isExpression: needsExprEval(cleanPath)
-                });
-            }
-        });
-
-        // Collect data-bind-class elements
-        const classSelector = this._attrSelector('bind-class');
-        this._querySelfAndDescendants(element, classSelector).forEach(el => {
-            if (!belongsToComponent(el)) return;
-            const expression = this._getAttr(el, 'bind-class');
-            if (expression) {
-                meta.push({
-                    element: el,
-                    type: 'class',
-                    path: expression,
-                    prevClasses: null, // Track previous classes for removal
-                    isExpression: needsExprEval(expression)
-                });
-            }
-        });
-
-        // Collect data-bind-style elements
-        const styleSelector = this._attrSelector('bind-style');
-        this._querySelfAndDescendants(element, styleSelector).forEach(el => {
-            if (!belongsToComponent(el)) return;
-            const expression = this._getAttr(el, 'bind-style');
-            if (expression) {
-                meta.push({
-                    element: el,
-                    type: 'style',
-                    path: expression,
-                    isExpression: needsExprEval(expression)
-                });
-            }
-        });
-
-        // Collect data-bind-attr elements
-        const attrSelector = this._attrSelector('bind-attr');
-        this._querySelfAndDescendants(element, attrSelector).forEach(el => {
-            if (!belongsToComponent(el)) return;
-            const expression = this._getAttr(el, 'bind-attr');
-            if (expression) {
-                meta.push({
-                    element: el,
-                    type: 'attr',
-                    path: expression,
-                    isExpression: needsExprEval(expression)
-                });
-            }
-        });
-
-        // Collect data-model elements (state→DOM sync only; DOM→state is event-driven)
-        const modelSelector = this._attrSelector('model');
-        this._querySelfAndDescendants(element, modelSelector).forEach(el => {
-            if (!belongsToComponent(el)) return;
-            const path = this._getAttr(el, 'model');
-            if (path) {
+                };
+            }],
+            ['bind-class', (el, path) => ({
+                element: el,
+                type: 'class',
+                path: path,
+                prevClasses: null, // Track previous classes for removal
+                isExpression: needsExprEval(path)
+            })],
+            ['bind-style', (el, path) => ({
+                element: el,
+                type: 'style',
+                path: path,
+                isExpression: needsExprEval(path)
+            })],
+            ['bind-attr', (el, path) => ({
+                element: el,
+                type: 'attr',
+                path: path,
+                isExpression: needsExprEval(path)
+            })],
+            // data-model: state→DOM sync only; DOM→state is event-driven
+            ['model', (el, path) => {
                 const inputType = (el.type || '').toLowerCase();
-                const tagName = element.tagName;
-                meta.push({
+                return {
                     element: el,
                     type: 'model',
                     path: path,
@@ -1987,9 +1818,28 @@ export const RenderingCoreMethods = {
                     isRadio: inputType === 'radio',
                     isSelectMultiple: el.tagName === 'SELECT' && el.multiple,
                     _webComponentAdapter: this._webComponentAdapters?.get(el.tagName.toLowerCase()) || null
-                });
+                };
+            }]
+        ];
+
+        for (const [attrKey, build] of specs) {
+            this._querySelfAndDescendants(element, this._attrSelector(attrKey)).forEach(el => {
+                if (!belongsToComponent(el)) return;
+                const path = this._getAttr(el, attrKey);
+                if (path) meta.push(build(el, path));
+            });
+        }
+
+        // Non-list data-render is effect-driven from the component's tracked render
+        // contexts (not a DOM scan: a falsy condition holds a detached element +
+        // placeholder, which a selector query can't rediscover). List-item render
+        // contexts (parentIndex set) stay on their per-item effects; skip them.
+        if (instance._renderContexts) {
+            for (const ctx of instance._renderContexts) {
+                if (!ctx || ctx._parentIndex !== undefined) continue;
+                meta.push(this._buildRenderMeta(ctx, instance));
             }
-        });
+        }
 
         return meta;
     },
@@ -2004,6 +1854,10 @@ export const RenderingCoreMethods = {
      */
     _executeComponentBindingsForEffect(instance, bindingMeta) {
         const stateManager = instance.stateManager;
+        // Snapshot the render token: a data-render insert recreates this effect
+        // (new clone + fresh meta) and bumps the token. When that happens mid-run
+        // we must stop iterating the now-stale meta array.
+        const renderToken = instance._renderToken | 0;
 
         for (const meta of bindingMeta) {
             // Read value via reactive proxy (establishes dependency tracking)
@@ -2044,8 +1898,63 @@ export const RenderingCoreMethods = {
                 case 'model':
                     this._executeModelBindForEffect(meta, value);
                     break;
+                case 'render':
+                    this._executeRenderForEffect(meta, value, instance);
+                    // An insert may have recreated this effect underneath us. Stop
+                    // iterating the stale array; the new effect owns the remaining
+                    // (render-last) work. Render metas are sorted to the tail, so
+                    // anything left to process here is also render.
+                    if ((instance._renderToken | 0) !== renderToken) return;
+                    break;
             }
         }
+    },
+
+    /**
+     * Stable-partition a binding-meta array so all type:'render' entries sit at
+     * the tail, preserving relative order within each group. See
+     * _createComponentRenderEffect for why render must run last.
+     * @private
+     */
+    _sortRenderMetaLast(metaArr) {
+        let w = 0;
+        let renders = null;
+        for (let r = 0; r < metaArr.length; r++) {
+            const m = metaArr[r];
+            if (m.type === 'render') {
+                (renders || (renders = [])).push(m);
+            } else {
+                metaArr[w++] = m;
+            }
+        }
+        if (renders) {
+            for (let i = 0; i < renders.length; i++) metaArr[w++] = renders[i];
+        }
+    },
+
+    /**
+     * Build a type:'render' effect-meta entry from a render-mode conditional
+     * context. Normalizes the condition path the same way _evaluateCondition does
+     * (strips computed: / computed:! prefixes) then splits leading '!' negation,
+     * so the effect's value read (getValue / _resolveEffectExpression) establishes
+     * the graph edge to the computed/state the condition reads. The writer
+     * (_executeRenderForEffect) applies the negate flag.
+     * @private
+     */
+    _buildRenderMeta(context, instance) {
+        let expr = context.path;
+        if (expr.startsWith('computed:!')) expr = '!' + expr.slice(10);
+        else if (expr.startsWith('computed:')) expr = expr.slice(9);
+        const negate = expr.startsWith('!');
+        const cleanPath = negate ? expr.slice(1) : expr;
+        return {
+            element: context.element,
+            type: 'render',
+            path: cleanPath,
+            negate,
+            isExpression: this.isExpression(cleanPath) || cleanPath.includes('$'),
+            context
+        };
     },
 
     /**
@@ -2102,16 +2011,13 @@ export const RenderingCoreMethods = {
             return;
         }
 
-        const strValue = value == null ? '' : String(value);
-
         if (meta.isInput) {
+            const strValue = value == null ? '' : String(value);
             if (el.value !== strValue) {
                 el.value = strValue;
             }
         } else {
-            if (el.textContent !== strValue) {
-                el.textContent = strValue;
-            }
+            applyText(el, value);
         }
     },
 
@@ -2158,7 +2064,7 @@ export const RenderingCoreMethods = {
                     mode: 'show',
                     element: el,
                     _updateConditionalElement(isVisible) {
-                        el.style.display = isVisible ? '' : 'none';
+                        applyShow(el, isVisible);
                     }
                 };
                 this._handleTransitionedVisibilityChange(el, showContext, shouldShow, instance);
@@ -2166,17 +2072,40 @@ export const RenderingCoreMethods = {
             return;
         }
 
-        const newDisplay = shouldShow ? '' : 'none';
-        if (el.style.display !== newDisplay) {
-            el.style.display = newDisplay;
+        applyShow(el, shouldShow);
+    },
+
+    /**
+     * Execute non-list data-render for Effect. Inserts/removes the element from
+     * the DOM on the boolean (vs data-show's display toggle), reusing the render
+     * context's existing insert/remove machinery (_updateConditionalElement →
+     * _updateRenderConditional). The value read happened in the effect loop
+     * (establishing the graph edge); this only applies the verdict. An insert
+     * re-clones the subtree and recreates this component's render effect, which
+     * bumps instance._renderToken; the effect loop's post-render guard then bails.
+     * @private
+     */
+    _executeRenderForEffect(meta, value, instance) {
+        const ctx = meta.context;
+        if (!ctx) return;
+        const shouldRender = meta.negate ? !value : Boolean(value);
+
+        if (__FEATURE_TRANSITIONS__) {
+            const el = ctx.element || ctx.templateClone;
+            if (this._handleTransitionedVisibilityChange && el && el.dataset && el.dataset.transition) {
+                this._handleTransitionedVisibilityChange(el, ctx, shouldRender, instance);
+                return;
+            }
         }
+
+        ctx._updateConditionalElement(shouldRender);
     },
 
     /**
      * Evaluate the visibility verdict for a cloaked element about to have its
      * data-cloak attribute stripped. Returns false when data-show resolves
      * falsy (element should be hidden), true otherwise (no data-show, truthy
-     * verdict, or evaluation gave up — fail-open so we never accidentally hide
+     * verdict, or evaluation gave up: fail-open so we never accidentally hide
      * something the user expects to see).
      *
      * Used by the cloak-strip rAF in FrameworkInit and ComponentScanning to
@@ -2187,7 +2116,7 @@ export const RenderingCoreMethods = {
      *
      * Uses the SAME expression evaluator (`_resolveEffectExpression`) that the
      * render effect uses, so the verdict is identical to what a subsequent
-     * effect run would produce — making the eventual effect re-run idempotent.
+     * effect run would produce, making the eventual effect re-run idempotent.
      * Outside an active effect context, reads do not register dependencies, so
      * this introduces no spurious tracking.
      *
@@ -2220,8 +2149,8 @@ export const RenderingCoreMethods = {
      * Strip data-cloak from an element, deferring if its nearest [data-component]
      * ancestor is registered but not yet initialized (no data-component-id).
      *
-     * Late-registered components — defer-loaded scripts whose wildflower.component
-     * call runs after the framework's initial scan — only initialize their DOM
+     * Late-registered components: defer-loaded scripts whose wildflower.component
+     * call runs after the framework's initial scan; only initialize their DOM
      * elements when their definition is registered. If the cloak-strip rAF runs
      * before that registration, stripping cloak makes the element visible before
      * the render effect has had a chance to write display:none, causing the
@@ -2243,7 +2172,7 @@ export const RenderingCoreMethods = {
         const componentEl = this._getComponentElement(el);
         if (componentEl && !(componentEl.dataset && componentEl.dataset.componentId)) {
             // Ancestor component is registered (has data-component) but not yet
-            // initialized (no data-component-id). Skip — the per-component strip
+            // initialized (no data-component-id). Skip; the per-component strip
             // pass after init will handle it.
             return false;
         }
@@ -2259,39 +2188,25 @@ export const RenderingCoreMethods = {
      * @private
      */
     _executeClassBindForEffect(meta, value) {
-        const el = meta.element;
-
-        // Remove previous classes added by this binding
-        if (meta.prevClasses) {
-            meta.prevClasses.forEach(cls => {
-                if (cls) el.classList.remove(cls);
+        // Friendly dev-mode shape check (WF-505): a COMPUTED (non-expression)
+        // bound to data-bind-class should return a string, not an object. Warn
+        // once per binding; applyClass still coerces truthy keys so the page keeps
+        // rendering. An INLINE object expression (`{'is-active': cond}`) is the
+        // supported form, so skip the warning for expression bindings.
+        if (typeof __DEV__ !== 'undefined' && __DEV__ && !meta.isExpression && !meta._classShapeWarned
+            && value && typeof value === 'object') {
+            meta._classShapeWarned = true;
+            wfError(WF_ERRORS.CLASS_BINDING_SHAPE, {
+                context: 'computed returned an object; coercing truthy keys to a class string',
+                suggestion: 'A computed should return a string. For inline expressions, write `data-bind-class="{\'is-active\': cond}"`.',
+                warn: true
             });
         }
 
-        // Apply new classes
-        const newClasses = new Set();
-
-        if (typeof value === 'string') {
-            // String value - space-separated class names
-            value.split(/\s+/).forEach(cls => {
-                if (cls) {
-                    el.classList.add(cls);
-                    newClasses.add(cls);
-                }
-            });
-        } else if (typeof value === 'object' && value !== null) {
-            // Object value - keys are class names, values are booleans
-            Object.keys(value).forEach(cls => {
-                if (value[cls]) {
-                    el.classList.add(cls);
-                    newClasses.add(cls);
-                } else {
-                    el.classList.remove(cls);
-                }
-            });
-        }
-
-        meta.prevClasses = newClasses;
+        // Canonical diff-tracking writer (preserves static / non-bound classes,
+        // removes only keys that drop out): the same writer the per-row class
+        // paths use, via the shared _prevBoundClasses tracking key.
+        applyClass(meta.element, value);
     },
 
     /**
@@ -2302,25 +2217,17 @@ export const RenderingCoreMethods = {
         const el = meta.element;
 
         if (typeof value === 'object' && value !== null) {
-            // Object value - keys are style properties, values are style values
-            Object.keys(value).forEach(prop => {
-                const styleValue = value[prop];
-                if (prop.startsWith('--')) {
-                    // CSS custom properties require setProperty/removeProperty
-                    if (styleValue == null) {
-                        el.style.removeProperty(prop);
-                    } else {
-                        el.style.setProperty(prop, styleValue);
-                    }
-                } else {
-                    // Regular properties: use direct assignment (handles camelCase and kebab-case)
-                    // setProperty only accepts kebab-case, but users write camelCase in JS objects
-                    el.style[prop] = styleValue == null ? '' : styleValue;
-                }
-            });
-        } else if (typeof value === 'string') {
-            // String value - treat as cssText
-            el.style.cssText = value;
+            // Canonical style-object writer: same !important parsing, custom-property
+            // handling, and stale-key cleanup as the list path (this path previously had
+            // none of those: a !important value was silently dropped and dropped keys
+            // left stale inline styles).
+            applyStyleObj(el, value);
+        } else if (value != null) {
+            // Non-object value: emit the shape warning a per-binding setup write
+            // used to emit. A bare CSS
+            // string is still applied as cssText for back-compat.
+            this._warnObjectBindingShape('style', el, value);
+            if (typeof value === 'string') el.style.cssText = value;
         }
     },
 
@@ -2332,28 +2239,17 @@ export const RenderingCoreMethods = {
         const el = meta.element;
 
         if (typeof value === 'object' && value !== null) {
-            // Object value - keys are attribute names, values are attribute values
-            // Apply the same blocklist and sanitization as the list rendering path
-            Object.keys(value).forEach(attr => {
-                if (this._isBlocklistedAttr && this._isBlocklistedAttr(attr)) return;
-                const attrValue = value[attr];
-                const sanitized = this._sanitizeAttrValue
-                    ? this._sanitizeAttrValue(attr, attrValue)
-                    : attrValue;
-                if (sanitized == null || sanitized === false) {
-                    if (el.hasAttribute(attr)) el.removeAttribute(attr);
-                } else if (sanitized === true) {
-                    if (el.getAttribute(attr) !== '') el.setAttribute(attr, '');
-                } else {
-                    // Skip the write if the attribute already holds the same value —
-                    // some elements (notably <video>) reload their resource when `src`
-                    // is set even to an identical string.
-                    const strValue = String(sanitized);
-                    if (el.getAttribute(attr) !== strValue) {
-                        el.setAttribute(attr, strValue);
-                    }
-                }
-            });
+            // Canonical attr-object writer: same blocklist/sanitize/boolean-attr
+            // semantics and stale-key cleanup as the list rendering path.
+            applyAttrObj(el, value, this._attrWriterHelpers || (this._attrWriterHelpers = {
+                isBlocklisted: (prop) => this._isBlocklistedAttr && this._isBlocklistedAttr(prop),
+                sanitize: (prop, v) => this._sanitizeAttrValue ? this._sanitizeAttrValue(prop, v) : v
+            }));
+        } else if (value != null) {
+            // Non-object value: emit the shape warning a per-binding setup write
+            // used to emit. data-bind-attr
+            // has no string form, so this is warn-and-no-op.
+            this._warnObjectBindingShape('attr', el, value);
         }
     },
 
@@ -2377,13 +2273,13 @@ export const RenderingCoreMethods = {
             if (domValue === stateStr) return;
         }
 
-        // Skip list items — handled by list rendering system
+        // Skip list items: handled by list rendering system
         if (listBoundElements.has(el)) return;
 
         // Web Component adapter
         if (meta._webComponentAdapter) {
             const tagName = el.tagName.toLowerCase();
-            // Defer property push if custom element hasn't upgraded yet —
+            // Defer property push if custom element hasn't upgraded yet:
             // properties set before upgrade are shadowed by the class constructor.
             // After whenDefined, allow a frame for internal rendering (Lit-based etc).
             if (tagName.includes('-') && typeof customElements !== 'undefined' && !customElements.get(tagName)) {
@@ -2403,26 +2299,10 @@ export const RenderingCoreMethods = {
             return;
         }
 
-        if (meta.isCheckbox) {
-            const isChecked = !!value;
-            if (el.checked !== isChecked) {
-                el.checked = isChecked;
-            }
-        } else if (meta.isRadio) {
-            const shouldBeChecked = el.value === String(value);
-            if (el.checked !== shouldBeChecked) {
-                el.checked = shouldBeChecked;
-            }
-        } else if (meta.isSelectMultiple) {
-            const values = Array.isArray(value) ? value.map(String) : [];
-            Array.from(el.options).forEach(opt => {
-                opt.selected = values.includes(opt.value);
-            });
-        } else {
-            const strValue = value == null ? '' : String(value);
-            if (el.value !== strValue) {
-                el.value = strValue;
-            }
-        }
+        const kind = meta.isCheckbox ? 'checkbox'
+            : meta.isRadio ? 'radio'
+            : meta.isSelectMultiple ? 'select-multiple'
+            : 'value';
+        applyModel(el, value, kind);
     }
 };
