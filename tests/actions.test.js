@@ -93,9 +93,8 @@ describe('Action Context', () => {
     const button = component.querySelector('#increment-button')
     const display = component.querySelector('#count-display')
 
-    // Verify action context was created
-    const registry = wildflower._contextRegistry
-    const actionContext = registry.getContextForElement(button)
+    // Verify action record was created on the element
+    const actionContext = button._actionContext
     expect(actionContext).toBeDefined()
     expect(actionContext.type).toBe('action')
     expect(actionContext.path).toBe('incrementCount')
@@ -149,10 +148,9 @@ describe('Action Context', () => {
     const resetButton = component.querySelector('#reset-button')
     const display = component.querySelector('#name-display')
 
-    // Verify action contexts were created with correct event types
-    const registry = wildflower._contextRegistry
-    const inputContext = registry.getContextForElement(input)
-    const buttonContext = registry.getContextForElement(resetButton)
+    // Verify action records were created with correct event types
+    const inputContext = input._actionContext
+    const buttonContext = resetButton._actionContext
 
     expect(inputContext).toBeDefined()
     expect(inputContext.type).toBe('action')
@@ -214,20 +212,10 @@ describe('Action Context', () => {
     const interactionArea = component.querySelector('#interaction-area')
     const display = component.querySelector('#event-display')
 
-    // Verify action contexts were created for all event types
-    const registry = wildflower._contextRegistry
-    const actionContexts = registry.getContextsByType('action')
-      .filter(ctx => ctx.componentInstance && ctx.componentInstance.id === componentId)
-
-    expect(actionContexts.length).toBe(3)
-
-    const clickContext = actionContexts.find(ctx => ctx.data && ctx.data.event === 'click')
-    const mouseoverContext = actionContexts.find(ctx => ctx.data && ctx.data.event === 'mouseover')
-    const mouseoutContext = actionContexts.find(ctx => ctx.data && ctx.data.event === 'mouseout')
-
-    expect(clickContext).toBeDefined()
-    expect(mouseoverContext).toBeDefined()
-    expect(mouseoutContext).toBeDefined()
+    // An action record lives on the element; the three event types are
+    // verified behaviorally below (each fires its handler).
+    expect(interactionArea._actionContext).toBeDefined()
+    expect(interactionArea._actionContext.type).toBe('action')
 
     // Test initial state
     expect(display.textContent).toBe('none')
@@ -314,14 +302,13 @@ describe('Action Context', () => {
     // Get first item's remove button
     const firstRemoveButton = listItems[0].querySelector('.remove-button')
 
-    // Verify action context in list item exists with correct properties
-    const registry = wildflower._contextRegistry
-    const actionContext = registry.getContextForElement(firstRemoveButton)
+    // Verify action record in list item exists with correct properties
+    const actionContext = firstRemoveButton._actionContext
     expect(actionContext).toBeDefined()
     expect(actionContext.type).toBe('action')
     expect(actionContext.path).toBe('removeItem')
 
-    // Verify parent-child relationship
+    // Verify parent-child relationship (the row's list context)
     expect(actionContext.parent).toBeDefined()
     expect(actionContext.parent.type).toBe('list')
 
@@ -796,12 +783,9 @@ describe('Action Context', () => {
     const componentId = component.dataset.componentId
     const button = component.querySelector('#test-button')
 
-    // Verify action context was created
-    const registry = wildflower._contextRegistry
-    const initialActionContexts = registry.getContextsByType('action')
-      .filter(ctx => ctx.componentInstance && ctx.componentInstance.id === componentId)
-
-    expect(initialActionContexts.length).toBe(1)
+    // Verify action record was created on the element
+    expect(button._actionContext).toBeDefined()
+    expect(button._actionContext.type).toBe('action')
 
     // Test action handler works
     button.click()
@@ -813,11 +797,6 @@ describe('Action Context', () => {
 
     // Verify component is destroyed
     expect(wildflower.componentInstances.has(componentId)).toBe(false)
-
-    // Verify context was removed
-    const remainingActionContexts = registry.getContextsByType('action')
-      .filter(ctx => ctx.componentInstance && ctx.componentInstance.id === componentId)
-    expect(remainingActionContexts.length).toBe(0)
 
     // Try to trigger action again - should not increment
     // (button may still be in DOM but handler should be detached)

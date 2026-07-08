@@ -1,5 +1,5 @@
 /**
- * RouteManager — Client-side SPA routing with history/hash mode,
+ * RouteManager: Client-side SPA routing with history/hash mode,
  * route guards, lazy loading, and deep framework integration.
  *
  * Architecture:
@@ -1223,10 +1223,10 @@ export class RouteManager {
                 window.history.pushState(historyState, '', url);
             }
         } else if (transitionOptions._replace) {
-            // navigate(path, { replace: true }) — update the address bar in
+            // navigate(path, { replace: true }): update the address bar in
             // place, without adding a history entry. pushState === false also
             // covers initial load and popstate, where the URL is already
-            // correct and must be left untouched — hence the explicit
+            // correct and must be left untouched; hence the explicit
             // _replace flag rather than an unconditional else branch.
             const url = this.urlParser.buildUrl(location);
             const historyState = {
@@ -1403,11 +1403,11 @@ export class RouteManager {
                 return;
             }
         } catch (e) {
-            // Invalid selector — don't retry
+            // Invalid selector; don't retry
             return;
         }
 
-        // Element not found yet — retry after content may have loaded
+        // Element not found yet; retry after content may have loaded
         if (retries > 0) {
             this._scrollHashTimerId = setTimeout(() => this._scrollToHash(hash, retries - 1), 100);
         }
@@ -1645,7 +1645,7 @@ export class RouteManager {
         }
 
         if (pattern.includes('*')) {
-            // Convert /docs/* to regex — capture rest of path
+            // Convert /docs/* to regex; capture rest of path
             const regexPattern = pattern
                 .replace(/\//g, '\\/')
                 .replace(/\*/g, '(.+)');
@@ -2072,7 +2072,7 @@ RouteManager._frameworkIntegration.init();
  * Factory function to create a router instance.
  *
  * Auto-initializes only when `routes:` is provided (declarative form). When
- * called without `routes:`, the staged form is assumed — register routes via
+ * called without `routes:`, the staged form is assumed; register routes via
  * `.onRoute(...)` and then call `router.init()` yourself. Auto-initializing
  * an empty route tree would emit "No route matched" warnings on every page
  * load.
@@ -2081,7 +2081,7 @@ RouteManager._frameworkIntegration.init();
  * @returns {RouteManager} - Router instance (initialized iff `routes:` was provided)
  *
  * @example
- * // Declarative — auto-initialized
+ * // Declarative (auto-initialized)
  * const router = wildflower.createRouter({
  *     mode: 'history',
  *     routes: [
@@ -2091,7 +2091,7 @@ RouteManager._frameworkIntegration.init();
  * });
  *
  * @example
- * // Staged — caller controls init timing
+ * // Staged (caller controls init timing)
  * const router = wildflower.createRouter({ mode: 'history' });
  * router.onRoute('/', { handler: ... });
  * router.onRoute('/users/:id', { handler: ... });

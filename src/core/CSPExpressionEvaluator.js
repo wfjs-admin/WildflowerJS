@@ -86,7 +86,7 @@ function parseExpression(expr) {
     function throwError(message) {
         if (typeof __DEV__ !== 'undefined' && __DEV__) {
             wfError(WF_ERRORS.CSP_SYNTAX, {
-                context: `"${expr}" — position ${index}: ${message}`,
+                context: `"${expr}", position ${index}: ${message}`,
                 suggestion: 'CSP mode supports identifiers, member access, arithmetic, comparisons, logical operators, ternary, and external() calls. Arrow functions, template literals, destructuring, spread, async/await are not supported.'
             });
         }
@@ -749,7 +749,7 @@ function evaluateCall(node, context) {
         return undefined;
     }
 
-    // Block arbitrary function calls — only external() is permitted
+    // Block arbitrary function calls; only external() is permitted
     if (typeof __DEV__ !== 'undefined' && __DEV__) {
         const calleeName = node.callee.type === 'Identifier'
             ? node.callee.name

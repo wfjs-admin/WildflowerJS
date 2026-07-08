@@ -38,6 +38,7 @@ export {
   getFrameworkScripts,
   hasFeature,
   isMinifiedBuild,
+  isMeadowBuild,
   hasConsoleWarnings,
   loadFramework,
   resetFramework,

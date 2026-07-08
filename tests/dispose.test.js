@@ -21,14 +21,14 @@ describe('Framework _dispose()', () => {
     expect(() => wildflower._dispose()).not.toThrow()
   })
 
-  it('disposes context registry if present', () => {
+  it('disposes the records factory if present', () => {
     wildflower = window.wildflower
 
-    // If context registry exists and has dispose, it should be called
+    // If the records factory exists and has dispose, it should be called
     let disposeCalled = false
-    const savedRegistry = wildflower._contextRegistry
+    const savedRecords = wildflower._contextRecords
 
-    wildflower._contextRegistry = {
+    wildflower._contextRecords = {
       dispose: () => { disposeCalled = true }
     }
 
@@ -37,30 +37,30 @@ describe('Framework _dispose()', () => {
     expect(disposeCalled).toBe(true)
 
     // Restore
-    wildflower._contextRegistry = savedRegistry
+    wildflower._contextRecords = savedRecords
   })
 
-  it('handles _dispose() when context registry has no dispose method', () => {
+  it('handles _dispose() when the records factory has no dispose method', () => {
     wildflower = window.wildflower
 
-    const savedRegistry = wildflower._contextRegistry
-    wildflower._contextRegistry = {}
+    const savedRecords = wildflower._contextRecords
+    wildflower._contextRecords = {}
 
     expect(() => wildflower._dispose()).not.toThrow()
 
     // Restore
-    wildflower._contextRegistry = savedRegistry
+    wildflower._contextRecords = savedRecords
   })
 
-  it('handles _dispose() when context registry is null', () => {
+  it('handles _dispose() when the records factory is null', () => {
     wildflower = window.wildflower
 
-    const savedRegistry = wildflower._contextRegistry
-    wildflower._contextRegistry = null
+    const savedRecords = wildflower._contextRecords
+    wildflower._contextRecords = null
 
     expect(() => wildflower._dispose()).not.toThrow()
 
     // Restore
-    wildflower._contextRegistry = savedRegistry
+    wildflower._contextRecords = savedRecords
   })
 })

@@ -27,16 +27,12 @@
  * Audit doc: docs/future/SUBSCRIPTION_FILTER_AUDIT.md
  */
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest'
-import { loadFramework, resetFramework, isMinifiedBuild } from './helpers/load-framework.js'
+import { loadFramework, resetFramework } from './helpers/load-framework.js'
 
-// Property-mangled builds (`.min.js`) rename underscore-prefixed framework
-// methods, so test code that calls `sm._registerEffectPatternDependency`
-// directly fails with "is not a function". The framework's own internal use
-// (mapArray at ReactiveStateManager.js:643) goes through the same renamed
-// symbol consistently, so the contract is unchanged — but the user-direct
-// pattern-subscription pathway exercised by Shape 3 is unreachable from
-// outside the bundle. Tests that depend on the private API skip on min.
-const SKIP_PRIVATE_API = isMinifiedBuild()
+// The user-direct pattern-subscription API (`_registerEffectPatternDependency`,
+// Shape 3) was an RSM pattern-trie feature. Meadow has no pattern-trie and no
+// such API, so the pattern-subscription tests do not apply on this branch.
+const SKIP_PRIVATE_API = true
 
 async function nextTick(ms = 30) {
     await new Promise(r => setTimeout(r, ms))

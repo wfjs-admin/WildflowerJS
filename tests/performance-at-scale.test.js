@@ -97,12 +97,6 @@ describe('Performance at Scale', () => {
     const listItems = component.querySelectorAll('.scale-item')
     expect(listItems.length).toBe(100)
 
-    // Count contexts
-    const allContexts = wildflower._contextRegistry.contexts.size
-    const bindingContexts = wildflower._contextRegistry.getContextsByType('binding').length
-    const conditionalContexts = wildflower._contextRegistry.getContextsByType('conditional').length
-    const listContexts = wildflower._contextRegistry.getContextsByType('list').length
-
     // Update half the items and measure performance
     const updateStartTime = performance.now()
 

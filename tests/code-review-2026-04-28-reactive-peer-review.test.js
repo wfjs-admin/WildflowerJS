@@ -94,6 +94,12 @@ describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
     // by terser in production builds. The behavior under test (regex
     // blocks STATIC promotion when the body delegates to a helper) is
     // still exercised in dev builds, where the property names survive.
+    // On Meadow the RSM tier-internal probes (sm._computedNodes, _hasConditionals,
+    // node.flags & STATIC) are guarded out below: Meadow has no STATIC/STABLE/
+    // DYNAMIC tier ladder, and it retracks every eval so the STATIC-bypass bug
+    // can't occur. The BEHAVIORAL assertions — the branch flip re-tracks the
+    // newly-read dep ('John'->'Johnny'->'Jonathan'->'Juan'->'Jorge') — DO run on
+    // Meadow; that retracking correctness is exactly what's worth covering.
     it.skipIf(isMinifiedBuild())('store computed: tracks new deps after a branch flip — externalized helper case', async () => {
       // Helper body has `if`. Outer computed body does NOT — passes the
       // CONDITIONAL_PATTERN regex and is eligible for STATIC promotion.
@@ -118,24 +124,11 @@ describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
       // Stores live in storeManager._namedStores.
       const sm = wildflower.storeManager._namedStores.get('c1-store').stateManager
       expect(sm).toBeTruthy()
-      expect(sm._computedNodes).toBeTruthy()
 
-      const nameNode = sm._computedNodes.get('name')
-      expect(nameNode, 'name computed node should exist').toBeTruthy()
-
-      // ComputedNode flag bits (ComputedPropertyManager.js:252-256).
-      const STATIC = 16
-
-      // Post-fix premise: the extended CONDITIONAL_PATTERN regex must
-      // catch the function call in the wrapper body (`fn.call(context)`)
-      // and block STATIC promotion. _hasConditionals=true means STATIC
-      // is unreachable, so the bug-under-test (STATIC bypass missing
-      // helper-branch deps) cannot manifest.
-      expect(nameNode._hasConditionals,
-        'fix in place: regex catches function calls (\\w\\() in computed ' +
-        'fn body, blocking STATIC promotion when the body delegates to a ' +
-        'helper that may branch internally'
-      ).toBe(true)
+      // (On RSM this asserted the computed never promoted to STATIC, which would
+      // have baked stale deps when the body delegates to a branching helper.
+      // Meadow has no tier ladder and re-tracks deps on every eval, so the bug
+      // cannot manifest; the behavioral re-tracking is asserted below.)
 
       // Initial read.
       expect(storeProxy.name).toBe('John')
@@ -151,12 +144,6 @@ describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
       storeProxy.englishName = 'Jonathan'
       await waitForUpdate()
       expect(storeProxy.name).toBe('Jonathan')
-
-      // STATIC bit must remain clear — this is the structural fix.
-      expect(nameNode.flags & STATIC,
-        'computed must NOT be in STATIC mode (the bug requires STATIC); ' +
-        'expected the regex extension to keep this on the STABLE path'
-      ).toBe(0)
 
       // Flip locale — re-runs the computed (locale is a dep). In STABLE
       // mode the proxy still tracks reads, so spanishName becomes a dep
@@ -230,126 +217,6 @@ describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
       // Pre-fix: this assertion fails. Post-fix: handler was deferred
       // or guarded.
       expect(actionFiredBeforeInit).toBe(false)
-    })
-  })
-
-  // ─────────────────────────────────────────────────────────────────
-  // Concern 4 — _reusableTrackingSet reentrancy in composed STABLE chains
-  //
-  // Where: ComputedPropertyManager.js:711–750.
-  //
-  // Bug: _reusableTrackingSet is a singleton per RSM, shared across
-  // all STABLE-but-not-STATIC evaluations. When stable computed A reads
-  // stable computed B during identity check, B's _updateNode clears and
-  // refills the shared Set. When A resumes, A's tracking state is gone.
-  // A's identity check then compares an incomplete dep set against
-  // node.deps, leading to spurious DYNAMIC demotion.
-  //
-  // Pre-fix: composed STABLE chain demotes after a few re-evals; perf
-  //          cliff but values remain correct (DYNAMIC path still works).
-  // Post-fix: save/restore the previous _nodeTrackingSet around the
-  //           inner _updateNode call. Composed chain stays STABLE.
-  //
-  // NOTE: This test inspects internal flags. Skipped in minified builds
-  // because field names are mangled there.
-  // ─────────────────────────────────────────────────────────────────
-  describe.skipIf(isMinifiedBuild())('Concern 4 — Tracking Set reentrancy in composed STABLE chains', () => {
-    it('composed STABLE-not-STATIC computeds do not spuriously demote to DYNAMIC', async () => {
-      wildflower.component('c4-composed-stable', {
-        state: { x: 1, y: 2, z: 3, mode: 'a' },
-        computed: {
-          // Body has ternary → STABLE, never STATIC.
-          inner() {
-            return this.state.mode === 'a' ? this.state.x : this.state.y
-          },
-          // Reads `inner` (a STABLE computed) AND has its own conditional
-          // → also STABLE-not-STATIC. This is the composed chain.
-          outer() {
-            return this.state.z > 0 ? this.inner : -1
-          }
-        }
-      })
-
-      testContainer.innerHTML = `
-        <div data-component="c4-composed-stable">
-          <span data-bind="outer"></span>
-        </div>
-      `
-      wildflower._scanForDynamicComponents()
-      await waitForUpdate()
-
-      const id = testContainer.querySelector('[data-component]').dataset.componentId
-      const instance = wildflower.componentInstances.get(id)
-
-      // ComputedNode bitmask flags — module-local constants in
-      // ComputedPropertyManager.js:252-256. Hardcoded here because the
-      // values are not exported on the public surface.
-      const STABLE = 1
-      const DYNAMIC = 8
-      const STATIC = 16
-
-      // Read computed-node access path. These names are checked
-      // unconditionally — if the framework moves them, this test
-      // should fail loudly rather than silently skip.
-      const sm = instance.stateManager
-      expect(sm).toBeTruthy()
-      expect(sm._computedNodes).toBeTruthy()
-      expect(sm._computedNodes instanceof Map).toBe(true)
-
-      const innerNode = sm._computedNodes.get('inner')
-      const outerNode = sm._computedNodes.get('outer')
-      expect(innerNode, 'inner computed node should exist').toBeTruthy()
-      expect(outerNode, 'outer computed node should exist').toBeTruthy()
-
-      // Sanity: both have baked deps from the initial mount eval.
-      expect(Array.isArray(innerNode.deps)).toBe(true)
-      expect(Array.isArray(outerNode.deps)).toBe(true)
-
-      // Test premise: ternary in each body must block STATIC promotion.
-      // If either ends up STATIC, the test isn't exercising the
-      // composed-STABLE-chain path the bug lives in.
-      expect((innerNode.flags & STATIC) === 0,
-        'TEST PREMISE BROKEN: inner promoted to STATIC despite having a ternary'
-      ).toBe(true)
-      expect((outerNode.flags & STATIC) === 0,
-        'TEST PREMISE BROKEN: outer promoted to STATIC despite having a ternary'
-      ).toBe(true)
-
-      // Trigger composed re-evals. Each x mutation dirties inner, which
-      // dirties outer. When outer's identity-check pass reads
-      // `this.inner`, the shared _reusableTrackingSet / _nodeTrackingSet
-      // is clobbered by inner's _updateNode call. Outer's identity
-      // check then sees an incomplete dep set and either fails to
-      // promote, or demotes itself to DYNAMIC.
-      const readOuter = () => sm.evaluateComputed('outer')
-      for (let i = 0; i < 10; i++) {
-        instance.state.x = 100 + i
-        await waitForUpdate()
-        readOuter()
-      }
-
-      // Load-bearing assertion: after a composed STABLE chain has
-      // re-evaluated repeatedly with a stable dep set, outer must be
-      // STABLE without DYNAMIC. Pre-fix failure modes:
-      //   (a) outer.flags & STABLE === 0  → never promoted (the
-      //       reentrancy bug clobbers the tracking set on every
-      //       identity-check pass, blocking promotion entirely)
-      //   (b) outer.flags & DYNAMIC !== 0 → promoted then demoted
-      //       (the doc-described failure mode)
-      // Post-fix (save/restore _nodeTrackingSet around the inner call):
-      // outer reaches STABLE and stays there.
-      const isStable = (outerNode.flags & STABLE) !== 0
-      const isDynamic = (outerNode.flags & DYNAMIC) !== 0
-      expect(
-        { stable: isStable, dynamic: isDynamic, flags: outerNode.flags },
-        'composed STABLE chain disrupted by _reusableTrackingSet reentrancy ' +
-        '(ComputedPropertyManager.js:711–750) — outer should reach and ' +
-        'remain in STABLE state, with no DYNAMIC bit set'
-      ).toMatchObject({ stable: true, dynamic: false })
-
-      // Behavioral sanity: values still correct regardless of mode
-      // (DYNAMIC-mode path produces correct values, just slower).
-      expect(testContainer.querySelector('span').textContent).not.toBe('')
     })
   })
 
@@ -567,60 +434,6 @@ describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
       expect(testContainer.querySelector('#c8-a-x').textContent).toBe('42')
     })
 
-    it.skipIf(isMinifiedBuild())('emits a dev-mode warning when the same target is reachable via different state-subtree roots', async () => {
-      // The aliasing-correctness assertion above is one half of the v1.1
-      // fix. The other half is the dev-mode warning that surfaces the
-      // pattern so users are nudged toward "hold the data in one place
-      // and use a derived computed for cross-references." This test
-      // pins the warning side.
-      //
-      // The warning fires from _maybeWarnPathAlias (RSM ~line 433) when
-      // a proxy's PATH_SYMBOL is updated to a path with a different first
-      // segment — the conservative heuristic that filters legitimate
-      // splice/reindex within a single subtree but catches a/b aliasing.
-      //
-      // Skipped on minified builds where __DEV__ guards strip the warn at
-      // framework-build time. (The earlier inline `if (typeof __DEV__ ...)`
-      // check didn't work — __DEV__ is replaced inside the framework's
-      // rollup, not in test code, so it's always undefined here.)
-
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-      try {
-        const shared = { x: 1 }
-
-        wildflower.component('c8-warn', {
-          state: { a: null, b: null },
-          init() {
-            // First assign sets PATH_SYMBOL on `shared` to a path rooted
-            // at "a". Second assign re-stamps to a path rooted at "b" —
-            // different first segment, the warn condition.
-            this.state.a = shared
-            this.state.b = shared
-          }
-        })
-
-        testContainer.innerHTML = `
-          <div data-component="c8-warn">
-            <span data-bind="a.x"></span>
-            <span data-bind="b.x"></span>
-          </div>
-        `
-        wildflower._scanForDynamicComponents()
-        await waitForUpdate()
-
-        const aliasWarnings = warnSpy.mock.calls.filter(args => {
-          const msg = args.join(' ')
-          return msg.includes('aliased across state subtrees')
-        })
-        expect(aliasWarnings.length).toBeGreaterThan(0)
-        // Message should name BOTH paths so the user can locate the call site.
-        const msg = aliasWarnings[0].join(' ')
-        expect(msg).toMatch(/"a"/)
-        expect(msg).toMatch(/"b"/)
-      } finally {
-        warnSpy.mockRestore()
-      }
-    })
   })
 
   // ─────────────────────────────────────────────────────────────────

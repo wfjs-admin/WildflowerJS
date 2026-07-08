@@ -54,7 +54,7 @@ describe('Binding Context', () => {
     }
   })
 
-  it.skipIf(isMinifiedBuild())('Basic binding context creation and resolution', async () => {
+  it.skipIf(isMinifiedBuild())('Basic binding renders and resolves values', async () => {
     testContainer.innerHTML = `
       <div data-component="binding-test">
         <span data-bind="message"></span>
@@ -72,27 +72,8 @@ describe('Binding Context', () => {
     await waitForUpdate()
 
     const component = testContainer.querySelector('[data-component="binding-test"]')
-    const componentId = component.dataset.componentId
     const messageElement = component.querySelector('[data-bind="message"]')
     const countElement = component.querySelector('[data-bind="count"]')
-
-    // Verify binding contexts were created
-    const registry = wildflower._contextRegistry
-    const messageContext = registry.getContextForElement(messageElement)
-    const countContext = registry.getContextForElement(countElement)
-
-    expect(messageContext).toBeDefined()
-    expect(messageContext.type).toBe('binding')
-    expect(messageContext.path).toBe('message')
-    expect(messageContext.componentInstance.id).toBe(componentId)
-
-    expect(countContext).toBeDefined()
-    expect(countContext.type).toBe('binding')
-    expect(countContext.path).toBe('count')
-
-    // Verify data resolution
-    expect(messageContext.resolveData()).toBe('Hello World')
-    expect(countContext.resolveData()).toBe(42)
 
     // Verify DOM elements are updated correctly
     expect(messageElement.textContent).toBe('Hello World')
@@ -134,26 +115,11 @@ describe('Binding Context', () => {
     expect(firstItem.querySelector('.name').textContent).toBe('Item One')
     expect(firstItem.querySelector('.value').textContent).toBe('100')
 
-    // Verify second item bindings
+    // Verify second item bindings (per-item effects paint list-item text from
+    // the row item proxy — no per-binding context is created)
     const secondItem = listItems[1]
     expect(secondItem.querySelector('.name').textContent).toBe('Item Two')
     expect(secondItem.querySelector('.value').textContent).toBe('200')
-
-    // Verify binding contexts exist with correct parent relationship
-    const registry = wildflower._contextRegistry
-    const nameBinding = registry.getContextForElement(firstItem.querySelector('.name'))
-    expect(nameBinding).toBeDefined()
-    expect(nameBinding.type).toBe('binding')
-    expect(nameBinding.path).toBe('name')
-    expect(nameBinding.parent).toBeDefined()
-    expect(nameBinding.parent.type).toBe('list')
-
-    // Verify data resolution through context chain
-    expect(nameBinding.resolveData()).toBe('Item One')
-
-    // Verify second item's context resolves different data
-    const secondNameBinding = registry.getContextForElement(secondItem.querySelector('.name'))
-    expect(secondNameBinding.resolveData()).toBe('Item Two')
   })
 
   it('Expression binding contexts', async () => {
@@ -191,7 +157,7 @@ describe('Binding Context', () => {
     expect(component.querySelector('#conditional').textContent).toBe('High')
   })
 
-  it.skipIf(isMinifiedBuild())('Update propagation between binding contexts (two-way binding)', async () => {
+  it.skipIf(isMinifiedBuild())('Update propagation (two-way binding)', async () => {
     testContainer.innerHTML = `
       <div data-component="two-way-binding">
         <input type="text" data-model="username">
@@ -216,18 +182,6 @@ describe('Binding Context', () => {
     const displayElement = component.querySelector('#display')
     const welcomeElement = component.querySelector('#welcome')
 
-    // Verify binding context for model input
-    const registry = wildflower._contextRegistry
-    const modelContext = registry.getContextForElement(inputElement)
-    expect(modelContext).toBeDefined()
-    expect(modelContext.type).toBe('binding')
-    expect(modelContext.path).toBe('username')
-
-    // Verify binding context for display
-    const displayContext = registry.getContextForElement(displayElement)
-    expect(displayContext).toBeDefined()
-    expect(displayContext.type).toBe('binding')
-
     // Verify initial state
     expect(inputElement.value).toBe('Guest')
     expect(displayElement.textContent).toBe('Guest')
@@ -239,7 +193,7 @@ describe('Binding Context', () => {
 
     await waitForCompleteRender()
 
-    // Verify binding contexts updated
+    // Verify updates propagated
     expect(instance.state.username).toBe('John')
     expect(displayElement.textContent).toBe('John')
     expect(welcomeElement.textContent).toBe('Welcome, John')
@@ -433,10 +387,6 @@ describe('Binding Context', () => {
     const container = component.querySelector('#container')
     const targetElement = component.querySelector('#target')
 
-    // Get binding context
-    const bindingContext = wildflower._contextRegistry.getContextForElement(targetElement)
-    expect(bindingContext).toBeDefined()
-
     // Detach element (but keep the same element reference)
     container.removeChild(targetElement)
 
@@ -445,9 +395,6 @@ describe('Binding Context', () => {
 
     await waitForCompleteRender()
     await waitForUpdate(50)
-
-    // Verify context was updated despite element being detached
-    expect(bindingContext.resolveData()).toBe('Updated While Detached')
 
     // Reattach the same element
     container.appendChild(targetElement)

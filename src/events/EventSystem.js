@@ -7,6 +7,32 @@
 import { actionBoundElements, handlingSubmitSet, keyModifiersCache, boundActionsCache } from '../core/DomMetadata.js';
 import { pathResolver } from '../core/wfUtils.js';
 
+// Modifier names usable in data-event-key-* attributes (bare or in combos).
+const _KEY_MODIFIER_NAMES = new Set(['ctrl', 'alt', 'shift', 'meta']);
+
+// Maps declared key tokens to the lowercased event.key values they accept.
+// Tokens not listed here match event.key exactly (lowercased).
+const _KEY_TOKEN_ALIASES = {
+    enter: ['enter', 'return'],
+    esc: ['escape'],
+    escape: ['escape'],
+    space: [' '],
+    up: ['arrowup'],
+    down: ['arrowdown'],
+    left: ['arrowleft'],
+    right: ['arrowright'],
+    delete: ['delete', 'backspace'],
+    backspace: ['delete', 'backspace'],
+    tab: ['tab']
+};
+
+function _keyTokenMatches(token, eventKeyLower)
+{
+    const aliases = _KEY_TOKEN_ALIASES[token];
+    if (aliases) return aliases.indexOf(eventKeyLower) !== -1;
+    return token === eventKeyLower;
+}
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
@@ -24,8 +50,15 @@ export const EventSystemMethods = {
             ? this._normalizeEventsConfig(definition.events)
             : this._getDefaultEventsConfig();
 
-        // Find all direct action elements (support both prefixes)
-        const allActionElements = element.querySelectorAll(this._attrSelector('action'));
+        // Find all direct action elements (support both prefixes).
+        // querySelectorAll only matches descendants, so include the component
+        // root itself if it carries data-action; otherwise `<div
+        // data-component="x" data-action="keydown:foo">` is silently skipped.
+        // Mirrors PortalSystem._processPortaledContentBindings.
+        const descendantActionElements = element.querySelectorAll(this._attrSelector('action'));
+        const allActionElements = this._hasAttr(element, 'action')
+            ? [element, ...descendantActionElements]
+            : descendantActionElements;
 
         const actionElements = Array.from(allActionElements)
             .filter(actionEl =>
@@ -47,7 +80,7 @@ export const EventSystemMethods = {
 
                 // If the action's closest component IS this component, keep it.
                 // Handles components inside lists (an inner component sitting
-                // inside an outer component's list) — the action belongs to
+                // inside an outer component's list); the action belongs to
                 // this component regardless of list ancestry.
                 if (closestComponent === element) {
                     return true;
@@ -115,7 +148,7 @@ export const EventSystemMethods = {
                     if (listElement && listElement._listContext)
                     {
                         // Create action context with list context as parent
-                        formActionContext = this._contextRegistry.createActionContext(
+                        formActionContext = this._contextRecords.createActionContext(
                             methodName,
                             instance,
                             el,
@@ -205,7 +238,7 @@ export const EventSystemMethods = {
                     {
 
                         // Create action context with list context as parent
-                        actionContext = this._contextRegistry.createActionContext(
+                        actionContext = this._contextRecords.createActionContext(
                             methodName,
                             instance,
                             el,
@@ -224,7 +257,7 @@ export const EventSystemMethods = {
                 {
 
                     // Create standard action context
-                    actionContext = this._contextRegistry.createActionContext(
+                    actionContext = this._contextRecords.createActionContext(
                         methodName,
                         instance,
                         el,
@@ -397,14 +430,26 @@ export const EventSystemMethods = {
                 }
                 elBoundActions.add(bindingKey);
 
-                // Store handler for cleanup
-                this.eventHandlers.set(actionKey, handler);
-
                 // Add the event listener with options
-                el.addEventListener(eventType, handler, {
+                const listenerOptions = {
                     once: actionConfig.once,
                     capture: actionConfig.capture,
                     passive: actionConfig.passive
+                };
+                el.addEventListener(eventType, handler, listenerOptions);
+
+                // Store handler for cleanup in the {target,event,handler,options}
+                // shape every teardown path matches on (ComponentLifecycle's
+                // destroy sweep, ContextRecords cleanup, SSRManager). A bare
+                // function would be found by key and deleted from the map, but its
+                // DOM listener would never be removed, leaking the closure when
+                // the destroyed component's element stays attached/reparented.
+                this.eventHandlers.set(actionKey, {
+                    target: el,
+                    event: eventType,
+                    handler,
+                    options: listenerOptions,
+                    componentId: instance.id
                 });
 
             });
@@ -421,11 +466,18 @@ export const EventSystemMethods = {
         }
 
         const { element, componentInstance } = actionContext;
+        // Action records live on the element and outlive their component (the
+        // direct-bound listener isn't removed on destroy; it was the disposed
+        // CM context that used to gate it). No-op once the owning component is
+        // gone so a post-destroy event can't fire a stale handler.
+        if (!this.componentInstances.has(componentInstance.id)) {
+            return;
+        }
         let methodName = actionContext.path;
 
         // Skip if a more-specific action (descendant component) already fired
         // for this event. Replaces the implicit stopPropagation that used to
-        // mask nested-component double-firing — events still bubble to legacy
+        // mask nested-component double-firing; events still bubble to legacy
         // delegation systems (jQuery, etc.), but WF only fires the action once.
         if (event._wfHandled === true) {
             return;
@@ -493,8 +545,9 @@ export const EventSystemMethods = {
             }
         }
 
-        const actionData = actionContext.resolveData();
-        const options = actionData.options || {};
+        // Action options are static metadata stored on the context (resolveData
+        // for an action context just repackages this.data); read them directly.
+        const options = actionContext.data?.options || {};
 
         // Check data-event-self - only fire if event.target is the element itself
         if (options.self && event.target !== element) {
@@ -528,37 +581,21 @@ export const EventSystemMethods = {
         // Prepare detail object for list items
         let detail = {};
 
-        // Try the normal context approach first
-        if (actionContext.parent && actionContext.parent.type === 'list') {
-            const listContext = actionContext.parent;
-            const itemIndex = actionContext._parentIndex;
-
-            if (typeof itemIndex === 'number') {
-                const listData = listContext.resolveData();
-
-                if (Array.isArray(listData) && itemIndex >= 0 && itemIndex < listData.length) {
-
-                    detail = {
-                        index: itemIndex,
-                        item: listData[itemIndex],
-                        list: listData,
-                        length: listData.length,
-                        first: itemIndex === 0,
-                        last: itemIndex === listData.length - 1,
-                        context: listContext
-                    };
-
-                    // Build parent context chain for nested lists
-                    this._buildParentListChain(detail, listContext);
-
-                    // If we have a valid item, use it
-                    if (detail.item) {
-                        // Attach action args to detail if present
-                        if (actionArgs && actionArgs.length > 0) { detail.args = actionArgs; }
-                        this._invokeActionHandler(componentInstance, methodName, event, element, detail, actionArgs, options);
-                        return;
-                    }
-                }
+        // Build the list-item detail straight off the row element: index/item
+        // from _listIndex/_itemData (the reactive item-proxy the render effect
+        // tracks), the array via getValue (top-level) or the parent row's
+        // item-proxy (nested). Identity-rooted, so it survives parent
+        // reorder/splice. Replaces the former list-context resolveData() read
+        // (one-graph absorption). Falls through to the DOM-hierarchy fallback
+        // below when the row's list does not resolve cleanly.
+        const rowEl = this._findListItemAncestor(element);
+        if (rowEl && rowEl._listIndex !== undefined && rowEl._itemData !== undefined) {
+            const built = this._buildListActionDetail(rowEl, componentInstance);
+            if (built) {
+                detail = built;
+                if (actionArgs && actionArgs.length > 0) { detail.args = actionArgs; }
+                this._invokeActionHandler(componentInstance, methodName, event, element, detail, actionArgs, options);
+                return;
             }
         }
 
@@ -680,7 +717,7 @@ export const EventSystemMethods = {
         // Mark this event as having been handled by a WF action so any
         // ancestor component delegations skip it (prevents nested-component
         // double-fire). Events still bubble to non-WF listeners (jQuery,
-        // native delegation) — we only short-circuit other WF delegations.
+        // native delegation); we only short-circuit other WF delegations.
         if (event && typeof event === 'object') {
             event._wfHandled = true;
         }
@@ -711,54 +748,127 @@ export const EventSystemMethods = {
         }
     },
     /**
-     * Build parent context chain for nested list actions
-     * Walks up the context hierarchy to find parent list contexts and adds them to the detail object
-     * @param {Object} detail - The detail object to add parent chain to
-     * @param {Object} listContext - The immediate list context
+     * Resolve the live array a list element renders, identity-rooted through the
+     * item-proxy chain: a top-level list reads via getValue(path); a nested list
+     * reads the child path off its owning row's item-proxy. Returns null when the
+     * path does not resolve to an array (caller then falls back).
      * @private
      */
-    _buildParentListChain(detail, listContext)
-    {
-        if (!listContext) return;
-
-        let currentDetail = detail;
-        let currentCtx = listContext;
-
-        // Walk up the context hierarchy looking for parent list contexts
-        // The _parentIndex on a list context indicates its position in the parent list
-        while (currentCtx) {
-            // Check if this list context is nested inside another list
-            // _parentIndex on the current context tells us its index in the parent list
-            if (typeof currentCtx._parentIndex === 'number' &&
-                currentCtx.parent &&
-                currentCtx.parent.type === 'list') {
-
-                const parentListCtx = currentCtx.parent;
-                const parentIndex = currentCtx._parentIndex;
-
-                try {
-                    const parentListData = parentListCtx.resolveData();
-
-                    if (Array.isArray(parentListData) && parentIndex >= 0 && parentIndex < parentListData.length) {
-                        currentDetail.parent = {
-                            index: parentIndex,
-                            item: parentListData[parentIndex],
-                            list: parentListData,
-                            context: parentListCtx
-                        };
-                        currentDetail = currentDetail.parent;
-                        currentCtx = parentListCtx;
-                        continue;
-                    }
-                } catch (e) {
-                    // Data resolution failed, stop walking
-                    break;
-                }
+    _resolveRowListArray(listEl, listPath, componentInstance) {
+        if (!listEl || !listPath) return null;
+        const ownerRow = this._findListItemAncestor(listEl);
+        if (ownerRow && ownerRow._listIndex !== undefined && ownerRow._itemData) {
+            const parentItem = ownerRow._itemData;
+            const nested = parentItem[listPath];
+            if (Array.isArray(nested)) return nested;
+            // Nested-list source that is an item-level computed (not a stored
+            // field): evaluate the path against the parent item, matching the
+            // implicit-computed fallback list rendering uses.
+            if (nested === undefined && this._resolveRawBinding) {
+                const parentListEl = this._findDirectParentList(ownerRow);
+                const parentListPath = parentListEl ? this._getAttr(parentListEl, 'list') : null;
+                const parentArray = this._resolveRowListArray(parentListEl, parentListPath, componentInstance);
+                const scope = {
+                    componentState: (componentInstance && componentInstance.state) || {},
+                    componentInstance,
+                    itemIndex: ownerRow._listIndex,
+                    listLength: Array.isArray(parentArray) ? parentArray.length : 0,
+                    listContext: parentListEl ? parentListEl._listContext : null,
+                    propsData: componentInstance && componentInstance._propsData
+                };
+                const computed = this._resolveRawBinding(listPath, parentItem, scope);
+                return Array.isArray(computed) ? computed : null;
             }
-
-            // No more parent list contexts found
-            break;
+            return null;
         }
+        // Top-level list: mirror the former list-context resolution: external(…)
+        // through the external fn, store shorthand normalized, then getValue
+        // (which already covers computed:/bare-computed/state paths).
+        const sm = componentInstance && componentInstance.stateManager;
+        if (!sm) return null;
+        let value;
+        if (listPath.includes('external(')) {
+            try {
+                value = this.evaluateExpression(listPath, sm.state || {}, {
+                    cacheKey: 'externalList',
+                    additionalContext: { external: this._getExternalFn(componentInstance) }
+                });
+            } catch (e) {
+                value = null;
+            }
+        } else {
+            const normalizedPath = (listPath.includes('$') && this._normalizeStoreShorthands)
+                ? this._normalizeStoreShorthands(listPath) : listPath;
+            value = sm.getValue(normalizedPath);
+        }
+        return Array.isArray(value) ? value : null;
+    },
+    /**
+     * Build the action `detail` for a list-row element without a CM list context.
+     * index/item come straight off the row (_listIndex / _itemData), the array
+     * from _resolveRowListArray, and the parent chain is walked through the DOM
+     * row ancestry. Returns null when the row's immediate list does not resolve to
+     * an array containing the row index (caller falls back to the DOM-hierarchy
+     * walk). Public event.detail contract:
+     * { index, item, list, length, first, last, context?, parent? }.
+     * @private
+     */
+    _buildListActionDetail(rowEl, componentInstance) {
+        const listEl = this._findDirectParentList(rowEl);
+        const listPath = listEl ? this._getAttr(listEl, 'list') : null;
+        const index = rowEl._listIndex;
+
+        // Cheap structural validity gate (no array resolution). A row missing its
+        // list element, path, item data, or index falls back to the caller's
+        // DOM-hierarchy walk, the cases that fallback exists for. The former
+        // index-in-bounds check is dropped: a live, freshly-rendered row's index
+        // is always within its source array.
+        if (!listEl || !listPath || rowEl._itemData === undefined || index == null || index < 0) {
+            return null;
+        }
+
+        // Resolve the row's list array LAZILY. Most handlers read only `item`
+        // (krausest select/remove), but resolving the array eagerly walks
+        // getValue -> getPath -> the reactive proxy on every dispatch; the
+        // dominant select-dispatch cost. list/length/last become getters that
+        // resolve (and cache) the array only when a handler actually reads them.
+        const self = this;
+        let _list, _resolved = false;
+        const getList = () => {
+            if (!_resolved) { _list = self._resolveRowListArray(listEl, listPath, componentInstance); _resolved = true; }
+            return _list;
+        };
+
+        const detail = {
+            index,
+            item: rowEl._itemData,
+            first: index === 0,
+            context: listEl ? listEl._listContext : undefined,
+            get list() { return getList(); },
+            get length() { const l = getList(); return Array.isArray(l) ? l.length : 0; },
+            get last() { const l = getList(); return Array.isArray(l) ? index === l.length - 1 : false; }
+        };
+
+        // Walk the DOM row ancestry to assemble detail.parent / .parent.parent…
+        let childDetail = detail;
+        let currentListEl = listEl;
+        while (currentListEl) {
+            const parentRow = this._findListItemAncestor(currentListEl);
+            if (!parentRow || parentRow._listIndex === undefined || parentRow._itemData === undefined) break;
+            const parentListEl = this._findDirectParentList(parentRow);
+            const parentListPath = parentListEl ? this._getAttr(parentListEl, 'list') : null;
+            const parentList = this._resolveRowListArray(parentListEl, parentListPath, componentInstance);
+            childDetail.parent = {
+                index: parentRow._listIndex,
+                item: parentRow._itemData,
+                list: Array.isArray(parentList) ? parentList : undefined,
+                context: parentListEl ? parentListEl._listContext : undefined
+            };
+            childDetail = childDetail.parent;
+            currentListEl = parentListEl;
+        }
+
+        return detail;
     },
     /**
      * Create enhanced context object for event handlers
@@ -847,12 +957,9 @@ export const EventSystemMethods = {
      * @private
      */
     _findActionElementViaRegistry(target, boundary) {
-        if (!this._contextRegistry) return null;
-
         let current = target;
         while (current && current !== boundary) {
-            const context = this._contextRegistry.contextsByElement?.get(current);
-            if (context && context.type === 'action') {
+            if (current._actionContext) {
                 return current;
             }
             current = current.parentElement;
@@ -915,18 +1022,12 @@ export const EventSystemMethods = {
         // Get or ensure list context if context system is initialized
         let listContext = null;
 
-        if (this._contextSystemInitialized && this._contextRegistry)
+        if (this._contextSystemInitialized)
         {
-            // First check if element already has a context
+            // List contexts are plain objects stored on the element.
             listContext = listElement._listContext;
 
-            // If not, try to get from registry
-            if (!listContext)
-            {
-                listContext = this._contextRegistry.getContextForElement(listElement);
-            }
-
-            // If still not found, create a new one
+            // If not found, create a new one
             if (!listContext && path)
             {
                 // Get data directly from component state
@@ -958,100 +1059,15 @@ export const EventSystemMethods = {
         }
 
 
-        // Add click delegation for all action elements
+        // Add click delegation for all action elements. Resolution, boundary
+        // checks, nested-component routing, and the handler cascade live in
+        // the shared _dispatchDelegatedListEvent; the resolver encodes the
+        // click-family rule (forms are submit-handled, everything else is a
+        // plain click).
         listElement.addEventListener('click', (event) =>
         {
-            // Find if an action element was clicked (support both prefixes)
-            // Try attribute-based first, then fall back to context registry,
-            // then to compiled metadata for stripped templates
-            let actionEl = event.target.closest('[data-action],[data-wf-action]');
-            // closest() walks the entire ancestor chain. If a list-row's
-            // data-action was stripped at compile time (canUseInnerHTML fast
-            // path), closest() walks PAST the row and may find an unrelated
-            // outer ancestor — e.g. a <form data-action="submit"> wrapping
-            // the modal body, or an outer list's row. Reject any actionEl
-            // outside this list's boundary so the metadata fallback below
-            // can locate the actual stripped row action.
-            if (actionEl && !listElement.contains(actionEl)) {
-                actionEl = null;
-            }
-            if (!actionEl) {
-                // Context-first fallback: walk up from target checking for ActionContext
-                actionEl = this._findActionElementViaRegistry(event.target, listElement);
-            }
-            if (!actionEl) {
-                // Metadata fallback: check compiled template metadata for action elements
-                // This enables data-action stripping while keeping lazy context creation
-                actionEl = this._findActionElementViaMetadata(event.target, listElement);
-            }
-            if (!actionEl) return;
-
-            // Skip form elements - they're handled via submit events, not click delegation
-            if (actionEl.tagName === 'FORM') return;
-
-            let closestList = actionEl.closest('[data-list],[data-wf-list]');
-
-            // CRITICAL: Only handle clicks for THIS list instance.
-            //
-            // If the found actionEl is outside this list, the row's own
-            // data-action may have been stripped during template compilation,
-            // and closest() walked past the (now-empty) row to find an
-            // ancestor — for example a wrapper using data-event-outside.
-            // Retry the metadata fallback before bailing, but only accept a
-            // row that actually belongs to THIS list (listItem.parentElement
-            // === listElement); otherwise nested-list handlers would steal
-            // each other's clicks.
-            if (closestList !== listElement) {
-                const stripped = this._findActionElementViaMetadata(event.target, listElement);
-                if (!stripped) return;
-                const row = this._findListItemAncestor(stripped);
-                if (!row || row.parentElement !== listElement) return;
-                actionEl = stripped;
-                closestList = listElement;
-            }
-
-            // Check if the action element is inside a nested component
-            // If so, route the action to that component instead of the list owner
-            // Use [data-component-id] to find initialized components
-            const closestComponent = actionEl.closest('[data-component-id]');
-            let targetInstance = instance;
-
-            if (closestComponent && closestComponent !== instance.element)
-            {
-                // Get the component instance directly from the data attribute
-                const componentId = closestComponent.dataset.componentId;
-                if (componentId)
-                {
-                    const nestedInstance = this.componentInstances.get(componentId);
-                    if (nestedInstance)
-                    {
-                        targetInstance = nestedInstance;
-                    }
-                }
-            }
-
-            // Try to handle with list context first
-            if (closestList && closestList._listContext)
-            {
-                const currentListContext = closestList._listContext;
-                const listItem = this._findListItemForAction(actionEl, closestList);
-                const allDataIndexElements = this._collectDataIndexHierarchy(actionEl);
-
-                if (listItem)
-                {
-                    const handled = this._handleDelegatedActionWithListItem(
-                        actionEl, listItem, currentListContext, closestList,
-                        allDataIndexElements, event, targetInstance, 'click'
-                    );
-                    if (handled) return;
-                }
-            }
-
-            // Try stored/registry context
-            if (this._handleDelegatedActionFromContext(actionEl, event, 'click')) return;
-
-            // Fall back to context-based approach
-            this._handleDelegatedActionFallback(actionEl, event, targetInstance, listContext, path, 'click');
+            this._dispatchDelegatedListEvent(event, listElement, instance, listContext, path,
+                (actionEl) => actionEl.tagName === 'FORM' ? null : 'click');
         });
 
         // Add submit delegation for forms inside list items
@@ -1066,6 +1082,177 @@ export const EventSystemMethods = {
         // found in data-action attributes within the list template.
         this._addListGenericEventDelegation(listElement, instance, listContext, path);
 
+    },
+    /**
+     * Shared dispatch core for all delegated list events (click, focus/blur,
+     * and the generic keyboard/input/mouse family). One implementation of:
+     *
+     * 1. Action-element resolution: closest [data-action] attribute, then
+     *    context registry, then compiled metadata (templates may strip the
+     *    attribute on the innerHTML fast path).
+     * 2. List-boundary rejection: closest() can walk past a stripped row to
+     *    an unrelated outer ancestor (e.g. a wrapping <form data-action>);
+     *    reject it so the registry/metadata fallbacks can find the real row.
+     * 3. Stripped-row retry: when the resolved actionEl belongs to another
+     *    list, retry compiled metadata and accept only rows whose parent is
+     *    THIS list (nested lists must not steal each other's events).
+     * 4. Nested-component routing: actions inside a child component dispatch
+     *    against that component's instance.
+     * 5. Handler cascade: list-item context → stored/registry context →
+     *    context-based fallback.
+     *
+     * Fixes 2 and 3 originally existed only in the click pipeline; the other
+     * event families silently dropped the same cases until unification.
+     *
+     * @param {Event} event - The DOM event
+     * @param {HTMLElement} listElement - The owning list container
+     * @param {Object} instance - The list-owning component instance
+     * @param {Object} listContext - The list context
+     * @param {string} path - The list data path
+     * @param {Function} resolveDispatchType - (actionEl, event) → event-type
+     *   string to dispatch under, or null to ignore this event for this
+     *   element. Per-family matching rules live in this closure.
+     * @private
+     */
+    _dispatchDelegatedListEvent(event, listElement, instance, listContext, path, resolveDispatchType)
+    {
+        let actionEl = event.target.closest('[data-action],[data-wf-action]');
+        if (actionEl && !listElement.contains(actionEl)) {
+            actionEl = null;
+        }
+        if (!actionEl) {
+            actionEl = this._findActionElementViaRegistry(event.target, listElement);
+        }
+        if (!actionEl) {
+            actionEl = this._findActionElementViaMetadata(event.target, listElement);
+        }
+        if (!actionEl) return;
+
+        const dispatchEventType = resolveDispatchType(actionEl, event);
+        if (!dispatchEventType) return;
+
+        let closestList = actionEl.closest('[data-list],[data-wf-list]');
+        if (closestList !== listElement) {
+            const stripped = this._findActionElementViaMetadata(event.target, listElement);
+            if (!stripped) return;
+            const row = this._findListItemAncestor(stripped);
+            if (!row || row.parentElement !== listElement) return;
+            actionEl = stripped;
+            closestList = listElement;
+        }
+
+        // Route to a nested component's instance when the action element
+        // lives inside one.
+        const closestComponent = actionEl.closest('[data-component-id]');
+        let targetInstance = instance;
+        if (closestComponent && closestComponent !== instance.element) {
+            const componentId = closestComponent.dataset.componentId;
+            if (componentId) {
+                const nestedInstance = this.componentInstances.get(componentId);
+                if (nestedInstance) targetInstance = nestedInstance;
+            }
+        }
+
+        // Handler cascade: list-item context first.
+        if (closestList && closestList._listContext) {
+            const currentListContext = closestList._listContext;
+            const listItem = this._findListItemForAction(actionEl, closestList);
+            const allDataIndexElements = this._collectDataIndexHierarchy(actionEl);
+
+            if (listItem) {
+                const handled = this._handleDelegatedActionWithListItem(
+                    actionEl, listItem, currentListContext, closestList,
+                    allDataIndexElements, event, targetInstance, dispatchEventType
+                );
+                if (handled) return;
+            }
+        }
+
+        // Then stored/registry context.
+        if (this._handleDelegatedActionFromContext(actionEl, event, dispatchEventType)) return;
+
+        // Finally the context-based fallback.
+        this._handleDelegatedActionFallback(actionEl, event, targetInstance, listContext, path, dispatchEventType);
+    },
+    /**
+     * Per-family matcher for focus/blur delegation: does this action element
+     * declare the given focus-family action (focus/blur, or the raw
+     * focusin/focusout)? Checks the DOM attribute first, then the action
+     * context, then compiled metadata for stripped templates.
+     * @private
+     */
+    _focusActionMatches(actionEl, bubblingEvent, actionEvent)
+    {
+        const actionAttr = this._getAttr(actionEl, 'action');
+        if (actionAttr) {
+            return actionAttr.split(/\s+/).some(action => {
+                const [eventType] = action.split(':');
+                return eventType === actionEvent || eventType === bubblingEvent;
+            });
+        }
+        // For stripped templates, check the action record for event type
+        const actionContext = actionEl._actionContext;
+        if (actionContext) {
+            // Event type is stored in record.data.event (see createActionContext)
+            const contextEventType = actionContext.data?.event || 'click';
+            return (contextEventType === actionEvent || contextEventType === bubblingEvent);
+        }
+        // Fallback: check compiled metadata for event type
+        const listItem = this._findListItemAncestor(actionEl);
+        if (listItem?._compiledMetadata?.actions) {
+            const elements = listItem._cachedElementsArray || listItem._bindingElements;
+            if (elements) {
+                for (const action of listItem._compiledMetadata.actions) {
+                    if (elements[action.index] === actionEl) {
+                        // Parse the action name to get event type
+                        const actionDefs = this._parseActions(action.actionName);
+                        return actionDefs.some(def =>
+                            def.eventType === actionEvent || def.eventType === bubblingEvent
+                        );
+                    }
+                }
+            }
+        }
+        return false;
+    },
+    /**
+     * Per-family resolver for generic event delegation (keyboard, input,
+     * change, mouseover/mouseout): verify the action element declares this
+     * event type, and synthesize mouseenter/mouseleave from mouseover/mouseout
+     * via the standard relatedTarget containment check. Returns the event-type
+     * name to dispatch under, or null to ignore. A stripped attribute (no
+     * actionAttr) dispatches under the raw event type, matching the
+     * pre-unification behavior.
+     * @private
+     */
+    _resolveGenericDispatchType(actionEl, event, eventType)
+    {
+        const actionAttr = this._getAttr(actionEl, 'action');
+        if (!actionAttr) return eventType;
+
+        const declared = actionAttr.split(/\s+/).map(part => {
+            const ci = part.indexOf(':');
+            return ci > 0 ? part.substring(0, ci) : '';
+        });
+        if (declared.indexOf(eventType) !== -1) {
+            // Direct match: dispatch as-is.
+            return eventType;
+        }
+        if (eventType === 'mouseover' && declared.indexOf('mouseenter') !== -1) {
+            // Synthesize mouseenter: only fire when the cursor crosses INTO
+            // this action element from outside.
+            const rel = event.relatedTarget;
+            if (rel && actionEl.contains(rel)) return null;
+            return 'mouseenter';
+        }
+        if (eventType === 'mouseout' && declared.indexOf('mouseleave') !== -1) {
+            // Synthesize mouseleave: only fire when the cursor crosses OUT of
+            // this action element.
+            const rel = event.relatedTarget;
+            if (rel && actionEl.contains(rel)) return null;
+            return 'mouseleave';
+        }
+        return null;
     },
     /**
      * Add focus/blur event delegation for list items
@@ -1085,107 +1272,13 @@ export const EventSystemMethods = {
             'focusout': 'blur'
         };
 
-        // Handler factory for focus-related events
+        // Handler factory for focus-related events. The shared dispatcher does
+        // resolution/boundary/routing/cascade; the resolver answers "does this
+        // element declare this focus-family action" via _focusActionMatches.
         const createFocusHandler = (bubblingEvent, actionEvent) => {
             return (event) => {
-                // The action element is the event target itself (focus doesn't bubble, so target is the focused element)
-                // Try attribute-based first, then fall back to context registry, then metadata
-                let actionEl = event.target.closest('[data-action],[data-wf-action]');
-                if (!actionEl) {
-                    actionEl = this._findActionElementViaRegistry(event.target, listElement);
-                }
-                if (!actionEl) {
-                    actionEl = this._findActionElementViaMetadata(event.target, listElement);
-                }
-                if (!actionEl) return;
-
-                // Check if this action element has the focus/blur action we're looking for
-                const actionAttr = this._getAttr(actionEl, 'action');
-
-                let hasMatchingAction = false;
-                if (actionAttr) {
-                    // Parse actions to find if there's a matching focus or blur handler
-                    // Also check for focusin/focusout directly
-                    hasMatchingAction = actionAttr.split(/\s+/).some(action => {
-                        const [eventType] = action.split(':');
-                        return eventType === actionEvent || eventType === bubblingEvent;
-                    });
-                } else {
-                    // For stripped templates, check the context for event type
-                    const actionContext = this._contextRegistry?.contextsByElement?.get(actionEl);
-                    if (actionContext && actionContext.type === 'action') {
-                        // Event type is stored in context.data.event (see createActionContext)
-                        const contextEventType = actionContext.data?.event || 'click';
-                        hasMatchingAction = (contextEventType === actionEvent || contextEventType === bubblingEvent);
-                    } else {
-                        // Fallback: check compiled metadata for event type
-                        const listItem = this._findListItemAncestor(actionEl);
-                        if (listItem?._compiledMetadata?.actions) {
-                            const elements = listItem._cachedElementsArray || listItem._bindingElements;
-                            if (elements) {
-                                for (const action of listItem._compiledMetadata.actions) {
-                                    if (elements[action.index] === actionEl) {
-                                        // Parse the action name to get event type
-                                        const actionDefs = this._parseActions(action.actionName);
-                                        hasMatchingAction = actionDefs.some(def =>
-                                            def.eventType === actionEvent || def.eventType === bubblingEvent
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (!hasMatchingAction) return;
-
-                const closestList = actionEl.closest('[data-list],[data-wf-list]');
-
-                // Only handle events for THIS list instance
-                if (closestList !== listElement) return;
-
-                // Find target instance (handle nested components)
-                const closestComponent = actionEl.closest('[data-component-id]');
-                let targetInstance = instance;
-
-                if (closestComponent && closestComponent !== instance.element)
-                {
-                    const componentId = closestComponent.dataset.componentId;
-                    if (componentId)
-                    {
-                        const nestedInstance = this.componentInstances.get(componentId);
-                        if (nestedInstance)
-                        {
-                            targetInstance = nestedInstance;
-                        }
-                    }
-                }
-
-                // Try to handle with list context first
-                if (closestList && closestList._listContext)
-                {
-                    const currentListContext = closestList._listContext;
-                    const listItem = this._findListItemForAction(actionEl, closestList);
-                    const allDataIndexElements = this._collectDataIndexHierarchy(actionEl);
-
-                    if (listItem)
-                    {
-                        // Create a synthetic event-like object that has the action event type
-                        // but preserves the original event properties
-                        const handled = this._handleDelegatedActionWithListItem(
-                            actionEl, listItem, currentListContext, closestList,
-                            allDataIndexElements, event, targetInstance, actionEvent
-                        );
-                        if (handled) return;
-                    }
-                }
-
-                // Try stored/registry context
-                if (this._handleDelegatedActionFromContext(actionEl, event, actionEvent)) return;
-
-                // Fall back to context-based approach
-                this._handleDelegatedActionFallback(actionEl, event, targetInstance, listContext, path, actionEvent);
+                this._dispatchDelegatedListEvent(event, listElement, instance, listContext, path,
+                    (actionEl) => this._focusActionMatches(actionEl, bubblingEvent, actionEvent) ? actionEvent : null);
             };
         };
 
@@ -1197,7 +1290,7 @@ export const EventSystemMethods = {
     /**
      * Add delegated event listeners for non-click, non-submit, non-focus events
      * found in data-action attributes within a list template.
-     * Handles keydown, keyup, input, change, etc. — any event type that bubbles.
+     * Handles keydown, keyup, input, change, etc. Any event type that bubbles.
      *
      * Scans the list's template for data-action attributes, extracts unique event types,
      * and registers a delegated listener on the list container for each one.
@@ -1215,7 +1308,7 @@ export const EventSystemMethods = {
         // when most templates only use click (handled separately).
         //
         // mouseover/mouseout bubble and delegate cleanly. mouseenter/mouseleave
-        // do not bubble — they're synthesized here from mouseover/mouseout by
+        // do not bubble; they're synthesized here from mouseover/mouseout by
         // checking event.relatedTarget against the action element's containment.
         // Standard browser semantics: a mouseover whose relatedTarget is
         // outside the element counts as "entering" it; same idea for mouseout.
@@ -1226,7 +1319,7 @@ export const EventSystemMethods = {
         const template = listElement.querySelector('template');
         if (template?.content) {
             const actionEls = template.content.querySelectorAll('[data-action],[data-wf-action]');
-            if (actionEls.length === 0) return; // No actions in template — skip entirely
+            if (actionEls.length === 0) return; // No actions in template, skip entirely
 
             const needed = new Set();
             for (const el of actionEls) {
@@ -1244,92 +1337,20 @@ export const EventSystemMethods = {
                     }
                 }
             }
-            if (needed.size === 0) return; // Only click/submit/focus actions — skip
+            if (needed.size === 0) return; // Only click/submit/focus actions, skip
             eventTypes = needed;
         } else {
-            // No template available (SSR or consumed) — fall back to all
+            // No template available (SSR or consumed); fall back to all
             eventTypes = ALL_GENERIC_EVENTS;
         }
 
-        // Register a delegated listener for each event type
+        // Register a delegated listener for each event type. The shared
+        // dispatcher does resolution/boundary/routing/cascade; the resolver
+        // verifies the declared event type and synthesizes mouseenter/leave.
         for (const eventType of eventTypes) {
             listElement.addEventListener(eventType, (event) => {
-                let actionEl = event.target.closest('[data-action],[data-wf-action]');
-                if (!actionEl) {
-                    actionEl = this._findActionElementViaRegistry(event.target, listElement);
-                }
-                if (!actionEl) {
-                    actionEl = this._findActionElementViaMetadata(event.target, listElement);
-                }
-                if (!actionEl) return;
-
-                // Verify this action element actually has this event type —
-                // and resolve synthesized mouseenter/mouseleave from the
-                // underlying mouseover/mouseout fire. dispatchEventType is
-                // what gets passed to the rest of the pipeline so the user's
-                // declared handler (e.g. mouseenter:onEnter) is looked up
-                // under the right name.
-                const actionAttr = this._getAttr(actionEl, 'action');
-                let dispatchEventType = eventType;
-                if (actionAttr) {
-                    const declared = actionAttr.split(/\s+/).map(part => {
-                        const ci = part.indexOf(':');
-                        return ci > 0 ? part.substring(0, ci) : '';
-                    });
-                    if (declared.indexOf(eventType) !== -1) {
-                        // Direct match — dispatch as-is.
-                        dispatchEventType = eventType;
-                    } else if (eventType === 'mouseover' && declared.indexOf('mouseenter') !== -1) {
-                        // Synthesize mouseenter: only fire when the cursor
-                        // crosses INTO this action element from outside.
-                        const rel = event.relatedTarget;
-                        if (rel && actionEl.contains(rel)) return;
-                        dispatchEventType = 'mouseenter';
-                    } else if (eventType === 'mouseout' && declared.indexOf('mouseleave') !== -1) {
-                        // Synthesize mouseleave: only fire when the cursor
-                        // crosses OUT of this action element.
-                        const rel = event.relatedTarget;
-                        if (rel && actionEl.contains(rel)) return;
-                        dispatchEventType = 'mouseleave';
-                    } else {
-                        return;
-                    }
-                }
-
-                const closestList = actionEl.closest('[data-list],[data-wf-list]');
-                if (closestList !== listElement) return;
-
-                // Find target instance (handle nested components)
-                const closestComponent = actionEl.closest('[data-component-id]');
-                let targetInstance = instance;
-                if (closestComponent && closestComponent !== instance.element) {
-                    const componentId = closestComponent.dataset.componentId;
-                    if (componentId) {
-                        const nestedInstance = this.componentInstances.get(componentId);
-                        if (nestedInstance) targetInstance = nestedInstance;
-                    }
-                }
-
-                // Try to handle with list context
-                if (closestList && closestList._listContext) {
-                    const currentListContext = closestList._listContext;
-                    const listItem = this._findListItemForAction(actionEl, closestList);
-                    const allDataIndexElements = this._collectDataIndexHierarchy(actionEl);
-
-                    if (listItem) {
-                        const handled = this._handleDelegatedActionWithListItem(
-                            actionEl, listItem, currentListContext, closestList,
-                            allDataIndexElements, event, targetInstance, dispatchEventType
-                        );
-                        if (handled) return;
-                    }
-                }
-
-                // Try stored/registry context
-                if (this._handleDelegatedActionFromContext(actionEl, event, dispatchEventType)) return;
-
-                // Fall back to context-based approach
-                this._handleDelegatedActionFallback(actionEl, event, targetInstance, listContext, path, dispatchEventType);
+                this._dispatchDelegatedListEvent(event, listElement, instance, listContext, path,
+                    (actionEl, evt) => this._resolveGenericDispatchType(actionEl, evt, eventType));
             });
         }
     },
@@ -1465,10 +1486,10 @@ export const EventSystemMethods = {
         const index = listItem._listIndex;
         if (isNaN(index)) return false;
 
-        // Check if element already has an action context
-        const existingContext = this._contextRegistry.contextsByElement.get(actionEl);
+        // Check if element already has an action record
+        const existingContext = actionEl._actionContext;
 
-        if (existingContext?.type === 'action')
+        if (existingContext)
         {
             this._ensureContextParentInfo(existingContext, closestList, index, allListItemElements);
 
@@ -1498,8 +1519,7 @@ export const EventSystemMethods = {
         // / "method" / "event:method" string. Without this fallback, every
         // row whose canUseInnerHTML fast path fired (any list-row template
         // with no data-bind-style / data-bind-attr / etc.) would silently
-        // fail to dispatch — surfaced 2026-05-17 (amber-otter-23) via PM
-        // demo icon picker. See test-new/list-row-action-attribute-preserved.test.js.
+        // fail to dispatch. See test-new/list-row-action-attribute-preserved.test.js.
         if (!actionAttr) {
             const elements = listItem._bindingElements || listItem._cachedElementsArray;
             const meta = listItem._compiledMetadata;
@@ -1518,7 +1538,7 @@ export const EventSystemMethods = {
         const eventType = actionEventType || event.type;
         const matchingAction = actions.find(a => a.eventType === eventType);
 
-        // No action matches this event type — don't fall back to actions[0]
+        // No action matches this event type; don't fall back to actions[0]
         // (e.g., click delegation should not invoke a keydown-only action)
         if (!matchingAction || !matchingAction.methodName) {
             return false;
@@ -1532,7 +1552,7 @@ export const EventSystemMethods = {
             return false;
         }
 
-        const context = this._contextRegistry.createActionContext(
+        const context = this._contextRecords.createActionContext(
             methodName,
             instance,
             actionEl,
@@ -1564,30 +1584,12 @@ export const EventSystemMethods = {
      */
     _handleDelegatedActionFromContext(actionEl, event, actionEventType = null)
     {
-        // Try stored context first
+        // Action records live on the element (set by createActionContext). The
+        // dispatcher reads list-item detail from the row element, not from any
+        // _parentIndex on the record, so no index refresh is needed here.
         if (actionEl._actionContext)
         {
             this._handleActionWithContext(actionEl._actionContext, event);
-            return true;
-        }
-
-        // Try registry lookup
-        const actionContext = this._contextRegistry.getContextForElement(actionEl);
-
-        if (actionContext && actionContext.type === 'action')
-        {
-            const rowEl = this._findListItemAncestor(actionEl);
-
-            if (rowEl)
-            {
-                const index = rowEl._listIndex;
-                if (!isNaN(index) && actionContext._parentIndex !== index)
-                {
-                    actionContext._parentIndex = index;
-                }
-            }
-
-            this._handleActionWithContext(actionContext, event);
             return true;
         }
 
@@ -1629,7 +1631,7 @@ export const EventSystemMethods = {
 
         if (directParentList && directParentList._listContext)
         {
-            const newContext = this._contextRegistry.createActionContext(
+            const newContext = this._contextRecords.createActionContext(
                 methodName,
                 instance,
                 actionEl,
@@ -1657,13 +1659,9 @@ export const EventSystemMethods = {
 
         this._applyEventConfiguration(event, actionConfig);
 
-        let item = null;
-
-        if (listContext)
-        {
-            const items = listContext.resolveData();
-            item = (Array.isArray(items) && index >= 0 && index < items.length) ? items[index] : null;
-        }
+        // The row's reactive item-proxy IS the item; read it straight off the
+        // row element instead of resolving the list context by index.
+        const item = rowEl._itemData || null;
 
         if (!item) return false;
 
@@ -1725,67 +1723,6 @@ export const EventSystemMethods = {
             return true;
         });
     },
-    // Bind events to list item elements
-
-    _bindListItemEvents(itemElement, instance, listPath, index, item, listElement = null, listContext = null) {
-        // OPTIMIZATION: Use passed list element/context if available, avoiding DOM traversal
-        // When called from _bindAllListItemEvents, we already have these from the parent context
-        if (!listElement) {
-            listElement = this._findDirectParentList(itemElement);
-        }
-        if (!listContext) {
-            listContext = listElement?._listContext;
-        }
-
-        if (!listContext || !this._contextSystemInitialized || !this._contextRegistry) {
-            return;
-        }
-
-        // Store references
-        itemElement._listContext = listContext;
-        itemElement._itemData = item;
-        itemElement._itemIndex = index;
-
-        // OPTIMIZATION: Use compiled metadata to find model elements instead of querySelectorAll
-        // This eliminates 1000 DOM queries for 1000 items
-        const componentName = instance?.name;
-        const compilationKey = componentName ? `${componentName}:${listPath}` : listPath;
-        let compiledMetadata = this._templateCache.compiled.get(compilationKey);
-
-        // Fallback: try just listPath
-        if (!compiledMetadata) {
-            compiledMetadata = this._templateCache.compiled.get(listPath);
-        }
-
-        if (compiledMetadata && compiledMetadata.models.length > 0) {
-            // FAST PATH: Use pre-computed element paths from compiled metadata
-            for (let i = 0; i < compiledMetadata.models.length; i++) {
-                const modelInfo = compiledMetadata.models[i];
-                const modelEl = this._getElementByPath(itemElement, modelInfo.elementPath);
-                if (modelEl) {
-                    this._bindListItemModel(modelEl, instance, listPath, index, item);
-                }
-            }
-        } else {
-            // FALLBACK: No compiled metadata - use querySelectorAll
-            const modelElementsNodeList = itemElement.querySelectorAll(this._attrSelector('model'));
-            for (let i = 0; i < modelElementsNodeList.length; i++) {
-                const modelEl = modelElementsNodeList[i];
-                // Skip model elements that belong to nested lists
-                // They will be bound by their own list's _bindListItemEvents call
-                const closestListItem = this._findListItemAncestor(modelEl);
-                if (closestListItem !== itemElement) {
-                    // This model element is inside a nested list item, skip it
-                    continue;
-                }
-                this._bindListItemModel(modelEl, instance, listPath, index, item);
-            }
-        }
-
-        // Process conditionals (data-show and data-render) for list items
-        // Pass list element and context to avoid redundant DOM traversal
-        this._bindListItemConditionals(itemElement, instance, listPath, index, item, listElement, listContext);
-    },
     /**
      * Process conditional elements (data-show and data-render) within a list item
      * @param {HTMLElement} itemElement - The list item element
@@ -1796,7 +1733,7 @@ export const EventSystemMethods = {
      * @private
      */
     _bindListItemConditionals(itemElement, instance, listPath, index, item, listContainer = null, parentListContext = null) {
-        if (!this._contextSystemInitialized || !this._contextRegistry) return;
+        if (!this._contextSystemInitialized || !this._contextRecords) return;
 
         // OPTIMIZATION: Check compiled metadata first - if no conditionals exist, exit early
         const componentName = instance?.name;
@@ -1816,7 +1753,7 @@ export const EventSystemMethods = {
             listContainer = this._findDirectParentList(itemElement);
         }
         if (!parentListContext) {
-            parentListContext = listContainer ? this._contextRegistry.getContextForElement(listContainer) : null;
+            parentListContext = listContainer ? (listContainer._listContext || null) : null;
         }
 
         let conditionalElements;
@@ -1860,7 +1797,10 @@ export const EventSystemMethods = {
             // Evaluate condition against item data. Pass the real list index so
             // expressions referencing _index/_first/_last/_length resolve correctly
             // (the resolver's expression case threads these through into scope).
-            const listLength = listContainer?.children?.length || 0;
+            // Source the length from the list context's array, not the DOM child
+            // count: at bind time the rows are not yet appended, so children.length
+            // reads 0 and any info.last/info.length frame would resolve wrong.
+            const listLength = parentListContext?.data?.length ?? (listContainer?.children?.length || 0);
             const conditionValue = this._evaluateListItemCondition(condPath, item, instance, index, listLength);
 
             if (isRenderMode) {
@@ -1868,6 +1808,12 @@ export const EventSystemMethods = {
                 const renderCtx = this._processListItemDataRender(conditionalElement, condPath, conditionValue, instance, listPath, index, item, parentListContext);
                 // Store render context on item element for per-item effect updates
                 if (renderCtx) {
+                    // Back-reference to the owning list row so a structural toggle
+                    // driven by the reconcile's position-frame re-eval
+                    // (_reEvalListItemComputedConditionals) can invalidate the row's
+                    // cached element arrays; otherwise the per-item effect's
+                    // subsequent re-bind lands on the pre-toggle (detached/stale) nodes.
+                    renderCtx._ownerItemEl = itemElement;
                     if (!itemElement._renderContexts) itemElement._renderContexts = [];
                     // Find matching compiled binding for this render path
                     const renderBinding = compiledMetadata?.renders?.find(r => r.path === condPath || r.path === condPath.replace(/^!/, ''));
@@ -1888,7 +1834,7 @@ export const EventSystemMethods = {
             } else {
                 // Handle data-show for list items - toggle visibility and wf-show class
                 // For expression/store paths, _executeShows already set display correctly
-                // via compiled metadata — only override for simple paths
+                // via compiled metadata; only override for simple paths
                 const isExpressionPath = this.isExpression(condPath) || condPath.includes('$');
 
                 if (!isExpressionPath) {
@@ -1901,20 +1847,13 @@ export const EventSystemMethods = {
                     }
                 }
 
-                // Create context for future updates with proper parent relationship
-                const context = this._contextRegistry.createConditionalContext(
-                    condPath,
-                    instance,
-                    conditionalElement,
-                    parentListContext, // parent list context
-                    index // parentIndex for item-level data resolution
-                );
-
-                if (context) {
-                    context.mode = 'show';
-                    // Store item data for reactive updates
-                    context.itemData = item;
-                }
+                // List-item data-show no longer gets a conditional Context. The
+                // initial visibility is set directly above; subsequent updates run
+                // through the per-item effect (_executeShows, data-driven) and the
+                // reconcile re-eval sweeps (_reEvalItemContextShow for literal `_last`
+                // tokens, _reEvalListItemComputedConditionals for position-frame
+                // computeds). Nothing read the show Context; it was write-only after
+                // RC:400's _updateConditionals sweep was removed.
             }
         });
     },
@@ -1936,18 +1875,23 @@ export const EventSystemMethods = {
             actualPath = path.slice(1);
         }
 
+        // Carry the position frame (info.first/last/length) into item-level
+        // computed evaluation. Passing null here would drop the frame to length
+        // 0, producing a wrong info.last/info.length on initial render.
+        const frame = { listLength };
+
         // Handle explicit computed: prefix
         if (actualPath.startsWith('computed:')) {
             const computedName = actualPath.slice(9);
             if (instance?.stateManager?.computed?.[computedName]) {
-                const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, null);
+                const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, frame);
                 return negate ? !value : !!value;
             }
         }
 
         // Check for implicit computed property (simple name, no dots)
         if (!actualPath.includes('.') && instance?.stateManager?.computed?.[actualPath]) {
-            const value = this._evaluateComputedInListContext(instance, actualPath, item, itemIndex, null);
+            const value = this._evaluateComputedInListContext(instance, actualPath, item, itemIndex, frame);
             return negate ? !value : !!value;
         }
 
@@ -1976,12 +1920,36 @@ export const EventSystemMethods = {
             }
         }
 
+        // Bare list-position token (data-show / data-render = "_first" / "_last" /
+        // "_index" / "_length"): resolve against the row's position FRAME, not the
+        // item (the item has no _index/_first/_last/_length). Mirrors the resolver's
+        // list-context-var case; without this a bare token reads undefined off the
+        // item and the condition is false on every row.
+        if (this._listContextVars && this._listContextVars.has(actualPath)) {
+            let frameVal;
+            switch (actualPath) {
+                case '_index': frameVal = itemIndex; break;
+                case '_length': frameVal = listLength; break;
+                case '_first': frameVal = itemIndex === 0; break;
+                case '_last': frameVal = itemIndex === listLength - 1; break;
+            }
+            return negate ? !frameVal : !!frameVal;
+        }
+
         // Get value from item data (cached path resolution, zero allocation)
         let value;
         try {
             value = pathResolver.get(item, actualPath);
         } catch (error) {
             value = false;
+        }
+
+        // Component-state fallback (outer scope): a bare name the item doesn't provide
+        // resolves against component state, so data-show / data-render="showAll" works in
+        // a list row. Mirrors the resolver's item-first→component fallback; the per-item
+        // effect re-evaluates (and reacts) via _resolveCompiledBinding's matching fallback.
+        if (value === undefined && instance?.state && typeof instance.state === 'object' && actualPath in instance.state) {
+            value = instance.state[actualPath];
         }
 
         return negate ? !value : !!value;
@@ -2004,18 +1972,17 @@ export const EventSystemMethods = {
         // Strip data-cloak from template so re-insertions don't inherit it
         templateClone.removeAttribute('data-cloak');
 
-        // Create the context with render mode and proper parent relationship
-        const context = this._contextRegistry.createConditionalContext(
+        // Create the render record (plain object, not registered). The list-item
+        // index is the parentIndex used for placeholder labelling / data resolution.
+        const context = this._contextRecords.createRenderRecord(
             path,
             instance,
             element,
-            parentListContext, // parent list context
-            index // parentIndex for item-level data resolution
+            index
         );
 
         if (context) {
             // Add render-specific properties
-            context.mode = 'render';
             context.templateClone = templateClone;
             context.isRendered = conditionValue;
             context.itemData = item;
@@ -2028,7 +1995,7 @@ export const EventSystemMethods = {
                 // bulk-create _processListItemDataRender runs while the item is still
                 // sitting in a DocumentFragment). DOM-fragment removal here would not
                 // stop mapFn from re-appending the element to the list. The result
-                // element substitution happens in _mapFn — see _renderList — which
+                // element substitution happens in _mapFn (see _renderList) which
                 // checks render contexts and uses placeholder when isRendered=false.
                 const parent = element.parentNode;
                 if (parent && parent.nodeType === 1 /* ELEMENT_NODE */) {
@@ -2259,5 +2226,631 @@ export const EventSystemMethods = {
                 }
             });
         });
+    },
+
+    /**
+     * Set up outside click detection for an element
+     * @param {HTMLElement} element - The element to detect clicks outside of
+     * @param {Object} instance - The component instance
+     * @param {string} methodName - The method name to call when click is outside
+     * @returns {Function} - The created event listener for cleanup
+     * @private
+     */
+
+    _setupOutsideClickHandler(element, instance, methodName, rowContext)
+    {
+        // Single document-level listener for the entire framework
+        // (lazy-initialized on first call). A per-element registry
+        // keyed by methodName collects every active subscription;
+        // iteration at click time drops entries whose element has
+        // detached (element.isConnected === false), so the registry
+        // self-cleans without needing element-destroy hooks.
+        //
+        // Why this shape: the original implementation added a fresh
+        // document.addEventListener per call, with the element
+        // captured in closure. When the element was re-bound (list
+        // reconciliation re-running per-row context creation), old
+        // listeners stayed alive and fired on every click, clobbering
+        // state with stale element refs. A single listener + a
+        // registry keyed by element eliminates the leak: re-binds
+        // are idempotent (existing entry returned), and detached
+        // elements drop themselves on the next click.
+        if (!this._outsideClickRegistry) {
+            // Map<HTMLElement, Map<methodName, { instance, rowContext }>>.
+            // Strong refs are fine; the lazy isConnected sweep drops
+            // entries for detached elements within one click. rowContext is
+            // null for non-list handlers, or { item, index, listContext }
+            // for a data-list row child so the handler gets a details arg.
+            this._outsideClickRegistry = new Map();
+            const self = this;
+            document.addEventListener('click', (event) =>
+            {
+                if (self._outsideClickRegistry.size === 0) return;
+                const target = event.target;
+                for (const [el, methodMap] of self._outsideClickRegistry)
+                {
+                    if (!el.isConnected)
+                    {
+                        self._outsideClickRegistry.delete(el);
+                        continue;
+                    }
+                    if (el === target || el.contains(target)) continue;
+                    for (const [name, entry] of methodMap)
+                    {
+                        try
+                        {
+                            let details;
+                            if (entry.rowContext)
+                            {
+                                const rc = entry.rowContext;
+                                // Resolve the list array off component state (top-level
+                                // lists) rather than the list context's resolveData; the
+                                // row item itself is already carried on rc.item (the same
+                                // proxy), so only list/length/first/last need the array.
+                                let listData = null;
+                                try {
+                                    listData = (rc.listContext && (!rc.listContext.parent || rc.listContext.parent.type === 'root'))
+                                        ? self._resolveListSourceData(rc.listContext.path, rc.listContext.componentInstance)
+                                        : null;
+                                }
+                                catch (e) { listData = null; }
+                                if (Array.isArray(listData) && listData.length && typeof rc.index === 'number')
+                                {
+                                    const idx = rc.index;
+                                    details = {
+                                        item: rc.item,
+                                        index: idx,
+                                        list: listData,
+                                        length: listData.length,
+                                        first: idx === 0,
+                                        last: idx === listData.length - 1,
+                                        context: rc.listContext
+                                    };
+                                }
+                                else
+                                {
+                                    details = { item: rc.item, index: rc.index, list: null, context: rc.listContext };
+                                }
+                            }
+                            entry.instance.context[name](event, el, details);
+                        } catch (error)
+                        {
+                            self._handleError(`Error in outside click handler for ${name}`, error, entry.instance);
+                        }
+                    }
+                }
+            });
+        }
+
+        let methodMap = this._outsideClickRegistry.get(element);
+        if (!methodMap)
+        {
+            methodMap = new Map();
+            this._outsideClickRegistry.set(element, methodMap);
+        }
+        // Re-registering the same (element, methodName) pair just
+        // refreshes the entry; a later registration (e.g. a row re-mount)
+        // overwrites with fresh context. No duplicate dispatch on click.
+        methodMap.set(methodName, { instance, rowContext: rowContext || null });
+    },
+    _applyEventConfiguration(event, config)
+    {
+        // Apply stopPropagation if configured
+        if (config.stopPropagation)
+        {
+            event.stopPropagation();
+        }
+
+        // Apply preventDefault if configured
+        if (config.preventDefault)
+        {
+            event.preventDefault();
+        }
+    },
+    /**
+     * Parse data-action attribute which can contain multiple action definitions
+     * Format: "eventType:methodName eventType2:methodName2" or just "methodName"
+     * @private
+     */
+    _parseActions(actionAttr)
+    {
+        const actions = [];
+
+        // Split on spaces that are outside parentheses and quotes
+        const parts = this._splitActionDefs(actionAttr);
+
+        parts.forEach(actionDef =>
+        {
+            let eventType = 'click';
+            let methodPart = actionDef;
+
+            // Only split on colon that's outside parentheses (before any '(')
+            const parenStart = actionDef.indexOf('(');
+            const colonIdx = actionDef.indexOf(':');
+            if (colonIdx !== -1 && (parenStart === -1 || colonIdx < parenStart))
+            {
+                eventType = actionDef.substring(0, colonIdx);
+                methodPart = actionDef.substring(colonIdx + 1);
+            }
+
+            // Check for argument syntax: methodName(arg1, arg2, ...)
+            const parenIdx = methodPart.indexOf('(');
+            if (parenIdx !== -1 && methodPart.endsWith(')'))
+            {
+                const methodName = methodPart.substring(0, parenIdx);
+                const argsString = methodPart.substring(parenIdx + 1, methodPart.length - 1).trim();
+                const args = argsString ? this._parseActionArgs(argsString) : [];
+                actions.push({eventType, methodName, args});
+            } else
+            {
+                actions.push({eventType, methodName: methodPart});
+            }
+        });
+
+        return actions;
+    },
+    /**
+     * Split action attribute string into individual action definitions,
+     * respecting parentheses and quoted strings so spaces within args are preserved.
+     * @param {string} actionAttr - The full data-action attribute value
+     * @returns {Array<string>} Individual action definition strings
+     * @private
+     */
+    _splitActionDefs(actionAttr)
+    {
+        const parts = [];
+        let current = '';
+        let parenDepth = 0;
+        let inString = false;
+        let stringChar = '';
+
+        for (let i = 0; i < actionAttr.length; i++)
+        {
+            const ch = actionAttr[i];
+            if (inString)
+            {
+                current += ch;
+                if (ch === stringChar) { inString = false; }
+            } else if (ch === "'" || ch === '"')
+            {
+                inString = true;
+                stringChar = ch;
+                current += ch;
+            } else if (ch === '(')
+            {
+                parenDepth++;
+                current += ch;
+            } else if (ch === ')')
+            {
+                parenDepth--;
+                current += ch;
+            } else if (ch === ' ' && parenDepth === 0)
+            {
+                if (current.trim()) { parts.push(current.trim()); }
+                current = '';
+            } else
+            {
+                current += ch;
+            }
+        }
+        if (current.trim()) { parts.push(current.trim()); }
+        return parts;
+    },
+    /**
+     * Parse comma-separated literal argument values from an action definition.
+     * Supports: strings ('x' or "x"), numbers, booleans (true/false), null.
+     * @param {string} argsString - The arguments string without outer parentheses
+     * @returns {Array} Parsed literal values
+     * @private
+     */
+    _parseActionArgs(argsString)
+    {
+        const args = [];
+        let current = '';
+        let inString = false;
+        let stringChar = '';
+
+        for (let i = 0; i < argsString.length; i++)
+        {
+            const ch = argsString[i];
+            if (inString)
+            {
+                if (ch === stringChar)
+                {
+                    inString = false;
+                }
+                current += ch;
+            } else if (ch === "'" || ch === '"')
+            {
+                inString = true;
+                stringChar = ch;
+                current += ch;
+            } else if (ch === ',')
+            {
+                args.push(this._parseLiteralValue(current.trim()));
+                current = '';
+            } else
+            {
+                current += ch;
+            }
+        }
+        if (current.trim())
+        {
+            args.push(this._parseLiteralValue(current.trim()));
+        }
+        return args;
+    },
+    /**
+     * Parse a single literal value string into its JavaScript type.
+     * @param {string} raw - The raw string value
+     * @returns {*} The parsed value (string, number, boolean, or null)
+     * @private
+     */
+    _parseLiteralValue(raw)
+    {
+        // String literals (single or double quoted)
+        if ((raw.startsWith("'") && raw.endsWith("'")) ||
+            (raw.startsWith('"') && raw.endsWith('"')))
+        {
+            return raw.slice(1, -1);
+        }
+        if (raw === 'true') return true;
+        if (raw === 'false') return false;
+        if (raw === 'null') return null;
+        const num = Number(raw);
+        if (!isNaN(num) && raw !== '') return num;
+        // Unknown literal: return as string (graceful fallback)
+        return raw;
+    },
+    /**
+     * Parse attribute event modifiers on an element
+     * @param {HTMLElement} element - Element to check for event modifiers
+     * @returns {Object} - Configuration object based on attributes
+     * @private
+     */
+    _parseEventModifiers(element)
+    {
+        // Support both data-event-* and data-wf-event-* prefixes
+        const config = {
+            stopPropagation: this._hasAttr(element, 'event-stop'),
+            preventDefault: this._hasAttr(element, 'event-prevent'),
+            once: this._hasAttr(element, 'event-once'),
+            capture: this._hasAttr(element, 'event-capture'),
+            passive: this._hasAttr(element, 'event-passive'),
+            self: this._hasAttr(element, 'event-self'),
+            outside: this._hasAttr(element, 'event-outside')
+        };
+
+        // Check for debounce attribute (support both prefixes)
+        if (this._hasAttr(element, 'event-debounce'))
+        {
+            const value = parseInt(this._getAttr(element, 'event-debounce'), 10);
+            config.debounce = isNaN(value) ? 300 : value; // Default to 300ms if not a number
+        }
+
+        // Check for throttle attribute (support both prefixes)
+        if (this._hasAttr(element, 'event-throttle'))
+        {
+            const value = parseInt(this._getAttr(element, 'event-throttle'), 10);
+            config.throttle = isNaN(value) ? 300 : value; // Default to 300ms if not a number
+        }
+
+        if (this._hasAttr(element, 'event-delay'))
+        {
+            const value = parseInt(this._getAttr(element, 'event-delay'), 10);
+            config.delay = isNaN(value) ? 0 : value;
+        }
+
+        if (this._hasAttr(element, 'event-if'))
+        {
+            config.condition = this._getAttr(element, 'event-if');
+        }
+
+        return config;
+    },
+    /**
+     * Parse data-event-key-* attributes into a key-filter spec.
+     *
+     * Spec shape (cached per element in keyModifiersCache):
+     *   ctrl/alt/shift/meta : bare modifier attrs; global AND-gates
+     *   keys   : plain key tokens (e.g. 'enter', 'a'); any-of match
+     *   combos : [{ctrl,alt,shift,meta,key|null}] from '+' attrs
+     *             (e.g. data-event-key-ctrl+s); any-of match
+     *   empty  : no data-event-key-* attrs at all (match every key)
+     *
+     * @param {HTMLElement} element - Element to check for key modifiers
+     * @returns {Object} - Key-filter spec
+     * @private
+     */
+    _parseKeyModifiers(element)
+    {
+        const spec = { ctrl: false, alt: false, shift: false, meta: false, keys: [], combos: [], empty: true };
+
+        const attrs = element.attributes;
+        for (let i = 0; i < attrs.length; i++)
+        {
+            const name = attrs[i].name;
+            if (!name.startsWith('data-event-key-')) continue;
+            const rest = name.slice('data-event-key-'.length);
+            if (!rest) continue;
+
+            spec.empty = false;
+
+            if (rest.indexOf('+') === -1)
+            {
+                if (_KEY_MODIFIER_NAMES.has(rest)) spec[rest] = true;
+                else spec.keys.push(rest);
+            }
+            else
+            {
+                const parts = rest.split('+');
+                const combo = { ctrl: false, alt: false, shift: false, meta: false, key: null };
+                for (let p = 0; p < parts.length; p++)
+                {
+                    const part = parts[p];
+                    if (_KEY_MODIFIER_NAMES.has(part)) combo[part] = true;
+                    else if (part) combo.key = part;
+                }
+                spec.combos.push(combo);
+            }
+        }
+
+        return spec;
+    },
+    /**
+     * Checks if a keyboard event matches a key-filter spec from _parseKeyModifiers
+     * @param {KeyboardEvent} event - The keyboard event
+     * @param {Object} spec - Key-filter spec
+     * @returns {boolean} - Whether the event matches
+     * @private
+     */
+    _matchesKeyModifiers(event, spec)
+    {
+        // No key filter declared: match all keys
+        if (spec.empty) return true;
+
+        // Bare modifier attrs gate every match
+        if (spec.ctrl && !event.ctrlKey) return false;
+        if (spec.alt && !event.altKey) return false;
+        if (spec.shift && !event.shiftKey) return false;
+        if (spec.meta && !event.metaKey) return false; // Command key on Mac
+
+        const keys = spec.keys;
+        const combos = spec.combos;
+
+        // Only modifiers declared: no specific key required
+        if (keys.length === 0 && combos.length === 0) return true;
+
+        const eventKey = event.key.toLowerCase();
+
+        for (let i = 0; i < keys.length; i++)
+        {
+            if (_keyTokenMatches(keys[i], eventKey)) return true;
+        }
+
+        for (let i = 0; i < combos.length; i++)
+        {
+            const combo = combos[i];
+            if (combo.ctrl && !event.ctrlKey) continue;
+            if (combo.alt && !event.altKey) continue;
+            if (combo.shift && !event.shiftKey) continue;
+            if (combo.meta && !event.metaKey) continue;
+            if (combo.key === null || _keyTokenMatches(combo.key, eventKey)) return true;
+        }
+
+        return false;
+    },
+    /**
+     * Merge event configuration objects
+     * @param {Object} baseConfig - Base configuration (usually from component)
+     * @param {Object} overrideConfig - Configuration from attributes
+     * @returns {Object} - Merged configuration
+     * @private
+     */
+    _mergeEventConfigs(baseConfig, overrideConfig)
+    {
+        const result = {...baseConfig};
+
+        // Copy override properties if they exist
+        if (overrideConfig.stopPropagation !== undefined) result.stopPropagation = overrideConfig.stopPropagation;
+        if (overrideConfig.preventDefault !== undefined) result.preventDefault = overrideConfig.preventDefault;
+        if (overrideConfig.once !== undefined) result.once = overrideConfig.once;
+        if (overrideConfig.capture !== undefined) result.capture = overrideConfig.capture;
+        if (overrideConfig.passive !== undefined) result.passive = overrideConfig.passive;
+        if (overrideConfig.self !== undefined) result.self = overrideConfig.self;
+        if (overrideConfig.outside !== undefined) result.outside = overrideConfig.outside;
+        if (overrideConfig.delay !== undefined) result.delay = overrideConfig.delay;
+        if (overrideConfig.condition !== undefined) result.condition = overrideConfig.condition;
+
+        // For debounce and throttle, prefer attribute config but don't allow both
+        if (overrideConfig.debounce)
+        {
+            result.debounce = overrideConfig.debounce;
+            result.throttle = 0; // Debounce takes precedence
+        } else if (overrideConfig.throttle)
+        {
+            result.throttle = overrideConfig.throttle;
+            result.debounce = 0; // Only allow one
+        }
+
+        return result;
+    },
+    /**
+     * Add a helper method for direct event binding with configuration options
+     * @param {string} eventType - Type of event to listen for
+     * @param {string|Element} selector - Element or selector to attach event to
+     * @param {Function} handler - Handler function
+     * @param {Object} options - Configuration options including debounce/throttle
+     * @public
+     */
+    on(eventType, selector, handler, options = {})
+    {
+        // Find elements to bind to
+        const elements = typeof selector === 'string'
+            ? this.root.querySelectorAll(selector)
+            : [selector];
+
+        if (elements.length === 0)
+        {
+            this._log('warn', `No elements found for selector: ${selector}`);
+            return this;
+        }
+
+        // Default options
+        const config = {
+            stopPropagation: false,
+            preventDefault: false,
+            once: false,
+            capture: false,
+            passive: false,
+            debounce: 0,
+            throttle: 0,
+            ...options
+        };
+
+        // Apply function limiting if needed
+        const wrappedHandler = this._getHandlerWithLimits(handler, config);
+
+        // Add listeners to all matching elements
+        elements.forEach(element =>
+        {
+            const handlerKey = `on-${eventType}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+
+            // Create event handler with config
+            const eventHandler = (event) =>
+            {
+                if (config.stopPropagation)
+                {
+                    event.stopPropagation();
+                }
+
+                if (config.preventDefault)
+                {
+                    event.preventDefault();
+                }
+
+                return wrappedHandler(event, element);
+            };
+
+            // Store handler for cleanup
+            this.eventHandlers.set(handlerKey, {
+                target: element,
+                event: eventType,
+                handler: eventHandler,
+                options: {
+                    capture: config.capture
+                }
+            });
+
+            // Add event listener with options
+            element.addEventListener(eventType, eventHandler, {
+                capture: config.capture,
+                passive: config.passive,
+                once: config.once
+            });
+        });
+
+        return this;
+    },
+    /**
+     * Get a handler with appropriate function wrapping based on configuration
+     * @param {Function} handler - The original handler function
+     * @param {Object} config - Configuration with debounce/throttle settings
+     * @param {string|null} [cacheKey=null] - Optional key for caching the wrapped function
+     * @returns {Function} - The handler, possibly wrapped with debounce/throttle
+     * @private
+     */
+
+    _getHandlerWithLimits(handler, config, cacheKey = null)
+    {
+        // No need to wrap if no limits are set
+        if (!config || ((!config.debounce || config.debounce <= 0) &&
+            (!config.throttle || config.throttle <= 0)))
+        {
+            return handler;
+        }
+
+        // Use cache if a key is provided (avoids creating duplicate wrappers)
+        if (cacheKey && this._wrappedHandlers.has(cacheKey))
+        {
+            return this._wrappedHandlers.get(cacheKey);
+        }
+
+        let wrappedHandler = handler;
+
+        // Apply debounce if configured (debounce takes precedence over throttle)
+        if (config.debounce && config.debounce > 0)
+        {
+            this._log('debug', `Applying debounce of ${config.debounce}ms to handler`);
+            wrappedHandler = this._debounce(handler, config.debounce);
+        }
+        // Apply throttle if configured
+        else if (config.throttle && config.throttle > 0)
+        {
+            this._log('debug', `Applying throttle of ${config.throttle}ms to handler`);
+            wrappedHandler = this._throttle(handler, config.throttle);
+        }
+
+        // Store in cache if key provided
+        if (cacheKey)
+        {
+            this._wrappedHandlers.set(cacheKey, wrappedHandler);
+        }
+
+        return wrappedHandler;
+    },
+    /**
+     * Creates a debounced version of a function
+     * @param {Function} fn - The function to debounce
+     * @param {number} wait - Milliseconds to wait
+     * @param {boolean} immediate - Whether to call on leading edge
+     * @returns {Function} - Debounced function
+     * @private
+     */
+
+    _debounce(fn, wait = 300, immediate = false)
+    {
+        let timeout;
+
+        return function (...args)
+        {
+            const context = this;
+            const callNow = immediate && !timeout;
+
+            clearTimeout(timeout);
+
+            timeout = setTimeout(() =>
+            {
+                timeout = null;
+                if (!immediate) fn.apply(context, args);
+            }, wait);
+
+            if (callNow) fn.apply(context, args);
+        };
+    },
+    /**
+     * Creates a throttled version of a function
+     * @param {Function} fn - The function to throttle
+     * @param {number} [limit=300] - Milliseconds between allowed calls
+     * @returns {Function} - Throttled function
+     * @private
+     */
+
+    _throttle(fn, limit = 300)
+    {
+        let lastCall = 0;
+
+        return function (...args)
+        {
+            const now = Date.now();
+            const context = this;
+
+            if (now - lastCall >= limit)
+            {
+                lastCall = now;
+                fn.apply(context, args);
+            }
+        };
     }
 };
+

@@ -95,10 +95,9 @@ describe('List System', () => {
       const names = listItems.map(li => li.querySelector('.name').textContent)
       expect(names).toEqual(['Item 1', 'Item 2', 'Item 3'])
 
-      // Verify list context was created
-      const registry = wildflower._contextRegistry
+      // Verify list context was created (plain object on the element)
       const listElement = testContainer.querySelector('[data-list="items"]')
-      const listContext = registry.getContextForElement(listElement)
+      const listContext = listElement._listContext
       expect(listContext).toBeDefined()
       expect(listContext.type).toBe('list')
       expect(listContext.path).toBe('items')
@@ -196,9 +195,8 @@ describe('List System', () => {
       const instance = wildflower.componentInstances.get(component.dataset.componentId)
 
       // Capture list context ID before modification
-      const registry = wildflower._contextRegistry
       const listElement = component.querySelector('[data-list="items"]')
-      const listContext = registry.getContextForElement(listElement)
+      const listContext = listElement._listContext
       const originalContextId = listContext.id
 
       // Add item
@@ -210,7 +208,7 @@ describe('List System', () => {
       expect(listItems[1].querySelector('span').textContent).toBe('Added')
 
       // Verify list context was reused (same ID)
-      const afterContext = registry.getContextForElement(listElement)
+      const afterContext = listElement._listContext
       expect(afterContext.id).toBe(originalContextId)
     })
 
@@ -500,10 +498,9 @@ describe('List System', () => {
       expect(firstCategoryItems[0].querySelector('.item-name').textContent).toBe('Item A-1')
 
       // Verify nested list context has correct parent relationship
-      const registry = wildflower._contextRegistry
-      const outerListContext = registry.getContextForElement(outerListElement)
+      const outerListContext = outerListElement._listContext
       const innerListElement = categories[0].querySelector('[data-list="items"]')
-      const innerListContext = registry.getContextForElement(innerListElement)
+      const innerListContext = innerListElement._listContext
 
       expect(innerListContext).toBeDefined()
       expect(innerListContext.type).toBe('list')

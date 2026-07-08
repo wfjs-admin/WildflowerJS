@@ -5,7 +5,8 @@
  */
 
 import { RAW_TARGET } from '../state/ContextProxy.js';
-import { pathResolver } from '../core/wfUtils.js';
+import { pathResolver, wfError, WF_ERRORS } from '../core/wfUtils.js';
+import { beginBatchScope, endBatchScope, discardScheduled } from '../state/reactive-graph/core.js';
 
 /**
  * Internal worker for wildflower.toRaw().
@@ -14,7 +15,7 @@ import { pathResolver } from '../core/wfUtils.js';
  * via the `seen` WeakMap. Reads go through the proxy get-trap, so calling
  * this from inside a reactive effect WILL register dependencies on every
  * walked path. Callers that want true opacity to reactivity should invoke
- * toRaw() outside an effect (the typical use case — snapshot for IDB /
+ * toRaw() outside an effect (the typical use case: snapshot for IDB /
  * postMessage / Web Worker happens in an async callback, not in a tracker).
  *
  * Supported types: primitives, null, undefined, Date, RegExp, Map, Set,
@@ -49,7 +50,7 @@ function _toRawWalk(value, seen) {
     }
 
     // Plain object (or proxy that surface-iterates like one). Skip
-    // functions — they aren't structured-clone-safe and rarely belong
+    // functions: they aren't structured-clone-safe and rarely belong
     // in a state snapshot.
     const out = {};
     seen.set(value, out);
@@ -75,51 +76,14 @@ export const EntitySystemMethods = {
      * @private
      */
     _resolveExternalValue(componentNameOrId, path, sourceComponentId) {
-        // Find the target component
-        let targetComponent = this.componentInstances.get(componentNameOrId);
+        // Find the target component (shared lookup chain)
+        const targetComponent = this._externalFindTarget(componentNameOrId);
 
-        // If not found by ID, try to find by name
-        if (!targetComponent) {
-            const components = this.getComponentsByType(componentNameOrId);
-            if (components.length > 0) {
-                targetComponent = components[0];
-            } else if (this.storeManager) {
-                // Try to find as a store component
-                targetComponent = this.storeManager.getStoreComponentByName(componentNameOrId);
-            }
-        }
-
-        // Try to resolve as a plugin (check for $pluginName or plugin:name format)
-        // Only when plugin feature is enabled
+        // Try to resolve as a plugin (only when plugin feature is enabled)
         if (__FEATURE_PLUGINS__) {
-            if (!targetComponent && this._pluginStates) {
-                let pluginName = componentNameOrId;
-
-                // Handle both "plugin:name" and direct "name" format
-                if (pluginName.startsWith('plugin:')) {
-                    pluginName = pluginName.slice(7);
-                }
-
-                const pluginContext = this._pluginStates.get(pluginName);
-                if (pluginContext && pluginContext.state) {
-                    // Register this component as depending on this plugin
-                    if (sourceComponentId) {
-                        this._registerPluginDependent(pluginName, sourceComponentId);
-                    }
-
-                    // Return the value from plugin state
-                    try {
-                        if (path.startsWith('computed:')) {
-                            const computedName = path.slice(9);
-                            return pluginContext._stateManager?.evaluateComputed(computedName) ??
-                                   pluginContext[computedName];
-                        } else {
-                            return pathResolver.get(pluginContext.state, path);
-                        }
-                    } catch (error) {
-                        return path.startsWith('computed:') ? 0 : null;
-                    }
-                }
+            if (!targetComponent) {
+                const pluginHit = this._externalPluginGet(componentNameOrId, path, 2, sourceComponentId);
+                if (pluginHit) return pluginHit.value;
             }
         }
 
@@ -127,18 +91,8 @@ export const EntitySystemMethods = {
             return path.startsWith('computed:') ? 0 : null;
         }
 
-        let value;
         try {
-            if (path.startsWith('computed:')) {
-                const computedPath = path.slice(9);
-                if (computedPath.includes('.')) {
-                    value = targetComponent.stateManager._resolveComputedPath(computedPath);
-                } else {
-                    value = targetComponent.stateManager.evaluateComputed(computedPath);
-                }
-            } else {
-                value = targetComponent.stateManager.getValue(path);
-            }
+            const value = this._externalResolveTargetValue(targetComponent, path);
 
             // Register external dependency for reactive updates
             // This tracks which components depend on external values from other components
@@ -152,6 +106,123 @@ export const EntitySystemMethods = {
         }
     },
     /**
+     * Shared lookup chain for every external() surface: by instance id →
+     * by component name → by store name.
+     * @private
+     */
+    _externalFindTarget(entityNameOrId) {
+        let target = this.componentInstances.get(entityNameOrId);
+        if (!target) {
+            const components = this.getComponentsByType(entityNameOrId);
+            if (components.length > 0) {
+                target = components[0];
+            } else if (this.storeManager) {
+                // Try to find as a store component
+                target = this.storeManager.getStoreComponentByName(entityNameOrId);
+            }
+        }
+        return target;
+    },
+    /**
+     * Shared plugin-state resolution for external(). Returns null when the
+     * name doesn't resolve to a plugin; otherwise { value } where value is
+     * the GET result (argc 2) or undefined (plugins don't support external
+     * writes or 1-arg context handles). Call sites gate on
+     * __FEATURE_PLUGINS__; the body is gated too so plugin-free builds strip
+     * it entirely.
+     * @private
+     */
+    _externalPluginGet(entityNameOrId, path, argc, callerId) {
+        if (!__FEATURE_PLUGINS__) return null;
+        if (!this._pluginStates) return null;
+        let pluginName = entityNameOrId;
+        // Handle both "plugin:name" and direct "name" format
+        if (pluginName.startsWith('plugin:')) {
+            pluginName = pluginName.slice(7);
+        }
+        const pluginContext = this._pluginStates.get(pluginName);
+        if (!pluginContext || !pluginContext.state) return null;
+
+        // Register the caller as depending on this plugin
+        if (callerId) {
+            this._registerPluginDependent(pluginName, callerId);
+        }
+
+        if (argc === 2) {
+            try {
+                if (path.startsWith('computed:')) {
+                    const computedName = path.slice(9);
+                    return { value: pluginContext._stateManager?.evaluateComputed(computedName) ??
+                                    pluginContext[computedName] };
+                }
+                let value = pathResolver.get(pluginContext.state, path);
+                if (value === undefined && !path.includes('.') && pluginContext[path] !== undefined) {
+                    // A bare path naming a computed, e.g. data-bind="$plugin.total",
+                    // which _normalizeStoreShorthands turns into external('plugin',
+                    // 'total') WITHOUT a computed: prefix; misses the state lookup
+                    // above because ReactiveGraph's reactiveTree state holds only real
+                    // state (computed names are not state keys). The ContextProxy
+                    // resolves computed names, so read the value through it.
+                    value = pluginContext[path];
+                }
+                return { value };
+            } catch (error) {
+                return { value: path.startsWith('computed:') ? 0 : null };
+            }
+        }
+        return { value: undefined };
+    },
+    /**
+     * Shared value resolution against a target entity: computed (dotted or
+     * plain) vs regular state path. No try/catch: each caller keeps its own
+     * fallback semantics.
+     * @private
+     */
+    _externalResolveTargetValue(targetEntity, path) {
+        if (path.startsWith('computed:')) {
+            const computedPath = path.slice(9);
+            if (computedPath.includes('.')) {
+                return targetEntity.stateManager._resolveComputedPath(computedPath);
+            }
+            return targetEntity.stateManager.evaluateComputed(computedPath);
+        }
+        return targetEntity.stateManager.getValue(path);
+    },
+    /**
+     * Shared SET path for external(): write, mark for update, schedule.
+     * @private
+     */
+    _externalSetTargetValue(targetEntity, path, value) {
+        targetEntity.stateManager.setValue(path, value);
+        if (this._componentsToUpdate) {
+            this._componentsToUpdate.add(targetEntity.id);
+        }
+        this._scheduleRender();
+        return value;
+    },
+    /**
+     * Shared pending-store-dependency registration for external() misses:
+     * when called during a computed evaluation and the target store doesn't
+     * exist yet, register so the computed re-evaluates on store creation.
+     * Keys off the tracking context set during list/computed eval.
+     * @private
+     */
+    _externalRegisterPending(entityNameOrId, fallbackComponentId, stateManager) {
+        const trackingContext = this._computedTrackingContext;
+        if (this.storeManager && trackingContext) {
+            const componentId = trackingContext.componentId || fallbackComponentId;
+            const computedName = trackingContext.computedName;
+            if (componentId && computedName) {
+                this.storeManager.registerPendingStoreDependency(
+                    entityNameOrId,
+                    componentId,
+                    computedName,
+                    null // listElement will be associated during list binding
+                );
+            }
+        }
+    },
+    /**
      * Register an external dependency between components
      * When targetComponentId's state changes at path, sourceComponentId should be re-rendered
      * @param {string} sourceComponentId - Component that depends on external value
@@ -160,19 +231,17 @@ export const EntitySystemMethods = {
      * @private
      */
     _registerExternalDependency(sourceComponentId, targetComponentId, path) {
-        // Key by target component - when it changes, we need to update all dependents
-        const key = `${targetComponentId}:${path}`;
-        if (!this._externalDependencies.has(key)) {
-            this._externalDependencies.set(key, new Set());
+        // Key by target entity id: any state change on the target notifies all
+        // external dependents. Path-level granularity is deliberately not
+        // tracked: a per-path index would always be a subset of this one
+        // (every registration implies "any change" semantics for 1-arg
+        // external() and the consumer unions anyway), so one index suffices.
+        let dependents = this._externalDependencies.get(targetComponentId);
+        if (!dependents) {
+            dependents = new Set();
+            this._externalDependencies.set(targetComponentId, dependents);
         }
-        this._externalDependencies.get(key).add(sourceComponentId);
-
-        // Also track by target component (for any state change)
-        const componentKey = targetComponentId;
-        if (!this._externalDependencies.has(componentKey)) {
-            this._externalDependencies.set(componentKey, new Set());
-        }
-        this._externalDependencies.get(componentKey).add(sourceComponentId);
+        dependents.add(sourceComponentId);
     },
     /**
      * Register a component as depending on a plugin's state
@@ -236,7 +305,7 @@ export const EntitySystemMethods = {
      * unrelated path on that store mutates (e.g. a hover/cursor field it
      * never reads).
      *
-     * Conservative by construction — returns true (must invalidate) whenever
+     * Conservative by construction: returns true (must invalidate) whenever
      * irrelevance can't be proven:
      *   - computed-path notifications (a store computed may transitively read
      *     anything; the matching `computed:` notification carries precision),
@@ -273,7 +342,7 @@ export const EntitySystemMethods = {
         const declared = dependentInstance._subscribedStores;
         if (!declared || declared.indexOf(entityName) === -1) return true;
 
-        // path P relates to dep D when either is a prefix of the other —
+        // path P relates to dep D when either is a prefix of the other:
         // covers `filters` <-> `filters.text` and `items` <-> `items.2.label`.
         const relates = (d) => d === path
             || path.startsWith(d + '.')
@@ -287,7 +356,7 @@ export const EntitySystemMethods = {
             }
         }
 
-        // 2. Runtime-tracked store dependencies — entries are 'state.<path>'
+        // 2. Runtime-tracked store dependencies: entries are 'state.<path>'
         //    or 'computed.<name>'. A computed dep can't be reasoned about, so
         //    bail to blanket invalidation when one is present.
         const tracked = dependentInstance._storeDependencies &&
@@ -300,7 +369,7 @@ export const EntitySystemMethods = {
             }
         }
 
-        // Explicit subscriber, but `path` matched nothing it reads — skip.
+        // Explicit subscriber, but `path` matched nothing it reads: skip.
         return false;
     },
     /**
@@ -351,40 +420,6 @@ export const EntitySystemMethods = {
                     instance[depKey].set(entityName, new Set());
                 }
                 instance[depKey].get(entityName).add(path);
-            }
-
-            // Record the source RSM on the currently-evaluating computed's
-            // node so its cache-hit fast path in evaluateComputed can
-            // short-circuit when source _globalEpoch is unchanged.
-            //
-            // Only track STATE-path reads, not computed-path reads. Tracking
-            // a computed source (e.g., C reads B.derivedValue) would falsely
-            // cache-hit when B's result changes in response to an upstream
-            // change that didn't bump B's own _globalEpoch. Cross-store
-            // computed-of-computed chains stay on the existing correct path.
-            if (path && path.charCodeAt(0) === 115 /* 's' */ && path.startsWith('state.')) {
-                const tc = framework._computedTrackingContext;
-                const targetSm = entityContext && entityContext.stateManager;
-                if (tc && tc.stateManager && tc.computedName && targetSm && targetSm !== tc.stateManager) {
-                    const evalNode = tc.stateManager._computedNodes &&
-                        tc.stateManager._computedNodes.get(tc.computedName);
-                    if (evalNode) {
-                        if (!evalNode.externalSources) {
-                            evalNode.externalSources = [{ rsm: targetSm, epoch: targetSm._globalEpoch || 0 }];
-                        } else {
-                            let found = false;
-                            for (let i = 0; i < evalNode.externalSources.length; i++) {
-                                if (evalNode.externalSources[i].rsm === targetSm) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found) {
-                                evalNode.externalSources.push({ rsm: targetSm, epoch: targetSm._globalEpoch || 0 });
-                            }
-                        }
-                    }
-                }
             }
         };
 
@@ -508,8 +543,7 @@ export const EntitySystemMethods = {
                     ? instance.name.slice(6) : instance.name;
                 const hasSubs = this.storeManager?.hasPathSubscribers(storeName);
                 const hasExtDeps = this._externalDependencies &&
-                    (this._externalDependencies.has(entityId) ||
-                     this._externalDependencies.has(`${entityId}:`));
+                    this._externalDependencies.has(entityId);
                 instance._hasNotifyTargets = !!(hasDeps || hasSubs || hasExtDeps);
                 if (!instance._hasNotifyTargets) {
                     return;
@@ -535,14 +569,11 @@ export const EntitySystemMethods = {
                 return;
             }
 
-            const sm = dependentInstance.stateManager;
-
-            // Virtual store fast exit: lean eval path handles
-            // re-evaluation lazily — just bump cache generation.
+            // Virtual store fast exit: the lean eval path re-evaluates lazily,
+            // so a dependent virtual store needs no eager work here.
             if (dependentInstance.isVirtual &&
                 !dependentInstance._propPaths)
             {
-                sm._cacheGeneration = (sm._cacheGeneration || 0) + 1;
                 return;
             }
 
@@ -557,33 +588,28 @@ export const EntitySystemMethods = {
             // back to blanket invalidation (see _entityPathAffectsDependent).
             const pathRelevant = this._entityPathAffectsDependent(dependentInstance, entityId, path);
 
-            // Mark computed nodes as DIRTY and schedule re-evaluation.
-            // Virtual stores use lean eval (fn() directly) so dirty flags
-            // don't matter — only sweep for DOM components.
-            if (pathRelevant && !dependentInstance.isVirtual) {
-                if (sm._computedNodes) {
-                    for (const [compName, node] of sm._computedNodes) {
-                        node.flags |= 2; // DIRTY
-                    }
-                }
-                const computedNames = sm.getComputedPropertyNames();
-                computedNames.forEach(propName => {
-                    sm.scheduleComputedEvaluation(propName);
-                });
-            }
-            sm._cacheGeneration = (sm._cacheGeneration || 0) + 1;
+            // ReactiveGraph wakes exactly the affected computeds via the graph
+            // edges a computed's store reads form, so no eager dependent sweep
+            // is needed on a store change.
 
-            // Wake any per-item effects that registered an external-entity dep
-            // when their item-level computed read from this (or another) entity.
-            // No-op when no item effect subscribed.
-            // Wake item effects on this dependent component. Per-item effects
-            // are not subscribed to external entities (their dep tracking only
-            // covers itemProxy and component state), so a store mutation that
-            // changes a derived value read by an item-level computed wouldn't
-            // otherwise re-evaluate. Force-queue each item effect; the existing
-            // binding diff layer drops no-op DOM writes.
-            if (pathRelevant && sm._dirtyAllItemEffects) {
-                sm._dirtyAllItemEffects();
+            // Per-item row effects track their reads (itemProxy, component state,
+            // and external store reads via this.stores) through the one graph, so
+            // ReactiveGraph wakes exactly the rows that depend on a changed value
+            // via notifyNode: no blanket per-item wake is needed here.
+
+            // Re-evaluate this dependent's portals on a relevant store change.
+            // A portal's data-show / data-render can read a computed that reads
+            // the changed store (e.g. a modal gated by
+            // `isEditing = stores.x.editingCard !== null`). The own-state render
+            // path (_scheduleComponentRender) re-evaluates portals, but a
+            // store-driven (subscribe) change reaches a dependent only through
+            // this loop, so without this the portal never re-evaluates on a pure
+            // store change and a modal won't hide when its condition flips to
+            // false (it had no own-state write to trigger a render). Gated on
+            // _hasPortals so portal-free components pay nothing.
+            if (pathRelevant && this._updatePortalVisibility
+                && dependentInstance._hasPortals && dependentInstance.element) {
+                this._updatePortalVisibility(dependentInstance);
             }
 
             // Refresh item-level computed bindings in lists
@@ -652,20 +678,10 @@ export const EntitySystemMethods = {
 
         // === SHARED: Notify external() dependents ===
         // Components using external('entityName', 'path') need updates when that path changes
-        if (this._externalDependencies) {
-            // Check both specific path and any-path dependents
-            const pathKey = `${entityId}:${path}`;
-            const externalDependents = new Set();
-
-            // Collect dependents for specific path
-            if (this._externalDependencies.has(pathKey)) {
-                this._externalDependencies.get(pathKey).forEach(id => externalDependents.add(id));
-            }
-            // Collect dependents for any change to this entity
-            if (this._externalDependencies.has(entityId)) {
-                this._externalDependencies.get(entityId).forEach(id => externalDependents.add(id));
-            }
-
+        // Single entity-keyed index: any path change on this entity
+        // notifies all of its external dependents.
+        const externalDependents = this._externalDependencies && this._externalDependencies.get(entityId);
+        if (externalDependents) {
             externalDependents.forEach(componentId => {
                 // Skip if already in update queue from entity dependents
                 if (!this._componentsToUpdate.has(componentId)) {
@@ -736,7 +752,7 @@ export const EntitySystemMethods = {
                         // Re-run child's render effect so bindings that read props
                         // (including computed properties that depend on props) update.
                         // Props aren't reactive proxy properties, so the effect doesn't
-                        // track them as dependencies — we trigger it explicitly.
+                        // track them as dependencies; we trigger it explicitly.
                         // If the child lacks an effect (e.g., batch didn't flush), create one now.
                         if (!childInstance._renderEffect && this._collectComponentBindingMeta && this._createComponentRenderEffect) {
                             childInstance._effectMeta = this._collectComponentBindingMeta(childInstance);
@@ -748,12 +764,6 @@ export const EntitySystemMethods = {
                         if (childEffect && !childEffect.disposed) {
                             childEffect.dirty = true;
                             childInstance.stateManager._runEffect(childEffect);
-                        }
-
-                        // Flush computed evaluations before onPropsChange so computed properties
-                        // reflect the new props values when the lifecycle hook runs
-                        if (childInstance.stateManager && childInstance.stateManager._flushComputedEvaluationQueue) {
-                            childInstance.stateManager._flushComputedEvaluationQueue();
                         }
 
                         // Trigger child's onPropsChange lifecycle hook if defined
@@ -782,7 +792,7 @@ export const EntitySystemMethods = {
             this._currentUpdatingInstance = instance;
 
             try {
-                // Handle list state changes — skip when component has no lists
+                // Handle list state changes: skip when component has no lists
                 const listAffected = instance._listContexts?.size > 0
                     ? this._handleComponentListStateChange(instance, path, newValue, oldValue)
                     : false;
@@ -791,11 +801,8 @@ export const EntitySystemMethods = {
                 this._executeWatchers(instance, path, newValue, oldValue);
 
                 // Update contexts for state change
-                if (this._contextSystemInitialized && this._contextRegistry) {
+                if (this._contextSystemInitialized && this._contextRecords) {
                     this._updateContextsForStateChange(entityId, path);
-                    // Notify dependent contexts (e.g., child components with props from this parent).
-                    // Required: PropsSystem registers context-level deps that are NOT in _entityDependents.
-                    this._contextRegistry._notifyDependentContexts(entityId, path, newValue, oldValue);
                 }
 
                 // Schedule rendering (handles sync vs async, batch mode, etc.)
@@ -805,12 +812,7 @@ export const EntitySystemMethods = {
                 this._currentUpdatingInstance = null;
             }
         } else {
-            // === STORE/PLUGIN: Simple context notification and render ===
-            // Notify through context system if available
-            if (this._contextSystemInitialized && this._contextRegistry) {
-                this._contextRegistry._notifyDependentContexts(entityId, path, newValue, oldValue);
-            }
-
+            // === STORE/PLUGIN: Simple render scheduling ===
             // Schedule render ONLY if DOM-attached components need updating.
             // Headless stores (no subscribing components with DOM elements) skip this entirely.
             // This avoids ~200K RAF scheduling calls in cross-store computed benchmarks.
@@ -850,16 +852,13 @@ export const EntitySystemMethods = {
         }
 
         // Update binding contexts through context system
-        if (this._contextSystemInitialized && this._contextRegistry) {
-            // Note: _notifyDependentContexts is called by the caller (_handleEntityStateChange)
-            // after this function returns, so we don't need to call it here
-
+        if (this._contextSystemInitialized && this._contextRecords) {
             // PERFORMANCE OPTIMIZATION: Skip O(n) binding iteration for array operations
             // where ListRenderer handles updates through optimized paths.
             //
             // Case 1: Array REPLACEMENT (newValue !== oldValue) - clear, replace, full reassignment
             // Case 2: Array LENGTH CHANGE notification (path ends with .length)
-            // Case 3: Array with recorded operation hint (splice/append/swap detected by RSM)
+            // Case 3: Array with recorded operation hint (splice/append/swap detected by state manager)
             //
             // We still need binding updates for:
             // - In-place property mutations (forEach changing item.label) - same ref, same length
@@ -902,25 +901,6 @@ export const EntitySystemMethods = {
             // Per-item effects handle all list-item binding updates
             // via _bindWithCompiledMetadata in effect re-runs. No EntitySystem
             // intervention needed for list-item bindings.
-        }
-
-        // Track updated paths for rendering
-        this._updatedPaths.add(path);
-
-        // For complex structures, also track parent paths
-        if (path.includes('.')) {
-            const parts = path.split('.');
-            let currentPath = '';
-
-            for (let i = 0; i < parts.length - 1; i++) {
-                currentPath = currentPath ? `${currentPath}.${parts[i]}` : parts[i];
-                this._updatedPaths.add(currentPath);
-            }
-        }
-
-        // For array length changes, add specific tracking
-        if (Array.isArray(newValue)) {
-            this._updatedPaths.add(`${path}.length`);
         }
 
         // Track pending state changes
@@ -984,6 +964,31 @@ export const EntitySystemMethods = {
      */
     _createEntitySubscription(stateManager, state, path, callback, options = {}) {
         const { immediate = false, once = false } = options;
+
+        // A subscription whose path matches a `computed:NAME` pulse needs that
+        // computed's notifier installed (lazy by default). The augmented
+        // onStateChange below matches exactly, so a subscribe-all ('') observes
+        // every computed; otherwise record the bare name (strip an explicit
+        // `computed:` prefix). Recording a plain-state name is harmless; the
+        // notifier only materializes if a computed by that name exists.
+        if (stateManager._ensureComputedNotifier) {
+            if (path === '') stateManager._observeAllComputedNotifiers();
+            else stateManager._ensureComputedNotifier(path.startsWith('computed:') ? path.slice(9) : path);
+        }
+
+        // RG-5 (review 2026-07-02, Chris decision): subscribing to a list item
+        // by numeric index is an anti-pattern. Reactivity is identity-based, so
+        // the index in an onStateChange path reflects the item's position when
+        // FIRST observed; after a splice/reorder the subscription misfires or
+        // goes silent. WF-213, dev-only, warn-severity (recoverable diagnostic;
+        // must not trip error-tracking pipelines).
+        if (__DEV__ && typeof path === 'string' && (/(^|\.)\d+(\.|$)|\[\d+\]/.test(path))) {
+            wfError(WF_ERRORS.INDEXED_PATH_OBSERVER, {
+                warn: true,
+                context: `subscribe path "${path}"`,
+                suggestion: 'Subscribe to the array (or a computed over it) and track items by id instead of position'
+            });
+        }
 
         // Create a unique subscription ID
         const subscriptionId = `sub_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -1193,68 +1198,13 @@ export const EntitySystemMethods = {
             return;
         }
 
-        // Binding context iteration removed — the render effect now handles ALL binding
+        // Binding context iteration removed; the render effect now handles ALL binding
         // DOM updates including web component adapters and portal bindings.
-
-        // Update conditional contexts.
-        // Effects handle data-show; per-item effects handle data-render in lists.
-        // Only non-list data-render still needs context iteration.
-        if (instance._renderEffect && !instance._hasNonListDataRender) {
-            // All conditionals are effect-driven — skip iteration entirely
-        } else {
-        const conditionalContexts = this._contextRegistry.getContextsByType('conditional')
-            .filter(ctx => ctx.componentInstance && ctx.componentInstance.id === instanceId);
-
-        conditionalContexts.forEach(context =>
-        {
-            // Extract actual path without negation
-            let actualPath = context.path;
-            if (actualPath.startsWith('!'))
-            {
-                actualPath = actualPath.slice(1);
-            } else if (actualPath.startsWith('computed:!'))
-            {
-                actualPath = 'computed:' + actualPath.slice(10);
-            }
-
-            // Determine if this conditional is affected by the state change
-            // For expressions, check if the changed path is used in the expression
-            const isSimpleMatch = actualPath === path || path.startsWith(actualPath + '.');
-            const isExpressionMatch = this.isExpression(actualPath) && this._expressionUsesPath(actualPath, path);
-            const shouldUpdate = isSimpleMatch || isExpressionMatch;
-
-            if (shouldUpdate)
-            {
-                // Force context to refresh its data
-                context._clearCache();
-
-                // For render mode, element may be null when not rendered
-                // For show mode, element must exist
-                const isRenderMode = context.mode === 'render';
-                // Effects handle data-show; per-item effects handle data-render in lists
-                if (!isRenderMode && instance._renderEffect) return;
-                // Per-item effects handle data-render for list-item conditional contexts
-                if (isRenderMode && instance._renderEffect && context.parent?.type === 'list') return;
-                if (context.element || isRenderMode)
-                {
-                    const isVisible = context.resolveData();
-
-                    if (__FEATURE_TRANSITIONS__) {
-                        // Check if element has data-transition attribute
-                        const element = context.element || (isRenderMode ? context.templateClone : null);
-                        // Use transition system if available and element has transition attribute
-                        if (this._handleTransitionedVisibilityChange && element && element.dataset && element.dataset.transition) {
-                            this._handleTransitionedVisibilityChange(element, context, isVisible, context.componentInstance);
-                        } else {
-                            context._updateConditionalElement(isVisible);
-                        }
-                    } else {
-                        context._updateConditionalElement(isVisible);
-                    }
-                }
-            }
-        });
-        } // end conditional iteration gate
+        //
+        // Conditional contexts (data-show, non-list data-render via type:'render'
+        // meta, list-item data-render via per-item effects) are likewise fully
+        // effect-driven, so the path-string conditional iteration that used to live
+        // here is gone; every component carries a render effect.
 
         // Update custom directives (only when plugin system is available)
         if (this._customDirectives && this._customDirectives.size > 0 && instance.element) {
@@ -1318,7 +1268,7 @@ export const EntitySystemMethods = {
             }
         }
 
-        // Computed changes notify as "computed:name" — also check watchers registered under bare name
+        // Computed changes notify as "computed:name"; also check watchers registered under bare name
         if (path.startsWith('computed:'))
         {
             const barePath = path.slice(9);
@@ -1337,7 +1287,7 @@ export const EntitySystemMethods = {
         // Notify parent path watchers
         // e.g., if path is 'user.name', notify watchers for 'user'
         // NOTE: Parent watchers receive (currentValue, currentValue, changedPath) because the
-        // parent object is the same mutable reference — no deep copy of the previous state exists.
+        // parent object is the same mutable reference; no deep copy of the previous state exists.
         // Use the third argument (changedPath) to identify what changed.
         const pathParts = path.split('.');
         while (pathParts.length > 1)
@@ -1397,11 +1347,17 @@ export const EntitySystemMethods = {
     startBatch()
     {
         // Set batch mode flag. Change detection happens at applyBatch by
-        // walking each RSM's _batchChanges Map, which the proxy set traps
+        // walking each state manager's _batchChanges Map, which the proxy set traps
         // populate as a side effect of every batch-mode write. No
         // upfront state snapshot is needed.
         this._batchMode = true;
         this._suppressRender = true;
+
+        // Mark the scheduler boundary so a later cancelBatch() drops only the
+        // effects this batch schedules, not unrelated work already queued before
+        // the batch opened (the ReactiveGraph queue is global; without the
+        // boundary, cancel would clear pending pre-batch renders too).
+        beginBatchScope();
 
         return {
             apply: () => this.applyBatch(),
@@ -1417,7 +1373,7 @@ export const EntitySystemMethods = {
      *   catch (e) { ctx.cancel(); throw e; }
      *
      * Removes the manual try/catch boilerplate and makes batch usage
-     * exception-safe by construction. Sync-only — if `fn` returns a
+     * exception-safe by construction. Sync-only: if `fn` returns a
      * Promise, the batch is applied/cancelled before the Promise
      * resolves. For async work, use the start/apply/cancel API
      * directly and manage the lifetime explicitly.
@@ -1454,10 +1410,14 @@ export const EntitySystemMethods = {
         this._batchMode = false;
         this._suppressRender = false;
 
+        // Close the scheduler discard scope opened in startBatch (apply keeps the
+        // scheduled renders; only cancelBatch discards them).
+        endBatchScope();
+
         this._batchChangedComponents = this._batchChangedComponents || new Set();
         this._batchChangedPaths = this._batchChangedPaths || new Set();
 
-        // CRITICAL ORDERING: processBatchChanges() on each RSM clears
+        // CRITICAL ORDERING: processBatchChanges() on each state manager clears
         // _batchChanges at the end (ReactiveStateManager.js:2111). Snapshot
         // those Maps BEFORE the clear runs so _applyBatchChangesFromProxy
         // has data to walk.
@@ -1490,7 +1450,7 @@ export const EntitySystemMethods = {
     },
 
     /**
-     * Snapshot each RSM's _batchChanges Map keyed by entity id. The proxy
+     * Snapshot each state manager's _batchChanges Map keyed by entity id. The proxy
      * set traps in ProxyHandlers.js populate these Maps for free during
      * batch-mode writes; we capture them here BEFORE processBatchChanges
      * clears them, so both the new code path and the dev-mode shadow
@@ -1544,7 +1504,7 @@ export const EntitySystemMethods = {
             const topLevelKeys = new Set();
 
             changes.forEach((change, path) => {
-                // .length writes are batch-tracking signals only — they
+                // .length writes are batch-tracking signals only; they
                 // tell us "this array changed via push/splice/etc." but
                 // shouldn't appear in the public _batchChangedPaths set.
                 if (path.endsWith('.length')) {
@@ -1628,12 +1588,12 @@ export const EntitySystemMethods = {
         this._batchMode = false;
         this._suppressRender = false;
 
-        // Clear per-RSM _batchChanges Maps so cancelled mutations don't
+        // Clear per-state manager _batchChanges Maps so cancelled mutations don't
         // leak into the next batch's bookkeeping. The proxy populates
         // these during batch mode; on a normal apply, processBatchChanges
         // clears them, but on cancel we have to do it explicitly.
         //
-        // Note: cancelBatch does NOT roll back the writes themselves —
+        // Note: cancelBatch does NOT roll back the writes themselves;
         // mutations made during the batch persist in instance.state.
         // It only skips the post-batch render scheduling and clears
         // change-tracking bookkeeping. A true rollback would iterate
@@ -1647,6 +1607,15 @@ export const EntitySystemMethods = {
                 instance.stateManager._batchArrayUpdates = [];
             }
         });
+
+        // The framework's _suppressRender flag doesn't reach ReactiveGraph's
+        // scheduler, which already marked + queued this batch's render effects
+        // eagerly on write. Drop them so cancel actually skips the render (state
+        // still persists). The queue is global and discardScheduled is scoped to
+        // the boundary set at startBatch, so this must run EXACTLY ONCE: a
+        // per-instance call would reset the boundary on the first pass and then
+        // globally clear (dropping unrelated pre-batch renders) on the next.
+        discardScheduled();
 
         return this;
     },
@@ -1702,7 +1671,7 @@ export const EntitySystemMethods = {
         });
 
         
-        // Handle initial render case — only force render if the component hasn't rendered yet
+        // Handle initial render case: only force render if the component hasn't rendered yet
         if (!result && pendingChanges.size > 0 && instance._hasRendered === false) {
             result = true;
         }
@@ -1752,7 +1721,7 @@ export const EntitySystemMethods = {
      * Caveat: calling toRaw() from inside a reactive effect/computed will
      * register every walked path as a dependency. Snapshotting is typically
      * done from async callbacks (debounced save, postMessage trigger), so
-     * this rarely matters in practice — but worth knowing.
+     * this rarely matters in practice, but worth knowing.
      *
      * @param {*} value - Any value: primitive, object, array, proxy.
      * @returns {*} A structured-clone-safe deep copy.

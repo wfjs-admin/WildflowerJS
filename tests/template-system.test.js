@@ -74,21 +74,17 @@ describe('Template System', () => {
     const firstItem = items[0].querySelector('span')
     expect(firstItem.textContent).toBe('First')
 
-    // Verify list context was created for template-based list
-    const registry = wildflower._contextRegistry
+    // Verify list context was created for template-based list (plain object)
     const listElement = testContainer.querySelector('[data-list="items"]')
-    const listContext = registry.getContextForElement(listElement)
+    const listContext = listElement._listContext
     expect(listContext).toBeDefined()
     expect(listContext.type).toBe('list')
     expect(listContext.path).toBe('items')
 
-    // Verify binding contexts were created for list items
-    const bindingContext = registry.getContextForElement(firstItem)
-    expect(bindingContext).toBeDefined()
-    expect(bindingContext.type).toBe('binding')
-    expect(bindingContext.path).toBe('name')
-    expect(bindingContext.parent).toBeDefined()
-    expect(bindingContext.parent.type).toBe('list')
+    // List-item text is painted by the per-item effect from the row item proxy;
+    // no per-binding context is created for it.
+    expect(items[1].querySelector('span').textContent).toBe('Second')
+    expect(items[2].querySelector('span').textContent).toBe('Third')
   })
 
   it('template content is cloned not moved', async () => {
@@ -161,16 +157,15 @@ describe('Template System', () => {
     expect(allNestedItems.length).toBe(3)
 
     // Verify nested list context hierarchy
-    const registry = wildflower._contextRegistry
     const outerList = testContainer.querySelector('[data-list="categories"]')
-    const outerContext = registry.getContextForElement(outerList)
+    const outerContext = outerList._listContext
     expect(outerContext).toBeDefined()
     expect(outerContext.type).toBe('list')
     expect(outerContext.path).toBe('categories')
 
     // Verify inner list has correct parent
     const innerList = categories[0].querySelector('[data-list="items"]')
-    const innerContext = registry.getContextForElement(innerList)
+    const innerContext = innerList._listContext
     expect(innerContext).toBeDefined()
     expect(innerContext.type).toBe('list')
     expect(innerContext.path).toBe('items')

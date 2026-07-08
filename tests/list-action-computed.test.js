@@ -455,8 +455,7 @@ describe('List Actions - Computed Lists', () => {
             await waitForCompleteRender()
 
             const button = testContainer.querySelector('.action-btn')
-            const registry = wildflower._contextRegistry
-            const actionContext = registry.getContextForElement(button)
+            const actionContext = button._actionContext
 
             expect(actionContext).toBeDefined()
             expect(actionContext.type).toBe('action')
@@ -506,10 +505,9 @@ describe('List Actions - Computed Lists', () => {
             let removeButtons = testContainer.querySelectorAll('.remove-btn')
             expect(removeButtons.length).toBe(2)
 
-            // Each button should have an action context
-            const registry = wildflower._contextRegistry
-            const context1 = registry.getContextForElement(removeButtons[0])
-            const context2 = registry.getContextForElement(removeButtons[1])
+            // Each button should have an action record
+            const context1 = removeButtons[0]._actionContext
+            const context2 = removeButtons[1]._actionContext
             expect(context1).toBeDefined()
             expect(context1.type).toBe('action')
             expect(context2).toBeDefined()
@@ -523,8 +521,8 @@ describe('List Actions - Computed Lists', () => {
             removeButtons = testContainer.querySelectorAll('.remove-btn')
             expect(removeButtons.length).toBe(1)
 
-            // The remaining button should have a valid action context
-            const remainingContext = registry.getContextForElement(removeButtons[0])
+            // The remaining button should have a valid action record
+            const remainingContext = removeButtons[0]._actionContext
             expect(remainingContext).toBeDefined()
             expect(remainingContext.type).toBe('action')
         })

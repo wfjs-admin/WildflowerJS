@@ -10,6 +10,8 @@
  */
 
 import { listBoundElements } from '../core/DomMetadata.js';
+import { pathResolver, __wf_str, __wf_txt } from '../core/wfUtils.js';
+import { applyShow, applyClass, applyModel } from '../core/BindingWriters.js';
 
 /**
  * V8 OPT: Reusable context object for _bindWithCompiledMetadata.
@@ -29,136 +31,6 @@ const _reusableBindCtx = {
  * Methods to be mixed into ListRendererMethods (and ultimately WildflowerJS.prototype)
  */
 export const ListItemBindingMethods = {
-    _bindItemData(itemEl, item, itemIndex, context, skipNestedCheck = false, precomputedMetadata = null) {
-        // Early validation
-        if (!item || typeof item !== 'object') return;
-
-        // Store metadata for deferred context creation
-        itemEl._bindItemData = item;
-        itemEl._bindItemIndex = itemIndex;
-
-        // PERF FIX: Update _parentIndex on existing binding contexts when rebinding
-        // This handles the case where contexts were created lazily before an element
-        // was reused for a different index position. Without this, stale _parentIndex
-        // values cause model bindings to update the wrong item.
-        //
-        // OPTIMIZATION: Skip during initial creation - fresh items from template have no contexts
-        // Only run for reused elements (indicated by existing _cachedElementsArray or _bindingElements)
-        if (this._contextRegistry?.contextsByElement) {
-            // Use cached elements if available (much faster than querySelectorAll)
-            const cachedElements = itemEl._cachedElementsArray || itemEl._bindingElements;
-            if (cachedElements) {
-                for (let i = 0; i < cachedElements.length; i++) {
-                    const el = cachedElements[i];
-                    if (!el) continue;
-                    const ctx = this._contextRegistry.contextsByElement.get(el);
-                    if (ctx && ctx._parentIndex !== undefined && ctx._parentIndex !== itemIndex) {
-                        ctx._parentIndex = itemIndex;
-                    }
-                }
-            }
-            // If no cached elements, skip - this is a fresh item with no contexts
-        }
-
-        // Process root element bindings
-        const ds = itemEl.dataset;
-        this._bindRootElementData(itemEl, item, ds, itemIndex, context);
-
-        // OPTIMIZATION: Use pre-computed metadata if provided (avoids per-item string concat + Map lookup)
-        const listContext = itemEl._listContext;
-        const compiledMetadata = precomputedMetadata !== null ? precomputedMetadata : this._getCompiledMetadata(listContext);
-
-        let allElements;
-
-        if (compiledMetadata) {
-            // FAST PATH: Use compiled metadata
-            allElements = this._bindWithCompiledMetadata(itemEl, item, compiledMetadata, listContext, itemIndex, context);
-        } else {
-            // FALLBACK: Use querySelectorAll
-            allElements = this._bindWithFallback(itemEl, item, listContext, itemIndex, context, skipNestedCheck);
-        }
-
-        // Process root element model/show
-        this._bindRootElementModelShow(itemEl, item, ds, itemIndex, context);
-
-        // Mark for deferred context creation (only if not already created)
-        // If contexts already exist (_needsContexts === false), keep using them
-        // This preserves contexts during element reuse while avoiding orphaned contexts
-        if (itemEl._needsContexts !== false) {
-            itemEl._needsContexts = true;
-        }
-        if (allElements) {
-            itemEl._bindingElements = allElements;
-        }
-
-        // Store compiled metadata for post-render updates so the
-        // cloneNode path can use metadata-based updates too.
-        if (compiledMetadata && !itemEl._compiledMetadata) {
-            itemEl._compiledMetadata = compiledMetadata;
-        }
-
-        // NOTE: Attribute stripping for cloneNode path is deferred
-        // Currently only innerHTML path strips attributes (in _compileTemplate)
-        // Stripping here requires refactoring all querySelectorAll calls first
-    },
-    /**
-     * Bind data-bind and data-bind-class on root element
-     * @private
-     */
-    _bindRootElementData(itemEl, item, ds, itemIndex, context) {
-        if (ds.bind) {
-            const componentInstance = context?.componentInstance;
-            const scope = {
-                componentState: componentInstance?.state || {},
-                componentInstance,
-                itemIndex,
-                listLength: context?.data?.length || 0,
-                listContext: context,
-                propsData: componentInstance?._propsData
-            };
-
-            const value = this._resolveRawBinding(ds.bind, item, scope);
-            const strValue = value == null ? '' : String(value);
-            // Only use textContent on leaf elements; for elements with children,
-            // use a dedicated text node to avoid destroying child DOM
-            if (itemEl.children.length === 0) {
-                itemEl.textContent = strValue;
-            } else {
-                if (!itemEl._boundTextNode) {
-                    itemEl._boundTextNode = document.createTextNode(strValue);
-                    itemEl.insertBefore(itemEl._boundTextNode, itemEl.firstChild);
-                } else {
-                    itemEl._boundTextNode.textContent = strValue;
-                }
-            }
-        }
-
-        if (ds.bindClass) {
-            this._processOptimizedClassBinding(itemEl, item, ds.bindClass, itemIndex, context);
-        }
-
-        if (ds.bindStyle) {
-            this._processStyleBinding(itemEl, item, ds.bindStyle, itemIndex, context);
-        }
-
-        if (ds.bindAttr) {
-            this._processAttrBinding(itemEl, item, ds.bindAttr, itemIndex, context);
-        }
-    },
-    /**
-     * Get compiled metadata for list context
-     * @private
-     */
-    _getCompiledMetadata(listContext) {
-        const listPath = listContext?.path;
-        if (!listPath) return null;
-
-        const componentName = listContext?.componentInstance?.name;
-        const compilationKey = componentName ? `${componentName}:${listPath}` : listPath;
-
-        return this._templateCache.compiled.get(compilationKey) ||
-               this._templateCache.compiled.get(listPath);
-    },
     /**
      * Bind using compiled metadata (fast path)
      * @private
@@ -172,7 +44,7 @@ export const ListItemBindingMethods = {
             itemEl._cachedElementsArray = allElementsArray;
         }
 
-        // PERF: Reuse context object — avoids per-item allocation in tight loops
+        // PERF: Reuse context object; avoids per-item allocation in tight loops
         const componentInstance = listContext?.componentInstance;
         const ctx = _reusableBindCtx;
         ctx.componentState = componentInstance?.state || {};
@@ -198,11 +70,16 @@ export const ListItemBindingMethods = {
         if (compiledMetadata.classBindings.length > 0) {
             this._executeClassBindings(allElementsArray, compiledMetadata.classBindings, item, ctx);
         }
-        if (!(_skipStyleAttr && compiledMetadata.styleEvaluators?.length) &&
+        // List callers pass _skipStyleAttr: their style/attr apply runs through
+        // _applyRowDecor's evaluator fast paths, which cover every style/attr
+        // binding (_compileTemplate emits an evaluator entry for each binding,
+        // null-evaluator entries included). Slot/SSR callers omit the flag and
+        // use these generic executors.
+        if (!_skipStyleAttr &&
             compiledMetadata.styleBindings && compiledMetadata.styleBindings.length > 0) {
             this._executeStyleBindings(allElementsArray, compiledMetadata.styleBindings, item, itemIndex, context);
         }
-        if (!(_skipStyleAttr && compiledMetadata.attrEvaluators?.length) &&
+        if (!_skipStyleAttr &&
             compiledMetadata.attrBindings && compiledMetadata.attrBindings.length > 0) {
             this._executeAttrBindings(allElementsArray, compiledMetadata.attrBindings, item, itemIndex, context);
         }
@@ -228,19 +105,26 @@ export const ListItemBindingMethods = {
             // For 1000 items × 5 bindings = 5000 function calls saved
             for (let i = 0; i < paths.length; i++) {
                 const path = paths[i];
-                if (!path || path.length === 0) {
+                const plen = path ? path.length : 0;
+                if (plen === 0) {
                     allElementsArray[i] = itemEl;
-                } else {
-                    let current = itemEl;
-                    for (let p = 0; p < path.length; p++) {
-                        if (!current.children || !current.children[path[p]]) {
-                            current = null;
-                            break;
-                        }
-                        current = current.children[path[p]];
-                    }
-                    allElementsArray[i] = current;
+                    continue;
                 }
+                // Resolve each child index by element node-pointers
+                // (firstElementChild + nextElementSibling) rather than fetching the live
+                // HTMLCollection (current.children) and indexing it per hop. elementPaths
+                // are element-child indices, and *ElementSibling traverse element-only
+                // nodes, so this is semantically identical to children[idx] (text/comment
+                // nodes excluded the same way) while avoiding the collection wrapper +
+                // index walk on each step (~58% faster per row at create10k).
+                let current = itemEl;
+                for (let p = 0; p < plen; p++) {
+                    let next = current.firstElementChild;
+                    for (let k = path[p]; k > 0 && next; k--) next = next.nextElementSibling;
+                    if (!next) { current = null; break; }
+                    current = next;
+                }
+                allElementsArray[i] = current;
             }
             return allElementsArray;
         }
@@ -255,6 +139,11 @@ export const ListItemBindingMethods = {
     _applyCustomElementAdapter(el, value) {
         let isCustomEl = el._isCustomEl;
         if (isCustomEl === undefined) {
+            // Guard against non-Element nodes: a data-render placeholder is a
+            // Comment, which has no tagName, so tagName.includes('-') TypeErrors
+            // (it gets caught by the effect boundary and just logs noise, but it
+            // still aborts the binding loop early).
+            if (!el.tagName) return false;
             isCustomEl = el._isCustomEl = el.tagName.includes('-');
         }
         if (!isCustomEl) return false;
@@ -267,38 +156,38 @@ export const ListItemBindingMethods = {
         return true;
     },
     /**
+     * Nested-change path-overlap test for the targeted-rebind filter. Used ONLY
+     * when the changed prop `tp` is itself a dotted nested path (the rare case):
+     * callers handle the common flat case inline with a plain `path === tp` so
+     * the hot flat update path stays call-free.
+     *
+     * Returns true when a path binding must be re-evaluated because the changed
+     * nested path and the binding `path` overlap:
+     *  - ANCESTOR: `path` is a strict prefix of `tp` at a '.' boundary; the
+     *    binding reads a parent object that now contains the changed leaf.
+     *  - DESCENDANT: `tp` is a strict prefix of `path` at a '.' boundary; the
+     *    changed value is an object the binding reads further into.
+     * Exact equality (`path === tp`) is the caller's fast path. Allocation-free
+     * (charCodeAt(46) === '.' tests the boundary before a prefix compare).
+     *
+     * @param {string|null} path - the binding's data path
+     * @param {string} tp - the changed nested path (contains at least one '.')
+     * @returns {boolean} true to re-evaluate, false to skip
+     * @private
+     */
+    _pathTouchedByNestedChange(path, tp) {
+        if (!path) return false;
+        if (tp.length > path.length && tp.charCodeAt(path.length) === 46 && tp.startsWith(path)) return true;
+        if (path.length > tp.length && path.charCodeAt(tp.length) === 46 && path.startsWith(tp)) return true;
+        return false;
+    },
+    /**
      * Execute data-bind bindings from compiled metadata
      * @private
      */
     _executeBindings(elementsArray, bindings, item, ctx) {
-        const targetedProp = this._targetedProp;
-        // Fast-path: skip computed-name bypass entirely when the component
-        // declares no computeds — every `computeds[name]` lookup would miss.
-        const componentInstance = ctx?.componentInstance;
-        const hasComputeds = this._instanceHasComputeds(componentInstance);
-        const computeds = hasComputeds ? componentInstance.stateManager.computed : null;
         for (let i = 0; i < bindings.length; i++) {
             const binding = bindings[i];
-
-            // Targeted rebind: skip DOM write for bindings not matching changed prop.
-            // Computed-name bindings are an exception — the computed body may read
-            // the changed prop transitively, so the path-equality filter would
-            // skip them incorrectly.
-            if (targetedProp) {
-                let matches = binding.isExpression
-                    ? (binding.expressionVars && binding.expressionVars.indexOf(targetedProp) !== -1)
-                    : (binding.path === targetedProp);
-                if (!matches && hasComputeds) {
-                    if (binding.isExpression && binding.expressionVars) {
-                        for (let v = 0; v < binding.expressionVars.length; v++) {
-                            if (computeds[binding.expressionVars[v]]) { matches = true; break; }
-                        }
-                    } else if (binding.path && computeds[binding.path]) {
-                        matches = true;
-                    }
-                }
-                if (!matches) continue;
-            }
 
             const el = elementsArray[binding.index];
             if (!el) continue;
@@ -306,7 +195,7 @@ export const ListItemBindingMethods = {
             let value;
 
             // PERF: Fast path for simple property bindings (e.g., data-bind="label")
-            // Bypasses _resolveCompiledBinding entirely — no destructuring, no branch checks,
+            // Bypasses _resolveCompiledBinding entirely: no destructuring, no branch checks,
             // just a direct property read. Covers the majority of list bindings.
             //
             // Fall back to full resolution when item[path] is undefined: the path may
@@ -337,15 +226,13 @@ export const ListItemBindingMethods = {
             }
 
             // PERF: Skip DOM write if value unchanged
-            const strValue = value == null ? '' : String(value);
+            const strValue = __wf_str(value);
             if (binding.isInput) {
                 if (el.value !== strValue) {
                     el.value = strValue;
                 }
             } else {
-                if (el.textContent !== strValue) {
-                    el.textContent = strValue;
-                }
+                __wf_txt(el, strValue);
             }
             listBoundElements.add(el);
         }
@@ -356,6 +243,7 @@ export const ListItemBindingMethods = {
      */
     _executeHtmlBindings(elementsArray, htmlBindings, item, ctx) {
         const targetedProp = this._targetedProp;
+        const targetedPropRoot = this._targetedPropRoot;
         const componentInstance = ctx?.componentInstance;
         const hasComputeds = this._instanceHasComputeds(componentInstance);
         const computeds = hasComputeds ? componentInstance.stateManager.computed : null;
@@ -366,11 +254,27 @@ export const ListItemBindingMethods = {
 
             const value = this._resolveCompiledBinding(binding, item, ctx);
 
-            // Targeted rebind: skip DOM write for non-matching bindings.
-            // Bypass when binding.path is a registered computed — the computed
-            // body may read the changed prop transitively.
-            if (targetedProp && binding.path !== targetedProp
-                && !(hasComputeds && binding.path && computeds[binding.path])) continue;
+            // Targeted rebind: skip DOM write for bindings not matching the changed
+            // prop. Expressions match the changed ROOT in expressionVars (vars are
+            // roots, not dotted paths); flat path bindings use a call-free exact
+            // match, nested consults the helper. Computed references bypass (the body
+            // may read the changed prop transitively). Mirrors _executeBindings.
+            if (targetedProp) {
+                let m = binding.isExpression
+                    ? (binding.expressionVars && binding.expressionVars.indexOf(targetedPropRoot) !== -1)
+                    : (binding.path === targetedProp
+                        || (targetedProp !== targetedPropRoot && this._pathTouchedByNestedChange(binding.path, targetedProp)));
+                if (!m && hasComputeds) {
+                    if (binding.isExpression && binding.expressionVars) {
+                        for (let v = 0; v < binding.expressionVars.length; v++) {
+                            if (computeds[binding.expressionVars[v]]) { m = true; break; }
+                        }
+                    } else if (binding.path && computeds[binding.path]) {
+                        m = true;
+                    }
+                }
+                if (!m) continue;
+            }
 
             const htmlStr = value == null ? '' : value;
             el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
@@ -382,6 +286,7 @@ export const ListItemBindingMethods = {
      */
     _executeModels(elementsArray, models, item) {
         const targetedProp = this._targetedProp;
+        const targetedPropRoot = this._targetedPropRoot;
         for (let i = 0; i < models.length; i++) {
             const modelBinding = models[i];
             const el = elementsArray[modelBinding.index];
@@ -389,20 +294,20 @@ export const ListItemBindingMethods = {
 
             const value = this._getValueFromItem(item, modelBinding.path);
 
-            // Targeted rebind: skip DOM write for non-matching bindings
-            if (targetedProp && modelBinding.path !== targetedProp) continue;
+            // Targeted rebind: skip DOM write for non-matching bindings. Flat
+            // change uses a call-free exact match; nested consults the helper.
+            // Models have no computed-name bypass.
+            if (targetedProp) {
+                const m = modelBinding.path === targetedProp
+                    || (targetedProp !== targetedPropRoot && this._pathTouchedByNestedChange(modelBinding.path, targetedProp));
+                if (!m) continue;
+            }
 
             if (this._applyCustomElementAdapter(el, value)) {
                 continue;
             }
 
-            if (modelBinding.type === 'checkbox') {
-                el.checked = Boolean(value);
-            } else if (modelBinding.type === 'radio') {
-                el.checked = el.value === String(value);
-            } else {
-                el.value = value == null ? '' : value;
-            }
+            applyModel(el, value, modelBinding.type);
         }
     },
     /**
@@ -411,6 +316,7 @@ export const ListItemBindingMethods = {
      */
     _executeShows(elementsArray, shows, item, ctx) {
         const targetedProp = this._targetedProp;
+        const targetedPropRoot = this._targetedPropRoot;
         // Fast-path: skip computed-name bypass when component declares no computeds
         const componentInstance = ctx?.componentInstance;
         const hasComputeds = this._instanceHasComputeds(componentInstance);
@@ -423,32 +329,32 @@ export const ListItemBindingMethods = {
             // Resolve value using consolidated helper
             const rawValue = this._resolveCompiledBinding(binding, item, ctx);
 
-            // Targeted rebind: skip DOM write for non-matching bindings.
-            // Computed-name bindings are an exception — the computed body may
-            // read the changed prop transitively, so the path-equality filter
-            // would skip them incorrectly. Same pattern as _executeBindings;
-            // omitting it caused per-row data-show on item-level computeds to
-            // freeze visually when component-own state mutated (the popover
+            // Targeted rebind: skip DOM write for non-matching bindings. Flat
+            // change uses a call-free exact match; nested consults the helper.
+            // Expressions match the changed ROOT. The computed bypass matters
+            // here; omitting it once caused per-row data-show on item-level
+            // computeds to freeze when component-own state mutated (the popover
             // open/close case in the PM tracker).
             if (targetedProp) {
-                let matches = binding.isExpression
-                    ? (binding.expressionVars && binding.expressionVars.indexOf(targetedProp) !== -1)
-                    : (binding.path === targetedProp);
-                if (!matches && hasComputeds) {
+                let m = binding.isExpression
+                    ? (binding.expressionVars && binding.expressionVars.indexOf(targetedPropRoot) !== -1)
+                    : (binding.path === targetedProp
+                        || (targetedProp !== targetedPropRoot && this._pathTouchedByNestedChange(binding.path, targetedProp)));
+                if (!m && hasComputeds) {
                     if (binding.isExpression && binding.expressionVars) {
                         for (let v = 0; v < binding.expressionVars.length; v++) {
-                            if (computeds[binding.expressionVars[v]]) { matches = true; break; }
+                            if (computeds[binding.expressionVars[v]]) { m = true; break; }
                         }
                     } else if (binding.path && computeds[binding.path]) {
-                        matches = true;
+                        m = true;
                     }
                 }
-                if (!matches) continue;
+                if (!m) continue;
             }
 
             // Apply negate flag and convert to display style
             const value = binding.negate ? !rawValue : Boolean(rawValue);
-            el.style.display = value ? '' : 'none';
+            applyShow(el, value);
         }
     },
     /**
@@ -491,7 +397,6 @@ export const ListItemBindingMethods = {
         const componentInstance = ctx.componentInstance;
         const itemIndex = ctx.itemIndex;
         const listContext = ctx.listContext;
-        const targetedProp = this._targetedProp;
         // Fast-path: skip computed-name bypass when component has no computeds
         const hasComputeds = this._instanceHasComputeds(componentInstance);
 
@@ -520,10 +425,6 @@ export const ListItemBindingMethods = {
                     } else {
                         value = this._getValueFromItem(item, expression);
                     }
-                    // Targeted rebind: skip DOM write if this prop didn't change.
-                    // Bypass when binding's expression is a registered computed —
-                    // the computed body may read the changed prop transitively.
-                    if (targetedProp && expression !== targetedProp && !isComputedName) continue;
                     this._toggleBoundClass(el, value ? String(value) : '');
                 } else if (classBinding.isComputed) {
                     // Computed property with list item context
@@ -535,28 +436,14 @@ export const ListItemBindingMethods = {
                             itemIndex,
                             listContext
                         );
-                        // Computed deps can't be checked cheaply — always write
+                        // Computed deps can't be checked cheaply; always write
                         this._toggleBoundClass(el, value ? String(value) : '');
                     }
                 } else if (classBinding.compiledFn && classBinding.expressionVars) {
-                    // PERF: Reuse args array — cached on the binding to avoid allocation per call
+                    // PERF: Reuse args array; cached on the binding to avoid allocation per call
                     const vars = classBinding.expressionVars;
                     const args = classBinding._args || (classBinding._args = new Array(vars.length));
                     this._resolveListExprArgs(args, vars, item, componentInstance);
-                    // Targeted rebind: skip DOM write if changed prop not in expression vars.
-                    // Bypass when any var is a registered computed name — the computed
-                    // body may read the changed prop transitively. Skip the var-lookup
-                    // entirely when component has no computeds.
-                    if (targetedProp && vars.indexOf(targetedProp) === -1) {
-                        let refsComputed = false;
-                        if (hasComputeds) {
-                            const computedMap = componentInstance.stateManager.computed;
-                            for (let v = 0; v < vars.length; v++) {
-                                if (computedMap[vars[v]]) { refsComputed = true; break; }
-                            }
-                        }
-                        if (!refsComputed) continue;
-                    }
                     try {
                         const result = classBinding.compiledFn(...args);
                         this._toggleBoundClass(el, this._classResultToString(result));
@@ -600,141 +487,27 @@ export const ListItemBindingMethods = {
         }
     },
     /**
-     * Fallback binding using querySelectorAll (slow path)
+     * Build the per-item resolution scope shared by the fallback / root-element
+     * binding executors. `ctx` is the list context (componentInstance, data, …).
      * @private
      */
-    _bindWithFallback(itemEl, item, listContext, itemIndex, context, skipNestedCheck) {
-        if (__DEV__) console.info(`[WF] Using fallback binding for list: "${listContext?.path}" (no compiled metadata)`);
-
-        // Build combined selector respecting useWfPrefixOnly mode
-        const combinedSelector = [
-            this._attrSelector('bind'),
-            this._attrSelector('bind-html'),
-            this._attrSelector('model'),
-            this._attrSelector('show'),
-            this._attrSelector('action'),
-            this._attrSelector('bind-class'),
-            this._attrSelector('bind-style'),
-            this._attrSelector('bind-attr')
-        ].join(',');
-        const allElementsRaw = itemEl.querySelectorAll(combinedSelector);
-
-        let allElements;
-        if (skipNestedCheck) {
-            allElements = Array.from(allElementsRaw);
-        } else {
-            // Check if itemEl itself is a component - if so, ALL children belong to the component
-            const itemElIsComponent = this._hasAttr(itemEl, 'component');
-            if (itemElIsComponent) {
-                // All children belong to the component, not the list
-                // List only processes root element attributes
-                allElements = [];
-            } else {
-                // Check for nested boundaries (lists or components)
-                const hasNestedLists = itemEl.querySelector(this._attrSelector('list')) !== null;
-                const hasNestedComponents = itemEl.querySelector(this._attrSelector('component')) !== null;
-
-                if (hasNestedLists || hasNestedComponents) {
-                    // Filter out elements inside nested boundaries
-                    allElements = Array.from(allElementsRaw).filter(el => {
-                        // Check if element is inside a nested list
-                        if (hasNestedLists) {
-                            const elList = el.closest(this._attrSelector('list'));
-                            const itemList = itemEl.closest(this._attrSelector('list'));
-                            if (elList !== itemList) return false;
-                        }
-                        // Check if element is inside a nested component
-                        if (hasNestedComponents) {
-                            const elComponent = el.closest(this._attrSelector('component'));
-                            // If element's closest component is not itemEl itself, it's inside a nested component
-                            if (elComponent && elComponent !== itemEl) {
-                                // Smart boundary detection: only skip if component owns the binding property
-                                const bindingProp = el.dataset.bind || el.dataset.bindHtml;
-                                if (bindingProp) {
-                                    // Check if it's a simple property (not an expression)
-                                    const isSimpleProp = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(bindingProp);
-                                    if (isSimpleProp) {
-                                        // Look up component instance to check if it owns this property
-                                        const componentId = elComponent.dataset.componentId;
-                                        if (componentId) {
-                                            const componentInstance = this.componentInstances.get(componentId);
-                                            if (componentInstance && componentInstance.state) {
-                                                // If component has this property, skip (component handles it)
-                                                if (bindingProp in componentInstance.state) {
-                                                    return false;
-                                                }
-                                                // Component doesn't have this property, include for list binding
-                                                return true;
-                                            }
-                                        }
-                                        // No component instance yet, include the binding for list
-                                        return true;
-                                    }
-                                }
-                                // Expression or other binding types - let component handle it
-                                return false;
-                            }
-                        }
-                        return true;
-                    });
-                } else {
-                    allElements = Array.from(allElementsRaw);
-                }
-            }
-        }
-
-        // Process all elements
-        for (let i = 0; i < allElements.length; i++) {
-            const el = allElements[i];
-            const dataset = el.dataset;
-            const tagName = el.tagName;
-            const isInput = tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT';
-
-            if (dataset.bindClass) {
-                this._processOptimizedClassBinding(el, item, dataset.bindClass, itemIndex, context);
-            }
-
-            if (dataset.bindStyle) {
-                this._processStyleBinding(el, item, dataset.bindStyle, itemIndex, context);
-            }
-
-            if (dataset.bindAttr) {
-                this._processAttrBinding(el, item, dataset.bindAttr, itemIndex, context);
-            }
-
-            if (dataset.bind) {
-                this._executeFallbackBind(el, item, dataset.bind, isInput, listContext, itemIndex);
-            }
-
-            if (dataset.bindHtml) {
-                this._executeFallbackBindHtml(el, item, dataset.bindHtml, listContext, itemIndex);
-            }
-
-            if (dataset.model) {
-                this._executeFallbackModel(el, item, dataset.model);
-            }
-
-            if (dataset.show) {
-                this._executeFallbackShow(el, item, dataset.show, listContext, itemIndex);
-            }
-        }
-
-        return allElements;
+    _buildItemScope(ctx, itemIndex) {
+        const componentInstance = ctx?.componentInstance;
+        return {
+            componentState: componentInstance?.state || {},
+            componentInstance,
+            itemIndex,
+            listLength: ctx?.data?.length || 0,
+            listContext: ctx,
+            propsData: componentInstance?._propsData
+        };
     },
     /**
      * Execute single data-bind in fallback mode
      * @private
      */
     _executeFallbackBind(el, item, bindPath, isInput, listContext, itemIndex) {
-        const componentInstance = listContext?.componentInstance;
-        const scope = {
-            componentState: componentInstance?.state || {},
-            componentInstance,
-            itemIndex,
-            listLength: listContext?.data?.length || 0,
-            listContext,
-            propsData: componentInstance?._propsData
-        };
+        const scope = this._buildItemScope(listContext, itemIndex);
 
         const value = this._resolveRawBinding(bindPath, item, scope);
 
@@ -753,15 +526,7 @@ export const ListItemBindingMethods = {
      * @private
      */
     _executeFallbackBindHtml(el, item, htmlPath, listContext, itemIndex) {
-        const componentInstance = listContext?.componentInstance;
-        const scope = {
-            componentState: componentInstance?.state || {},
-            componentInstance,
-            itemIndex,
-            listLength: listContext?.data?.length || 0,
-            listContext,
-            propsData: componentInstance?._propsData
-        };
+        const scope = this._buildItemScope(listContext, itemIndex);
 
         const value = this._resolveRawBinding(htmlPath, item, scope);
         const htmlStr = value == null ? '' : value;
@@ -778,34 +543,18 @@ export const ListItemBindingMethods = {
             return;
         }
 
-        const type = el.type;
-
-        if (type === 'checkbox') {
-            el.checked = Boolean(value);
-        } else if (type === 'radio') {
-            el.checked = el.value === String(value);
-        } else {
-            el.value = value == null ? '' : value;
-        }
+        applyModel(el, value, el.type);
     },
     /**
      * Execute single data-show in fallback mode
      * @private
      */
     _executeFallbackShow(el, item, showPath, listContext, itemIndex) {
-        const componentInstance = listContext?.componentInstance;
-        const scope = {
-            componentState: componentInstance?.state || {},
-            componentInstance,
-            itemIndex,
-            listLength: listContext?.data?.length || 0,
-            listContext,
-            propsData: componentInstance?._propsData
-        };
+        const scope = this._buildItemScope(listContext, itemIndex);
 
         // _resolveRawBinding handles negation and all path types (computed:, $store.path, expressions, etc.)
         const value = this._resolveRawBinding(showPath, item, scope);
-        el.style.display = value ? '' : 'none';
+        applyShow(el, value);
     },
     /**
      * Bind model and show on root element itself
@@ -814,30 +563,16 @@ export const ListItemBindingMethods = {
     _bindRootElementModelShow(itemEl, item, ds, itemIndex, context) {
         if (ds.model) {
             const value = this._getValueFromItem(item, ds.model);
-            const type = itemEl.type;
-
-            if (type === 'checkbox') {
-                itemEl.checked = Boolean(value);
-            } else if (type === 'radio') {
-                itemEl.checked = itemEl.value === String(value);
-            } else if (itemEl.tagName === 'INPUT' || itemEl.tagName === 'TEXTAREA' || itemEl.tagName === 'SELECT') {
-                itemEl.value = value == null ? '' : value;
+            if (itemEl.tagName === 'INPUT' || itemEl.tagName === 'TEXTAREA' || itemEl.tagName === 'SELECT') {
+                applyModel(itemEl, value, itemEl.type);
             }
         }
 
         if (ds.show) {
-            const componentInstance = context?.componentInstance;
-            const scope = {
-                componentState: componentInstance?.state || {},
-                componentInstance,
-                itemIndex,
-                listLength: context?.data?.length || 0,
-                listContext: context,
-                propsData: componentInstance?._propsData
-            };
+            const scope = this._buildItemScope(context, itemIndex);
 
             const value = this._resolveRawBinding(ds.show, item, scope);
-            itemEl.style.display = value ? '' : 'none';
+            applyShow(itemEl, value);
         }
     },
     /**
@@ -849,65 +584,10 @@ export const ListItemBindingMethods = {
      * @private
      */
     _toggleBoundClass(element, newClasses) {
-        // Initialize tracking set if needed
-        if (!element._prevBoundClasses) {
-            element._prevBoundClasses = new Set();
-        }
-
-        // PERF OPTIMIZATION 1.3: Early exit if classes unchanged
-        // Compare new classes with previous to skip DOM operations when unchanged
-        const prevClasses = element._prevBoundClasses;
-        const trimmedNew = newClasses ? newClasses.trim() : '';
-
-        // Fast path: both empty
-        if (!trimmedNew && prevClasses.size === 0) {
-            return;
-        }
-
-        // Parse new classes once (reused for comparison and application)
-        let newClassArray = null;
-        if (trimmedNew) {
-            newClassArray = trimmedNew.split(/\s+/);
-            // Filter out empty strings from split
-            let validCount = 0;
-            for (let i = 0; i < newClassArray.length; i++) {
-                if (newClassArray[i]) validCount++;
-            }
-
-            // Check if same size and all classes match
-            if (validCount === prevClasses.size) {
-                let allMatch = true;
-                for (let i = 0; i < newClassArray.length; i++) {
-                    const cls = newClassArray[i];
-                    if (cls && !prevClasses.has(cls)) {
-                        allMatch = false;
-                        break;
-                    }
-                }
-                if (allMatch) {
-                    return; // Classes unchanged, skip DOM operations
-                }
-            }
-        }
-
-        // Remove all previously bound classes
-        prevClasses.forEach(cls => {
-            if (cls && element.classList.contains(cls)) {
-                element.classList.remove(cls);
-            }
-        });
-        prevClasses.clear();
-
-        // Add the new class(es) if they exist
-        if (newClassArray) {
-            for (let i = 0; i < newClassArray.length; i++) {
-                const cls = newClassArray[i];
-                if (cls) {
-                    element.classList.add(cls);
-                    prevClasses.add(cls);
-                }
-            }
-        }
+        // Canonical diff-tracking lives in the BindingWriters kernel. This path
+        // always receives a string (callers stringify via _classResultToString),
+        // but applyClass also accepts object/array forms used by other callers.
+        applyClass(element, newClasses);
     },
 
     /**
@@ -918,19 +598,20 @@ export const ListItemBindingMethods = {
     _ensureItemContexts(itemEl) {
 
         // Skip if contexts already created or no data available
-        if (!itemEl._needsContexts || !itemEl._bindItemData) {
+        if (!itemEl._needsContexts || !itemEl._itemData) {
             return;
         }
 
-        // Get stored metadata
-        const itemIndex = itemEl._bindItemIndex;
+        // Get stored metadata (_listIndex is the canonical row index, kept current
+        // by onMove; _bindItemIndex was a redundant mirror, now retired).
+        const itemIndex = itemEl._listIndex;
         const allElements = itemEl._bindingElements;
 
         // Get the list context
         const listContext = itemEl._listContext;
         const componentInstance = listContext?.componentInstance;
 
-        if (!this._contextSystemInitialized || !this._contextRegistry || !componentInstance) {
+        if (!this._contextSystemInitialized || !this._contextRecords || !componentInstance) {
             // Can't create contexts without the registry or component instance
             return;
         }
@@ -941,7 +622,7 @@ export const ListItemBindingMethods = {
 
         // Metadata-based context creation for stripped templates.
         // If compiled metadata is available, use it instead of reading
-        // attributes — this enables attribute stripping on the
+        // attributes; this enables attribute stripping on the
         // innerHTML-path templates.
         const compiledMetadata = itemEl._compiledMetadata;
         if (compiledMetadata && allElements) {
@@ -957,7 +638,7 @@ export const ListItemBindingMethods = {
         // This helps with establishing proper hierarchical relationships
         const sortedElements = this._sortElementsForContextCreation(allElements);
 
-        // First pass — create all non-action contexts.
+        // First pass: create all non-action contexts.
         const createdContexts = new Map(); // Track contexts by element
 
         for (let i = 0; i < sortedElements.length; i++) {
@@ -966,74 +647,26 @@ export const ListItemBindingMethods = {
             // Skip action elements for now (handled separately)
             if (this._hasAttr(el, 'action')) continue;
 
-            // --- DATA-BIND CONTEXTS ---
-            if (this._hasAttr(el, 'bind')) {
-                const bindPath = this._getAttr(el, 'bind');
-                if (!bindPath) continue;
+            // Per-row data-bind binding contexts are not created; the per-item
+            // effect (_executeBindings) paints list-item text/value from the row
+            // item proxy; the binding context was created and never read.
 
-                // Create binding context
-                const bindingContext = this._contextRegistry.createBindingContext(
-                    bindPath,
-                    componentInstance,
-                    el,
-                    verifiedListContext, // CRITICAL: Direct parent relationship to list context
-                    itemIndex
-                );
+            // Per-row data-model contexts are not created here; the metadata path
+            // (_ensureItemContextsFromMetadata via _executeModels) handles list-item
+            // models functionally without a context, and write-back routes through
+            // the document-level _handleInputChange off the row item proxy. The
+            // fallback's model-context block was vestigial: never reached (0 hits
+            // across the full suite) and its only consumer (_setupModelEventHandling)
+            // no longer exists in the modular source.
 
-                // Set parent index and store the context
-                if (bindingContext) {
-                    // PERF: _parentIndex already set during createBindingContext() via options.parentIndex
-                    this._contextRegistry.contextsByElement.set(el, bindingContext);
-                    createdContexts.set(el, bindingContext);
-                }
-            }
-
-            // --- DATA-MODEL CONTEXTS ---
-            if (this._hasAttr(el, 'model')) {
-                const modelPath = this._getAttr(el, 'model');
-                if (!modelPath) continue;
-
-                // Create binding context with model flag
-                const modelContext = this._contextRegistry.createBindingContext(
-                    modelPath,
-                    componentInstance,
-                    el,
-                    verifiedListContext, // CRITICAL: Direct parent relationship
-                    itemIndex
-                );
-
-                if (modelContext) {
-                    // PERF: _parentIndex already set during createBindingContext() via options.parentIndex
-                    modelContext._isModelBinding = true;
-                    createdContexts.set(el, modelContext);
-
-                    // Set up event handling for this model
-                    this._setupModelEventHandling(el, modelContext);
-                }
-            }
-
-            // --- DATA-SHOW CONTEXTS ---
-            if (this._hasAttr(el, 'show')) {
-                const showPath = this._getAttr(el, 'show');
-                if (!showPath) continue;
-
-                // Create conditional context
-                const conditionalContext = this._contextRegistry.createConditionalContext(
-                    showPath,
-                    componentInstance,
-                    el,
-                    verifiedListContext, // CRITICAL: Direct parent relationship
-                    itemIndex
-                );
-
-                if (conditionalContext) {
-                    // PERF: _parentIndex already set during createConditionalContext() via options.parentIndex
-                    createdContexts.set(el, conditionalContext);
-                }
-            }
+            // Per-row data-show conditional contexts are not created here. The
+            // per-item effect (_executeShows) paints initial + data-driven
+            // visibility, and the reconcile re-eval sweeps handle position-frame
+            // changes. The fallback show Context was write-only (never read) once
+            // RC:400's _updateConditionals sweep was removed.
         }
 
-        // Second pass — create action contexts after the others.
+        // Second pass: create action contexts after the others.
         // PERF: Filter out undefined/null elements that may exist in sparse arrays
         const actionElements = Array.from(allElements).filter(el =>
             el != null && this._hasAttr(el, 'action')
@@ -1062,13 +695,13 @@ export const ListItemBindingMethods = {
             // data-event-outside on row-template action elements: register
             // the document-level outside-click handler and skip the regular
             // per-event action context. See _ensureItemContextsFromMetadata
-            // for the rationale — same path, different template-compilation
+            // for the rationale; same path, different template-compilation
             // mode (this one runs for templates that don't get the innerHTML
             // fast path).
             if (this._hasAttr(actionEl, 'event-outside')) {
                 const outsideDefs = this._parseActions(actionAttr);
                 const rowCtx = {
-                    item: itemEl._bindItemData,
+                    item: itemEl._itemData,
                     index: itemIndex,
                     listContext: verifiedListContext
                 };
@@ -1092,13 +725,13 @@ export const ListItemBindingMethods = {
                     continue;
                 }
 
-                // Check if element already has an action context - if so, don't overwrite it
-                if (this._contextRegistry.contextsByElement.get(actionEl)?.type === 'action') {
+                // Check if element already has an action record - if so, don't overwrite it
+                if (actionEl._actionContext) {
                     continue;
                 }
 
                 // Create action context
-                const actionContext = this._contextRegistry.createActionContext(
+                const actionContext = this._contextRecords.createActionContext(
                     methodName,
                     componentInstance,
                     actionEl,
@@ -1145,27 +778,9 @@ export const ListItemBindingMethods = {
     _ensureItemContextsFromMetadata(itemEl, allElements, compiledMetadata, verifiedListContext, componentInstance, itemIndex) {
         const createdContexts = new Map();
 
-        // --- Create binding contexts from metadata ---
-        if (compiledMetadata.bindings) {
-            for (const binding of compiledMetadata.bindings) {
-                const el = allElements[binding.index];
-                if (!el) continue;
-
-                const bindingContext = this._contextRegistry.createBindingContext(
-                    binding.path,
-                    componentInstance,
-                    el,
-                    verifiedListContext,
-                    itemIndex
-                );
-
-                if (bindingContext) {
-                    // PERF: _parentIndex already set during createBindingContext() via options.parentIndex
-                    this._contextRegistry.contextsByElement.set(el, bindingContext);
-                    createdContexts.set(el, bindingContext);
-                }
-            }
-        }
+        // Per-row data-bind binding contexts are not created: the per-item effect
+        // (_executeBindings) paints list-item text/value straight from the row
+        // item proxy, so the binding context was created and never read.
 
         // --- Create action contexts from metadata ---
         if (compiledMetadata.actions) {
@@ -1189,13 +804,13 @@ export const ListItemBindingMethods = {
                 // adding a regular event listener. Direct clicks on the
                 // element must NOT fire the handler (popovers stay open when
                 // their own trigger is clicked), so we deliberately skip
-                // action-context creation. The registry in PropsSystem is
-                // idempotent — repeat registrations of the same (element,
-                // methodName) pair collapse onto a single entry.
+                // action-context creation. EventSystem._setupOutsideClickHandler's
+                // registry is idempotent; repeat registrations of the same
+                // (element, methodName) pair collapse onto a single entry.
                 if (action.hasEventOutside) {
                     const outsideDefs = this._parseActions(action.actionName);
                     const rowCtx = {
-                        item: itemEl._bindItemData,
+                        item: itemEl._itemData,
                         index: itemIndex,
                         listContext: verifiedListContext
                     };
@@ -1224,8 +839,8 @@ export const ListItemBindingMethods = {
                     // fire time. Without this, a list-row element with
                     // multiple actions (e.g. `data-action="click:open
                     // mouseenter:hover"`) would only wire up the first one.
-                    const existing = this._contextRegistry.contextsByElement.get(actionEl);
-                    if (existing?.type === 'action') {
+                    const existing = actionEl._actionContext;
+                    if (existing) {
                         if (!existing.data.eventHandlers) {
                             existing.data.eventHandlers = new Map();
                             // Seed the map with the primary handler so
@@ -1244,7 +859,7 @@ export const ListItemBindingMethods = {
                     }
 
                     // PERF: Pass itemIndex to skip .closest() DOM query inside createActionContext
-                    const actionContext = this._contextRegistry.createActionContext(
+                    const actionContext = this._contextRecords.createActionContext(
                         methodName,
                         componentInstance,
                         actionEl,
@@ -1310,17 +925,348 @@ export const ListItemBindingMethods = {
         return depth;
     },
 
+    _updateModelValue(context, newValue)
+    {
+        if (!context || !context.element) {
+            return false;
+        }
+
+        // Defensive fallback: if no value was passed, read from the element.
+        // Callers pass the input value captured at event-dispatch time so a
+        // mid-tick list re-render that swaps context.element doesn't cause a
+        // stale/empty read here.
+        if (newValue === undefined) {
+            newValue = this._getInputValue(context.element);
+        }
+        if (newValue === undefined) return false; // Skip unchecked radio
+
+        // Determine where to update based on context hierarchy
+        if (context.parent && context.parent.type === 'list' && context._parentIndex !== undefined)
+        {
+            // List-item model: write straight through the row's reactive
+            // item-proxy (the SAME proxy the render effect tracks), so the set
+            // propagates through the graph for top-level, computed-source, and
+            // nested lists alike; no immutable copy/replace/writeback or manual
+            // binding refresh required. Converges on the mapArray mutation path.
+            const rowEl = this._findListItemAncestor(context.element);
+            const item = (rowEl && rowEl._itemData) || context._itemData;
+            if (item) {
+                this._applyMapArrayMutation(item, context.path, newValue);
+                return true;
+            }
+            return false;
+        } else if (context.componentInstance)
+        {
+            // Check if this is a store path (e.g., "checkout.firstName")
+            const modelPath = context.path;
+            const firstDot = modelPath.indexOf('.');
+            if (firstDot > 0) {
+                const possibleStoreName = modelPath.slice(0, firstDot);
+                const storeComponent = this.storeManager?.getStoreComponentByName(possibleStoreName);
+                if (storeComponent) {
+                    // Route to store state
+                    const storePath = modelPath.slice(firstDot + 1);
+                    // Use pathResolver for nested paths within store
+                    pathResolver.set(storeComponent.state, storePath, newValue);
+                    return true;
+                }
+            }
+
+            // Regular model - update component state directly
+            // Handle nested paths using pathResolver
+            if (modelPath.includes('.')) {
+                pathResolver.set(context.componentInstance.state, modelPath, newValue);
+            } else {
+                context.componentInstance.state[modelPath] = newValue;
+            }
+            return true;
+        }
+
+        return false;
+    },
     /**
-     * Dispose an item's Effect when the item is removed from the list.
-     * @param {HTMLElement} itemEl - The list item DOM element
+     * Refresh bindings containing external() in a list item when external state changes
+     * This is called when a component that provides external() data has its state updated
+     * @param {HTMLElement} itemEl - The list item element
+     * @param {Object} item - The item data
+     * @param {number} itemIndex - Index of the item in the list
+     * @param {Object} listContext - The list context
      * @private
      */
-    _disposeItemEffect(itemEl) {
-        if (itemEl._wfDisposeEffect) {
-            itemEl._wfDisposeEffect();
-            itemEl._wfDisposeEffect = null;
+    _refreshListItemExternalBindings(itemEl, item, itemIndex, listContext) {
+        if (!itemEl) return;
+
+        // Helper to detect external dependencies: both external() and $store.path shorthand
+        const hasExternalRef = (expr) => expr.includes('external(') || /\$[a-zA-Z]/.test(expr);
+
+        // Check for nested lists and filter them out to prevent cross-contamination
+        const hasNestedLists = itemEl.querySelector('[data-list],[data-wf-list]') !== null;
+
+        // Find all text bindings that might contain external refs (excluding nested list elements)
+        const textBindingsRaw = itemEl.querySelectorAll('[data-bind],[data-wf-bind]');
+        const textBindings = this._filterOutNestedListElements(textBindingsRaw, itemEl, hasNestedLists);
+        textBindings.forEach(el => {
+            const bindPath = this._getAttr(el, 'bind');
+            if (bindPath && hasExternalRef(bindPath)) {
+                const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
+                this._executeFallbackBind(el, item, bindPath, isInput, listContext, itemIndex);
+            }
+        });
+
+        // Also check the item element itself
+        const itemBindPath = this._getAttr(itemEl, 'bind');
+        if (itemBindPath && hasExternalRef(itemBindPath)) {
+            const isInput = itemEl.tagName === 'INPUT' || itemEl.tagName === 'TEXTAREA' || itemEl.tagName === 'SELECT';
+            this._executeFallbackBind(itemEl, item, itemBindPath, isInput, listContext, itemIndex);
         }
-        // Also clean up cached elements
-        itemEl._wfBoundElements = null;
-    }
+
+        // Find all class bindings that might contain external refs (excluding nested list elements)
+        const classBindingsRaw = itemEl.querySelectorAll('[data-bind-class],[data-wf-bind-class]');
+        const classBindings = this._filterOutNestedListElements(classBindingsRaw, itemEl, hasNestedLists);
+        classBindings.forEach(el => {
+            const expr = this._getAttr(el, 'bind-class');
+            if (expr && hasExternalRef(expr)) {
+                this._processOptimizedClassBinding(el, item, expr, itemIndex, listContext);
+            }
+        });
+
+        // Also check the item element itself for class binding
+        const itemClassExpr = this._getAttr(itemEl, 'bind-class');
+        if (itemClassExpr && hasExternalRef(itemClassExpr)) {
+            this._processOptimizedClassBinding(itemEl, item, itemClassExpr, itemIndex, listContext);
+        }
+
+        // Find all style bindings that might contain external refs (excluding nested list elements)
+        const styleBindingsRaw = itemEl.querySelectorAll('[data-bind-style],[data-wf-bind-style]');
+        const styleBindings = this._filterOutNestedListElements(styleBindingsRaw, itemEl, hasNestedLists);
+        styleBindings.forEach(el => {
+            const styleExpr = this._getAttr(el, 'bind-style');
+            if (styleExpr && hasExternalRef(styleExpr)) {
+                this._processStyleBinding(el, item, styleExpr, itemIndex, listContext);
+            }
+        });
+
+        // Also check the item element itself for style binding
+        const itemStyleExpr = this._getAttr(itemEl, 'bind-style');
+        if (itemStyleExpr && hasExternalRef(itemStyleExpr)) {
+            this._processStyleBinding(itemEl, item, itemStyleExpr, itemIndex, listContext);
+        }
+
+        // Find all HTML bindings that might contain external refs (excluding nested list elements)
+        const htmlBindingsRaw = itemEl.querySelectorAll('[data-bind-html],[data-wf-bind-html]');
+        const htmlBindings = this._filterOutNestedListElements(htmlBindingsRaw, itemEl, hasNestedLists);
+        htmlBindings.forEach(el => {
+            const htmlPath = this._getAttr(el, 'bind-html');
+            if (htmlPath && hasExternalRef(htmlPath)) {
+                this._executeFallbackBindHtml(el, item, htmlPath, listContext, itemIndex);
+            }
+        });
+
+        // Also check the item element itself for HTML binding
+        const itemHtmlPath = this._getAttr(itemEl, 'bind-html');
+        if (itemHtmlPath && hasExternalRef(itemHtmlPath)) {
+            this._executeFallbackBindHtml(itemEl, item, itemHtmlPath, listContext, itemIndex);
+        }
+
+        // Find all attr bindings that might contain external refs (excluding nested list elements)
+        const attrBindingsRaw = itemEl.querySelectorAll('[data-bind-attr],[data-wf-bind-attr]');
+        const attrBindings = this._filterOutNestedListElements(attrBindingsRaw, itemEl, hasNestedLists);
+        attrBindings.forEach(el => {
+            const attrExpr = this._getAttr(el, 'bind-attr');
+            if (attrExpr && hasExternalRef(attrExpr)) {
+                this._processAttrBinding(el, item, attrExpr, itemIndex, listContext);
+            }
+        });
+
+        // Also check the item element itself for attr binding
+        const itemAttrExpr = this._getAttr(itemEl, 'bind-attr');
+        if (itemAttrExpr && hasExternalRef(itemAttrExpr)) {
+            this._processAttrBinding(itemEl, item, itemAttrExpr, itemIndex, listContext);
+        }
+    },
+    /**
+     * Refresh list item bindings that use item-level computed properties.
+     * Called when a store that the component depends on changes.
+     * This re-evaluates all computed bindings in list items that have parameterized computeds.
+     *
+     * @param {Element} itemEl - The list item element
+     * @param {Object} item - The item data
+     * @param {number} itemIndex - Index of the item in the list
+     * @param {Object} listContext - The list context
+     * @param {Object} instance - The component instance
+     * @private
+     */
+    _refreshListItemComputedBindings(itemEl, item, itemIndex, listContext, instance) {
+        if (!itemEl || !instance || !item) return;
+
+        // Ensure stateManager and original computed functions exist
+        if (!instance.stateManager || !instance.stateManager._originalComputedFunctions) return;
+
+        // Check for nested lists and filter them out to prevent cross-contamination
+        const hasNestedLists = itemEl.querySelector('[data-list],[data-wf-list]') !== null;
+
+        // Helper to check if a computed is item-level (has parameters)
+        const isItemLevelComputed = (computedName) => {
+            const originalFn = instance?.stateManager?._originalComputedFunctions?.get(computedName);
+            return originalFn && originalFn.length > 0;
+        };
+
+        // Find all text bindings that use computed: prefix (excluding nested list elements)
+        const textBindingsRaw = itemEl.querySelectorAll('[data-bind],[data-wf-bind]');
+        const textBindings = this._filterOutNestedListElements(textBindingsRaw, itemEl, hasNestedLists);
+        textBindings.forEach(el => {
+            const bindPath = this._getAttr(el, 'bind');
+            if (bindPath && bindPath.startsWith('computed:')) {
+                const computedName = bindPath.substring(9); // Remove 'computed:' prefix
+                if (isItemLevelComputed(computedName)) {
+                    // Re-evaluate using _evaluateComputedInListContext
+                    const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, listContext);
+                    el.textContent = value != null ? String(value) : '';
+                }
+            }
+        });
+
+        // Also check the item element itself
+        const itemBindPath = this._getAttr(itemEl, 'bind');
+        if (itemBindPath && itemBindPath.startsWith('computed:')) {
+            const computedName = itemBindPath.substring(9);
+            if (isItemLevelComputed(computedName)) {
+                const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, listContext);
+                itemEl.textContent = value != null ? String(value) : '';
+            }
+        }
+
+        // Find all conditional bindings (data-show) that use computed: prefix
+        const showBindingsRaw = itemEl.querySelectorAll('[data-show],[data-wf-show]');
+        const showBindings = this._filterOutNestedListElements(showBindingsRaw, itemEl, hasNestedLists);
+        showBindings.forEach(el => {
+            const showExpr = this._getAttr(el, 'show');
+            if (showExpr && showExpr.startsWith('computed:')) {
+                const computedName = showExpr.substring(9);
+                if (isItemLevelComputed(computedName)) {
+                    const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, listContext);
+                    applyShow(el, value);
+                }
+            }
+        });
+
+        // Also check the item element itself for data-show
+        const itemShowExpr = this._getAttr(itemEl, 'show');
+        if (itemShowExpr && itemShowExpr.startsWith('computed:')) {
+            const computedName = itemShowExpr.substring(9);
+            if (isItemLevelComputed(computedName)) {
+                const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, listContext);
+                applyShow(itemEl, value);
+            }
+        }
+
+        // Find all class bindings that use computed: prefix
+        const classBindingsRaw = itemEl.querySelectorAll('[data-bind-class],[data-wf-bind-class]');
+        const classBindings = this._filterOutNestedListElements(classBindingsRaw, itemEl, hasNestedLists);
+        classBindings.forEach(el => {
+            const classExpr = this._getAttr(el, 'bind-class');
+            if (classExpr && classExpr.startsWith('computed:')) {
+                const computedName = classExpr.substring(9);
+                if (isItemLevelComputed(computedName)) {
+                    const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, listContext);
+                    // Diff-track via the kernel: preserves static/non-bound classes
+                    // (el.className = value previously wiped them) and removes object
+                    // keys that drop out (classList.toggle previously left them).
+                    applyClass(el, value);
+                }
+            }
+        });
+
+        // Also check the item element itself for class binding
+        const itemClassExpr = this._getAttr(itemEl, 'bind-class');
+        if (itemClassExpr && itemClassExpr.startsWith('computed:')) {
+            const computedName = itemClassExpr.substring(9);
+            if (isItemLevelComputed(computedName)) {
+                const value = this._evaluateComputedInListContext(instance, computedName, item, itemIndex, listContext);
+                applyClass(itemEl, value);
+            }
+        }
+    },
+    /**
+     * Refresh standalone (non-list) elements that have external() in their bindings.
+     * Called when external store state changes to update dependent component elements.
+     * @param {Object} instance - The component instance
+     * @private
+     */
+    _refreshStandaloneExternalBindings(instance) {
+        if (!instance || !instance.element) return;
+
+        // GATE: Effect system handles all bindings including external store refs
+        if (instance._renderEffect) return;
+
+        const el = instance.element;
+
+        // Helper to detect external dependencies: both external() and $store.path shorthand
+        const hasExternalRef = (expr) => expr.includes('external(') || /\$[a-zA-Z]/.test(expr);
+
+        // Helper to check if an element is inside a list
+        const isInsideList = (element) => {
+            let parent = element.parentElement;
+            while (parent && parent !== el) {
+                if (this._getAttr(parent, 'list')) {
+                    return true;
+                }
+                parent = parent.parentElement;
+            }
+            return false;
+        };
+
+        // Find all attr bindings with external refs that are NOT inside lists
+        const attrBindings = el.querySelectorAll('[data-bind-attr],[data-wf-bind-attr]');
+        attrBindings.forEach(bindEl => {
+            const attrExpr = this._getAttr(bindEl, 'bind-attr');
+            if (attrExpr && hasExternalRef(attrExpr) && !isInsideList(bindEl)) {
+                // Standalone element - pass null for list-specific context
+                this._processAttrBinding(bindEl, instance.state, attrExpr, 0, null);
+            }
+        });
+
+        // Also check the component root element itself
+        const rootAttrExpr = this._getAttr(el, 'bind-attr');
+        if (rootAttrExpr && hasExternalRef(rootAttrExpr)) {
+            this._processAttrBinding(el, instance.state, rootAttrExpr, 0, null);
+        }
+
+        // Handle other binding types that might have external refs - text bindings
+        const textBindings = el.querySelectorAll('[data-bind],[data-wf-bind]');
+        textBindings.forEach(bindEl => {
+            const bindPath = this._getAttr(bindEl, 'bind');
+            if (bindPath && hasExternalRef(bindPath) && !isInsideList(bindEl)) {
+                const isInput = bindEl.tagName === 'INPUT' || bindEl.tagName === 'TEXTAREA' || bindEl.tagName === 'SELECT';
+                this._executeFallbackBind(bindEl, instance.state, bindPath, isInput, null, 0);
+            }
+        });
+
+        // Class bindings
+        const classBindings = el.querySelectorAll('[data-bind-class],[data-wf-bind-class]');
+        classBindings.forEach(bindEl => {
+            const expr = this._getAttr(bindEl, 'bind-class');
+            if (expr && hasExternalRef(expr) && !isInsideList(bindEl)) {
+                this._processOptimizedClassBinding(bindEl, instance.state, expr, 0, null);
+            }
+        });
+
+        // Style bindings
+        const styleBindings = el.querySelectorAll('[data-bind-style],[data-wf-bind-style]');
+        styleBindings.forEach(bindEl => {
+            const styleExpr = this._getAttr(bindEl, 'bind-style');
+            if (styleExpr && hasExternalRef(styleExpr) && !isInsideList(bindEl)) {
+                this._processStyleBinding(bindEl, instance.state, styleExpr, 0, null);
+            }
+        });
+
+        // HTML bindings
+        const htmlBindings = el.querySelectorAll('[data-bind-html],[data-wf-bind-html]');
+        htmlBindings.forEach(bindEl => {
+            const htmlPath = this._getAttr(bindEl, 'bind-html');
+            if (htmlPath && hasExternalRef(htmlPath) && !isInsideList(bindEl)) {
+                this._executeFallbackBindHtml(bindEl, instance.state, htmlPath, null, 0);
+            }
+        });
+    },
 };

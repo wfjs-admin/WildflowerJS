@@ -7,6 +7,8 @@
  * @module Bootstrap
  */
 
+import { startTimelineRecording, stopTimelineRecording, getTimelineSnapshot } from '../state/TimelineRecorder.js';
+
 // Read configuration from script tag before creating instance
 // Usage: <script src="wildflower.js" data-debug="true" data-error-handling="throw"></script>
 let _scriptConfig = {};
@@ -38,6 +40,17 @@ if (typeof document !== 'undefined' && document.currentScript) {
     if (script.hasAttribute('data-wf-prefix')) {
         _scriptConfig.useWfPrefixOnly = script.getAttribute('data-wf-prefix') === 'true';
     }
+
+    // CSP-safe mode: data-csp-safe (bare attribute or ="true").
+    // Sets forceCSPMode BEFORE construction, so the framework never runs its
+    // `new Function` capability probe — a strict-CSP page loads with zero
+    // securitypolicyviolation events / CSP reports. Without the attribute the
+    // probe still auto-detects and falls back, at the cost of one benign
+    // violation report at startup.
+    if (script.hasAttribute('data-csp-safe')) {
+        const cspVal = script.getAttribute('data-csp-safe');
+        _scriptConfig.forceCSPMode = cspVal === 'true' || cspVal === '';
+    }
 }
 
 /**
@@ -47,10 +60,17 @@ if (typeof document !== 'undefined' && document.currentScript) {
  */
 function _createDevToolsHook(wf) {
     const L = new Map();
+    // Keep refs to the document listeners so _dispose() can remove them; the
+    // hook holds `framework: wf`, so an unremoved listener pins the whole
+    // framework instance across mount/unmount cycles (multi-instance/test paths).
+    wf._devToolsListeners = wf._devToolsListeners || [];
     ['componentInit','componentDestroy','store-ready','routeChange'].forEach(n => {
-        document.addEventListener('wildflower:' + n, e => {
+        const evt = 'wildflower:' + n;
+        const fn = e => {
             const s = L.get(n); if (s) s.forEach(f => { try { f(e.detail); } catch {} });
-        });
+        };
+        document.addEventListener(evt, fn);
+        wf._devToolsListeners.push({ event: evt, handler: fn });
     });
     // Shared: serialize stateManager._state to plain object
     const ss = sm => {
@@ -58,8 +78,13 @@ function _createDevToolsHook(wf) {
         try { for (const k of Object.keys(sm._state)) if (!k.startsWith('_')) try { o[k] = sm._state[k]; } catch { o[k] = '(error)'; } } catch {}
         return o;
     };
-    return {
-        version: '1.0.0', framework: wf,
+    const hook = {
+        // version: framework version reported to DevTools (v1.2 dev line).
+        // schemaVersion: the hook *contract* version; the extension feature-
+        // detects capabilities off this, NOT the framework version. Start at 1.
+        // dev: true on development builds; false on minified production builds
+        // (the extension uses it to show which introspection is available).
+        version: '1.2.0', schemaVersion: 1, dev: __DEV__, framework: wf,
         getComponents() {
             const r = [];
             wf.componentInstances.forEach((i, id) => {
@@ -99,6 +124,38 @@ function _createDevToolsHook(wf) {
         on(e, f) { if (!L.has(e)) L.set(e, new Set()); L.get(e).add(f); },
         off(e, f) { const s = L.get(e); if (s) s.delete(f); }
     };
+    if (__DEV__) {
+        // Introspection surface: dev builds only, stripped wholesale from
+        // production (the schemaVersion/version/dev fields above stay so the
+        // extension can detect a prod build and report limited introspection).
+        // All getters are pollable (request/response via inspectedWindow.eval),
+        // each entry self-describing (ownerKind/ownerId/ownerName) so the panel
+        // can group client-side from a single poll.
+
+        // Per-frame microtask/rAF timeline (coarse). Off by default;
+        // start/stop toggles the hot-path recorder, getTimelineSnapshot polls
+        // while recording. See TimelineRecorder.
+        hook.startTimelineRecording = function (opts) { startTimelineRecording(opts || {}); return true; };
+        hook.stopTimelineRecording = function () { return stopTimelineRecording(); };
+        hook.getTimelineSnapshot = function () { return getTimelineSnapshot(); };
+
+        // Registered component + store definitions (for an anti-pattern validator).
+        hook.getDefinitions = function () {
+            const components = [];
+            if (wf.componentDefinitions) wf.componentDefinitions.forEach((d, name) => {
+                const methods = []; try { for (const k of Object.keys(d)) if (typeof d[k] === 'function') methods.push(k); } catch {}
+                components.push({ name, hasState: !!d.state, stateKeys: (d.state && typeof d.state !== 'function') ? Object.keys(d.state) : [], computed: d.computed ? Object.keys(d.computed) : [], methods, stores: Array.isArray(d.stores) ? d.stores.slice() : [], props: d.props ? Object.keys(d.props) : [], hasTemplate: !!d.template, hasPools: !!d.pools });
+            });
+            const stores = [], sm = wf.storeManager?._namedStores;
+            if (sm) sm.forEach((st, n) => {
+                const methods = []; try { for (const k of Object.keys(st)) if (typeof st[k] === 'function' && !k.startsWith('_')) methods.push(k); } catch {}
+                const computed = []; try { const cn = st.stateManager?.getComputedPropertyNames?.(); if (cn) for (const k of cn) computed.push(k); } catch {}
+                stores.push({ name: n, methods, computed });
+            });
+            return { components, stores };
+        };
+    }
+    return hook;
 }
 
 // Create a global instance for easy access
@@ -116,7 +173,7 @@ export function createInstance(WildflowerClass) {
         window.WildflowerJS = WildflowerClass;
         window.wildflower = instance;
 
-        // DevTools global hook — enables browser extensions to introspect the framework
+        // DevTools global hook: enables browser extensions to introspect the framework
         window.__WF_DEVTOOLS_GLOBAL_HOOK__ = _createDevToolsHook(instance);
     }
 

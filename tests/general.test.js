@@ -82,14 +82,12 @@ describe('GENERAL - Context System', () => {
 
     const component = testContainer.querySelector('[data-component="context-list-test"]')
     const instance = wildflower.componentInstances.get(component.dataset.componentId)
-    const contextRegistry = wildflower._contextRegistry
 
-    // Verify list context was created
-    const listContexts = contextRegistry.getContextsByType('list')
-      .filter(ctx => ctx.componentInstance === instance)
-
-    expect(listContexts.length).toBe(1)
-    expect(listContexts[0].path).toBe('contextListItems')
+    // List contexts are plain objects on the instance map, not registry-tracked
+    const listContext = instance._listContexts.get('contextListItems')
+    expect(listContext).toBeDefined()
+    expect(listContext.type).toBe('list')
+    expect(listContext.path).toBe('contextListItems')
   })
 
   it.skipIf(isMinifiedBuild())('context registry creates binding contexts for data-bind elements', async () => {
@@ -115,14 +113,10 @@ describe('GENERAL - Context System', () => {
     await waitForUpdate()
 
     const component = testContainer.querySelector('[data-component="context-binding-test"]')
-    const contextRegistry = wildflower._contextRegistry
 
-    // Verify binding context was created for the name element
+    // List-item data-bind is painted by the per-item effect from the row item
+    // proxy (no per-binding context is created); verify the rendered value.
     const nameBinding = component.querySelector('.name')
-    const bindingContext = contextRegistry.getContextForElement(nameBinding)
-
-    expect(bindingContext).toBeDefined()
-    expect(bindingContext.type).toBe('binding')
     expect(nameBinding.textContent).toBe('Binding 1')
   })
 
@@ -284,13 +278,11 @@ describe('GENERAL - Context System', () => {
     const component = testContainer.querySelector('[data-component="auto-context-creation-test"]')
     const componentId = component.dataset.componentId
     const componentInstance = wildflower.componentInstances.get(componentId)
-    const contextRegistry = wildflower._contextRegistry
 
-    // Verify list context was created
-    const listContexts = contextRegistry.getContextsByType('list')
-      .filter(ctx => ctx.componentInstance === componentInstance)
-    expect(listContexts.length).toBe(1)
-    expect(listContexts[0].path).toBe('autoCreateItems')
+    // Verify list context was created (plain object on the instance map)
+    const listContext = componentInstance._listContexts.get('autoCreateItems')
+    expect(listContext).toBeDefined()
+    expect(listContext.path).toBe('autoCreateItems')
 
     // Verify binding works - list items rendered
     const listItems = component.querySelectorAll('li')
@@ -329,11 +321,9 @@ describe('GENERAL - Context System', () => {
     const component = testContainer.querySelector('[data-component="efficient-update-test"]')
     const componentId = component.dataset.componentId
     const componentInstance = wildflower.componentInstances.get(componentId)
-    const contextRegistry = wildflower._contextRegistry
 
-    // Get the list context
-    const listContext = contextRegistry.getContextsByType('list')
-      .find(ctx => ctx.path === 'efficientItems' && ctx.componentInstance === componentInstance)
+    // Get the list context (plain object on the instance map)
+    const listContext = componentInstance._listContexts.get('efficientItems')
 
     expect(listContext).toBeDefined()
 

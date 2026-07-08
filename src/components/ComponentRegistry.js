@@ -4,6 +4,8 @@
  * @module
  */
 
+import { wfError, WF_ERRORS, definitionSignature } from '../core/wfUtils.js';
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
@@ -110,8 +112,21 @@ export const ComponentRegistryMethods = {
         // Check if this component is already registered
         if (this.componentDefinitions.has(name))
         {
-            this._log('warn', `Component "${name}" is already registered. Skipping duplicate registration.`);
-            
+            // WF-215 (dev): a re-registration under an existing name whose
+            // definition DIFFERS from the stored one is almost always an
+            // accidental collision (two demos, HMR without teardown, etc.).
+            // The original is kept; warn so the conflict is diagnosable.
+            // Unregister first (wildflower.unregister) to replace intentionally.
+            if (__DEV__ && definitionSignature(this.componentDefinitions.get(name)) !== definitionSignature(definition)) {
+                wfError(WF_ERRORS.DUPLICATE_REGISTRATION_CONFLICT, {
+                    warn: true,
+                    context: `component "${name}"`,
+                    suggestion: `Call wildflower.unregister('${name}') before re-registering, or use a distinct name`
+                });
+            } else {
+                this._log('warn', `Component "${name}" is already registered. Skipping duplicate registration.`);
+            }
+
             // Skip re-initialization for duplicate registrations to prevent cascades
             // Components should already be initialized from the first registration
             return this;
@@ -125,15 +140,77 @@ export const ComponentRegistryMethods = {
         if (this._hasInitialized)
         {
             this._initializeComponentElements(name);
-
-            //Rebuild hierarchy after new components are initialized
-            if (this._contextSystemInitialized)
-            {
-                this._buildComponentContextHierarchy();
-            }
         }
 
 
         return this;
+    },
+
+    /**
+     * Unregister a component definition and destroy its live instances.
+     *
+     * Removes the definition so the name can be re-registered with a fresh
+     * definition, and tears down every mounted instance of that type (disposing
+     * their reactive state, effects, contexts, and event handlers via
+     * destroyComponent). Virtual store components are not touched here; see
+     * unregister() for the unified entry point that also handles stores.
+     *
+     * @param {string} name - Registered component name
+     * @returns {boolean} True if a definition existed and was removed
+     */
+    unregisterComponent(name)
+    {
+        if (!name || !this.componentDefinitions.has(name)) return false;
+        const ids = [];
+        this.componentInstances.forEach((inst, id) => {
+            if (inst && inst.name === name && !inst.isVirtual) ids.push(id);
+        });
+        ids.forEach(id => this.destroyComponent(id));
+        this.componentDefinitions.delete(name);
+        return true;
+    },
+
+    // COMPONENT LOOKUP HELPERS
+
+    /**
+     * Get a component instance by its type name
+     * @param {string} name - Component type name (e.g., 'theme-manager')
+     * @returns {Object|null} - Component's ContextProxy or null if not found
+     *
+     * Returns the ContextProxy so callers can use `getComponent('x').prop`
+     * without needing `.state.` or `.computed.`, consistent with how
+     * `this.prop` works inside component methods.
+     *
+     * AUTOMATIC DEPENDENCY TRACKING: When called inside a computed property,
+     * the calling component is automatically registered as dependent on the
+     * returned component. Changes to the returned component's state will
+     * trigger re-evaluation of the calling component's computed properties.
+     */
+    getComponent(name) {
+        for (const [_id, instance] of this.componentInstances) {
+            if (instance.name === name) {
+                // AUTOMATIC DEPENDENCY TRACKING: If we're inside a computed property evaluation,
+                // use the shared tracking proxy to automatically register dependencies
+                if (this._computedTrackingContext && instance.id) {
+                    return this._createEntityTrackingProxy(instance.context, instance.id, name, 'component');
+                }
+                return instance.context;
+            }
+        }
+        return null;
+    },
+    /**
+     * Get all component instances of a given type
+     * @param {string} name - Component type name
+     * @returns {Array} - Array of matching component ContextProxies
+     */
+    getComponents(name) {
+        const results = [];
+        for (const [_id, instance] of this.componentInstances) {
+            if (instance.name === name) {
+                results.push(instance.context);
+            }
+        }
+        return results;
     }
 };

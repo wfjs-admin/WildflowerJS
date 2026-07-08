@@ -30,9 +30,9 @@ async function waitForComponent(selector, timeout = 2000) {
   throw new Error(`Component ${selector} failed to initialize within ${timeout}ms`)
 }
 
-const describeIfPlugins = hasFeature('plugins') ? describe : describe.skip
+const describeIfDirectives = hasFeature('directives') ? describe : describe.skip
 
-describeIfPlugins('Custom Directives', () => {
+describeIfDirectives('Custom Directives', () => {
   let testContainer
   let wildflower
 

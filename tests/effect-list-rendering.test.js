@@ -339,10 +339,12 @@ describe('Effect-Based List Rendering - Phase 2', () => {
       expect(items[0].querySelector('.name').textContent).toBe('Item 1')
       expect(items[1].querySelector('.name').textContent).toBe('Item 2')
 
-      // Verify ItemEffects are attached (mapArray creates dispose functions)
-      expect(items[0]._wfDisposeEffect).toBeDefined()
-      expect(typeof items[0]._wfDisposeEffect).toBe('function')
-      expect(items[1]._wfDisposeEffect).toBeDefined()
+      // Post-P4-S5a: a fully sink-covered template (pure flat text) creates
+      // NO per-item effects — rows dispatch through the per-list sink
+      // dispatcher instead (_wfDisposeEffect is explicitly null).
+      expect(items[0]._wfDisposeEffect).toBeNull()
+      expect(items[1]._wfDisposeEffect).toBeNull()
+      expect(listEl._wfListSinkDispatcher).toBeTruthy()
 
       // Verify list is initialized with mapArray
       expect(listEl._mapArrayInitialized).toBe(true)
@@ -468,9 +470,10 @@ describe('Effect-Based List Rendering - Phase 2', () => {
       expect(items.length).toBe(2)
       expect(items[1].querySelector('.name').textContent).toBe('Item 2')
 
-      // Verify the new item has an ItemEffect
-      expect(items[1]._wfDisposeEffect).toBeDefined()
-      expect(typeof items[1]._wfDisposeEffect).toBe('function')
+      // Post-P4-S5a: covered templates create no per-item effect for the
+      // appended row either — it registers on the per-list sink dispatcher
+      // (the reactive-update assertion below proves the wiring works).
+      expect(items[1]._wfDisposeEffect).toBeNull()
 
       // Verify the new item's Effect works reactively
       component.state.items[1].name = 'Updated Item 2'
