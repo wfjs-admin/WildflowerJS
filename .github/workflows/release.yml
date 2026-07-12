@@ -1,0 +1,84 @@
+name: Release
+
+# Tag-triggered npm publish via OIDC trusted publishing.
+# No npm token exists anywhere in this pipeline: npmjs.com is configured to
+# trust this exact workflow file (wfjs-admin/WildflowerJS, release.yml), and
+# npm generates signed SLSA provenance automatically on publish.
+#
+# Release flow: bump package.json version + CHANGELOG, push to main, then
+# push the matching tag (e.g. v1.3.0). A prerelease tag (e.g. v1.3.0-rc.0)
+# publishes under the "next" dist-tag instead of "latest".
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write   # required: lets the workflow mint the OIDC token npm exchanges for publish rights
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Assert npm supports trusted publishing (>= 11.5.1)
+        run: |
+          required="11.5.1"
+          actual="$(npm --version)"
+          if [ "$(printf '%s\n%s\n' "$required" "$actual" | sort -V | head -1)" != "$required" ]; then
+            echo "npm $actual < $required — trusted publishing unsupported; bump node-version or add a pinned npm upgrade step"
+            exit 1
+          fi
+          echo "npm $actual OK"
+
+      - name: Assert tag matches package.json version
+        run: |
+          pkg="v$(node -p "require('./package.json').version")"
+          if [ "$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $pkg — bump package.json (and CHANGELOG) before tagging"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Build (vendored rollup + terser, SHA-512 pinned)
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Publish to npm (OIDC, provenance generated automatically)
+        run: |
+          if [ "${GITHUB_REF_NAME#*-}" != "$GITHUB_REF_NAME" ]; then
+            echo "Prerelease tag — publishing under dist-tag 'next'"
+            npm publish --tag next
+          else
+            npm publish
+          fi
+
+      - name: Verify published attestation
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sleep 15
+          curl -sf "https://registry.npmjs.org/-/npm/v1/attestations/wildflowerjs@${version}" \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d).attestations.map(x=>x.predicateType);console.log('attestations:',a.join(', '));process.exit(a.length?0:1)})"
