@@ -8,7 +8,17 @@
  * @module
  */
 
-import { WF_ERRORS, wfError, __wf_txt } from '../core/wfUtils.js';
+import { WF_ERRORS, wfError, __wf_txt, validateEntityDefinition, HAS_MOVE_BEFORE } from '../core/wfUtils.js';
+import { reactive as rgReactive, isTracking as rgIsTracking } from '../state/reactive-graph/core.js';
+
+// Non-function keys the pool entity block actually consumes
+// (validateEntityDefinition allowlist — everything else that isn't a function
+// is silently skipped by the method collector below).
+const POOL_ENTITY_CONTRACT_KEYS = ['state', 'computed'];
+
+// Dev-only once-per-(component:pool) guard for the container diagnostics
+// (WF-408 undeclared name / WF-409 never populated).
+const _warnedPoolContainers = new Set();
 
 // Static blocklist for pool attr binding security (O(1) lookup, no allocation per flush)
 const _POOL_BLOCKED_ATTRS = new Set([
@@ -304,11 +314,20 @@ class PoolHandle {
      * @returns {Object} The same object (for chaining)
      */
     add(objOrArray) {
-        // Bulk add: array of objects → DocumentFragment for single DOM operation
-        if (Array.isArray(objOrArray)) {
-            return this._addBulk(objOrArray);
+        if (typeof __DEV__ !== 'undefined' && __DEV__) {
+            this._devAssertItemsConsistency();
+            this._everAdded = true; // suppresses the never-populated settle note
         }
-        return this._addSingle(objOrArray);
+        // Bulk add: array of objects → DocumentFragment for single DOM operation
+        try {
+            if (Array.isArray(objOrArray)) {
+                return this._addBulk(objOrArray);
+            }
+            return this._addSingle(objOrArray);
+        } finally {
+            if (typeof __DEV__ !== 'undefined' && __DEV__) this._devCheckComputedBudget();
+            this._syncAggregate(); // one pulse per call, batch or single
+        }
     }
 
     /**
@@ -318,11 +337,11 @@ class PoolHandle {
     _addSingle(obj) {
         const key = obj[this._keyProp];
         if (key === undefined) {
-            if (__DEV__) console.warn(`[WF Pool "${this.name}"] Entity missing key property "${this._keyProp}"`);
+            if (__DEV__) wfError(WF_ERRORS.POOL_ENTITY_KEY, { warn: true, context: `Pool "${this.name}": entity missing key property "${this._keyProp}"` });
             return obj;
         }
         if (this._entities.has(key)) {
-            if (__DEV__) console.warn(`[WF Pool "${this.name}"] Duplicate key "${key}", ignoring`);
+            if (__DEV__) wfError(WF_ERRORS.POOL_ENTITY_KEY, { warn: true, context: `Pool "${this.name}": duplicate key "${key}", ignoring` });
             return obj;
         }
 
@@ -331,6 +350,7 @@ class PoolHandle {
         this._applyEntityStateTemplate(obj);
         this._installEntityComputed(obj);
         this._installEntityMethods(obj);
+        if (typeof __DEV__ !== 'undefined' && __DEV__) this._devCheckEntityShape(obj);
         this.items.push(obj);
 
         let el, elementsArray;
@@ -409,17 +429,18 @@ class PoolHandle {
             const key = obj[keyProp];
 
             if (key === undefined) {
-                if (__DEV__) console.warn(`[WF Pool "${this.name}"] Entity missing key property "${keyProp}"`);
+                if (__DEV__) wfError(WF_ERRORS.POOL_ENTITY_KEY, { warn: true, context: `Pool "${this.name}": entity missing key property "${keyProp}"` });
                 continue;
             }
             if (this._entities.has(key)) {
-                if (__DEV__) console.warn(`[WF Pool "${this.name}"] Duplicate key "${key}", ignoring`);
+                if (__DEV__) wfError(WF_ERRORS.POOL_ENTITY_KEY, { warn: true, context: `Pool "${this.name}": duplicate key "${key}", ignoring` });
                 continue;
             }
 
             this._applyEntityStateTemplate(obj);
             this._installEntityComputed(obj);
             this._installEntityMethods(obj);
+            if (typeof __DEV__ !== 'undefined' && __DEV__) this._devCheckEntityShape(obj);
             this.items.push(obj);
 
             let el, elementsArray;
@@ -480,6 +501,7 @@ class PoolHandle {
      * @returns {boolean} True if the entity was found and removed
      */
     remove(key) {
+        if (typeof __DEV__ !== 'undefined' && __DEV__) this._devAssertItemsConsistency();
         const entry = this._entities.get(key);
         if (!entry) return false;
 
@@ -534,6 +556,7 @@ class PoolHandle {
             this._framework._checkPoolLoopNeeded();
         }
 
+        this._syncAggregate();
         if (this.onChange) this.onChange(this);
 
         return true;
@@ -574,6 +597,7 @@ class PoolHandle {
         this._entitiesArray.length = 0;
         this._dynamicArray.length = 0;
         this._staticArray.length = 0;
+        this._syncAggregate();
         if (this.onChange) this.onChange(this);
         this._framework._checkPoolLoopNeeded();
     }
@@ -617,12 +641,21 @@ class PoolHandle {
         const el2 = entry2.el;
         const parent = el1.parentNode;
         const next1 = el1.nextSibling;
+        // Atomic state-preserving moves (focus/media/iframe/animation survive)
+        // when available. el1 is a child of parent by construction; el2 needs
+        // the same-parent check (same shadow-including root ⇒ cannot throw).
+        // Mismatched parents fall back to insertBefore with today's semantics.
+        const mv = HAS_MOVE_BEFORE && el2.parentNode === parent;
         if (next1 === el2) {
             // Adjacent siblings (el1 immediately precedes el2): both
             // insertBefore calls in the general path become no-ops
             // (el1 is already before el2; next1 === el2 means we'd
             // insert el2 before itself). Single move handles this.
-            parent.insertBefore(el2, el1);
+            if (mv) parent.moveBefore(el2, el1);
+            else parent.insertBefore(el2, el1);
+        } else if (mv) {
+            parent.moveBefore(el1, el2);
+            parent.moveBefore(el2, next1);
         } else {
             parent.insertBefore(el1, el2);
             parent.insertBefore(el2, next1);
@@ -713,42 +746,42 @@ class PoolHandle {
     }
 
     /**
-     * Current entity count.
+     * Current entity count. REACTIVE on demand (B2, DX diagnostics sweep):
+     * a computed/effect reading this materializes a lazy one-field reactive
+     * box that structural mutations (add/remove/clear) keep in sync — the
+     * box's set trap gives value-dedup and observer wake for free, and pools
+     * that are never read reactively never allocate it. The per-frame entity
+     * FIELD path is untouched: fields stay non-reactive by design.
      * @returns {number}
      */
     get size() {
-        if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._aggregateReadWarned) {
-            const tc = this._framework && this._framework._computedTrackingContext;
-            if (tc) {
-                this._aggregateReadWarned = true;
-                wfError(WF_ERRORS.POOL_AGGREGATE_NONREACTIVE, {
-                    context: `computed "${tc.computedName || '?'}" on "${tc.componentId || '?'}"`,
-                    suggestion: 'Pool aggregates bypass reactivity. Mirror the count into state inside a tick: if (this.count !== pool.size) this.count = pool.size; then bind that state.',
-                    warn: true
-                });
-            }
-        }
-        return this._entities.size;
+        return this._aggregateRead();
     }
 
     /**
      * Array-like alias for `size`. Enables pool.length to read naturally
-     * alongside JavaScript array idioms (length, push, pop, filter, etc.).
+     * alongside JavaScript array idioms (length, push, filter, etc.).
      * @returns {number}
      */
     get length() {
-        if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._aggregateReadWarned) {
-            const tc = this._framework && this._framework._computedTrackingContext;
-            if (tc) {
-                this._aggregateReadWarned = true;
-                wfError(WF_ERRORS.POOL_AGGREGATE_NONREACTIVE, {
-                    context: `computed "${tc.computedName || '?'}" on "${tc.componentId || '?'}"`,
-                    suggestion: 'Pool aggregates bypass reactivity. Mirror the count into state inside a tick: if (this.count !== pool.length) this.count = pool.length; then bind that state.',
-                    warn: true
-                });
-            }
+        return this._aggregateRead();
+    }
+
+    // Shared aggregate read: reactive when a box exists or tracking is
+    // active; a plain Map.size read otherwise (zero machinery).
+    _aggregateRead() {
+        if (this._lenBox) return this._lenBox.n;
+        if (rgIsTracking()) {
+            this._lenBox = rgReactive({ n: this._entities.size });
+            return this._lenBox.n;
         }
         return this._entities.size;
+    }
+
+    // Called by every structural mutator; a no-op until a reactive reader
+    // materialized the box. The reactive set trap dedups unchanged values.
+    _syncAggregate() {
+        if (this._lenBox) this._lenBox.n = this._entities.size;
     }
 
     // ========================================================================
@@ -768,11 +801,6 @@ class PoolHandle {
         return this._entities.size;
     }
 
-    /**
-     * Remove and return the last entity in the pool.
-     * Uses swap-with-last semantics from the underlying items array.
-     * @returns {Object|undefined} The removed entity, or undefined if empty.
-     */
     // ---- Array readers -- pure delegates to the underlying items array ----
     //
     // Index-dependent methods (splice, pop, indexOf, slice) are intentionally
@@ -781,6 +809,9 @@ class PoolHandle {
     // "remove at index i" operation silently refers to a different entity
     // than the caller likely intended. Use remove(key) to delete, and at(i)
     // when you need positional access in DOM order (stable).
+    // A7 (DX diagnostics sweep): in dev builds the omitted methods exist as
+    // throwing stubs that explain the WHY — production keeps them absent
+    // (same TypeError as before, lean tiers unchanged).
 
     find(fn)    { return this.items.find(fn); }
     filter(fn)  { return this.items.filter(fn); }
@@ -1283,6 +1314,67 @@ class PoolHandle {
     }
 }
 
+// A7 (DX diagnostics sweep, dev builds only — the whole block is dead-code-
+// eliminated in production, keeping the lean tiers byte-identical):
+// (a) the deliberately-omitted index-dependent array methods exist as throwing
+//     stubs that explain WHY (production keeps the plain TypeError);
+// (b) a one-comparison consistency assert catches direct pool.items mutation
+//     (splice/push on the raw array desyncs the itemsIdx back-pointers and the
+//     wrong entity gets removed or rendered LATER, far from the mutation).
+if (typeof __DEV__ !== 'undefined' && __DEV__) {
+    for (const m of ['splice', 'pop', 'indexOf', 'slice']) {
+        PoolHandle.prototype[m] = function () {
+            throw new Error(`[WF WF-414] pool.${m}() is not supported: pools use swap-with-last storage, so positions reshuffle on every removal and index-based operations would hit a different entity than intended. Use remove(key) to delete, at(i) for stable DOM-order access, and add/remove for all mutations.`);
+        };
+    }
+    PoolHandle.prototype._devAssertItemsConsistency = function () {
+        if (this.items.length !== this._entities.size && !this._itemsMismatchWarned) {
+            this._itemsMismatchWarned = true;
+            wfError(WF_ERRORS.POOL_ARRAY_MISUSE, {
+                warn: true,
+                context: `pool: items array length (${this.items.length}) no longer matches the entity registry (${this._entities.size}); pool.items was mutated directly. Iterate pool.items freely, but mutate only through the pool API (add/remove)`
+            });
+        }
+    };
+
+    // Sealing row 5 (WF-410): V8 gives a pool one fast hidden class only when
+    // every spawn path produces entities with the same fields in the same
+    // order. Compare each entity's post-merge key signature (entity.state
+    // defaults already applied, so default-filled fields legitimately
+    // normalize) against the pool's first-seen shape; warn once per pool.
+    PoolHandle.prototype._devCheckEntityShape = function (obj) {
+        if (this._shapeWarned) return;
+        const sig = Object.keys(obj).join(', ');
+        if (this._firstShapeSig === undefined) {
+            this._firstShapeSig = sig;
+            return;
+        }
+        if (sig !== this._firstShapeSig) {
+            this._shapeWarned = true;
+            wfError(WF_ERRORS.POOL_MIXED_ENTITY_SHAPES, {
+                warn: true,
+                context: `pool '${this.name}': entity { ${sig} } vs first-seen shape { ${this._firstShapeSig} }`,
+                suggestion: `Hidden-class deoptimization is platform physics: once shapes diverge, every hot-loop read in the pool slows down. Make all spawn paths build entities with the same fields in the same order. Initialize missing fields up front ({ ${this._firstShapeSig} }) or split differently-shaped entities into separate pools.`
+            });
+        }
+    };
+
+    // Sealing row 7 (WF-411): entity.computed is uncached by contract
+    // (~60us/entity/flush measured), so per-frame cost scales with pool size.
+    // Warn once when a non-passive pool with computeds reaches the threshold.
+    PoolHandle.prototype._devCheckComputedBudget = function () {
+        if (this._computedBudgetWarned || this._isPassive || !this._entityComputedNames) return;
+        if (this.size < 200) return;
+        this._computedBudgetWarned = true;
+        const names = this._entityComputedNames.map(n => `'${n}'`).join(', ');
+        wfError(WF_ERRORS.POOL_COMPUTED_FRAME_BUDGET, {
+            warn: true,
+            context: `pool '${this.name}' reached ${this.size} entities with entity.computed (${names})`,
+            suggestion: `entity.computed re-evaluates on every read of every flush (~60us per entity per flush measured); at this pool size that cost lands on every animation frame. For per-frame pools this large, store the derived value as a plain data field updated on mutation instead of entity.computed, or mark non-animating entities static (data-pool-static="prop").`
+        });
+    };
+}
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
@@ -1307,6 +1399,14 @@ export const PoolRendererMethods = {
                 const names = Object.keys(poolsDef);
                 for (let i = 0; i < names.length; i++) {
                     instance._poolDefinitions.set(names[i], poolsDef[names[i]] || {});
+                    // Contract check at registration so programmatic pools
+                    // (this.getPool('x') with no data-pool markup) are covered too.
+                    if (__DEV__) {
+                        const pd = poolsDef[names[i]];
+                        if (pd && pd.entity && typeof pd.entity === 'object') {
+                            validateEntityDefinition('Pool entity', `${instance.name}.${names[i]}`, pd.entity, POOL_ENTITY_CONTRACT_KEYS);
+                        }
+                    }
                 }
             }
         }
@@ -1357,7 +1457,7 @@ export const PoolRendererMethods = {
             // Find and extract template
             const template = this._findTemplate(element, instance);
             if (!template) {
-                if (__DEV__) console.warn(`[WF Pool] No <template> found in data-pool="${path}"`);
+                if (__DEV__) wfError(WF_ERRORS.TEMPLATE_NOT_FOUND, { warn: true, context: `No <template> found in data-pool="${path}"` });
                 continue;
             }
 
@@ -1456,6 +1556,48 @@ export const PoolRendererMethods = {
             });
             instance._pools.set(path, handle);
 
+            if (__DEV__) {
+                // A container whose pool never receives entities renders nothing
+                // forever and says nothing. Two shapes, one diagnostic each:
+                // (a) the container name misses the declared pools block —
+                //     near-certain typo, deterministic at setup, warn now;
+                // (b) nothing ever added by the settle window — one dev note
+                //     (apps that populate on user interaction can ignore it).
+                const guardKey = `${instance.name}:${path}`;
+                const defs = instance._poolDefinitions;
+                if (defs && defs.size > 0 && !defs.has(path)) {
+                    handle._undeclaredWarned = true;
+                    if (!_warnedPoolContainers.has(guardKey)) {
+                        _warnedPoolContainers.add(guardKey);
+                        const declared = Array.from(defs.keys());
+                        const similar = this._findSimilarPropertyNames(path, declared);
+                        wfError(WF_ERRORS.POOL_CONTAINER_UNDECLARED, {
+                            warn: true,
+                            context: `data-pool="${path}" in component '${instance.name}' (declared pools: ${declared.map(n => `'${n}'`).join(', ')})`,
+                            suggestion: (similar.length ? `Did you mean data-pool="${similar[0]}"? ` : '') +
+                                `Pool names must match exactly; code populating getPool('${similar[0] || declared[0]}') never reaches this container. If '${path}' is intentional, populate it via this.getPool('${path}').add(...) or add it to the pools block.`
+                        });
+                    }
+                }
+                const settleMs = this._devPoolSettleMs ?? 1500;
+                const instanceId = instance.id;
+                const componentName = instance.name;
+                setTimeout(() => {
+                    if (!handle._framework) return;                      // pool destroyed
+                    if (!this.componentInstances.has(instanceId)) return; // instance gone / framework reset
+                    if (!element.isConnected) return;                     // container left the document
+                    if (handle._everAdded) return;                        // populated at some point
+                    if (handle._undeclaredWarned) return;                 // already diagnosed at setup
+                    if (_warnedPoolContainers.has(guardKey)) return;
+                    _warnedPoolContainers.add(guardKey);
+                    wfError(WF_ERRORS.POOL_NEVER_POPULATED, {
+                        warn: true,
+                        context: `pool '${path}' in component '${componentName}'`,
+                        suggestion: `The container and template are wired, but nothing was ever added, so nothing renders. Populate it with this.getPool('${path}').add({ ${keyProp}: 1, ... }). If this pool fills later by design (e.g. on user interaction), ignore this note.`
+                    });
+                }, settleMs);
+            }
+
             // Register in flat array for fast iteration in tick loop
             if (!this._activePoolHandles) this._activePoolHandles = [];
             this._activePoolHandles.push(handle);
@@ -1529,11 +1671,33 @@ export const PoolRendererMethods = {
                 if (handle) poolsObj[name] = handle;
             });
             instance.pools = poolsObj;
-            // Set on raw context (bypass ContextProxy SET trap)
-            // RAW_TARGET symbol may not be available here, so use direct assignment
-            // which works because context.pools was not initialized (no proxy conflict)
+            // Repoint context.pools from the pre-setup getter container
+            // (_injectPoolReferences) to the resolved plain-handle map, so per-frame
+            // reads of this.pools.name are plain property reads (zero getter overhead).
+            // 'pools' is essential, so the proxy SET trap writes straight to the raw
+            // context. definition.pools is untouched (the getters live on a separate
+            // container, not the definition block).
             if (instance.context) instance.context.pools = poolsObj;
         }
+
+        // Wake any computed/effect that read this.getPool(name) (or this.pools.x)
+        // before the pools existed (B2: they tracked the registry pulse, not a handle).
+        this._poolRegistryPulse(instance);
+    },
+
+    // B2 (reactive pool aggregates): per-instance pool-registry pulse. A
+    // reader that misses a pool under active tracking observes this box;
+    // registration bumps it, re-running the reader against the live handle.
+    _poolRegistryTrack(instance) {
+        if (!instance._poolRegBox) {
+            if (!rgIsTracking()) return; // plain read: no allocation, no tracking
+            instance._poolRegBox = rgReactive({ v: 0 });
+        }
+        void instance._poolRegBox.v; // tracked read
+    },
+
+    _poolRegistryPulse(instance) {
+        if (instance._poolRegBox) instance._poolRegBox.v++;
     },
 
     /**
@@ -1639,7 +1803,8 @@ export const PoolRendererMethods = {
 
     /**
      * Get or create a pool handle for a component instance.
-     * Called via this.pool('name') in component methods.
+     * Called via this.getPool('name') in component methods (and by the
+     * this.pools.name getters).
      *
      * @param {Object} instance - Component instance
      * @param {string} name - Pool name (matches data-pool attribute value)

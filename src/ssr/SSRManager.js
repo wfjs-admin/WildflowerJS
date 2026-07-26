@@ -333,7 +333,10 @@ export class SSRManager {
      * Sets lists to PROTECTED phase
      */
     _protectListsInComponent(element) {
-        const listElements = element.querySelectorAll('[data-list], [data-wf-list]');
+        // [data-query] elements transform into data-list during component
+        // init (after this protection pass), so they must be protected by
+        // their own attribute here for the SSR handoff to hold.
+        const listElements = element.querySelectorAll('[data-list], [data-wf-list], [data-query], [data-wf-query]');
         listElements.forEach(listEl => {
             listEl._ssrPhase = SSRPhase.PROTECTED;
             ssrAdoptedElements.add(listEl);
@@ -453,7 +456,7 @@ export class SSRManager {
      * Transitions lists to COMPLETE phase
      */
     _activateListsInComponent(element) {
-        const listElements = element.querySelectorAll('[data-list], [data-wf-list]');
+        const listElements = element.querySelectorAll('[data-list], [data-wf-list], [data-query], [data-wf-query]');
         listElements.forEach(listEl => {
             if (listEl._ssrPhase === SSRPhase.PROTECTED) {
 
@@ -465,8 +468,20 @@ export class SSRManager {
                 const componentElement = listEl.closest('[data-component]');
                 if (componentElement) {
                     const instance = this.wildflower.componentInstances.get(componentElement.dataset.componentId);
+                    let data = null;
                     if (instance && instance.state && instance.state[listName]) {
-                        const data = instance.state[listName];
+                        data = instance.state[listName];
+                    } else if (listName) {
+                        // Query-fed list: data-query transformed this element
+                        // to data-list="$name.rows"; the seed rows live in
+                        // the query's backing store, not component state.
+                        const dollar = /^\$([A-Za-z_][\w-]*)\.rows$/.exec(listName);
+                        if (dollar && this.wildflower.getStore) {
+                            const qs = this.wildflower.getStore(dollar[1]);
+                            if (qs && Array.isArray(qs.rows)) data = qs.rows;
+                        }
+                    }
+                    if (data) {
                         // Calculate initial fingerprint for SSR data
                         listEl._lastDataFingerprint = this.wildflower._getDataFingerprint(data);
                         // Set previous data to enable fast removal optimizations
@@ -640,7 +655,32 @@ export class SSRManager {
             // Set nested value in state object using shared pathResolver utility
             pathResolver.set(state, path, value);
         });
+
+        // data-seed on the component root: state fields the page does not
+        // render (the DOM parse can only recover displayed values). Machine
+        // truth wins overlaps with parsed display text.
+        const rootSeed = this._readSeedAttribute(element);
+        if (rootSeed) Object.assign(state, rootSeed);
+
         return state;
+    }
+
+    /**
+     * Read a data-seed attribute: a JSON object carrying fields the server
+     * rendered into the page's data but not into its visible text. Used on
+     * the component root (state fields), on list item roots (item fields),
+     * and by the data-query adoption path (row/record fields).
+     */
+    _readSeedAttribute(el) {
+        const raw = el.getAttribute && (el.getAttribute('data-seed') || el.getAttribute('data-wf-seed'));
+        if (!raw) return null;
+        try {
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+        } catch (e) {
+            this._log('data-seed is not valid JSON; ignored:', raw);
+            return null;
+        }
     }
 
     /**
@@ -701,6 +741,10 @@ export class SSRManager {
                     pathResolver.set(itemState, nl.dataset.list, this._parseListElement(nl));
                 }
             });
+
+            // data-seed on the item root: unrendered item fields (ids, flags).
+            const itemSeed = this._readSeedAttribute(itemEl);
+            if (itemSeed) Object.assign(itemState, itemSeed);
 
             listItems.push(itemState);
         });

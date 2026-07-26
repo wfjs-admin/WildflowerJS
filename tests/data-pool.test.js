@@ -129,7 +129,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       expect(instance._pools.has('enemies')).toBe(true)
     })
 
-    it('this.pool("name") returns a PoolHandle', async () => {
+    it('this.getPool("name") returns a PoolHandle', async () => {
       testContainer.innerHTML = `
         <div data-component="pool-handle-test">
           <div data-pool="units">
@@ -144,7 +144,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-handle-test', {
         state: {},
         init() {
-          poolHandle = this.pool('units')
+          poolHandle = this.getPool('units')
         }
       })
 
@@ -159,7 +159,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       expect(typeof poolHandle.getElement).toBe('function')
     })
 
-    it('this.pool("nonexistent") returns null', async () => {
+    it('this.getPool("nonexistent") returns null', async () => {
       testContainer.innerHTML = `
         <div data-component="pool-null-test">
           <div data-pool="items">
@@ -174,7 +174,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-null-test', {
         state: {},
         init() {
-          result = this.pool('nonexistent')
+          result = this.getPool('nonexistent')
         }
       })
 
@@ -199,7 +199,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-add-test', {
         state: {},
         init() {
-          pool = this.pool('bullets')
+          pool = this.getPool('bullets')
         }
       })
 
@@ -229,7 +229,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-dup-test', {
         state: {},
         init() {
-          pool = this.pool('entities')
+          pool = this.getPool('entities')
         }
       })
 
@@ -245,7 +245,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       expect(pool.items.length).toBe(1)
       expect(pool.items[0].name).toBe('First')
 
-      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Duplicate key'))
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('duplicate key'))
 
       warnSpy.mockRestore()
     })
@@ -265,7 +265,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-nokey-test', {
         state: {},
         init() {
-          pool = this.pool('things')
+          pool = this.getPool('things')
         }
       })
 
@@ -297,7 +297,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-remove-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -332,7 +332,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-remove-false-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -360,7 +360,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-clear-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -396,7 +396,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-size-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -433,7 +433,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-items-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -474,7 +474,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-bind-text', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -518,7 +518,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-show-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -563,7 +563,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-multi-bind', {
         state: {},
         init() {
-          pool = this.pool('players')
+          pool = this.getPool('players')
         }
       })
 
@@ -607,7 +607,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-sync-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -650,7 +650,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-batch-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -697,7 +697,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-multi-add', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -731,7 +731,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-remove-mid', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -772,7 +772,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-reuse-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -811,7 +811,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-clear-add', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -860,7 +860,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-init-access', {
         state: {},
         init() {
-          poolInInit = this.pool('items')
+          poolInInit = this.getPool('items')
           if (poolInInit) {
             poolInInit.add({ id: 1, name: 'Added in init' })
             addedInInit = true
@@ -895,7 +895,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-destroy-test', {
         state: {},
         init() {
-          pool = this.pool('entities')
+          pool = this.getPool('entities')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
         }
@@ -938,8 +938,8 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-multi-pool', {
         state: {},
         init() {
-          enemyPool = this.pool('enemies')
-          bulletPool = this.pool('bullets')
+          enemyPool = this.getPool('enemies')
+          bulletPool = this.getPool('bullets')
         }
       })
 
@@ -985,7 +985,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-default-key', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1017,7 +1017,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-custom-key', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1048,7 +1048,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-getelement', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1093,7 +1093,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-empty', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1126,7 +1126,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-single', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1161,7 +1161,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-rapid', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1206,7 +1206,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-nested', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1245,7 +1245,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-chain', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1272,7 +1272,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-readd', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1310,7 +1310,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('pool-loop-stop', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
         }
       })
 
@@ -1355,7 +1355,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('cull-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       // Entity inside viewport
       pool.add({ id: 1, x: 100, y: 100 })
@@ -1399,7 +1399,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('cull-move-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       // Start outside viewport
       pool.add({ id: 1, x: 5000, y: 5000 })
@@ -1435,7 +1435,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('no-cull-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       // Entity way outside container — no cull attribute so it stays visible
       pool.add({ id: 1, x: 9000, y: 9000 })
@@ -1466,7 +1466,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('cull-padding-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       // Entity 500px outside container — within 200px padding? No (500 > 200+400)
       pool.add({ id: 1, x: 550, y: 150 })
@@ -1507,7 +1507,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('sort-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       pool.add({ id: 1, x: 10, y: 200 })
       pool.add({ id: 2, x: 10, y: 50 })
@@ -1547,7 +1547,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('sort-update-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       pool.add({ id: 1, x: 10, y: 100 })
       pool.add({ id: 2, x: 10, y: 200 })
@@ -1589,7 +1589,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('no-sort-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       pool.add({ id: 1, x: 10, y: 200 })
       await waitForRAF()
@@ -1618,7 +1618,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       await waitForCompleteRender()
 
       const comp = wildflower.getComponent('sort-desc-test')
-      const pool = comp.pool('entities')
+      const pool = comp.getPool('entities')
 
       pool.add({ id: 1, x: 10, y: 200 })
       pool.add({ id: 2, x: 10, y: 50 })
@@ -1657,7 +1657,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('boolean-attr-test', {
         state: {},
         pools: { todos: {} },
-        init() { pool = this.pool('todos'); }
+        init() { pool = this.getPool('todos'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -1696,7 +1696,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
       wildflower.component('input-bind-test', {
         state: {},
         pools: { rows: {} },
-        init() { pool = this.pool('rows'); }
+        init() { pool = this.getPool('rows'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -1744,7 +1744,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
             entity: {}
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -1781,7 +1781,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
             entity: {}
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -1819,7 +1819,7 @@ describeIfPools('Data-Pool Entity Pool Rendering', () => {
             entity: {}
           }
         },
-        init() { this.pool('items').push({ id: 1 }); }
+        init() { this.getPool('items').push({ id: 1 }); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()

@@ -103,7 +103,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       let pool
       wildflower.component('pp-upd-exists', {
         state: {},
-        init() { pool = this.pool('items') }
+        init() { pool = this.getPool('items') }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -122,7 +122,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-upd-patch', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'Alpha', x: 0, y: 0 })
         }
       })
@@ -146,7 +146,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-upd-return', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -169,7 +169,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       let pool
       wildflower.component('pp-upd-null', {
         state: {},
-        init() { pool = this.pool('items') }
+        init() { pool = this.getPool('items') }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -189,7 +189,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-upd-render', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'Before' })
         }
       })
@@ -217,7 +217,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-upd-preserve', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: 10, y: 20, name: 'A' })
         }
       })
@@ -241,7 +241,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-upd-expr', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: 0 })
         }
       })
@@ -269,7 +269,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-upd-batch', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -301,7 +301,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-size', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           for (let i = 1; i <= 5; i++) pool.add({ id: i, name: `E${i}` })
         }
       })
@@ -325,7 +325,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-render', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           for (let i = 1; i <= 5; i++) pool.add({ id: i, name: `E${i}` })
         }
       })
@@ -353,7 +353,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-last', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
           pool.add({ id: 3, name: 'C' })
@@ -381,7 +381,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-first', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
           pool.add({ id: 3, name: 'C' })
@@ -409,7 +409,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-only', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -433,7 +433,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-addafter', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
           pool.add({ id: 3, name: 'C' })
@@ -462,7 +462,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-seq', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           for (let i = 1; i <= 5; i++) pool.add({ id: i, name: `E${i}` })
         }
       })
@@ -490,7 +490,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-getel', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
           pool.add({ id: 3, name: 'C' })
@@ -517,7 +517,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-stress', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           for (let i = 1; i <= 20; i++) pool.add({ id: i, name: `E${i}` })
         }
       })
@@ -555,7 +555,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-o1-items', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
           pool.add({ id: 3, name: 'C' })
@@ -588,7 +588,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       let pool
       wildflower.component('pp-rec-init', {
         state: {},
-        init() { pool = this.pool('items') }
+        init() { pool = this.getPool('items') }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -607,7 +607,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-pop', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -630,7 +630,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-reuse', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'Alpha' })
         }
       })
@@ -656,7 +656,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-data', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'Alpha' })
         }
       })
@@ -682,7 +682,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-cache', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'Same' })
         }
       })
@@ -712,7 +712,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-clone', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
         }
@@ -739,7 +739,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-cap', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           for (let i = 1; i <= 150; i++) pool.add({ id: i, name: `E${i}` })
         }
       })
@@ -763,7 +763,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-clear', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           for (let i = 1; i <= 5; i++) pool.add({ id: i, name: `E${i}` })
         }
       })
@@ -786,7 +786,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-clearcap', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           for (let i = 1; i <= 150; i++) pool.add({ id: i, name: `E${i}` })
         }
       })
@@ -809,7 +809,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-detach', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -833,7 +833,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-multi', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -863,7 +863,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-items', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -888,7 +888,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-size', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
           pool.add({ id: 2, name: 'B' })
           pool.add({ id: 3, name: 'C' })
@@ -918,7 +918,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-ref', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'Old' })
         }
       })
@@ -944,7 +944,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-rec-destroy', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, name: 'A' })
         }
       })
@@ -982,7 +982,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-basic', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: 100, y: 100 }) // inside
           pool.add({ id: 2, x: 9000, y: 9000 }) // far outside
         }
@@ -1010,7 +1010,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-outside', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: -500, y: -500 })
         }
       })
@@ -1034,7 +1034,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-inside', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: 50, y: 50 })
         }
       })
@@ -1058,7 +1058,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-move', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: 9000, y: 9000 })
         }
       })
@@ -1090,7 +1090,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-wh', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           // Entity at x:380 with w:100 — overlaps container right edge, should be visible
           pool.add({ id: 1, x: 380, y: 100, w: 100, h: 100 })
           // Entity at x:600 with w:10 — fully outside
@@ -1118,7 +1118,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-pad', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           // Within 100px padding of container edge — should be visible
           pool.add({ id: 1, x: -50, y: 100 })
           // Beyond 100px padding — should be culled
@@ -1148,7 +1148,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-fallback', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: 50, y: 50 })
         }
       })
@@ -1173,7 +1173,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-none', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, x: 9000, y: 9000 })
         }
       })
@@ -1198,7 +1198,7 @@ describeIfPools('Pool Pipeline Optimizations', () => {
       wildflower.component('pp-cull-custom', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add({ id: 1, posX: 100, posY: 100 })
           pool.add({ id: 2, posX: 9000, posY: 9000 })
         }

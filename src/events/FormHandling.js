@@ -6,6 +6,7 @@
 
 import { handlingSubmitSet, validationCache } from '../core/DomMetadata.js';
 import { pathResolver } from '../core/wfUtils.js';
+import { reactive as rgReactive, toRaw as rgToRaw } from '../state/reactive-graph/core.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -17,11 +18,88 @@ export const FormHandlingMethods = {
      * @private
      */
     _applyMapArrayMutation(item, propertyPath, value) {
+        // The list create path stores RAW items (no per-item proxy at create).
+        // This write is the reactivity trigger for data-model in list rows, so
+        // it must go through the set trap — and through the TREE proxy when the
+        // item lives in an entity-state tree, so the write also fires the
+        // entity onStateChange dispatch (hooks/watchers), matching a user's own
+        // state[listPath][i].field write. Normalize to raw first: a plain-cache
+        // proxy minted before the tree wrap existed would short-circuit
+        // wrap-on-demand and silently skip that dispatch.
+        item = rgReactive(rgToRaw(item));
         if (propertyPath.includes('.')) {
             pathResolver.set(item, propertyPath, value);
         } else {
             item[propertyPath] = value;
         }
+    },
+
+    /**
+     * Write a data-model input value back to its source (component state, store,
+     * or list-item proxy). Relocated from ListItemBinding so data-model write-back
+     * ships in the nano tier; all deps (_getInputValue, _applyMapArrayMutation,
+     * pathResolver, _findListItemAncestor) are core/nano-shipped. The list-item
+     * branch is runtime-inert without list contexts.
+     * @private
+     */
+    _updateModelValue(context, newValue)
+    {
+        if (!context || !context.element) {
+            return false;
+        }
+
+        // Defensive fallback: if no value was passed, read from the element.
+        // Callers pass the input value captured at event-dispatch time so a
+        // mid-tick list re-render that swaps context.element doesn't cause a
+        // stale/empty read here.
+        if (newValue === undefined) {
+            newValue = this._getInputValue(context.element);
+        }
+        if (newValue === undefined) return false; // Skip unchecked radio
+
+        // Determine where to update based on context hierarchy
+        if (context.parent && context.parent.type === 'list' && context._parentIndex !== undefined)
+        {
+            // List-item model: write straight through the row's reactive
+            // item-proxy (the SAME proxy the render effect tracks), so the set
+            // propagates through the graph for top-level, computed-source, and
+            // nested lists alike; no immutable copy/replace/writeback or manual
+            // binding refresh required. Converges on the mapArray mutation path.
+            const rowEl = this._findListItemAncestor(context.element);
+            const item = (rowEl && rowEl._itemData) || context._itemData;
+            if (item) {
+                this._applyMapArrayMutation(item, context.path, newValue);
+                return true;
+            }
+            return false;
+        } else if (context.componentInstance)
+        {
+            // Check if this is a store path (e.g., "checkout.firstName")
+            const modelPath = context.path;
+            const firstDot = modelPath.indexOf('.');
+            if (firstDot > 0) {
+                const possibleStoreName = modelPath.slice(0, firstDot);
+                const storeComponent = this.storeManager?.getStoreComponentByName(possibleStoreName);
+                if (storeComponent) {
+                    // Route to store state
+                    const storePath = modelPath.slice(firstDot + 1);
+                    // Use pathResolver for nested paths within store
+                    pathResolver.set(storeComponent.state, storePath, newValue);
+                    return true;
+                }
+            }
+
+            // Regular model - update component state directly
+            // Handle nested paths using pathResolver
+            if (modelPath.includes('.')) {
+                pathResolver.set(context.componentInstance.state, modelPath, newValue);
+            } else {
+                context.componentInstance.state[modelPath] = newValue;
+            }
+            return true;
+        }
+
+        return false;
     },
 
     /**
@@ -303,7 +381,7 @@ export const FormHandlingMethods = {
 
 
         // LIST ITEM CHECK: Determine if input is in a list item using minimal DOM traversal
-        const listItem = this._findListItemAncestor(e.target);
+        const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(e.target) : null;
 
         if (listItem)
         {
@@ -450,7 +528,7 @@ export const FormHandlingMethods = {
             if (!modelPath) return;
 
             // Determine the context of this input using DOM structure
-            const listItem = this._findListItemAncestor(input);
+            const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(input) : null;
             if (listItem)
             {
                 // This is an input within a list item
@@ -540,7 +618,7 @@ export const FormHandlingMethods = {
         if (value === undefined) return; // Skip unchecked radio buttons
 
         // Check if input is within a list item
-        const listItem = this._findListItemAncestor(input);
+        const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(input) : null;
         if (listItem)
         {
             const listElement = this._findDirectParentList(listItem);
@@ -968,6 +1046,7 @@ export const FormHandlingMethods = {
      */
     _addListSubmitDelegation(listElement, instance, listContext, path)
     {
+        if (!__FEATURE_LISTS__) return;
         listElement.addEventListener('submit', (event) =>
         {
             // Find if a form with data-action was submitted

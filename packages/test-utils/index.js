@@ -52,6 +52,7 @@ const MANGLE_MAP = {
   _hooks: '__hk',
   _pluginsByName: '__pn',
   _scanForComponents: '__sc',
+  _scanForComponentsAsync: '__sy',
   _stateVersions: '__sv',
   _computedDependsOn: '__co',
   _computedDepVersions: '__cv',
@@ -238,6 +239,8 @@ export function getFrameworkScripts(mode) {
     // Minified production builds
     case 'core':
       return [`${dir}/wildflower.min.js`]
+    case 'nano':
+      return [`${dir}/wildflower.nano.min.js`]
     case 'mini':
       return [`${dir}/wildflower.mini.min.js`]
     case 'lite':
@@ -249,6 +252,8 @@ export function getFrameworkScripts(mode) {
     // Explicit minified builds (same as short names, for clarity)
     case 'core-min':
       return [`${dir}/wildflower.min.js`]
+    case 'nano-min':
+      return [`${dir}/wildflower.nano.min.js`]
     case 'mini-min':
       return [`${dir}/wildflower.mini.min.js`]
     case 'lite-min':
@@ -262,6 +267,8 @@ export function getFrameworkScripts(mode) {
     // Development builds (console warnings preserved)
     case 'core-dev':
       return [`${dir}/wildflower.dev.js`]
+    case 'nano-dev':
+      return [`${dir}/wildflower.nano.dev.js`]
     case 'mini-dev':
       return [`${dir}/wildflower.mini.dev.js`]
     case 'lite-dev':
@@ -273,6 +280,8 @@ export function getFrameworkScripts(mode) {
     // Uncompressed builds (plain .js — unminified, __DEV__=true, full source readable)
     case 'core-raw':
       return [`${dir}/wildflower.js`]
+    case 'nano-raw':
+      return [`${dir}/wildflower.nano.js`]
     case 'mini-raw':
       return [`${dir}/wildflower.mini.js`]
     case 'lite-raw':
@@ -364,12 +373,24 @@ export function hasFeature(feature) {
   // on all variants. Same for CSP evaluation (never listed here).
   const liteStrippedFeatures = ['portals', 'transitions', 'modals', 'plugins']
 
-  if ((baseMode === 'lite' || baseMode === 'mini') && liteStrippedFeatures.includes(feature)) {
+  if ((baseMode === 'lite' || baseMode === 'mini' || baseMode === 'nano') && liteStrippedFeatures.includes(feature)) {
     return false
   }
 
-  // Mini build also excludes pools (data-pool renderer)
-  if (baseMode === 'mini' && (feature === 'pools' || feature === 'data-pool')) {
+  // Mini and nano builds exclude pools (data-pool renderer)
+  if ((baseMode === 'mini' || baseMode === 'nano') && (feature === 'pools' || feature === 'data-pool')) {
+    return false
+  }
+
+  // data-query rides the SSR tier: full builds only (__FEATURE_QUERY__)
+  if (feature === 'query' || feature === 'data-query') {
+    return baseMode === 'full'
+  }
+
+  // Nano is the below-mini widget tier: no data-list render cluster (and the
+  // features that ride it — polymorphic templates, scoped-slot read bindings).
+  // data-show / data-render / data-model / external() remain (core widget features).
+  if (baseMode === 'nano' && (feature === 'lists' || feature === 'data-list' || feature === 'polymorphic-templates')) {
     return false
   }
 
@@ -384,13 +405,13 @@ export function hasFeature(feature) {
 
   // SSR is only in full builds (and source)
   // Experimental build is based on core, so no SSR
-  if (feature === 'ssr' && (baseMode === 'core' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'spa' || baseMode === 'experimental')) {
+  if (feature === 'ssr' && (baseMode === 'core' || baseMode === 'nano' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'spa' || baseMode === 'experimental')) {
     return false
   }
 
   // Router is only in spa and full builds (and source)
   // Experimental build is based on core, so no router
-  if (feature === 'router' && (baseMode === 'core' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'experimental')) {
+  if (feature === 'router' && (baseMode === 'core' || baseMode === 'nano' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'experimental')) {
     return false
   }
 

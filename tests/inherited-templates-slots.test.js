@@ -19,6 +19,15 @@ import { loadFramework, resetFramework, hasConsoleWarnings, waitForUpdate, waitF
 // Skip entire suite if configurable-templates feature is not available
 const suiteRunner = hasFeature('configurable-templates') ? describe : describe.skip
 
+// Scoped-slot READ bindings (data-bind / -bind-class / -bind-style painting a value
+// from the data-with object) ride the list render cluster, so they are inert in the
+// nano tier — hasFeature('lists') is false there (see packages/test-utils/index.js).
+// Gate only those value-painting tests on it; models, actions, data-show, and the
+// null/undefined/edge cases work in nano and keep running. Reliable in nano-min:
+// hasFeature keys off the build mode (__WILDFLOWER_DIST__), which is never mangled —
+// unlike the framework's __DEV__-only inert-binding marker, absent in min builds.
+const rbIt = hasFeature('lists') ? it : it.skip
+
 suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
   let testContainer
   let wildflower
@@ -66,7 +75,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
   // ============================================
   describe('Basic data-with Usage', () => {
 
-    it('should render template with data-with binding to state path', async () => {
+    rbIt('should render template with data-with binding to state path', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="user-card">
@@ -100,7 +109,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(card.querySelector('.email').textContent).toBe('alice@example.com')
     })
 
-    it('should update when data-with path value changes', async () => {
+    rbIt('should update when data-with path value changes', async () => {
       let childInstance
 
       testContainer.innerHTML = `
@@ -137,7 +146,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(testContainer.querySelector('.name').textContent).toBe('Bob')
     })
 
-    it('should support nested property paths in data-with', async () => {
+    rbIt('should support nested property paths in data-with', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="address-card">
@@ -239,7 +248,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(card).toBeNull()
     })
 
-    it('should render template when data-with value becomes non-null', async () => {
+    rbIt('should render template when data-with value becomes non-null', async () => {
       let childInstance
 
       testContainer.innerHTML = `
@@ -414,7 +423,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
   // ============================================
   describe('Template Hierarchy Lookup', () => {
 
-    it('should find template in direct parent component', async () => {
+    rbIt('should find template in direct parent component', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="info-card">
@@ -439,7 +448,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(testContainer.querySelector('.info span').textContent).toBe('Hello')
     })
 
-    it('should find template in grandparent component', async () => {
+    rbIt('should find template in grandparent component', async () => {
       testContainer.innerHTML = `
         <div data-component="grandparent-comp">
           <template data-item-template="info-card">
@@ -510,7 +519,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
   // ============================================
   describe('Multiple Slots Pattern', () => {
 
-    it('should support multiple data-with templates in same component', async () => {
+    rbIt('should support multiple data-with templates in same component', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="header-template">
@@ -548,7 +557,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(testContainer.querySelector('.footer span').textContent).toBe('2024 Acme Inc')
     })
 
-    it('should update slots independently', async () => {
+    rbIt('should update slots independently', async () => {
       let childInstance
 
       testContainer.innerHTML = `
@@ -731,7 +740,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(badge.style.display).not.toBe('none')
     })
 
-    it('should support data-bind-class inside slot templates', async () => {
+    rbIt('should support data-bind-class inside slot templates', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="user-card">
@@ -767,7 +776,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
   // ============================================
   describe('Fallback Templates', () => {
 
-    it('should use inline fallback when parent template not found', async () => {
+    rbIt('should use inline fallback when parent template not found', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <!-- No template defined -->
@@ -802,7 +811,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
   // ============================================
   describe('DOM Context Variations', () => {
 
-    it('should render as direct child of component element', async () => {
+    rbIt('should render as direct child of component element', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="card">
@@ -827,7 +836,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(card.querySelector('span').textContent).toBe('Alice')
     })
 
-    it('should render nested inside multiple div layers', async () => {
+    rbIt('should render nested inside multiple div layers', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="card">
@@ -858,7 +867,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(card.querySelector('span').textContent).toBe('Deep Alice')
     })
 
-    it('should render inside a conditional data-show block', async () => {
+    rbIt('should render inside a conditional data-show block', async () => {
       let childInstance
 
       testContainer.innerHTML = `
@@ -897,7 +906,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(wrapper.style.display).toBe('none')
     })
 
-    it('should render inside a data-render block', async () => {
+    rbIt('should render inside a data-render block', async () => {
       let childInstance
 
       testContainer.innerHTML = `
@@ -936,7 +945,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(testContainer.querySelector('.card span').textContent).toBe('Render Alice')
     })
 
-    it('should render alongside static sibling content', async () => {
+    rbIt('should render alongside static sibling content', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="card">
@@ -997,7 +1006,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(form.querySelector('.email-input').value).toBe('alice@example.com')
     })
 
-    it('should render inside table cells', async () => {
+    rbIt('should render inside table cells', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="user-cells">
@@ -1030,7 +1039,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(testContainer.querySelector('.email-cell').textContent).toBe('alice@example.com')
     })
 
-    it('should render inside flexbox container', async () => {
+    rbIt('should render inside flexbox container', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="flex-item">
@@ -1064,7 +1073,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
       expect(cards[1].querySelector('span').textContent).toBe('Second')
     })
 
-    it('should render in correct position relative to siblings', async () => {
+    rbIt('should render in correct position relative to siblings', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="marker">
@@ -1227,7 +1236,7 @@ suiteRunner('Inherited Templates - Slot-like Usage (data-with)', () => {
   // ============================================
   describe('Advanced Scenarios', () => {
 
-    it('should support data-with pointing to a computed property', async () => {
+    rbIt('should support data-with pointing to a computed property', async () => {
       testContainer.innerHTML = `
         <div data-component="parent-comp">
           <template data-item-template="user-card">

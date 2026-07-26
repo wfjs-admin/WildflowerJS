@@ -8,7 +8,12 @@
 
 import { createStateManager } from '../state/createStateManager.js';
 import { createContextProxy, patchSelfReferences, warnCollisions, RAW_TARGET } from '../state/ContextProxy.js';
-import { pathResolver } from '../core/wfUtils.js';
+import { pathResolver, validateEntityDefinition, warnDefinitionCollisions, wfError, WF_ERRORS } from '../core/wfUtils.js';
+
+// Non-function definition keys the plugin factory actually consumes
+// (validateEntityDefinition allowlist — note plugins DO have a 'methods'
+// block, unlike components/stores).
+const PLUGIN_CONTRACT_KEYS = ['name', 'version', 'install', 'setup', 'uses', 'methods', 'state', 'computed', 'watch'];
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -50,7 +55,7 @@ export const PluginSystemMethods = {
         try {
             // Check for duplicate plugin name
             if (metadata?.name && this._pluginsByName.has(metadata.name)) {
-                if (__DEV__) console.warn(`[WF] Plugin "${metadata.name}" is being overwritten`);
+                if (__DEV__) wfError(WF_ERRORS.REGISTRATION_OVERWRITTEN, { warn: true, context: `Plugin "${metadata.name}" is being overwritten` });
             }
 
             // If plugin has uses, create a context object with services
@@ -205,6 +210,8 @@ export const PluginSystemMethods = {
         context = createContextProxy(rawContext, stateManager);
         patchSelfReferences(rawContext, context, stateManager);
         if (__DEV__) warnCollisions(stateManager, `plugin:${name}`);
+        if (__DEV__) validateEntityDefinition('Plugin', name, metadata, PLUGIN_CONTRACT_KEYS);
+        if (__DEV__) warnDefinitionCollisions('Plugin', name, metadata);
 
         // Bind methods using the unified entity method binder
         // Filter out plugin metadata keys that shouldn't become methods
@@ -254,12 +261,21 @@ export const PluginSystemMethods = {
         this.componentInstances.set(entityKey, pluginInstance);
 
 
-        // Register tick lifecycle hook if defined (shared rAF loop with components)
+        // Register tick lifecycle hook if defined (shared rAF loop with
+        // components). Guarded: the frame loop lives in the pool module,
+        // absent from tiers without pools (see ComponentLifecycle twin).
         if (typeof metadata.tick === 'function') {
-            pluginInstance._tickFn = metadata.tick.bind(context);
-            if (!this._tickableInstances) this._tickableInstances = [];
-            this._tickableInstances.push(pluginInstance);
-            this._startPoolLoop();
+            if (this._startPoolLoop) {
+                pluginInstance._tickFn = metadata.tick.bind(context);
+                if (!this._tickableInstances) this._tickableInstances = [];
+                this._tickableInstances.push(pluginInstance);
+                this._startPoolLoop();
+            } else if (__DEV__) {
+                wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
+                    warn: true,
+                    context: `Plugin '${name}': tick() is defined, but this build does not include the frame loop (pool module excluded from this tier); tick will never run`
+                });
+            }
         }
 
         // Store in the plugin states map
@@ -406,7 +422,11 @@ export const PluginSystemMethods = {
                     target.context[accessorName] = target[accessorName];
                 }
             } else {
-                if (__DEV__) console.warn(`[WF] Missing provider: "${key}"`);
+                if (__DEV__) wfError(WF_ERRORS.PROVIDER_MISSING, {
+                    warn: true,
+                    context: `Missing provider "${key}"`,
+                    suggestion: `Register it with wildflower.provide('${key}', value) before components that use it initialize.`
+                });
             }
         }
     },

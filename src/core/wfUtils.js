@@ -26,16 +26,6 @@
  * - objectUtils.deepClone() : Deep clone with circular reference handling
  * - objectUtils.isEqual()   : Deep equality comparison
  *
- * ARRAY DETECTION:
- * ────────────────
- * - arrayDetector.detectAppend()      : Detect array append operations
- * - arrayDetector.detectSwap()        : Detect two-element swaps
- * - arrayDetector.detectSparseUpdate(): Detect sparse property updates
- *
- * DATA STRUCTURES:
- * ────────────────
- * - LRUCache          : Least Recently Used cache with eviction
- *
  * ═══════════════════════════════════════════════════════════════════════════════════════
  * DEPENDENCY GRAPH
  * ═══════════════════════════════════════════════════════════════════════════════════════
@@ -86,14 +76,6 @@
  * ```javascript
  * const clone = objectUtils.deepClone(complexObject);
  * const areEqual = objectUtils.isEqual(obj1, obj2);
- * ```
- *
- * @example Array Detection:
- * ```javascript
- * const appendInfo = arrayDetector.detectAppend(oldArray, newArray);
- * if (appendInfo) {
- *     console.log(`${appendInfo.appendedCount} items added at index ${appendInfo.startIndex}`);
- * }
  * ```
  *
  * @module wfUtils
@@ -155,15 +137,55 @@ export function __wf_txt(el, s) {
     }
 }
 
+/**
+ * Element.moveBefore (Chrome 133+, WHATWG atomic move): relocates an
+ * already-connected node WITHOUT disconnect/reconnect, preserving focus,
+ * selection, iframe documents, playing media, and running CSS animations
+ * across the move. Callers must guard on same-parent (which guarantees the
+ * same shadow-including root, the spec's throw condition) and fall back to
+ * insertBefore/appendChild — moves only, never initial insertion.
+ */
+export const HAS_MOVE_BEFORE = typeof Element !== 'undefined' && typeof Element.prototype.moveBefore === 'function';
+
+/**
+ * Cooperative yield for chunked page-load work: pause so pending input and
+ * paint are serviced, then resume PROMPTLY. Prefers scheduler.yield
+ * (Chrome 129+, Firefox 142+; continuation priority), then a user-visible
+ * scheduler.postTask (Chrome 94+), then setTimeout (Safari — matches the
+ * previous shim's cadence). Deliberately NOT requestIdleCallback: idle
+ * priority starves under main-thread contention — the 2026-07-15 headroom
+ * probe measured 240-component page-load init at 418 ms via rIC vs 90 ms via
+ * postTask under animation-grade contention, identical when idle, with
+ * worst-case input wait bounded by the caller's chunk budget (P3 in
+ * docs/future/PLATFORM_API_OPPORTUNITIES_2026-07-15.md).
+ */
+export const wfYield = (() => {
+    const sch = typeof scheduler !== 'undefined' ? scheduler : null;
+    if (sch && typeof sch.yield === 'function') {
+        return () => sch.yield();
+    }
+    if (sch && typeof sch.postTask === 'function') {
+        const noop = () => {};
+        return () => sch.postTask(noop, { priority: 'user-visible' });
+    }
+    return () => new Promise(resolve => setTimeout(resolve, 0));
+})();
+
 export const WF_ERRORS = {
     // Core/initialization (001-099)
     ROOT_NOT_FOUND: { code: 'WF-001', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Root element not found' }) },
+    CONFIG_INVALID: { code: 'WF-002', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid configuration value' }) },
+    FEATURE_NOT_IN_BUILD: { code: 'WF-003', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A defined capability is excluded from this build tier' }) },
 
     // Component lifecycle (100-199)
     COMPONENT_INIT_FAILED: { code: 'WF-101', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error initializing component' }) },
     COMPONENT_NOT_FOUND: { code: 'WF-102', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Component instance not found' }) },
     COMPONENT_CONTEXT_MISSING: { code: 'WF-103', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Component context not available' }) },
     PARENT_HANDLER_ERROR: { code: 'WF-104', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in parent event handler' }) },
+    DOM_OWNERSHIP: { code: 'WF-105', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Manual DOM write on a node the engine keeps current' }) },
+    DESTROY_RESURRECT: { code: 'WF-106', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'destroy() called with the component element still in the document' }) },
+    PROVIDER_MISSING: { code: 'WF-107', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A declared provider was never provided' }) },
+    REGISTRATION_OVERWRITTEN: { code: 'WF-108', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A directive or plugin registration was overwritten' }) },
 
     // State/reactivity (200-299)
     COMPUTED_EVAL_ERROR: { code: 'WF-201', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating computed property' }) },
@@ -173,14 +195,24 @@ export const WF_ERRORS = {
     STATE_LOAD_ERROR: { code: 'WF-205', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading state from storage' }) },
     STATE_SAVE_ERROR: { code: 'WF-206', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error saving state to storage' }) },
     STATE_UPDATE_INVALID: { code: 'WF-207', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid parameter for state update' }) },
-    COMPUTED_NOT_FOUND: { code: 'WF-208', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed property does not exist' }) },
+    // WF-208 (COMPUTED_NOT_FOUND) RETIRED 2026-07-17: defined at launch but
+    // never fired from any code path; misspelled computed references are
+    // caught by binding validation instead. Do not reuse the code number.
     COMPUTED_NOT_FUNCTION: { code: 'WF-209', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed property must be a function' }) },
     PATH_INVALID: { code: 'WF-210', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid path segment' }) },
     SUBSCRIPTION_ERROR: { code: 'WF-211', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in subscription callback' }) },
-    POOL_AGGREGATE_NONREACTIVE: { code: 'WF-212', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool aggregate (length/size) read inside a computed; pool aggregates bypass reactivity, so the computed will not re-evaluate when the pool changes' }) },
+    // WF-212 (POOL_AGGREGATE_NONREACTIVE) RETIRED 2026-07-12: pool.length/.size
+    // are reactive on demand now (B2, DX diagnostics sweep) — the trap the
+    // warning guarded no longer exists. Do not reuse the code number.
     INDEXED_PATH_OBSERVER: { code: 'WF-213', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Watch/subscribe path targets a list item by numeric index; index paths reflect the item\'s position when first observed and go stale after splice/reorder' }) },
     ITEM_COMPUTED_THIS_MISS: { code: 'WF-214', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Zero-arg computed referenced in a list row reads a property via `this` that is undefined on the component but present on the list item; item-level computeds receive the item as their first argument' }) },
     DUPLICATE_REGISTRATION_CONFLICT: { code: 'WF-215', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component or store is being re-registered under a name that already exists with a DIFFERENT definition; the new definition is ignored and the original is kept. Unregister the existing one first (wildflower.unregister(name)) or use a distinct name' }) },
+    HOT_LOOP_FACADE_READS: { code: 'WF-216', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A state property is read thousands of times per frame through the reactive facade (sustained hot loop)' }) },
+    COMPUTED_WRITE_IN_EVAL: { code: 'WF-217', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed wrote to reactive state during its own evaluation' }) },
+    NAME_COLLISION: { code: 'WF-218', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The same name is defined in more than one definition bucket' }) },
+    DEFINITION_KEY_IGNORED: { code: 'WF-219', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Definition key is not part of the contract and was ignored' }) },
+    COMPUTED_ASSIGNMENT: { code: 'WF-220', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Assignment to a computed property was ignored (computeds are read-only)' }) },
+    BATCH_ARG_INVALID: { code: 'WF-221', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'wildflower.batch(fn) requires a function argument' }) },
 
     // Context system (300-399)
     CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
@@ -196,6 +228,13 @@ export const WF_ERRORS = {
     LIST_APPEND_ERROR: { code: 'WF-405', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in append optimization' }) },
     LIST_SWAP_ERROR: { code: 'WF-406', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in swap optimization' }) },
     LIST_SPARSE_ERROR: { code: 'WF-407', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in sparse update optimization' }) },
+    POOL_CONTAINER_UNDECLARED: { code: 'WF-408', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-pool container references a pool name that is not in the component\'s pools block' }) },
+    POOL_NEVER_POPULATED: { code: 'WF-409', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool has a data-pool container but was never populated, so it renders nothing' }) },
+    POOL_MIXED_ENTITY_SHAPES: { code: 'WF-410', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Entity spawns in this pool produce different shapes (fields or field order), which breaks V8\'s hidden-class optimization for every entity in the pool' }) },
+    POOL_COMPUTED_FRAME_BUDGET: { code: 'WF-411', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool with entity.computed reached a size where per-flush computed evaluation threatens the frame budget' }) },
+    TEMPLATE_LOOKUP_MISS: { code: 'WF-412', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A named or typed template never resolved' }) },
+    POOL_ARRAY_MISUSE: { code: 'WF-414', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Index-dependent array method or direct items mutation on pool storage' }) },
+    POOL_ENTITY_KEY: { code: 'WF-415', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool entity key missing or duplicate' }) },
 
     // Binding errors (500-599)
     BINDING_EVAL_ERROR: { code: 'WF-501', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating binding expression' }) },
@@ -206,11 +245,22 @@ export const WF_ERRORS = {
     HTML_BINDING_ERROR: { code: 'WF-503', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create HTML binding context' }) },
     CONDITIONAL_UPDATE_ERROR: { code: 'WF-504', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error updating conditional context' }) },
     CLASS_BINDING_SHAPE: { code: 'WF-505', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Class binding shape mismatch (coerced)' }) },
+    // WF-506 RETIRED 2026-07-16: briefly used for $-in-props before that became
+    // a supported feature (c9a0a953) the same day. Do not reuse the number.
+    PROP_PATH_UNRESOLVED: { code: 'WF-507', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A data-prop path resolved to undefined and is still unresolvable in the parent after init settled' }) },
+    PROP_ATTR_UNDECLARED: { code: 'WF-508', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A data-prop-*/data-props value names a prop the component never declared, so it is ignored' }) },
+    BINDING_VALIDATION: { code: 'WF-509', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Binding validation' }) },
+    PROPS_PARSE_FAILED: { code: 'WF-510', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to parse the data-props attribute as JSON' }) },
+    // WF-511 briefly held the query external-write diagnostic pre-release;
+    // renumbered to WF-950 (query block, store century) before shipping.
 
     // Action/event errors (600-699)
     ACTION_HANDLER_ERROR: { code: 'WF-601', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in action handler' }) },
     METHOD_ERROR: { code: 'WF-602', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in component method' }) },
     EMIT_NO_INSTANCE: { code: 'WF-603', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component instance not found' }) },
+    LIFECYCLE_NAME_ACTION: { code: 'WF-604', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-action targets a reserved lifecycle name' }) },
+    REPLAY_STALE_EVENT: { code: 'WF-605', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Stale event API called in an action replayed after init' }) },
+    ACTION_STORE_SHORTHAND: { code: 'WF-606', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: '$entity.path cannot name an action handler' }) },
 
     // Router errors (700-799)
     ROUTE_NOT_FOUND: { code: 'WF-701', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Route not found' }) },
@@ -238,6 +288,25 @@ export const WF_ERRORS = {
     STORE_EXTERNAL_ERROR: { code: 'WF-905', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in external() accessing store' }) },
     STORE_SUBSCRIPTION_ERROR: { code: 'WF-906', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in store subscription callback' }) },
     STORE_DEFAULT_ERROR: { code: 'WF-907', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create default app-store' }) },
+    STORE_REENTRANT_WRITE: { code: 'WF-908', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store path written from inside its own change notification' }) },
+    STORE_NEVER_REGISTERED: { code: 'WF-909', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A subscribed or watched store never registered' }) },
+    STORE_WAIT_TIMEOUT: { code: 'WF-910', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Timed out waiting for a subscribed store to become ready' }) },
+
+    // Query diagnostics (950-969): queries are stores with a source, so
+    // their codes live in the store century, in their own block.
+    QUERY_STORE_EXTERNAL_WRITE: { code: 'WF-950', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'External write to a query-owned store' }) },
+    QUERY_DUPLICATE: { code: 'WF-951', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query name already registered; second registration ignored' }) },
+    QUERY_NAME_COLLISION: { code: 'WF-952', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query name collides with an existing store; registration ignored' }) },
+    QUERY_FROM_INVALID: { code: 'WF-953', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query `from` must be a URL string or a function' }) },
+    QUERY_POLL_SUBSECOND: { code: 'WF-954', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query poll rung is sub-second' }) },
+    // Shares one code across getQuery() and data-query markup (docs entry covers both shapes)
+    QUERY_UNKNOWN: { code: 'WF-955', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'No such query is registered' }) },
+    QUERY_SEED_INVALID: { code: 'WF-956', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-seed attribute is not valid JSON; ignored' }) },
+    QUERY_SSE_NO_URL: { code: 'WF-957', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The sse rung needs a URL; rung skipped' }) },
+    QUERY_SSE_NON_JSON: { code: 'WF-958', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'SSE message was not valid JSON; treated as an invalidation signal' }) },
+    QUERY_NULL_RECORD: { code: 'WF-959', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Record query resolved null/undefined; bound fields render empty' }) },
+    QUERY_APPEND_UNKEYED: { code: 'WF-960', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Append received rows without the declared key; applied as a replace' }) },
+    QUERY_REFRESH_SHAPE: { code: 'WF-961', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'refresh() received unexpected options; request parameters belong inside params' }) },
 
     // CSP-safe expression evaluator (non-numeric codes: separate category
     // from the 1xx-9xx ranges because they describe parser / security
@@ -246,9 +315,23 @@ export const WF_ERRORS = {
     CSP_UNSUPPORTED: { code: 'WF-CSP-UNSUPPORTED', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Expression uses unsupported syntax' }) },
     CSP_SECURITY: { code: 'WF-CSP-SECURITY', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Blocked access to restricted API' }) },
 
+    // Security policy outcomes (non-numeric, like the CSP set): the engine
+    // blocked or flagged something by design, not an internal error.
+    SEC_BLOCKED: { code: 'WF-SEC-BLOCKED', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Blocked a dangerous attribute or URL value' }) },
+    SEC_SANITIZER: { code: 'WF-SEC-SANITIZER', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'HTML is rendered without a configured sanitizer' }) },
+
     // Render-effect path resolution failures
     EFFECT_PATH: { code: 'WF-EFFECT', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving path in render effect' }) }
 };
+
+/**
+ * Marker for query-engine writes to query-owned stores. The engine bumps
+ * depth around its synchronous write blocks; the ContextProxy set trap
+ * treats depth 0 as an external write and emits WF-950 in dev builds.
+ * A shared mutable object (not a boolean export) so both modules see the
+ * same cell.
+ */
+export const QUERY_ENGINE_WRITE = { depth: 0 };
 
 /**
  * Build the canonical doc URL for an error code.
@@ -315,6 +398,83 @@ export function wfWarn(message, data) {
     console.warn(`[WF] ${message}`);
     if (data) {
         console.warn(`  ↳ Data:`, data);
+    }
+}
+
+// Dev-only definition-contract check. Entity definitions (component / store /
+// plugin / pool entity block) consume a fixed set of named keys, bind
+// function-valued keys as methods, and silently ignore everything else — which
+// reads as data loss to the author (state written at the top level instead of
+// inside `state: {}` is THE recurring mistake). Warn for each ignored key.
+// `_`-prefixed keys are the documented deliberate-stash escape and stay
+// silent. Only called inside __DEV__ blocks, so it never runs in production.
+const _warnedDefContracts = new Set();
+export function validateEntityDefinition(kind, name, definition, allowedKeys) {
+    if (!definition || typeof definition !== 'object') return;
+    const guard = kind + ':' + name;
+    if (_warnedDefContracts.has(guard)) return; // one batch per definition, not per instance
+    _warnedDefContracts.add(guard);
+    for (const key of Object.keys(definition)) {
+        if (key.charCodeAt(0) === 95) continue;              // '_' prefix: deliberate stash
+        if (typeof definition[key] === 'function') continue; // functions bind as methods
+        if (allowedKeys.indexOf(key) !== -1) continue;
+        let hint;
+        if (key === 'methods' || key === 'actions') {
+            hint = `Methods live at the top level of the definition, not in a '${key}' block.`;
+        } else if (kind === 'Component' && (key === 'storageKey' || key === 'autoSave')) {
+            hint = 'Components read persistence config from element attributes (data-storage-key), not the definition.';
+        } else {
+            hint = "State values belong inside 'state: {}'; only methods live at the top level.";
+        }
+        wfError(WF_ERRORS.DEFINITION_KEY_IGNORED, {
+            warn: true,
+            context: `${kind} '${name}': top-level key '${key}' is not a function and is not part of the ${kind.toLowerCase()} contract, so it was ignored`,
+            suggestion: hint
+        });
+    }
+}
+
+// Dev-only cross-bucket name-collision check (A5). Duplicate keys WITHIN one
+// object literal are invisible at runtime (JS collapses them at parse time —
+// lint territory), but the same name living in DIFFERENT buckets is visible
+// and silently shadows: a method vs a state/computed name means one of them
+// is unreachable; state vs computed resolves by documented precedence
+// (computed wins) which is a trap when unintentional. Only called inside
+// __DEV__ blocks, so it never runs in production.
+export function warnDefinitionCollisions(kind, name, definition) {
+    if (!definition || typeof definition !== 'object') return;
+    const guard = 'collide:' + kind + ':' + name;
+    if (_warnedDefContracts.has(guard)) return;
+    _warnedDefContracts.add(guard);
+    const state = (definition.state && typeof definition.state === 'object') ? definition.state : null;
+    const computed = (definition.computed && typeof definition.computed === 'object') ? definition.computed : null;
+    for (const key of Object.keys(definition)) {
+        if (typeof definition[key] !== 'function') continue;
+        if (state && key in state) {
+            wfError(WF_ERRORS.NAME_COLLISION, {
+                warn: true,
+                context: `${kind} '${name}': method '${key}()' collides with state.${key}; one of them is shadowed wherever the bare name resolves`,
+                suggestion: 'Rename one.'
+            });
+        }
+        if (computed && key in computed) {
+            wfError(WF_ERRORS.NAME_COLLISION, {
+                warn: true,
+                context: `${kind} '${name}': method '${key}()' collides with computed '${key}'; one of them is shadowed wherever the bare name resolves`,
+                suggestion: 'Rename one.'
+            });
+        }
+    }
+    if (state && computed) {
+        for (const key of Object.keys(computed)) {
+            if (key in state) {
+                wfError(WF_ERRORS.NAME_COLLISION, {
+                    warn: true,
+                    context: `${kind} '${name}': '${key}' is defined in both state and computed. The computed wins everywhere except explicit this.state.${key} reads`,
+                    suggestion: 'Rename one if this is unintentional.'
+                });
+            }
+        }
     }
 }
 
@@ -661,449 +821,6 @@ export const objectUtils = {
 };
 
 
-// ============================================================================
-// ARRAY OPERATION DETECTOR
-// ============================================================================
-
-/**
- * ArrayOperationDetector - Unified array change detection for WildflowerJS
- *
- * Consolidates array operation detection logic used across:
- * - reactiveStateManager.js (_detectArrayAppend, _detectArraySwap, _detectSparsePropertyUpdate)
- * - wildflowerJS.js (_detectArrayChanges)
- *
- * Provides pure detection algorithms without class-specific dependencies.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * PURPOSE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Enables efficient DOM updates by detecting what kind of array operation
- * occurred, allowing the framework to use optimized update paths instead
- * of full re-renders.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * DETECTION HIERARCHY
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   Array Change
- *        │
- *        ▼
- *   ┌────────────────┐     Yes    ┌─────────────────────────────────────┐
- *   │ Different      │───────────▶│ detectAppend()                      │
- *   │ lengths?       │            │ → Append new items only             │
- *   └────────────────┘            │ → O(n) for n new items              │
- *        │ No                     └─────────────────────────────────────┘
- *        ▼
- *   ┌────────────────┐     Yes    ┌─────────────────────────────────────┐
- *   │ Exactly 2      │───────────▶│ detectSwap()                        │
- *   │ positions      │            │ → Swap two DOM elements             │
- *   │ changed?       │            │ → O(1) DOM operations               │
- *   └────────────────┘            └─────────────────────────────────────┘
- *        │ No
- *        ▼
- *   ┌────────────────┐     Yes    ┌─────────────────────────────────────┐
- *   │ Same IDs,      │───────────▶│ detectSparseUpdate()                │
- *   │ property       │            │ → Update specific bindings only     │
- *   │ changes?       │            │ → O(changed) DOM operations         │
- *   └────────────────┘            └─────────────────────────────────────┘
- *        │ No
- *        ▼
- *   ┌─────────────────────────────────────────────────────────────────┐
- *   │ Full re-render (worst case)                                     │
- *   │ → Clear and rebuild entire list                                 │
- *   │ → O(n) DOM operations                                           │
- *   └─────────────────────────────────────────────────────────────────┘
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * PERFORMANCE NOTES
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * - Large arrays (>1000 items): Uses sampling for append detection
- * - ID-based detection: Uses hash comparison for quick reorder rejection
- * - Early exits: Detection functions exit as soon as conditions fail
- *
- * @namespace arrayDetector
- */
-export const arrayDetector = {
-    /**
-     * Detect if new array is an append of old array
-     * @param {Array} oldArray - Previous array state
-     * @param {Array} newArray - New array state
-     * @returns {Object|null} Append metadata or null if not an append
-     */
-    detectAppend(oldArray, newArray) {
-        // Quick validation
-        if (!oldArray || !newArray ||
-            newArray.length <= oldArray.length ||
-            oldArray.length === 0) {
-            return null;
-        }
-
-        const oldLength = oldArray.length;
-        const newLength = newArray.length;
-
-        // For large arrays, sample check for performance
-        if (oldLength > 1000) {
-            // Check first 10 items
-            for (let i = 0; i < Math.min(10, oldLength); i++) {
-                if (oldArray[i] !== newArray[i] && !objectUtils.isEqual(oldArray[i], newArray[i])) {
-                    return null;
-                }
-            }
-            // Check last 10 items before the new ones
-            for (let i = Math.max(0, oldLength - 10); i < oldLength; i++) {
-                if (oldArray[i] !== newArray[i] && !objectUtils.isEqual(oldArray[i], newArray[i])) {
-                    return null;
-                }
-            }
-        } else {
-            // For smaller arrays, check all items
-            for (let i = 0; i < oldLength; i++) {
-                if (oldArray[i] !== newArray[i] && !objectUtils.isEqual(oldArray[i], newArray[i])) {
-                    return null;
-                }
-            }
-        }
-
-        return {
-            type: 'append',
-            startIndex: oldLength,
-            newItems: newArray.slice(oldLength),
-            appendedCount: newLength - oldLength
-        };
-    },
-
-    /**
-     * Detect if arrays differ by a two-element swap
-     * @param {Array} oldArray - Previous array state
-     * @param {Array} newArray - New array state
-     * @returns {Object|null} Swap metadata or null if not a swap
-     */
-    detectSwap(oldArray, newArray) {
-        // Quick validation
-        if (!oldArray || !newArray ||
-            oldArray.length !== newArray.length ||
-            oldArray.length < 2) {
-            return null;
-        }
-
-        let changedCount = 0;
-        const changedIndices = [];
-
-        // Find positions where items changed (using ID or reference comparison)
-        for (let i = 0; i < oldArray.length; i++) {
-            const oldItem = oldArray[i];
-            const newItem = newArray[i];
-
-            const itemsMatch = oldItem?.id !== undefined && newItem?.id !== undefined
-                ? oldItem.id === newItem.id
-                : oldItem === newItem;
-
-            if (!itemsMatch) {
-                changedIndices.push(i);
-                changedCount++;
-                if (changedCount > 2) return null; // Early exit
-            }
-        }
-
-        if (changedCount !== 2) return null;
-
-        const [idx1, idx2] = changedIndices;
-        const oldItem1 = oldArray[idx1];
-        const oldItem2 = oldArray[idx2];
-        const newItem1 = newArray[idx1];
-        const newItem2 = newArray[idx2];
-
-        // Verify items actually swapped positions
-        const isSwap = oldItem1?.id !== undefined && oldItem2?.id !== undefined
-            ? (oldItem1.id === newItem2.id && oldItem2.id === newItem1.id)
-            : (oldItem1 === newItem2 && oldItem2 === newItem1);
-
-        if (!isSwap) return null;
-
-        return {
-            type: 'swap',
-            index1: idx1,
-            index2: idx2,
-            item1: newItem1,
-            item2: newItem2
-        };
-    },
-
-    /**
-     * Detect sparse property updates across array items
-     * @param {Array} oldArray - Previous array state
-     * @param {Array} newArray - New array state
-     * @param {Object} options - Detection options
-     * @param {number} [options.maxChangeRatio=0.5] - Max ratio of changed items to trigger sparse
-     * @returns {Object|null} Sparse update metadata or null
-     */
-    detectSparseUpdate(oldArray, newArray, options = {}) {
-        const maxChangeRatio = options.maxChangeRatio || 0.5;
-
-        // Quick validation
-        if (!oldArray || !newArray ||
-            oldArray.length !== newArray.length ||
-            oldArray.length === 0) {
-            return null;
-        }
-
-        // Quick sample check - if first few items all different, likely full replacement
-        const sampleSize = Math.min(3, oldArray.length);
-        let allDifferent = true;
-        for (let i = 0; i < sampleSize; i++) {
-            if (oldArray[i] === newArray[i]) {
-                allDifferent = false;
-                break;
-            }
-        }
-        if (allDifferent && oldArray.length > sampleSize) {
-            return null;
-        }
-
-        // Hash-based ID check for reorder detection
-        if (oldArray.length > 0 && oldArray[0]?.id !== undefined) {
-            let oldHash = 0, newHash = 0;
-            for (let i = 0; i < oldArray.length; i++) {
-                const oldId = oldArray[i]?.id;
-                const newId = newArray[i]?.id;
-                // Hash string IDs by char codes; numeric IDs directly
-                const oldVal = typeof oldId === 'string'
-                    ? (oldId.length > 0 ? (oldId.charCodeAt(0) * 131 + oldId.charCodeAt(oldId.length - 1) + oldId.length) : 0)
-                    : (oldId || 0);
-                const newVal = typeof newId === 'string'
-                    ? (newId.length > 0 ? (newId.charCodeAt(0) * 131 + newId.charCodeAt(newId.length - 1) + newId.length) : 0)
-                    : (newId || 0);
-                oldHash = (oldHash * 31 + oldVal) | 0;
-                newHash = (newHash * 31 + newVal) | 0;
-            }
-            if (oldHash !== newHash) {
-                return null; // ID order changed, not sparse update
-            }
-        }
-
-        const changes = new Map();
-        let totalChanges = 0;
-        let commonProperties = null;
-        let hasNestedArrayChanges = false;
-
-        for (let i = 0; i < oldArray.length; i++) {
-            const oldItem = oldArray[i];
-            const newItem = newArray[i];
-
-            if (oldItem === newItem) continue;
-
-            if (oldItem && newItem &&
-                typeof oldItem === 'object' &&
-                typeof newItem === 'object' &&
-                oldItem.id === newItem.id) {
-
-                const changedProps = new Set();
-                for (const key in newItem) {
-                    if (key !== 'id' && oldItem[key] !== newItem[key]) {
-                        changedProps.add(key);
-                        if (Array.isArray(newItem[key]) || Array.isArray(oldItem[key])) {
-                            hasNestedArrayChanges = true;
-                        }
-                    }
-                }
-
-                if (changedProps.size > 0) {
-                    changes.set(i, changedProps);
-                    totalChanges++;
-
-                    if (commonProperties === null) {
-                        commonProperties = new Set(changedProps);
-                    } else {
-                        for (const prop of commonProperties) {
-                            if (!changedProps.has(prop)) {
-                                commonProperties.delete(prop);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Don't optimize nested arrays or too many changes
-        if (hasNestedArrayChanges || totalChanges === 0 ||
-            totalChanges > oldArray.length * maxChangeRatio) {
-            return null;
-        }
-
-        // Detect regular interval pattern
-        const indices = Array.from(changes.keys()).sort((a, b) => a - b);
-        let interval = null;
-        if (indices.length >= 2) {
-            interval = indices[1] - indices[0];
-            for (let i = 2; i < indices.length; i++) {
-                if (indices[i] - indices[i-1] !== interval) {
-                    interval = null;
-                    break;
-                }
-            }
-        }
-
-        return {
-            type: 'sparse-update',
-            changes,
-            totalChanges,
-            commonProperties: commonProperties ? Array.from(commonProperties) : [],
-            interval
-        };
-    },
-
-    /**
-     * Find changed indices between arrays (helper for sparse updates)
-     * @param {Array} oldArray - Previous array state
-     * @param {Array} newArray - New array state
-     * @param {number} maxChanges - Maximum changes to track
-     * @returns {Array} Array of changed indices
-     */
-    findChangedIndices(oldArray, newArray, maxChanges = 100) {
-        const changedIndices = [];
-        const minLength = Math.min(oldArray.length, newArray.length);
-
-        for (let i = 0; i < minLength && changedIndices.length < maxChanges; i++) {
-            if (!objectUtils.isEqual(oldArray[i], newArray[i])) {
-                changedIndices.push(i);
-            }
-        }
-
-        return changedIndices;
-    }
-};
-
-
-// ============================================================================
-// LRU CACHE
-// ============================================================================
-
-/**
- * LRUCache - Simple Least Recently Used cache with max size eviction
- *
- * Used for caching expensive computations with bounded memory:
- * - Path splitting results
- * - Pattern matching results
- * - Expression compilation results
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * HOW LRU WORKS
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Uses JavaScript Map's insertion order to track access recency:
- *
- *   get("key") - Access existing key
- *        │
- *        ▼
- *   ┌─────────────────────────────────────────────────┐
- *   │ 1. Delete key from Map                          │
- *   │ 2. Re-insert key (now at end = most recent)     │
- *   │ 3. Return value                                 │
- *   └─────────────────────────────────────────────────┘
- *
- *   set("newKey", value) - Insert new key
- *        │
- *        ▼
- *   ┌─────────────────────────────────────────────────┐
- *   │ if (size >= maxSize)                            │
- *   │     Delete FIRST key (oldest = least recent)    │
- *   │ Insert new key at END (most recent)             │
- *   └─────────────────────────────────────────────────┘
- *
- * Map iteration order: [oldest] → [newest]
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * USAGE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * @example
- * ```javascript
- * const cache = new LRUCache(100);  // Max 100 entries
- *
- * cache.set('key1', expensiveComputation());
- * const value = cache.get('key1');  // Returns cached value, marks as recently used
- *
- * // After 100 entries, least recently used entries are evicted
- * ```
- *
- * @class LRUCache
- */
-export class LRUCache {
-    /**
-     * @param {number} maxSize - Maximum number of entries before eviction
-     */
-    constructor(maxSize = 500) {
-        this._maxSize = maxSize;
-        this._cache = new Map();
-    }
-
-    /**
-     * Get a cached value
-     * @param {string} key - Cache key
-     * @returns {*} Cached value or undefined
-     */
-    get(key) {
-        if (!this._cache.has(key)) {
-            return undefined;
-        }
-        // Move to end (most recently used)
-        const value = this._cache.get(key);
-        this._cache.delete(key);
-        this._cache.set(key, value);
-        return value;
-    }
-
-    /**
-     * Set a cached value with LRU eviction
-     * @param {string} key - Cache key
-     * @param {*} value - Value to cache
-     */
-    set(key, value) {
-        // Delete first to ensure it moves to end if exists
-        if (this._cache.has(key)) {
-            this._cache.delete(key);
-        } else if (this._cache.size >= this._maxSize) {
-            // Evict oldest (first) entry
-            const firstKey = this._cache.keys().next().value;
-            this._cache.delete(firstKey);
-        }
-        this._cache.set(key, value);
-    }
-
-    /**
-     * Check if key exists
-     * @param {string} key - Cache key
-     * @returns {boolean}
-     */
-    has(key) {
-        return this._cache.has(key);
-    }
-
-    /**
-     * Delete a cached value
-     * @param {string} key - Cache key
-     */
-    delete(key) {
-        this._cache.delete(key);
-    }
-
-    /**
-     * Clear all cached values
-     */
-    clear() {
-        this._cache.clear();
-    }
-
-    /**
-     * Get current cache size
-     * @returns {number}
-     */
-    get size() {
-        return this._cache.size;
-    }
-}
 
 
 // ============================================================================
@@ -1118,6 +835,4 @@ if (typeof window !== 'undefined') {
     window.PathResolver = PathResolver;
     window.pathResolver = pathResolver;
     window.objectUtils = objectUtils;
-    window.arrayDetector = arrayDetector;
-    window.LRUCache = LRUCache;
 }

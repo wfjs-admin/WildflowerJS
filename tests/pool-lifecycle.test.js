@@ -737,13 +737,13 @@ describeIfPools('Pool Lifecycle Hooks', () => {
   // BACKWARD COMPATIBILITY
   // =========================================================================
   describe('Backward compatibility', () => {
-    it('this.pool(name) still works without pools block', async () => {
+    it('this.getPool(name) still works without pools block', async () => {
       let poolRef = null
 
       wildflower.component('compat-imperative', {
         state: {},
         init() {
-          poolRef = this.pool('dots')
+          poolRef = this.getPool('dots')
         }
       })
 
@@ -767,14 +767,14 @@ describeIfPools('Pool Lifecycle Hooks', () => {
       expect(poolRef.size).toBe(1)
     })
 
-    it('this.pool(name, { onAdd, onRemove }) imperative form works', async () => {
+    it('this.getPool(name, { onAdd, onRemove }) imperative form works', async () => {
       const added = []
       const removed = []
 
       wildflower.component('compat-imperative-hooks', {
         state: {},
         init() {
-          this._myPool = this.pool('items', {
+          this._myPool = this.getPool('items', {
             onAdd(item) { added.push(item.id) },
             onRemove(item) { removed.push(item.id) }
           })

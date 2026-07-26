@@ -518,6 +518,49 @@ export const EntitySystemMethods = {
      * @param {any} oldValue - Previous value
      * @private
      */
+    /**
+     * Re-resolve one child's props and, when a value actually changed, run the
+     * full follow-up: invalidate props-dependent computeds, re-run the child's
+     * render effect (props are plain objects — effects can't track them, so
+     * the trigger is explicit), and fire onPropsChange. Shared by the
+     * parent-STATE sweep (isComponent branch) and the entity-dependents sweep:
+     * a store change can move a dependent's COMPUTEDS, and children may
+     * receive those computeds as props (the passthrough pattern), so both
+     * sweeps must cascade to children through the same code.
+     * @private
+     */
+    _refreshChildProps(childInstance, propsChangeInfo) {
+        if (!this._updateComponentProps(childInstance)) return;
+
+        // Props changed - invalidate props-dependent computeds so they
+        // recalculate (props access is untracked). Core props reactivity,
+        // not list-specific — ships in every tier incl. nano.
+        this._updatePropsBindingsForComponent(childInstance);
+
+        // If the child lacks an effect (e.g., batch didn't flush), create one now.
+        if (!childInstance._renderEffect && this._collectComponentBindingMeta && this._createComponentRenderEffect) {
+            childInstance._effectMeta = this._collectComponentBindingMeta(childInstance);
+            if (childInstance._effectMeta?.length) {
+                this._createComponentRenderEffect(childInstance);
+            }
+        }
+        const childEffect = childInstance._renderEffect?._effect;
+        if (childEffect && !childEffect.disposed) {
+            childEffect.dirty = true;
+            childInstance.stateManager._runEffect(childEffect);
+        }
+
+        // Trigger child's onPropsChange lifecycle hook if defined
+        if (this._triggerHook) this._triggerHook('component:onPropsChange', childInstance, propsChangeInfo);
+        if (childInstance.definition && typeof childInstance.definition.onPropsChange === 'function') {
+            try {
+                childInstance.definition.onPropsChange.call(childInstance.context, propsChangeInfo);
+            } catch (error) {
+                if (__DEV__) console.error(`[WF] Error in onPropsChange for ${childInstance.name}:`, error);
+            }
+        }
+    },
+
     _handleEntityStateChange(entityId, path, newValue, oldValue) {
         const instance = this.componentInstances.get(entityId);
         if (!instance) {
@@ -582,6 +625,21 @@ export const EntitySystemMethods = {
             // Update props first if this component receives props from the changed parent
             this._updateComponentProps(dependentInstance);
 
+            // A store change can move this dependent's COMPUTEDS, and its
+            // children may receive those computeds as props (the passthrough
+            // pattern: store -> parent computed -> child prop). The
+            // isComponent branch below only sweeps children on parent STATE
+            // changes, so without this the child's props snapshot froze at
+            // its init-time value while the parent's own bindings moved on.
+            // _updateComponentProps returns true only on a real value change,
+            // so the cascade is bounded.
+            if (dependentInstance.children && dependentInstance.children.length > 0) {
+                const propsChangeInfo = { parentPath: path, newValue, oldValue, viaEntity: entityId };
+                dependentInstance.children.forEach(child => {
+                    this._refreshChildProps(child, propsChangeInfo);
+                });
+            }
+
             // Path-scoped invalidation: a component that declares a
             // `subscribe: {}` contract is only re-dirtied / re-run by store
             // mutations to paths it actually reads. Unprovable cases fall
@@ -614,7 +672,7 @@ export const EntitySystemMethods = {
 
             // Refresh item-level computed bindings in lists
             // Per-item effects handle this for effect-backed components
-            if (dependentInstance.element && this._refreshListItemComputedBindings
+            if (__FEATURE_LISTS__ && dependentInstance.element && this._refreshListItemComputedBindings
                 && !dependentInstance._renderEffect) {
                 const listElements = dependentInstance.element.querySelectorAll('[data-list]');
                 listElements.forEach(listEl => {
@@ -704,7 +762,7 @@ export const EntitySystemMethods = {
                                 listPath.includes('$')
                             );
 
-                            if (usesExternalStore && this._processList) {
+                            if (__FEATURE_LISTS__ && usesExternalStore && this._processList) {
                                 // CRITICAL FIX: For external store lists, trigger FULL re-render
                                 // not just binding refresh. This handles add/remove operations.
                                 this._processList(
@@ -731,8 +789,40 @@ export const EntitySystemMethods = {
                             }
                         });
 
-                        // Also refresh STANDALONE elements (not in lists) with external() bindings
-                        this._refreshStandaloneExternalBindings(dependentInstance);
+                        // Also refresh STANDALONE elements (not in lists) with external() bindings.
+                        // Cluster-defined (shares list-item binding executors); on the effect
+                        // path external() refresh rides the render effect, so this legacy
+                        // !_renderEffect helper is inert in nano.
+                        if (__FEATURE_LISTS__) {
+                            this._refreshStandaloneExternalBindings(dependentInstance);
+                        }
+                    } else if (__FEATURE_LISTS__ && this._processList &&
+                               this._queryControllers && this._queryControllers.size > 0) {
+                        // Effect-backed component: effects cover mapArray-managed
+                        // lists, but a $-path list WITHOUT a mapArray effect
+                        // (an SSR-adopted list awaiting its first framework
+                        // render) has no other update channel. Process just
+                        // those; the fingerprint check inside the list path
+                        // keeps unchanged data render-free. Guarded on any
+                        // queries existing: the subtree scan is on the store-
+                        // change hot path, and adopted-list updates only arise
+                        // from the query feature.
+                        const listElements = dependentInstance.element.querySelectorAll('[data-list]');
+                        listElements.forEach(listEl => {
+                            if (listEl._mapArrayInitialized) return;
+                            const listPath = listEl.dataset.list;
+                            const usesExternalStore = listPath && (
+                                listPath.includes('external(') ||
+                                listPath.includes('$')
+                            );
+                            if (usesExternalStore) {
+                                this._processList(
+                                    { element: listEl, path: listPath, componentId: dependentInstance.id },
+                                    dependentInstance,
+                                    true
+                                );
+                            }
+                        });
                     }
                 }
             });
@@ -744,39 +834,9 @@ export const EntitySystemMethods = {
 
             // Update child component props that depend on this parent's state
             if (instance.children && instance.children.length > 0) {
+                const propsChangeInfo = { parentPath: path, newValue, oldValue };
                 instance.children.forEach(childInstance => {
-                    if (this._updateComponentProps(childInstance)) {
-                        // Props changed - update child's bindings that use props.* paths
-                        this._updatePropsBindingsForComponent(childInstance);
-
-                        // Re-run child's render effect so bindings that read props
-                        // (including computed properties that depend on props) update.
-                        // Props aren't reactive proxy properties, so the effect doesn't
-                        // track them as dependencies; we trigger it explicitly.
-                        // If the child lacks an effect (e.g., batch didn't flush), create one now.
-                        if (!childInstance._renderEffect && this._collectComponentBindingMeta && this._createComponentRenderEffect) {
-                            childInstance._effectMeta = this._collectComponentBindingMeta(childInstance);
-                            if (childInstance._effectMeta?.length) {
-                                this._createComponentRenderEffect(childInstance);
-                            }
-                        }
-                        const childEffect = childInstance._renderEffect?._effect;
-                        if (childEffect && !childEffect.disposed) {
-                            childEffect.dirty = true;
-                            childInstance.stateManager._runEffect(childEffect);
-                        }
-
-                        // Trigger child's onPropsChange lifecycle hook if defined
-                        const propsChangeInfo = { parentPath: path, newValue, oldValue };
-                        if (this._triggerHook) this._triggerHook('component:onPropsChange', childInstance, propsChangeInfo);
-                        if (childInstance.definition && typeof childInstance.definition.onPropsChange === 'function') {
-                            try {
-                                childInstance.definition.onPropsChange.call(childInstance.context, propsChangeInfo);
-                            } catch (error) {
-                                if (__DEV__) console.error(`[WF] Error in onPropsChange for ${childInstance.name}:`, error);
-                            }
-                        }
-                    }
+                    this._refreshChildProps(childInstance, propsChangeInfo);
                 });
             }
 
@@ -1070,7 +1130,10 @@ export const EntitySystemMethods = {
         // Re-entrancy guard: prevent infinite loops if onStoreUpdate modifies the store
         const pathKey = `${storeName}:${path}`;
         if (this._notifyingPaths.has(pathKey)) {
-            if (__DEV__) console.warn(`[WF] Re-entrant store update detected for ${pathKey}`);
+            if (__DEV__) wfError(WF_ERRORS.STORE_REENTRANT_WRITE, {
+                warn: true,
+                context: `Re-entrant store update detected for ${pathKey}; the nested notification was dropped (the write itself landed)`
+            });
             return;
         }
 
@@ -1384,7 +1447,7 @@ export const EntitySystemMethods = {
      */
     batch(fn) {
         if (typeof fn !== 'function') {
-            if (__DEV__) console.warn('[WF] wildflower.batch(fn) requires a function argument');
+            if (__DEV__) wfError(WF_ERRORS.BATCH_ARG_INVALID, { warn: true, context: 'wildflower.batch(fn) called without a function' });
             return this;
         }
         const ctx = this.startBatch();
@@ -1550,6 +1613,7 @@ export const EntitySystemMethods = {
 
     _applyBatchToLists()
     {
+        if (!__FEATURE_LISTS__) return;
         if (!this._batchChangedComponents || !this._batchChangedPaths) return;
 
         // Find affected list components
@@ -1629,34 +1693,9 @@ export const EntitySystemMethods = {
     _componentMightBeAffected(instance, pendingChanges)
     {
 
-        // For components with computed properties, check for dependencies
-        
-        if (instance.stateManager && instance.stateManager.computedDependencies && 
-            instance.stateManager.computedDependencies.size > 0)
-        {
-            return Array.from(pendingChanges).some(changePath =>
-            {
-                // Check if any computed property depends on this path
-                return Array.from(instance.stateManager.computedDependencies.keys()).some(computedName =>
-                {
-                    const deps = instance.stateManager.computedDependencies.get(computedName);
-                    if (!deps) return false;
-
-                    // Check if any dependency matches or is a parent of the changed path
-                    return Array.from(deps).some(depPath =>
-                    {
-                        return depPath === changePath ||
-                            changePath.startsWith(depPath + '.') ||
-                            depPath.startsWith(changePath + '.');
-                    });
-                });
-            });
-
-
-        }
-
-        // For other components, do a simpler check
-        
+        // NB: `stateManager.computedDependencies` is never populated (the reactive
+        // graph wakes affected computeds directly), so the former computed-dependency
+        // branch here was dead. A direct path-vs-state check is the whole method.
         let result = Array.from(pendingChanges).some(changePath =>
         {
             // If the component has this path directly in its state

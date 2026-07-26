@@ -4,6 +4,32 @@
  * @module
  */
 
+import { wfError, WF_ERRORS } from '../core/wfUtils.js';
+
+// Mirrors STORE_SHORTHAND_REGEX in ExpressionEvaluator.js. Anchored, entity name
+// may contain hyphens (component names do), and a dotted path is required — so
+// "$5.00" and "Price: $5.00" are correctly NOT store shorthands and stay literals.
+const PROP_STORE_SHORTHAND_RE = /^\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.]+)$/;
+
+// Dev-only once-per-(component:prop:path) guard for WF-507.
+const _warnedPropPaths = new Set();
+
+// Dev-only once-per-(component:key) guard for WF-508.
+const _warnedUndeclaredProps = new Set();
+
+// Dev-only existence walk for the WF-507 settle check: does the dotted path
+// lead through present keys of the raw object? Distinguishes "key absent"
+// (suspect) from "key present with value undefined" (legal).
+function _propPathExists(obj, path) {
+    let cur = obj;
+    const parts = path.replace(/\[(\d+)]/g, '.$1').split('.');
+    for (let i = 0; i < parts.length; i++) {
+        if (cur == null || typeof cur !== 'object' || !(parts[i] in cur)) return false;
+        cur = cur[parts[i]];
+    }
+    return true;
+}
+
 /**
  * Split a string on commas, respecting single/double quotes and nested braces/parens/brackets.
  * e.g. "label: 'hello, world', color: color" → ["label: 'hello, world'", " color: color"]
@@ -55,6 +81,24 @@ function _splitRespectingQuotes(str) {
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const PropsSystemMethods = {
+    /**
+     * Refresh a component's bindings after its props changed. props.* DOM bindings
+     * repaint via the component render effect; here we invalidate every computed so
+     * props-dependent computeds recalculate against the new props values (props access
+     * is untracked, so we can't invalidate selectively). Relocated from ListNestedManager
+     * — this is core props reactivity, not list-specific, and must ship in the nano tier.
+     * @param {Object} instance - Component instance whose props changed
+     * @private
+     */
+    _updatePropsBindingsForComponent(instance) {
+        if (instance.stateManager) {
+            const sm = instance.stateManager;
+            sm.getComputedPropertyNames().forEach(propName => {
+                sm._invalidateCachedComputed?.(propName);
+                sm.scheduleComputedEvaluation(propName);
+            });
+        }
+    },
 /**
      * Normalize props definition - convert shorthand forms to full form
      * Supports: { propName: Type } or { propName: { type, required, default, validator } }
@@ -170,7 +214,7 @@ export const PropsSystemMethods = {
                 }
                 catch (e)
                 {
-                    if (__DEV__) console.warn('[WF] Failed to parse data-props attribute:', e);
+                    if (__DEV__) wfError(WF_ERRORS.PROPS_PARSE_FAILED, { warn: true, context: 'Failed to parse data-props attribute as JSON', cause: e });
                 }
             }
         }
@@ -278,6 +322,69 @@ export const PropsSystemMethods = {
             return this._getListItemData(childElement, parentInstance);
         }
 
+        // $entity.path out-reach: resolve through the parent's external() — the
+        // same accessor every other read binding compiles $ shorthands into. That
+        // buys the full external contract for free: entity lookup (stores,
+        // components, plugins), pending-entity registration when the target
+        // doesn't exist yet, and dependency registration for reactivity. Because
+        // instance.props re-resolves per access, the prop is live-on-read against
+        // the target's CURRENT state — unlike the passthrough-computed workaround,
+        // whose cache can go stale when the computed is never read under an
+        // observer.
+        //
+        // Would-be typos are safe from misclassification: `$` is a legal JS
+        // identifier start, so without this branch "$probe.val" would fall through
+        // to the parent state lookup, miss, and yield undefined silently.
+        if (typeof valuePath === 'string' && valuePath.charCodeAt(0) === 36 /* $ */)
+        {
+            const m = PROP_STORE_SHORTHAND_RE.exec(valuePath);
+            if (m)
+            {
+                // Keep the child in the late-binding re-evaluation set, same as
+                // the in-scope branches below.
+                if (this._contextSystemInitialized)
+                {
+                    this._addDeferredDependency(childInstanceId, parentInstance.id, valuePath, 'props');
+                }
+                const target = this._externalFindTarget ? this._externalFindTarget(m[1]) : null;
+                if (target)
+                {
+                    // Register the CHILD as the target's dependent — not the
+                    // parent. A write to the target then re-resolves this prop
+                    // through the existing sweep (EntitySystem entity-change →
+                    // _updateComponentProps(dependent) → this branch again) and
+                    // re-runs the child's render effect. Registering the parent
+                    // would refresh the parent's own props, not these.
+                    if (target.isVirtual && this._registerEntityDependent)
+                    {
+                        this._registerEntityDependent(target.id, childInstanceId);
+                    }
+                    if (this._registerExternalDependency)
+                    {
+                        this._registerExternalDependency(childInstanceId, target.id, m[2]);
+                    }
+                    try
+                    {
+                        return this._externalResolveTargetValue(target, m[2]);
+                    }
+                    catch (e)
+                    {
+                        return m[2].startsWith('computed:') ? 0 : null;
+                    }
+                }
+                // Target doesn't exist yet (or is a plugin): the parent's
+                // external() covers plugin lookup and pending-entity
+                // registration; the deferred 'props' dependency above re-inits
+                // this child once the target appears.
+                const parentCtx = parentInstance.context;
+                if (parentCtx && typeof parentCtx.external === 'function')
+                {
+                    return parentCtx.external.call(parentCtx, m[1], m[2]);
+                }
+                return null;
+            }
+        }
+
         // Resolve from parent state, computed, or methods
         let resolvedValue;
         try
@@ -351,6 +458,25 @@ export const PropsSystemMethods = {
         // No props defined - set empty props object
         if (!propsDefinition)
         {
+            if (__DEV__)
+            {
+                // Sealing row 12, shape 2 (WF-508): with no props block, every
+                // data-prop-* attribute and data-props key on the element is
+                // dead. The author addressed the props system; teach the
+                // declaration.
+                const passed = this._parsePropsFromElement(element);
+                for (const key of Object.keys(passed))
+                {
+                    const guardKey = `${instance.name}:${key}`;
+                    if (_warnedUndeclaredProps.has(guardKey)) continue;
+                    _warnedUndeclaredProps.add(guardKey);
+                    wfError(WF_ERRORS.PROP_ATTR_UNDECLARED, {
+                        warn: true,
+                        context: `component '${instance.name}' declares no props, so the passed prop '${key}' was ignored`,
+                        suggestion: `Attributes in the data-prop-*/data-props namespace are read only through the props declaration. Declare it to receive it: props: { ${key}: { type: String } }.`
+                    });
+                }
+            }
             instance.props = {};
             return;
         }
@@ -358,9 +484,33 @@ export const PropsSystemMethods = {
         // Parse data-prop-* attributes from element
         const propsFromAttributes = this._parsePropsFromElement(element);
 
+        if (__DEV__)
+        {
+            // Sealing row 12, shape 1 (WF-508): a passed key that misses the
+            // declared props is never read (the prop-NAME typo, sibling of
+            // WF-507's path typo). Flagging is unconditional; the Levenshtein
+            // distance gates only the did-you-mean line, because a name with
+            // NO close match is the case most in need of the warning.
+            for (const key of Object.keys(propsFromAttributes))
+            {
+                if (key in propsDefinition) continue;
+                const guardKey = `${instance.name}:${key}`;
+                if (_warnedUndeclaredProps.has(guardKey)) continue;
+                _warnedUndeclaredProps.add(guardKey);
+                const declared = Object.keys(propsDefinition);
+                const similar = this._findSimilarPropertyNames(key, declared);
+                wfError(WF_ERRORS.PROP_ATTR_UNDECLARED, {
+                    warn: true,
+                    context: `prop '${key}' passed to component '${instance.name}' matches no declared prop (declared: ${declared.map(n => `'${n}'`).join(', ')})`,
+                    suggestion: `${similar.length ? `Did you mean '${similar[0]}'? ` : ''}Only declared props are read. Fix the attribute name or add '${key}' to the component's props block.`
+                });
+            }
+        }
+
         // Build props object with defaults, validation, and reactivity
         const propsData = {};
         const self = this;
+        let devSuspects = null;
 
         for (const [propName, propDef] of Object.entries(propsDefinition))
         {
@@ -382,6 +532,23 @@ export const PropsSystemMethods = {
                         ? propDef.default()
                         : propDef.default;
                     usedDefault = true;
+                }
+
+                if (__DEV__)
+                {
+                    // Sealing row 1 (WF-507): a path-shaped value that resolved
+                    // to undefined with no default absorbing it is a suspect.
+                    // Warning NOW would false-positive (parents legitimately set
+                    // state in init(), after this first resolution), so suspects
+                    // are re-checked after the settle window below. Literals,
+                    // "."/list passthrough, and $-paths have their own handling.
+                    if (value === undefined && !usedDefault && parentInstance
+                        && typeof attrValue === 'string' && attrValue !== '.'
+                        && attrValue !== 'undefined' && attrValue.charCodeAt(0) !== 36
+                        && /^(?:state\.|computed:)?[a-zA-Z_][a-zA-Z0-9_$.]*$/.test(attrValue))
+                    {
+                        (devSuspects || (devSuspects = [])).push({ propName, path: attrValue });
+                    }
                 }
 
                 // Only store path for reactive updates if we didn't use default
@@ -444,6 +611,78 @@ export const PropsSystemMethods = {
 
         // Store raw props data for internal updates
         instance._propsData = propsData;
+
+        if (__DEV__ && devSuspects)
+        {
+            // WF-507 settle check: re-verify each suspect against the parent
+            // once the init window has drained. Existence-based (state keys,
+            // computed names, methods), not value-based, so a key that exists
+            // with value undefined stays silent.
+            const settleMs = this._devPropsSettleMs ?? 1500;
+            const childId = instance.id;
+            const parentId = parentInstance.id;
+            setTimeout(() => {
+                if (!this.componentInstances.has(childId) || !this.componentInstances.has(parentId)) return;
+                if (!element.isConnected) return;
+                const parent = this.componentInstances.get(parentId);
+                for (const s of devSuspects)
+                {
+                    const guardKey = `${instance.name}:${s.propName}:${s.path}`;
+                    if (_warnedPropPaths.has(guardKey)) continue;
+                    if (this._devPropPathResolvable(parent, s.path)) continue;
+                    _warnedPropPaths.add(guardKey);
+                    const candidates = this._devPropPathCandidates(parent);
+                    const bare = s.path.replace(/^(?:state\.|computed:)/, '');
+                    const similar = this._findSimilarPropertyNames(bare, candidates);
+                    const keyList = candidates.slice(0, 8).map(k => `'${k}'`).join(', ') || '(nothing declared)';
+                    wfError(WF_ERRORS.PROP_PATH_UNRESOLVED, {
+                        warn: true,
+                        context: `prop '${s.propName}' of component '${instance.name}' takes its value from path "${s.path}", which is still unresolvable in parent '${parent.name}' after init settled`,
+                        suggestion: `${similar.length ? `Did you mean '${similar[0]}'? ` : ''}Prop paths are looked up in the parent's state, computed properties, and methods (parent has: ${keyList}). If the parent provides '${s.path}' later by design, ignore this note.`
+                    });
+                }
+            }, settleMs);
+        }
+    },
+
+    // Dev-only (WF-507): can `path` resolve against the parent right now?
+    // Mirrors _resolvePropsValue's lookup order as EXISTENCE checks. Unknown
+    // stateManager shapes report resolvable, so the warning can only under-fire.
+    _devPropPathResolvable(parent, path)
+    {
+        const sm = parent.stateManager;
+        if (!sm || !sm._raw) return true;
+        if (path.startsWith('state.')) return _propPathExists(sm._raw, path.slice(6));
+        let p = path;
+        let computedOnly = false;
+        if (p.startsWith('computed:')) { p = p.slice(9); computedOnly = true; }
+        const dot = p.indexOf('.');
+        const head = dot > 0 ? p.slice(0, dot) : p;
+        if (sm._getters && sm._getters[head]) return true;
+        if (computedOnly) return false;
+        if (_propPathExists(sm._raw, p)) return true;
+        const ctx = parent.context;
+        if (ctx && typeof ctx[p] === 'function') return true;
+        if (parent.definition && typeof parent.definition[p] === 'function') return true;
+        return false;
+    },
+
+    // Dev-only (WF-507): parent-side names for the did-you-mean suggestion.
+    _devPropPathCandidates(parent)
+    {
+        const out = [];
+        const sm = parent.stateManager;
+        if (sm && sm._raw) out.push(...Object.keys(sm._raw));
+        if (sm && sm._getters) out.push(...Object.keys(sm._getters));
+        const def = parent.definition;
+        if (def)
+        {
+            for (const k of Object.keys(def))
+            {
+                if (typeof def[k] === 'function' && k !== 'init' && k !== 'destroy') out.push(k);
+            }
+        }
+        return out;
     },
     /**
      * Validate props against their definitions
@@ -470,7 +709,9 @@ export const PropsSystemMethods = {
             {
                 if (!this._isValidPropType(value, propDef.type))
                 {
-                    errors.push(`Prop "${propName}" expected ${propDef.type.name}, got ${typeof value}`);
+                    // type may be a constructor (String → .name) or a string
+                    // type name ('string' — no .name; print it as-is).
+                    errors.push(`Prop "${propName}" expected ${propDef.type.name || propDef.type}, got ${typeof value}`);
                 }
             }
 

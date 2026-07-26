@@ -9,7 +9,7 @@
  * @module
  */
 
-import { __wf_str, __wf_txt } from './wfUtils.js';
+import { __wf_str, __wf_txt, wfError, WF_ERRORS } from './wfUtils.js';
 
 /**
  * Apply a data-show visibility verdict to an element.
@@ -129,7 +129,7 @@ export function applyAttrObj(element, object, helpers) {
     for (const [prop, value] of Object.entries(object)) {
         try {
             if (isBlocklisted && isBlocklisted(prop)) {
-                if (__DEV__) console.warn(`[WildflowerJS] Cannot bind blacklisted attribute: ${prop}`);
+                if (__DEV__) wfError(WF_ERRORS.SEC_BLOCKED, { warn: true, context: `Cannot bind blacklisted attribute: ${prop}` });
                 continue;
             }
 

@@ -9,10 +9,297 @@ import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { recording as __tlOn, timelineNoteFrame as __tlFrame } from '../state/TimelineRecorder.js';
 import { applyShow, applyAttrObj, applyStyleObj, applyText, applyModel, applyClass } from '../core/BindingWriters.js';
 
+/** Blocklisted attributes for data-bind-attr security (O(1) lookup, no per-call allocation).
+ *  Relocated from ListExpressionEval so data-bind-attr sanitization ships in the nano
+ *  tier — data-bind-attr is a core binding, and without these the object-attr writer
+ *  would apply on-handler and javascript-protocol values unsanitized. */
+const _LIST_BLOCKED_ATTRS = new Set([
+    'class', 'style', 'srcdoc',
+    'data-bind', 'data-action', 'data-list', 'data-if', 'data-show',
+    'data-render', 'data-component', 'data-template', 'data-slot',
+    'data-portal', 'data-bind-html', 'data-bind-class', 'data-bind-style',
+    'data-bind-attr', 'data-model', 'data-key',
+    'data-wf-bind', 'data-wf-action', 'data-wf-list', 'data-wf-if', 'data-wf-show',
+    'data-wf-render', 'data-wf-component', 'data-wf-template', 'data-wf-slot',
+    'data-wf-portal', 'data-wf-bind-html', 'data-wf-bind-class', 'data-wf-bind-style',
+    'data-wf-bind-attr', 'data-wf-model', 'data-wf-key'
+]);
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const RenderingCoreMethods = {
+    // -------------------------------------------------------------------------
+    // Conditional subsystem (data-show / data-render) + external() resolver.
+    // Relocated here from ListRenderer so they ship in the nano tier: data-show
+    // and data-render are core widget features, and external() is a general
+    // cross-store binding — none are list-bound. The runtime executors
+    // (_executeShowForEffect / _executeRenderForEffect / _buildRenderMeta) and
+    // the render record (_updateConditionalElement) already live in nano-shipped
+    // modules, so this makes the whole conditional path list-independent.
+    // -------------------------------------------------------------------------
+    /**
+     * Process conditional elements (data-show and data-render)
+     * @param {Object} instance - Component instance
+     * @private
+     */
+    _processConditionalElements(instance)
+    {
+        if (!this._contextSystemInitialized) {
+            return;
+        }
+
+        const {element} = instance;
+
+        // Find all conditional elements (both data-show and data-render) - support both prefixes
+        // IMPORTANT: Exclude elements inside <template> elements (they belong to list templates)
+        // and elements inside data-list containers (they're handled by _bindListItemConditionals)
+        const allConditionalElements = element.querySelectorAll(`${this._attrSelector('show')}, ${this._attrSelector('render')}`);
+
+        const conditionalElements = Array.from(allConditionalElements)
+            .filter(el =>
+            {
+                const closestComponent = this._getComponentElement(el);
+                if (closestComponent !== element) {
+                    return false;
+                }
+
+                // Also exclude elements inside uninitialized child components
+                // (components with data-component but no data-component-id yet)
+                const uninitializedParent = el.closest(this._attrSelector('component'));
+                if (uninitializedParent && uninitializedParent !== element && !uninitializedParent.dataset.componentId) {
+                    return false;
+                }
+
+                // Exclude elements inside <template> elements (list templates)
+                if (el.closest('template')) {
+                    return false;
+                }
+
+                // Exclude elements rendered by data-use-template (they have their own binding system)
+                if (el.closest('[data-use-template-rendered]')) {
+                    return false;
+                }
+
+                // Exclude elements INSIDE data-list containers (handled by list item binding)
+                // But DO process the list container itself if it has data-show
+                const closestList = el.closest(this._attrSelector('list'));
+                if (closestList && closestList !== el && closestList.closest(this._attrSelector('component')) === element) {
+                    return false;
+                }
+
+                return true;
+            });
+
+        conditionalElements.forEach(conditionalElement =>
+        {
+            // Determine mode: 'show' or 'render' (support both prefixes)
+            const isRenderMode = this._hasAttr(conditionalElement, 'render');
+            const condPath = isRenderMode
+                ? this._getAttr(conditionalElement, 'render')
+                : this._getAttr(conditionalElement, 'show');
+            if (!condPath) return;
+
+            // For data-render, we need to handle initial state
+            if (isRenderMode) {
+                const renderCtx = this._processDataRenderElement(conditionalElement, condPath, instance);
+                // Drive non-list data-render through the component render effect:
+                // track the context so a post-insert effect rescan can re-add it,
+                // and push its render meta so the effect observes the condition's
+                // computed/state directly (establishing the graph edge).
+                if (renderCtx && instance._effectMeta) {
+                    (instance._renderContexts || (instance._renderContexts = [])).push(renderCtx);
+                    instance._effectMeta.push(this._buildRenderMeta(renderCtx, instance));
+                }
+            } else {
+                // data-show: no registry-tracked conditional context. The component
+                // render effect owns initial paint and every update via this 'show'
+                // meta (_executeShowForEffect → applyShow, transitions included); the
+                // setup-time context paint was a redundant parallel build.
+                if (instance._effectMeta) {
+                    const negate = condPath.startsWith('!');
+                    const cleanPath = negate ? condPath.slice(1) : condPath;
+                    instance._effectMeta.push({
+                        element: conditionalElement,
+                        type: 'show',
+                        path: cleanPath,
+                        negate,
+                        isExpression: this.isExpression(cleanPath) || cleanPath.includes('$')
+                    });
+                }
+            }
+        });
+    },
+    /**
+     * Process a data-render element - handles initial state and context creation
+     * @param {HTMLElement} element - The element with data-render
+     * @param {string} path - The condition path
+     * @param {Object} instance - Component instance
+     * @private
+     */
+    _processDataRenderElement(element, path, instance)
+    {
+        // Evaluate the initial condition
+        let conditionValue = this._evaluateCondition(path, instance);
+
+        // Clone the element as template before any DOM manipulation
+        const templateClone = element.cloneNode(true);
+        // Strip data-cloak from template so re-insertions don't inherit it
+        templateClone.removeAttribute('data-cloak');
+
+        // Create the render record (plain object, not registered; the render
+        // effect holds it directly via its type:'render' meta).
+        const context = this._contextRecords.createRenderRecord(
+            path,
+            instance,
+            element
+        );
+
+        if (context) {
+            // Add render-specific properties
+            context.templateClone = templateClone;
+            context.isRendered = conditionValue;
+
+            // If condition is initially false, remove element and insert placeholder
+            if (!conditionValue) {
+                const placeholder = document.createComment(` data-render: ${path} `);
+                context.placeholder = placeholder;
+                element.parentNode.insertBefore(placeholder, element);
+                element.parentNode.removeChild(element);
+                context.element = null; // Element is not in DOM
+            } else {
+                context.placeholder = null; // No placeholder needed when rendered
+            }
+        }
+
+        return context;
+    },
+    /**
+     * Evaluate a condition path for data-show/data-render
+     * @param {string} path - The condition path (may include negation, computed:)
+     * @param {Object} instance - Component instance
+     * @returns {boolean} The evaluated condition
+     * @private
+     */
+    _evaluateCondition(path, instance)
+    {
+        // Strip obsolete computed: prefix (e.g., "computed:isVisible" → "isVisible",
+        // "computed:!isVisible" → "!isVisible"). evaluateExpression resolves
+        // computed properties by name automatically.
+        let expr = path;
+        if (expr.startsWith('computed:!')) {
+            expr = '!' + expr.slice(10);
+        } else if (expr.startsWith('computed:')) {
+            expr = expr.slice(9);
+        }
+        try {
+            return !!this.evaluateExpression(expr, instance.state, {
+                stateManager: instance.stateManager,
+                cacheKey: 'condition'
+            });
+        } catch (error) {
+            return false;
+        }
+    },
+    /**
+     * Get the external() function bound to a component instance
+     * @private
+     */
+    _getExternalFn(componentInstance) {
+        if (componentInstance.context && typeof componentInstance.context.external === 'function') {
+            return componentInstance.context.external.bind(componentInstance.context);
+        }
+        const self = this;
+        const instanceId = componentInstance.id;
+        return function(componentNameOrId, path) {
+            return self._resolveExternalValue(componentNameOrId, path, instanceId);
+        };
+    },
+    /**
+     * Dev-mode once-per-(type, element) warning when data-bind-style/-attr gets a
+     * non-object value (e.g. a CSS string). Shared by the setup-write path
+     * (_applyObjectBinding) and the component render effect
+     * (_executeStyleBindForEffect/_executeAttrBindForEffect) so the warning fires
+     * exactly once regardless of which writer paints, without a per-binding
+     * context. No-op in production (__DEV__ folds). Relocated from ListExpressionEval
+     * so the core style/attr effect path stays list-independent (nano tier).
+     * @private
+     */
+    _warnObjectBindingShape(type, element, value) {
+        if (!__DEV__) return;
+        // The shape mismatch is almost always a CSS-string passed to
+        // data-bind-style ('background:red' instead of {background:'red'});
+        // silently skipping it leaves the user wondering why colors never apply.
+        this._warnedBindingShape = this._warnedBindingShape || new WeakMap();
+        let perEl = this._warnedBindingShape.get(element);
+        if (!perEl) { perEl = new Set(); this._warnedBindingShape.set(element, perEl); }
+        if (perEl.has(type)) return;
+        perEl.add(type);
+        const example = type === 'style'
+            ? "{ background: '#5b8def' } or { backgroundColor: '#5b8def' }"
+            : "{ 'data-id': item.id, title: item.label }";
+        const sample = String(value).slice(0, 60);
+        const tag = element.tagName ? element.tagName.toLowerCase() : 'element';
+        const cls = element.className && typeof element.className === 'string'
+            ? '.' + element.className.split(/\s+/)[0] : '';
+        console.warn(
+            `[WildflowerJS] data-bind-${type} expected an object, got ${typeof value} ("${sample}").\n` +
+            `  Element: <${tag}${cls}>\n` +
+            `  Use object form: ${example}\n` +
+            `  CSS strings like "background:red" silently no-op.`
+        );
+    },
+    /**
+     * Check if an attribute name is blocklisted for security or framework integrity.
+     * Relocated from ListExpressionEval so data-bind-attr sanitization ships in nano.
+     * @param {string} attrName - Attribute name to check
+     * @returns {boolean} True if blocklisted
+     * @private
+     */
+    _isBlocklistedAttr(attrName) {
+        const lower = attrName.toLowerCase();
+
+        // Block event handlers (XSS prevention)
+        if (lower.startsWith('on')) return true;
+
+        // Block framework directives, class/style, srcdoc (O(1) Set lookup)
+        return _LIST_BLOCKED_ATTRS.has(lower);
+    },
+    /**
+     * Sanitize attribute value for security (dangerous protocols / data: URIs in
+     * URL-bearing attributes). Relocated from ListExpressionEval for the nano tier.
+     * @param {string} attrName - Attribute name
+     * @param {*} value - Value to sanitize
+     * @returns {*} Sanitized value or null if blocked
+     * @private
+     */
+    _sanitizeAttrValue(attrName, value) {
+        if (value === null || value === undefined) return value;
+
+        const lower = attrName.toLowerCase();
+
+        // For URL-bearing attributes, normalize and check dangerous protocols
+        if (['href', 'src', 'formaction', 'action', 'poster', 'xlink:href'].includes(lower)) {
+            // Strip all whitespace and control characters before protocol check
+            // to prevent bypasses like "java\tscript:" or "java\nscript:"
+            const normalized = String(value).replace(/[\s\x00-\x1F\x7F]/g, '').toLowerCase();
+
+            if (normalized.startsWith('javascript:') || normalized.startsWith('vbscript:')) {
+                if (__DEV__) wfError(WF_ERRORS.SEC_BLOCKED, { warn: true, context: `Blocked dangerous protocol in ${attrName}` });
+                return null;
+            }
+
+            // Block all data: URIs in URL attributes EXCEPT raster image formats.
+            // data:image/svg+xml and data:image/xml can execute inline scripts
+            // when loaded via <object>/<iframe>/<embed>, so they are NOT allowed.
+            if (/^data:(?!image\/(png|jpe?g|gif|webp|avif|bmp|ico|tiff?|x-icon)[,;])/i.test(normalized)) {
+                if (__DEV__) wfError(WF_ERRORS.SEC_BLOCKED, { warn: true, context: `Blocked dangerous data: URI in ${attrName}` });
+                return null;
+            }
+        }
+
+        return value;
+    },
 /**
      * Schedule a render to update the UI
      * @private
@@ -134,7 +421,7 @@ export const RenderingCoreMethods = {
         let activeInfo = null;
 
         // Check if the active element is an input in a list item
-        if (activeElement &&
+        if (__FEATURE_LISTS__ && activeElement &&
             (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA' || activeElement.tagName === 'SELECT') &&
             activeElement.dataset.model)
         {
@@ -382,7 +669,7 @@ export const RenderingCoreMethods = {
      * @private
      */
     _createListAwareBindingContext(bindingElement, bindPath, instance) {
-        const listItem = this._findListItemAncestor(bindingElement);
+        const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(bindingElement) : null;
 
         if (listItem) {
             const listElement = this._findDirectParentList(listItem);
@@ -909,9 +1196,6 @@ export const RenderingCoreMethods = {
             }
         }
 
-        // Defer context registry cleanup to requestIdleCallback
-        // This is expensive (O(contexts) scan) but not user-visible
-        this._scheduleDeferredCleanup(elementsToClean);
     },
 
     // ========================================================================
@@ -925,6 +1209,16 @@ export const RenderingCoreMethods = {
     _processComponentBindings(instance)
     {
         const { element, id: instanceId, name: componentName } = instance;
+
+        // data-query pre-pass (full tier): rewrite [data-query]+<template>
+        // to data-list BEFORE bindings are compiled. This is the one site
+        // every init path funnels through (registration-triggered init,
+        // incremental scan, batched orchestrators), so the compiled binding
+        // snapshot (which feeds domElements.lists and therefore list
+        // mounting) always sees the transformed attribute. Idempotent.
+        if (__FEATURE_QUERY__ && this._transformQueryElements) {
+            this._transformQueryElements(element);
+        }
 
         // ═══════════════════════════════════════════════════════════════════
         // JIT COMPILATION FAST PATH (Flyweight Pattern)
@@ -1151,6 +1445,15 @@ export const RenderingCoreMethods = {
         // belong to child components and will be validated when those initialize
         if (componentElement) {
             const isOwnedByThisComponent = (el) => {
+                // Slot templates (data-use-template + data-with) are expanded
+                // against the object named by data-with, so their bindings
+                // resolve in THAT scope, not this component's state. Validating
+                // them here reported valid bindings as undefined (WF-509 false
+                // positive). Every runtime binding processor already skips these
+                // via the same closest() guard — see the call sites around
+                // _processBindingElements / _processClassBindingElements.
+                if (el.closest('[data-use-template-rendered]')) return false;
+
                 let parent = el.parentElement;
                 while (parent && parent !== componentElement) {
                     if (parent.hasAttribute('data-component') || parent.hasAttribute('data-wf-component')) return false;
@@ -1175,7 +1478,7 @@ export const RenderingCoreMethods = {
                 if (!isOwnedByThisComponent(el)) return;
                 const expression = this._getAttr(el, 'bind-class');
                 if (expression) {
-                    this._validateExpressionVariables(expression, stateKeys, componentName, 'data-bind-class', state);
+                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-class');
                 }
             });
 
@@ -1185,7 +1488,7 @@ export const RenderingCoreMethods = {
                 if (!isOwnedByThisComponent(el)) return;
                 const expression = this._getAttr(el, 'bind-style');
                 if (expression) {
-                    this._validateStyleExpression(expression, stateKeys, componentName, state);
+                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-style');
                 }
             });
 
@@ -1260,14 +1563,14 @@ export const RenderingCoreMethods = {
         if (!stateKeys.includes(rootVar)) {
             // Find similar property names for typo suggestions
             const suggestions = this._findSimilarPropertyNames(rootVar, stateKeys);
-            let message = `[WF] Binding validation: ${bindingType}="${actualPath}" references undefined state property "${rootVar}" in component "${componentName}"`;
+            let message = `${bindingType}="${actualPath}" references undefined state property "${rootVar}" in component "${componentName}"`;
 
             if (suggestions.length > 0) {
                 message += `. Did you mean: ${suggestions.join(', ')}?`;
             }
 
             message += ` Available properties: ${stateKeys.join(', ')}`;
-            if (__DEV__) console.warn(message);
+            if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
             return;
         }
 
@@ -1292,14 +1595,14 @@ export const RenderingCoreMethods = {
                     const availableProps = Object.keys(currentObj);
                     const suggestions = this._findSimilarPropertyNames(part, availableProps);
                     const parentPath = pathParts.slice(0, i).join('.');
-                    let message = `[WF] Binding validation: ${bindingType}="${actualPath}" references undefined property "${part}" on "${parentPath}" in component "${componentName}"`;
+                    let message = `${bindingType}="${actualPath}" references undefined property "${part}" on "${parentPath}" in component "${componentName}"`;
 
                     if (suggestions.length > 0) {
                         message += `. Did you mean: ${suggestions.join(', ')}?`;
                     }
 
                     message += ` Available properties: ${availableProps.join(', ')}`;
-                    if (__DEV__) console.warn(message);
+                    if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
                     return;
                 }
                 currentObj = currentObj[part];
@@ -1311,11 +1614,12 @@ export const RenderingCoreMethods = {
         if (typeHint && finalValue !== undefined) {
             const actualType = this._inferTypeFromValue(finalValue);
             if (actualType !== typeHint && actualType !== 'any') {
-                if (__DEV__) console.warn(
-                    `[WF] Type hint mismatch in component "${componentName}": ` +
-                    `${bindingType}="${path}" expects ${typeHint} but property "${actualPath}" has type ${actualType}. ` +
-                    `Value: ${JSON.stringify(finalValue)}`
-                );
+                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, {
+                    warn: true,
+                    context: `Type hint mismatch in component "${componentName}": ` +
+                        `${bindingType}="${path}" expects ${typeHint} but property "${actualPath}" has type ${actualType}. ` +
+                        `Value: ${JSON.stringify(finalValue)}`
+                });
             }
         }
     },
@@ -1369,31 +1673,38 @@ export const RenderingCoreMethods = {
             // Check if this variable exists in state
             if (!stateKeys.includes(varName)) {
                 const suggestions = this._findSimilarPropertyNames(varName, stateKeys);
-                let message = `[WF] Binding validation: ${bindingType} expression "${expression}" references undefined state property "${varName}" in component "${componentName}"`;
+                let message = `${bindingType} expression "${expression}" references undefined state property "${varName}" in component "${componentName}"`;
 
                 if (suggestions.length > 0) {
                     message += `. Did you mean: ${suggestions.join(', ')}?`;
                 }
 
                 message += ` Available properties: ${stateKeys.join(', ')}`;
-                if (__DEV__) console.warn(message);
+                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
             }
         }
     },
     /**
-     * Validate variables in a data-bind-style expression
-     * Style bindings use { cssProperty: stateVar } format; only validate VALUE-side identifiers
-     * @param {string} expression - The style expression (e.g., "{ color: textColor }")
+     * Validate variables in an object-form-capable binding expression
+     * (data-bind-style and data-bind-class). Object form is
+     * { key: stateVar, ... } where the KEY is a CSS property or class NAME,
+     * not a variable — only VALUE-side identifiers are validated. Unquoted
+     * class keys ({ active: isTab1 }) previously hit the generic expression
+     * validator and were flagged as undefined state properties (AI-surface
+     * eval finding F3, 2026-07-16); quoted keys never tripped it because
+     * string-stripping removes them first.
+     * @param {string} expression - The expression (e.g., "{ color: textColor }")
      * @param {Array<string>} stateKeys - Available state property names
      * @param {string} componentName - Name of the component for error messages
      * @param {Object} state - The component state object
+     * @param {string} bindingType - 'data-bind-style' or 'data-bind-class'
      * @private
      */
-    _validateStyleExpression(expression, stateKeys, componentName, state) {
+    _validateObjectFormExpression(expression, stateKeys, componentName, state, bindingType) {
         if (!__DEV__) return;
         const trimmed = expression.trim();
 
-        // Object syntax: { cssProperty: stateVar, ... }
+        // Object syntax: { key: stateVar, ... }
         if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
             const inner = trimmed.slice(1, -1).trim();
             if (!inner) return;
@@ -1404,18 +1715,18 @@ export const RenderingCoreMethods = {
                 const colonIdx = pair.indexOf(':');
                 if (colonIdx === -1) continue;
 
-                // Only validate the VALUE side (after the colon); the KEY side is a CSS property name
+                // Only validate the VALUE side (after the colon); the KEY side is a name
                 const valuePart = pair.substring(colonIdx + 1).trim();
                 if (!valuePart) continue;
 
                 // The value might be a simple identifier or an expression
-                this._validateExpressionVariables(valuePart, stateKeys, componentName, 'data-bind-style', state);
+                this._validateExpressionVariables(valuePart, stateKeys, componentName, bindingType, state);
             }
             return;
         }
 
         // Non-object syntax: treat as expression (bare property name or expression)
-        this._validateExpressionVariables(expression, stateKeys, componentName, 'data-bind-style', state);
+        this._validateExpressionVariables(expression, stateKeys, componentName, bindingType, state);
     },
     /**
      * Validate action method references against available component methods
@@ -1441,15 +1752,33 @@ export const RenderingCoreMethods = {
             if (!methodName) continue;
 
             if (typeof context[methodName] !== 'function') {
+                // $entity.path in data-action: the generic "undefined method"
+                // message below sends the author hunting for a typo among their
+                // own methods, when the real issue is that $ is a read accessor
+                // for external state and doesn't name action handlers. Same
+                // anchored shape as ExpressionEvaluator's STORE_SHORTHAND_REGEX.
+                const dollar = /^\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.]+)$/.exec(methodName);
+                if (dollar) {
+                    wfError(WF_ERRORS.ACTION_STORE_SHORTHAND, {
+                        warn: true,
+                        context: `data-action="${methodName}" in component "${componentName}". ` +
+                            `$entity.path is a read accessor for external state and cannot name an action handler; ` +
+                            `actions are methods on this component. To delegate to another entity's method, define one: ` +
+                            // Wrapper named for the method being invoked (LAST path
+                            // segment): $foo.util.bump -> bump() { ...util.bump(); }
+                            `${dollar[2].split('.').pop()}() { this.getStore('${dollar[1]}').${dollar[2]}(); }`
+                    });
+                    continue;
+                }
                 const suggestions = this._findSimilarPropertyNames(methodName, methodNames);
-                let message = `[WF] Binding validation: data-action references undefined method "${methodName}" in component "${componentName}"`;
+                let message = `data-action references undefined method "${methodName}" in component "${componentName}"`;
 
                 if (suggestions.length > 0) {
                     message += `. Did you mean: ${suggestions.join(', ')}?`;
                 }
 
                 message += ` Available methods: ${methodNames.join(', ')}`;
-                if (__DEV__) console.warn(message);
+                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
             }
         }
     },

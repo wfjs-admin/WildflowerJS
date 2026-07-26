@@ -7,6 +7,7 @@ export default defineConfig({
   define: {
     __DEV__: 'false',
     __FEATURE_SSR__: 'false',
+    __FEATURE_LISTS__: 'true',
     __FEATURE_PLUGINS__: 'true',
     // Enable portals/transitions so their subsystems initialize (the GC path
     // calls _cleanupComponentPortals, which needs _activePortals to exist).

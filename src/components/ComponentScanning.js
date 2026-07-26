@@ -5,6 +5,13 @@
  */
 
 import { createContextProxy, patchSelfReferences, warnCollisions } from '../state/ContextProxy.js';
+import { validateEntityDefinition, warnDefinitionCollisions, wfYield } from '../core/wfUtils.js';
+import { warnLifecycleActionNames } from './ComponentLifecycle.js';
+
+// Non-function definition keys the component factory actually consumes
+// (validateEntityDefinition allowlist — keep in sync with the reads in
+// ComponentScanning/ComponentLifecycle/ComponentRegistry/EntitySystem).
+const COMPONENT_CONTRACT_KEYS = ['state', 'computed', 'watch', 'subscribe', 'subscribeTimeout', 'types', 'events', 'props', 'stores', 'pools'];
 
 const GC_DELAY_MS = 40; // Delay before GC runs (allows DOM to settle)
 
@@ -452,8 +459,15 @@ _setupDynamicComponentDetection()
      * @private
      */
     _setupSingleInstanceComputed(instance) {
-        // Inject store references before computed setup so they're available in computed properties
+        // Inject store AND pool references before computed setup so they're available in
+        // computed properties. The pool injection is essential here (not only in
+        // _initializeComponentElement): without it, this scanner path leaves
+        // context.pools aliased to definition.pools, so a computed reading
+        // this.pools.name.length sees the empty definition config (length undefined),
+        // establishes no reactive dependency, and never re-evaluates once the pool
+        // populates. That is invisible to the test suite, which scans manually.
         this._injectStoreReferences(instance);
+        this._injectPoolReferences(instance);
 
         if (!instance.definition.computed) return;
         this._setupComputedProperties(
@@ -506,7 +520,9 @@ _setupDynamicComponentDetection()
             ? this.root
             : (this.root?.documentElement || document.documentElement);
         if (!walkRoot) return;
-        this._detectAndRegisterListRelationships(walkRoot);
+        if (__FEATURE_LISTS__) {
+            this._detectAndRegisterListRelationships(walkRoot);
+        }
     },
 
     _setupSingleInstanceFeatures(instance) {
@@ -523,7 +539,7 @@ _setupDynamicComponentDetection()
         }
         // Process polymorphic templates (data-template-key) BEFORE bindings
         // because template insertion adds the DOM that bindings need to find
-        if (this._processPolymorphicTemplates) {
+        if (__FEATURE_LISTS__ && this._processPolymorphicTemplates) {
             this._processPolymorphicTemplates(instance);
         }
         this._processComponentBindings(instance);
@@ -536,6 +552,16 @@ _setupDynamicComponentDetection()
         // Custom directives only if plugin system is loaded
         if (this._processCustomDirectivesInSubtree) {
             this._processCustomDirectivesInSubtree(instance.element, instance);
+        }
+
+        // Process portals declared in the component's initial markup. The
+        // incremental path (_initializeComponentElement) does this unconditionally;
+        // the batched path only otherwise processes portals inside _initWithStoreWait
+        // (for init-created portals), which no-init components never reach, so their
+        // markup portals were never teleported on real page loads. Idempotent with the
+        // later init-time pass, exactly as on the incremental path.
+        if (this._processPortals) {
+            this._processPortals(instance);
         }
     },
 
@@ -563,7 +589,9 @@ _setupDynamicComponentDetection()
         }));
 
         // Set up list contexts for each component (critical for nested lists)
-        this._setupListContexts(instance);
+        if (__FEATURE_LISTS__) {
+            this._setupListContexts(instance);
+        }
     },
 
     /**
@@ -632,7 +660,7 @@ _setupDynamicComponentDetection()
             }
 
             // Pre-pass: declare store subscriptions BEFORE computed setup.
-            // The async path may yield between phases (requestIdleCallback);
+            // The async path may yield between phases (wfYield chunks);
             // the sync path doesn't yield, but we mirror the same order here
             // so the behavior is identical regardless of which orchestrator
             // ran. Without this pre-pass, the first computed-eval microtask
@@ -684,7 +712,9 @@ _setupDynamicComponentDetection()
             }
 
             // List processing
-            this._mountLists(this.domElements.lists);
+            if (__FEATURE_LISTS__) {
+                this._mountLists(this.domElements.lists);
+            }
 
             // Deferred init() execution via macrotask
             this._executeDeferredInits(ctx.pendingInits);
@@ -701,7 +731,7 @@ _setupDynamicComponentDetection()
     /**
      * Async version of _scanForComponents for page load.
      * Processes components in batches to reduce Total Blocking Time (TBT).
-     * Uses "Sprint then Jog" strategy with requestIdleCallback.
+     * Uses "Sprint then Jog" strategy with cooperative yields (wfYield).
      *
      * @private
      * @returns {Promise<void>} Resolves when all components are initialized
@@ -715,7 +745,7 @@ _setupDynamicComponentDetection()
 
             // "Sprint then Jog" strategy for TBT optimization:
             // Sprint (0-20ms): Process synchronously for fast initial render
-            // Jog (20ms+): Use requestIdleCallback to process remaining work during idle time
+            // Jog (20ms+): budget-chunked work with cooperative yields between chunks
             const SPRINT_BUDGET = 20;
 
             // Check if we're still in sprint phase
@@ -732,29 +762,23 @@ _setupDynamicComponentDetection()
                     index++;
                 }
 
-                // Jog phase: process remaining items via requestIdleCallback
+                // Jog phase: budget-chunked with cooperative yields (wfYield).
+                // Replaced requestIdleCallback: idle priority starves under
+                // main-thread contention (418 ms -> 90 ms in the headroom
+                // probe; see wfYield in wfUtils). Each chunk works ~8 ms then
+                // yields, so pending input and paint are serviced between
+                // chunks and the worst-case input wait is one chunk, while
+                // progress no longer depends on the browser finding idle time.
                 if (index < items.length) {
-                    await new Promise(resolve => {
-                        const scheduleIdle = window.requestIdleCallback ||
-                            ((cb) => setTimeout(() => cb({ timeRemaining: () => 10 }), 1));
-
-                        const processQueue = (deadline) => {
-                            // Process items while we have idle time (> 1ms remaining)
-                            while (index < items.length && deadline.timeRemaining() > 1) {
-                                processItem(items[index]);
-                                index++;
-                            }
-
-                            // If more items remain, schedule next idle callback
-                            if (index < items.length) {
-                                scheduleIdle(processQueue, { timeout: 100 });
-                            } else {
-                                resolve();
-                            }
-                        };
-
-                        scheduleIdle(processQueue, { timeout: 100 });
-                    });
+                    const CHUNK_BUDGET = 8;
+                    while (index < items.length) {
+                        await wfYield();
+                        const chunkStart = performance.now();
+                        while (index < items.length && performance.now() - chunkStart < CHUNK_BUDGET) {
+                            processItem(items[index]);
+                            index++;
+                        }
+                    }
                 }
             };
 
@@ -833,7 +857,9 @@ _setupDynamicComponentDetection()
             }
 
             // List processing (async with yielding)
-            await this._mountListsAsync(this.domElements.lists, ctx.scanStart);
+            if (__FEATURE_LISTS__) {
+                await this._mountListsAsync(this.domElements.lists, ctx.scanStart);
+            }
 
             // Deferred init() execution via macrotask (shared method)
             this._executeDeferredInits(ctx.pendingInits);
@@ -865,6 +891,13 @@ _setupDynamicComponentDetection()
         // Get definition
         let definition = this.componentDefinitions.get(componentName);
         if (!definition) return null;
+
+        // Contract check on the ORIGINAL definition (pre-SSR-enhancement),
+        // once per definition name (validateEntityDefinition self-guards).
+        if (__DEV__) validateEntityDefinition('Component', componentName, definition, COMPONENT_CONTRACT_KEYS);
+        if (__DEV__) warnDefinitionCollisions('Component', componentName, definition);
+        // Lifecycle-hook names wired as event handlers (self-guards per name).
+        if (__DEV__) warnLifecycleActionNames(element, componentName);
 
         // SSR: Enhance definition if this is an SSR component
         if (__FEATURE_SSR__ && options.ssrEnhance && this.ssrManager) {

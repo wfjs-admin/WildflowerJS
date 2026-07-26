@@ -123,7 +123,7 @@ describe.skipIf(isMinifiedBuild())('Code Review 2026-04-22 — Group 1 (phase 1)
       wildflower.component('c2-host', {
         state: {},
         init() {
-          pool = this.pool('fx')
+          pool = this.getPool('fx')
         }
       })
 
@@ -227,7 +227,7 @@ describe.skipIf(isMinifiedBuild())('Code Review 2026-04-22 — Group 1 (phase 1)
       wildflower.component('c2-order-host', {
         state: {},
         init() {
-          pool = this.pool('rows')
+          pool = this.getPool('rows')
         }
       })
 

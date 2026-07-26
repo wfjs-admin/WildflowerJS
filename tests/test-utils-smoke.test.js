@@ -45,7 +45,7 @@ describe('@wildflowerjs/test-utils', () => {
         // '*-min' modes load explicitly-minified bundles (alias of the
         // unsuffixed build; included so the 15-variant pre-launch sweep
         // exercises the test utility against the explicit names too)
-        expect(['source', 'core', 'mini', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'mini-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev', 'core-raw', 'mini-raw', 'lite-raw', 'spa-raw', 'full-raw', 'core-min', 'mini-min', 'lite-min', 'spa-min', 'full-min', 'experimental-min']).toContain(mode)
+        expect(['source', 'core', 'nano', 'mini', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'nano-dev', 'mini-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev', 'core-raw', 'nano-raw', 'mini-raw', 'lite-raw', 'spa-raw', 'full-raw', 'core-min', 'nano-min', 'mini-min', 'lite-min', 'spa-min', 'full-min', 'experimental-min']).toContain(mode)
       })
 
       it('should default to ai-dev mode', () => {
@@ -53,7 +53,7 @@ describe('@wildflowerjs/test-utils', () => {
         // Default is now 'ai-dev' (full framework with debug info)
         // When WILDFLOWER_DIST is explicitly set, it returns that mode
         // 'experimental', '*-raw', and explicit '*-min' modes are also valid
-        expect(['core', 'mini', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'mini-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev', 'core-raw', 'mini-raw', 'lite-raw', 'spa-raw', 'full-raw', 'core-min', 'mini-min', 'lite-min', 'spa-min', 'full-min', 'experimental-min']).toContain(mode)
+        expect(['core', 'nano', 'mini', 'lite', 'spa', 'full', 'ai', 'experimental', 'core-dev', 'nano-dev', 'mini-dev', 'lite-dev', 'spa-dev', 'full-dev', 'ai-dev', 'experimental-dev', 'core-raw', 'nano-raw', 'mini-raw', 'lite-raw', 'spa-raw', 'full-raw', 'core-min', 'nano-min', 'mini-min', 'lite-min', 'spa-min', 'full-min', 'experimental-min']).toContain(mode)
       })
     })
 

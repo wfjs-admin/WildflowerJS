@@ -32,6 +32,9 @@ const SRC_CANDIDATES = [
 ];
 const SRC = SRC_CANDIDATES.find((p) => fs.existsSync(path.join(p, 'index.js'))) || SRC_CANDIDATES[0];
 
+// On the spike/unified-graph-core branch Meadow is the only reactive core (the
+// legacy ReactiveStateManager has been deleted), so there is no core switch and
+// the build writes to the normal `dist`.
 const DEFAULT_DIST = SRC === SRC_CANDIDATES[0] ? 'www/js/dist' : 'dist';
 const DIST = path.resolve(ROOT, process.env.WF_BUILD_OUTDIR || DEFAULT_DIST);
 
@@ -116,16 +119,24 @@ const FEATURES_ALL = {
     __FEATURE_PORTALS__: 'true',
     __FEATURE_TRANSITIONS__: 'true',
     __FEATURE_SSR__: 'false',
-    __LEGACY_RENDER__: 'false',
+    __FEATURE_LISTS__: 'true',
+    __FEATURE_QUERY__: 'false',
 };
-const FEATURES_FULL = { ...FEATURES_ALL, __FEATURE_SSR__: 'true' };
+// data-query rides the SSR tier by decision (docs/future/data-query/DESIGN.md):
+// "you use full for SSR, you get data-query too."
+const FEATURES_FULL = { ...FEATURES_ALL, __FEATURE_SSR__: 'true', __FEATURE_QUERY__: 'true' };
 const FEATURES_LITE = {
     __FEATURE_PLUGINS__: 'false',
     __FEATURE_PORTALS__: 'false',
     __FEATURE_TRANSITIONS__: 'false',
     __FEATURE_SSR__: 'false',
-    __LEGACY_RENDER__: 'false',
+    __FEATURE_LISTS__: 'true',
+    __FEATURE_QUERY__: 'false',
 };
+// NANO: below mini — everything in lite/mini minus the data-list render cluster.
+// __FEATURE_LISTS__ = false constant-folds the list call-sites out of the
+// nano-shipped modules (crash-safe) and drops the cluster spread.
+const FEATURES_NANO = { ...FEATURES_LITE, __FEATURE_LISTS__: 'false' };
 
 function defines(features, dev) {
     return { __DEV__: String(!!dev), ...features };
@@ -135,6 +146,12 @@ function defines(features, dev) {
 // Build configurations
 // -----------------------------------------------------------------------------
 const configs = [
+    // NANO (below mini: no data-list render cluster) — the interactive-widget /
+    // single-file-artifact tier. __FEATURE_LISTS__ = false folds list call-sites out.
+    { entry: 'index.nano.js', file: 'wildflower.nano.js',      features: FEATURES_NANO, dev: true,  minify: false, mangleProps: false, footer: 'core' },
+    { entry: 'index.nano.js', file: 'wildflower.nano.dev.js',  features: FEATURES_NANO, dev: true,  minify: true,  mangleProps: false, footer: 'core' },
+    { entry: 'index.nano.js', file: 'wildflower.nano.min.js',  features: FEATURES_NANO, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
+
     // CORE
     { entry: 'index.js',      file: 'wildflower.js',           features: FEATURES_ALL,  dev: true,  minify: false, mangleProps: false, footer: 'core' },
     { entry: 'index.js',      file: 'wildflower.dev.js',       features: FEATURES_ALL,  dev: true,  minify: true,  mangleProps: false, footer: 'core' },
@@ -160,6 +177,10 @@ const configs = [
     { entry: 'index.full.js', file: 'wildflower.full.dev.js',  features: FEATURES_FULL, dev: true,  minify: true,  mangleProps: false, footer: 'full' },
     { entry: 'index.full.js', file: 'wildflower.full.min.js',  features: FEATURES_FULL, dev: false, minify: true,  mangleProps: true,  footer: 'full' },
 ];
+
+// Optional maintainer-local variant extensions (repo-internal tooling; the
+// extension file is not part of the published package). Absent file = no-op.
+try { configs.push(...require('./build-variants.bench.cjs')); } catch (_) { /* no local variants */ }
 
 // -----------------------------------------------------------------------------
 // Property mangling regex

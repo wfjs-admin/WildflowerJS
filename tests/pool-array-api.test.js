@@ -46,7 +46,7 @@ function getInstance(wildflower, el) {
 /**
  * Standard pool setup used by most tests in this file.
  * Returns { instance, pool } for a pool named "items".
- * Uses `this.pool('items')` inside init() (same pattern as existing pool tests).
+ * Uses `this.getPool('items')` inside init() (same pattern as existing pool tests).
  */
 async function setupPool(wildflower, testContainer, componentName = 'array-api-test') {
   testContainer.innerHTML = `
@@ -62,7 +62,7 @@ async function setupPool(wildflower, testContainer, componentName = 'array-api-t
   let pool = null
   wildflower.component(componentName, {
     state: {},
-    init() { pool = this.pool('items') }
+    init() { pool = this.getPool('items') }
   })
   ensureComponentScanning(wildflower)
   await waitForCompleteRender()
@@ -183,8 +183,8 @@ describeIfPools('Pool Array-like API', () => {
       `
 
       let p1 = null, p2 = null
-      wildflower.component('push-test-1', { state: {}, init() { p1 = this.pool('items') } })
-      wildflower.component('push-test-2', { state: {}, init() { p2 = this.pool('items') } })
+      wildflower.component('push-test-1', { state: {}, init() { p1 = this.getPool('items') } })
+      wildflower.component('push-test-2', { state: {}, init() { p2 = this.getPool('items') } })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
 
@@ -418,12 +418,19 @@ describeIfPools('Pool Array-like API', () => {
   // rationale first. See PoolRenderer.js near the array-readers block.
   // ==========================================================================
   describe('index-unstable methods are not exposed', () => {
-    it('pool does not expose splice / pop / indexOf / slice', async () => {
+    it('pool does not support splice / pop / indexOf / slice', async () => {
+      // Contract updated by the DX diagnostics sweep (A7): the methods remain
+      // UNSUPPORTED everywhere, but dev builds carry throwing stubs that
+      // explain the swap-with-last storage instead of a bare TypeError.
+      // Min builds keep them absent entirely.
       const { pool } = await setupPool(wildflower, testContainer)
-      expect(pool.splice).toBeUndefined()
-      expect(pool.pop).toBeUndefined()
-      expect(pool.indexOf).toBeUndefined()
-      expect(pool.slice).toBeUndefined()
+      for (const m of ['splice', 'pop', 'indexOf', 'slice']) {
+        if (isMinifiedBuild()) {
+          expect(pool[m]).toBeUndefined()
+        } else {
+          expect(() => pool[m]()).toThrowError(/swap-with-last/)
+        }
+      }
     })
   })
 })

@@ -78,7 +78,7 @@ describeIfPools('Pool Entity Methods', () => {
             }
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -112,7 +112,7 @@ describeIfPools('Pool Entity Methods', () => {
             }
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -158,7 +158,7 @@ describeIfPools('Pool Entity Methods', () => {
           componentCallCount++
           receivedItem = item
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -195,7 +195,7 @@ describeIfPools('Pool Entity Methods', () => {
           }
         },
         tag() { componentCalled = true; },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -233,7 +233,7 @@ describeIfPools('Pool Entity Methods', () => {
             }
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -275,7 +275,7 @@ describeIfPools('Pool Entity Methods', () => {
             }
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -365,7 +365,7 @@ describeIfPools('Pool Entity Methods', () => {
             }
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -412,7 +412,7 @@ describeIfPools('Pool Entity Methods', () => {
             }
           }
         },
-        init() { pool = this.pool('enemies'); }
+        init() { pool = this.getPool('enemies'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -453,7 +453,7 @@ describeIfPools('Pool Entity Methods', () => {
       wildflower.component('scale-test', {
         state: {},
         pools: { items: {} },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -487,7 +487,7 @@ describeIfPools('Pool Entity Methods', () => {
         state: {},
         pools: { items: {} },
         handle(item) { handled = item.id; },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()
@@ -533,7 +533,7 @@ describeIfPools('Pool Entity Methods', () => {
             }
           }
         },
-        init() { pool = this.pool('items'); }
+        init() { pool = this.getPool('items'); }
       })
       ensureComponentScanning(wildflower)
       await waitForCompleteRender()

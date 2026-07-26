@@ -770,6 +770,8 @@ const handlers = {
     // or, under a list frame, registers the leaf on the per-list sink instead.
     if (activeObserver && !suppressTracking) {
       trackRead(target, key);
+    } else if (__DEV__ && !suppressTracking && typeof key === 'string') {
+      devCountRead(target, key); // WF-216: sustained hot-loop read detection
     }
     // Wrap nested objects so deep reads track too (one proxy per raw object).
     if (value !== null && typeof value === 'object') return reactive(value);
@@ -782,6 +784,7 @@ const handlers = {
     if (value !== null && typeof value === 'object' && value[RAW]) value = value[RAW];
     const old = target[key];
     if (Object.is(old, value)) return true; // no-op writes are free
+    if (__DEV__ && activeObserver !== null) warnComputedWrite('wrote to reactive state ("' + String(key) + '")');
     const wasArray = Array.isArray(target);
     const oldLen = wasArray ? target.length : -1;
     // Genuine key ADD (not an update of an undefined-valued existing key):
@@ -834,6 +837,13 @@ const handlers = {
 function reactive(obj) {
   if (obj === null || typeof obj !== 'object') return obj;
   if (obj[RAW]) return obj; // already a proxy
+  // Prefer an existing path-aware tree proxy: consumers wrapping a raw object
+  // that lives inside an entity-state tree must get the SAME proxy a facade
+  // read (state.rows[i]) returns — identity stability — and its set trap
+  // carries the entity's onStateChange dispatch. List items are tree-wrapped
+  // during create (clone setter walk), so this is a cache hit for them.
+  const tree = treeProxies.get(obj);
+  if (tree) return tree.proxy;
   const existing = proxyCache.get(obj);
   if (existing) return existing;
   const p = new Proxy(obj, handlers);
@@ -873,6 +883,79 @@ const COMPUTED_MISS = Symbol('reactive-graph.computed-miss');
 // normally.
 const ARRAY_MUTATORS = new Set(['splice', 'push', 'pop', 'shift', 'unshift', 'reverse', 'sort', 'copyWithin', 'fill']);
 
+// __DEV__ diagnostic (F5, AI-surface eval 2026-07-16): computeds must be pure.
+// Mutating tracked state from INSIDE a computed invalidates the computed while
+// it runs (an in-place `sort()` routes through the mutator wrapper, whose
+// `length` pulse re-enters the evaluating node), and everything bound to it
+// breaks SILENTLY — a data-list bound to a `this.items.sort(...)` computed can
+// render empty with no console output at all. Warn once per computed node,
+// naming the computed and the write, with the copy-first fix inline. Writes
+// inside untrack() are the sanctioned escape and stay silent; production
+// builds compile the call sites out entirely.
+let _computedWriteWarned = null;
+function warnComputedWrite(desc) {
+    if (activeObserver === null || suppressTracking || activeObserver.kind !== COMPUTED) return;
+    if (_computedWriteWarned === null) _computedWriteWarned = new WeakSet();
+    if (_computedWriteWarned.has(activeObserver)) return;
+    _computedWriteWarned.add(activeObserver);
+    const name = activeObserver.key || (activeObserver.fn && activeObserver.fn.name) || '(anonymous)';
+    console.warn(
+        `[WF WF-217] Computed "${name}" ${desc} during its own evaluation. ` +
+        'Computeds must be pure: mutating tracked state from inside a computed ' +
+        'invalidates it while it runs, and anything bound to it (a data-list, a ' +
+        'binding) can silently render empty or stale. If you are sorting or ' +
+        'reversing an array, copy it first: return [...items].sort(...).'
+    );
+}
+
+// __DEV__ diagnostic (WF-216, sealing row 6): hot-loop facade reads. A facade
+// read costs ~100x a plain property read (proxy physics — every fine-grained
+// framework pays it); the framework can't remove the cost, but it can catch
+// the pattern that pays it thousands of times per frame. Untracked reads are
+// counted per (object, property); each BURST-th read of one property is a
+// "crossing", timestamped once (performance.now() per 1024 reads, not per
+// read). Crossings closer than GAP_MIN ms apart are the same synchronous
+// batch (one-shot init sweeps stay silent); farther than GAP_MAX apart is
+// not sustained (run resets). RUNS consecutive frame-scale crossings =
+// a sustained hot loop → warn once per property name, teaching the hoist.
+// The warn text is emitted through a reporter the entity-handle facade
+// installs (wfError/WF-216); this module stays clean-room (imports nothing),
+// so a plain-console fallback covers standalone-core usage. Production
+// builds compile the call sites out entirely.
+const DEV_HOT_BURST = 1024;   // reads of one property per crossing
+const DEV_HOT_GAP_MIN = 2;    // ms; closer crossings = same synchronous batch
+const DEV_HOT_GAP_MAX = 250;  // ms; farther crossings = not sustained
+const DEV_HOT_RUNS = 3;       // consecutive frame-scale crossings to warn
+const devHotCounts = (typeof __DEV__ !== 'undefined' && __DEV__) ? new WeakMap() : null;
+const devHotWarned = (typeof __DEV__ !== 'undefined' && __DEV__) ? new Set() : null;
+let devHotReporter = null;
+
+export function __setDevHotReadReporter(fn) { devHotReporter = fn; }
+
+function devCountRead(target, key) {
+    let m = devHotCounts.get(target);
+    if (m === undefined) { m = new Map(); devHotCounts.set(target, m); }
+    const rec = m.get(key);
+    if (rec === undefined) { m.set(key, { n: 1, tPrev: 0, runs: 0 }); return; }
+    if (++rec.n < DEV_HOT_BURST) return;
+    rec.n = 0;
+    const now = performance.now();
+    const dt = now - rec.tPrev;
+    rec.tPrev = now;
+    if (dt < DEV_HOT_GAP_MIN) return;                    // same synchronous batch
+    if (dt > DEV_HOT_GAP_MAX) { rec.runs = 1; return; }  // idle gap: new run
+    if (++rec.runs < DEV_HOT_RUNS) return;
+    rec.runs = 0;
+    if (devHotWarned.has(key)) return;
+    devHotWarned.add(key);
+    const perFrame = Math.round((DEV_HOT_BURST / dt) * 16.7);
+    if (devHotReporter) {
+        devHotReporter(key, perFrame);
+    } else {
+        console.warn(`[WF WF-216] state '${key}' is being read ~${perFrame} times per frame through the reactive facade, sustained across frames. Hoist it to a local outside the loop.`);
+    }
+}
+
 function wrapTree(obj, prefix, notify, computedResolver) {
   if (obj === null || typeof obj !== 'object') return obj;
   const cached = treeProxies.get(obj);
@@ -889,6 +972,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
         // graph nodes stay correct; only the framework dispatch is batched.
         if (typeof key === 'string' && ARRAY_MUTATORS.has(key) && Array.isArray(target)) {
           return function (...args) {
+            if (__DEV__ && activeObserver !== null) warnComputedWrite('mutated a reactive array with .' + key + '()');
             const oldLen = target.length;
             // Unwrap any proxy arguments (inserted elements) to raw. The set trap
             // unwrapped on store; the RAW mutator below bypasses it, so unwrap here
@@ -942,7 +1026,11 @@ function wrapTree(obj, prefix, notify, computedResolver) {
         const resolved = computedResolver(key);
         if (resolved !== COMPUTED_MISS) return resolved;
       }
-      if (activeObserver && !suppressTracking) trackRead(target, key);
+      if (activeObserver && !suppressTracking) {
+        trackRead(target, key);
+      } else if (__DEV__ && !suppressTracking && typeof key === 'string') {
+        devCountRead(target, key); // WF-216: sustained hot-loop read detection
+      }
       if (value !== null && typeof value === 'object') {
         if (typeof key === 'symbol') return value; // Symbol-keyed internals are not path-observable
         // On a cache HIT, return the existing child proxy WITHOUT building the
@@ -966,6 +1054,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
       if (value !== null && typeof value === 'object' && value[RAW]) value = value[RAW];
       const old = target[key];
       if (Object.is(old, value)) return true;
+      if (__DEV__ && activeObserver !== null) warnComputedWrite('wrote to reactive state ("' + prefix + String(key) + '")');
       const wasArray = Array.isArray(target);
       const oldLen = wasArray ? target.length : -1;
       // Genuine key ADD (see the core set trap): checked only when
@@ -1044,6 +1133,14 @@ function wrapTree(obj, prefix, notify, computedResolver) {
 
 function reactiveTree(obj, notify, computedResolver) {
   return wrapTree(obj, '', notify || (() => {}), computedResolver);
+}
+
+// True while a computed/effect evaluation is tracking reads. Consumers that
+// bridge non-reactive storage into the graph on demand (the pool's lazy
+// aggregate node) use this to materialize their reactive surface exactly at
+// the first tracked read and stay zero-cost for plain reads.
+function isTracking() {
+  return activeObserver !== null && !suppressTracking;
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,6 +1223,7 @@ function __nodeOf(getterOrDispose) { return getterOrDispose && getterOrDispose._
 export {
   reactive,
   reactiveTree,
+  isTracking,
   COMPUTED_MISS,
   computed,
   effect,

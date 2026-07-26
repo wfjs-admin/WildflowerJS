@@ -234,7 +234,7 @@ describe('lifecycle invariants', () => {
       init() {
         // Pool must exist by the time init() runs (i.e. _setupPools (phase 9)
         // completed before the deferred init macrotask (phase 14)).
-        const p = this.pool('enemies')
+        const p = this.getPool('enemies')
         if (!p) throw new Error('pool not initialized before init()')
         p.add({ id: 1, name: 'a' })
         p.add({ id: 2, name: 'b' })

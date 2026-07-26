@@ -9,7 +9,6 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
     parseExpression,
     evaluateAST,
-    getCSPSafeEvaluator,
     getCSPSafeEvaluatorWithArgs,
     getCSPSafeMergedContextEvaluator,
     BLOCKED_PROPERTIES,
@@ -537,27 +536,6 @@ describe('Security Blocklists', () => {
 });
 
 describe('CSP Evaluator Factory Functions', () => {
-    describe('getCSPSafeEvaluator', () => {
-        it('should return evaluator function', () => {
-            const cache = new Map();
-            const evaluator = getCSPSafeEvaluator('a + b', cache);
-            expect(typeof evaluator).toBe('function');
-        });
-
-        it('should cache evaluators', () => {
-            const cache = new Map();
-            const eval1 = getCSPSafeEvaluator('a + b', cache);
-            const eval2 = getCSPSafeEvaluator('a + b', cache);
-            expect(eval1).toBe(eval2);
-        });
-
-        it('should evaluate with context', () => {
-            const cache = new Map();
-            const evaluator = getCSPSafeEvaluator('a + b', cache);
-            expect(evaluator({ a: 1, b: 2 })).toBe(3);
-        });
-    });
-
     describe('getCSPSafeEvaluatorWithArgs', () => {
         it('should return evaluator that takes args in order', () => {
             const cache = new Map();

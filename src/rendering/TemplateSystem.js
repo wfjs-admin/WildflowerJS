@@ -7,6 +7,7 @@
 // Import CSP-safe evaluation functions
 import { getCSPSafeMergedContextEvaluator, getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
 import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
+import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { slotDataCache } from '../core/DomMetadata.js';
 import { applyShow, applyText } from '../core/BindingWriters.js';
 
@@ -97,12 +98,22 @@ export const TemplateSystemMethods = {
             }
 
             // No template found - warn and return null
-            if (__DEV__) console.warn(`Configurable template '${templateName}' not found and no fallback provided`);
+            if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `Configurable template '${templateName}' not found and no fallback provided` });
             return null;
         }
 
         // Standard template discovery (existing behavior)
-        return container.querySelector('template');
+        const found = container.querySelector('template');
+        // A4 (DX diagnostics sweep, dev only): a 'template'-named element with
+        // no content fragment is the HTML parser's foreign-content leftover
+        // (e.g. <template> inside <svg> parses as an inert SVG element, NOT an
+        // HTMLTemplateElement). Return null so the no-template diagnosis names
+        // the cause, instead of downstream code building rows from the inert
+        // element or choking on .content. Production keeps today's behavior.
+        if (__DEV__ && found && found.content === undefined) {
+            return null;
+        }
+        return found;
     },
     /**
      * Extract usable content from a template
@@ -165,7 +176,7 @@ export const TemplateSystemMethods = {
             if (name) {
                 // Warn on duplicate names at same level
                 if (instance._itemTemplates.has(name)) {
-                    if (__DEV__) console.warn(`Duplicate item-template name '${name}' in component - first one used`);
+                    if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `Duplicate item-template name '${name}' in component - first one used` });
                     return;
                 }
                 // Store the ORIGINAL template element reference (never mutate this!)
@@ -199,14 +210,14 @@ export const TemplateSystemMethods = {
                             const cloned = originalTemplate.content.cloneNode(true);
                             // Diagnostic: warn if template content is empty
                             if (cloned.childElementCount === 0) {
-                                if (__DEV__) console.warn(`[WF] Configurable template '${templateName}' has empty content (no element children). Check if template was properly parsed.`);
+                                if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `Configurable template '${templateName}' has empty content (no element children). Check if template was properly parsed` });
                             }
                             return cloned;
                         }
                         return originalTemplate.cloneNode(true);
                     }
                     // Target found but template not present
-                    if (__DEV__) console.warn(`Configurable template '${templateName}' not found in target component '${targetComponentName}'`);
+                    if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `Configurable template '${templateName}' not found in target component '${targetComponentName}'` });
                     return null;
                 }
             } else {
@@ -219,7 +230,7 @@ export const TemplateSystemMethods = {
                         const cloned = originalTemplate.content.cloneNode(true);
                         // Diagnostic: warn if template content is empty
                         if (cloned.childElementCount === 0) {
-                            if (__DEV__) console.warn(`[WF] Configurable template '${templateName}' has empty content (no element children). Check if template was properly parsed.`);
+                            if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `Configurable template '${templateName}' has empty content (no element children). Check if template was properly parsed` });
                         }
                         return cloned;
                     }
@@ -234,7 +245,7 @@ export const TemplateSystemMethods = {
 
         // If explicit target was specified but not found in hierarchy
         if (targetComponentName && !foundTarget) {
-            if (__DEV__) console.warn(`Target component '${targetComponentName}' not found in component hierarchy`);
+            if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `Target component '${targetComponentName}' not found in component hierarchy` });
         }
 
         return null;
@@ -506,7 +517,7 @@ export const TemplateSystemMethods = {
         }
 
         if (!templateContent) {
-            if (__DEV__) console.warn(`[WildflowerJS] Template '${templateName}' not found and no fallback provided`);
+            if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `Template '${templateName}' not found and no fallback provided` });
             return;
         }
 
@@ -568,11 +579,40 @@ export const TemplateSystemMethods = {
         // root is a live, already-rendered, in-DOM subtree; element paths are
         // element-index based, so they align with the live element. The compiled
         // metadata is cached on the slot context for cheap re-apply on update.
-        const meta = this._compileTemplate(element, slotContext.dataWithPath, { isConfigurableTemplate: true });
-        if (meta) {
-            const slotCtx = { componentInstance: instance, data: [dataValue], path: slotContext.dataWithPath };
-            this._bindWithCompiledMetadata(element, dataValue, meta, slotCtx, 0, slotCtx);
-            (slotContext._compiledMeta || (slotContext._compiledMeta = [])).push({ element, meta, slotCtx });
+        // Scoped-slot READ bindings reuse the list row applier (compile + apply),
+        // which is a list-tier feature absent in the nano build. Gate the whole
+        // compile/apply — _compileTemplate itself relies on list-cluster state and
+        // throws in nano — so nano never enters it. Models/actions below still work.
+        if (__FEATURE_LISTS__) {
+            const meta = this._compileTemplate(element, slotContext.dataWithPath, { isConfigurableTemplate: true });
+            if (meta) {
+                const slotCtx = { componentInstance: instance, data: [dataValue], path: slotContext.dataWithPath };
+                this._bindWithCompiledMetadata(element, dataValue, meta, slotCtx, 0, slotCtx);
+                // Decorative bindings (class/style/attr) go through the shared
+                // evaluator pass, the sole list-path owner since the executors were
+                // retired. A scoped slot is a single row (index 0, length 1).
+                this._applyRowDecor(element, dataValue, meta, 0, 1, instance?.state || {}, instance, slotCtx);
+                (slotContext._compiledMeta || (slotContext._compiledMeta = [])).push({ element, meta, slotCtx });
+            }
+        } else if (__DEV__) {
+            // Read-binding attrs on the slot root itself OR any descendant. The root
+            // check matters for single-element slots (e.g. <td data-bind="name">).
+            const READ_SEL = '[data-bind],[data-wf-bind],[data-bind-class],[data-wf-bind-class],[data-bind-style],[data-wf-bind-style],[data-show],[data-wf-show]';
+            const hasReadBinding = (element.matches && element.matches(READ_SEL)) ||
+                                   (element.querySelector && element.querySelector(READ_SEL));
+            if (hasReadBinding) {
+                // Dev-only marker so the nano test harness can auto-skip a test that
+                // relies on scoped-slot read bindings (inert in nano). Folds out of
+                // production builds with the surrounding __DEV__ branch. (nano-min has
+                // no __DEV__, so those tests gate on hasFeature('lists') instead — see
+                // test-new/inherited-templates-slots.test.js.)
+                if (typeof window !== 'undefined') window.__wf_nano_inert_binding__ = true;
+                wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
+                    warn: true,
+                    context: `Scoped-slot read bindings (data-bind/-show/-class/-style) require the list render cluster and are inert in the nano build`,
+                    suggestion: 'Use data-model/data-action, or move to the mini tier.'
+                });
+            }
         }
 
         // Models (two-way write-back to the using component's data object) and
@@ -599,7 +639,7 @@ export const TemplateSystemMethods = {
             // Check if action exists on the using component
             const actionMethod = instance.context[actionName];
             if (typeof actionMethod !== 'function') {
-                if (__DEV__) console.warn(`[WildflowerJS] Action '${actionName}' not found on component '${instance.name}'`);
+                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: `Action '${actionName}' not found on component '${instance.name}'` });
                 continue;
             }
 
@@ -775,11 +815,13 @@ export const TemplateSystemMethods = {
         // refreshes model-displayed values (_executeModels). Model write-back
         // listeners and action listeners persist on the elements across updates;
         // they reference the data object directly and need no re-binding.
-        if (slotContext._compiledMeta) {
+        if (__FEATURE_LISTS__ && slotContext._compiledMeta) {
             for (let i = 0; i < slotContext._compiledMeta.length; i++) {
                 const entry = slotContext._compiledMeta[i];
                 entry.slotCtx.data = [dataValue];
                 this._bindWithCompiledMetadata(entry.element, dataValue, entry.meta, entry.slotCtx, 0, entry.slotCtx);
+                // Decorative bindings re-applied via the shared evaluator pass.
+                this._applyRowDecor(entry.element, dataValue, entry.meta, 0, 1, instance?.state || {}, instance, entry.slotCtx);
             }
         }
     },
@@ -1721,6 +1763,42 @@ export const TemplateSystemMethods = {
             attrEvaluators.unshift({ elementPath: [], evaluator: evalFn, expression: expr, isRoot: true, isComputed: false });
         }
         metadata.attrEvaluators = attrEvaluators;
+
+        // Applier-program scaffolding (additive; NO consumer yet). ONE flat ordered
+        // record list over every paint binding — the structure the execution engine
+        // (a following stage) will iterate to paint a row, superseding the per-type
+        // executor fan-out. Each record is { elementIndex (into _cachedElementsArray),
+        // kind, spec }, where spec is the resolve descriptor: the per-type binding for
+        // text/html/model/show/render, and the compiled evaluator for class/style/attr
+        // (the list-path decor owners, whose root entry is isRoot with no indexed
+        // duplicate). Element-major order via a fixed kind priority (text < html <
+        // model < show < render < class < style < attr); for a single element this
+        // matches today's executor sequence. Actions are event wiring, not paint, so
+        // they are excluded.
+        // __FEATURE_LISTS__-gated: the applier program is list/slot paint machinery,
+        // dead in nano (which never reaches _compileTemplate), so it DCE's out there.
+        if (__FEATURE_LISTS__) {
+            const _appProgram = [];
+            const _pushSpecs = (arr, kind) => {
+                if (!arr) return;
+                for (let i = 0; i < arr.length; i++) {
+                    const spec = arr[i];
+                    _appProgram.push({ elementIndex: spec.isRoot ? 0 : (spec.index | 0), kind, spec });
+                }
+            };
+            _pushSpecs(metadata.bindings, 'TEXT');
+            _pushSpecs(metadata.htmlBindings, 'HTML');
+            _pushSpecs(metadata.models, 'MODEL');
+            _pushSpecs(metadata.shows, 'SHOW');
+            _pushSpecs(metadata.renders, 'RENDER');
+            _pushSpecs(metadata.classEvaluators, 'CLASS');
+            _pushSpecs(metadata.styleEvaluators, 'STYLE');
+            _pushSpecs(metadata.attrEvaluators, 'ATTR');
+            // Stable sort -> element-major; equal indices keep the kind-priority push
+            // order above (Array.prototype.sort is stable in the target engines).
+            _appProgram.sort((a, b) => a.elementIndex - b.elementIndex);
+            metadata._appProgram = _appProgram;
+        }
 
         return metadata;
     },

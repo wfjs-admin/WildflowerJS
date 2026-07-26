@@ -11,6 +11,7 @@ import {
   effect as mEffect,
   refresh as mRefresh,
   toRaw as mToRaw,
+  reactive as mReactive,
   untrack as mUntrack,
   enableArrayOps as mEnableArrayOps, consumeArrayOps as mConsumeArrayOps,
 } from './core.js';
@@ -92,10 +93,17 @@ export function reconcile(arrayFn, mapFn, options = {}) {
       // the effect no longer needs to observe ~N per-index nodes to react to a
       // reorder, which is what made a splice pulse ~N index nodes. Per-index nodes
       // now exist only for genuine absolute-index readers (e.g. a `rows.5` binding),
-      // not the structural effect. items[i] is still the proxy (the get-trap wraps
-      // regardless of tracking); keys read raw as before.
+      // not the structural effect. Items are stored RAW: bulk create allocates no
+      // per-item Proxy (the dominant reactive-specific create cost — proxy alloc
+      // + GC of N proxies). Consumers that need tracking or the set trap wrap on
+      // demand via the cached, identity-stable reactive() (see entity-handle
+      // reactive()); the reconciler itself never needs the proxy — identity,
+      // keying, and onItemUpdate compares all work on raw. mapFn is the one
+      // exception: its public contract is a reactive item (callers hang tracked
+      // effects off it), so the item is wrapped AT the mapFn call — a path the
+      // bulk fast paths (create/append/replace-all) never take.
       mUntrack(() => {
-        for (let i = 0; i < n; i++) { items[i] = arr[i]; keys[i] = keyOf(rawArr[i], i); }
+        for (let i = 0; i < n; i++) { items[i] = rawArr[i]; keys[i] = keyOf(rawArr[i], i); }
       });
 
       const oldByKey = new Map();
@@ -222,7 +230,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
               if (options.onDeferredEffects) options.onDeferredEffects(bulkResults, next, undefined);
             } else {
               for (let i = 0; i < n; i++) {
-                const res = mapFn(items[i], i, false) || {};
+                const res = mapFn(mReactive(items[i]), i, false) || {};
                 next[i] = { key: keys[i], element: res.element, itemProxy: items[i], disposeEffect: res.disposeEffect };
                 if (options.onInsert && next[i].element) options.onInsert(next[i].element, i);
               }
@@ -242,13 +250,23 @@ export function reconcile(arrayFn, mapFn, options = {}) {
               // stamps moved to the new raw, nested-list refresh) and applies
               // the row's full binding set against the new proxy; rows have
               // no per-item effect, so it is the sole applier.
-              if (options.onItemUpdate) options.onItemUpdate(ex.element, items[i], ex.itemProxy, i);
+              //
+              // The item MUST be handed over as its reactive wrap (same cached,
+              // identity-stable mReactive the mapFn path uses), not raw. items[]
+              // holds raws since the raw-items optimization, but everything
+              // onItemUpdate re-points is a TRACKING consumer: a nested list's
+              // arrayFn reads _parentItemProxy[childPath], and the sink's
+              // registerWalk re-discovers row deps by reading the object. Handing
+              // them the raw made those reads register nothing, so the row went
+              // permanently deaf to later mutations of the new object (renders
+              // once via the refresh, then never again).
+              if (options.onItemUpdate) options.onItemUpdate(ex.element, mReactive(items[i]), ex.itemProxy, i);
             }
             ex.itemProxy = items[i];
             next[i] = ex;
           } else {
             anyCreated = true;
-            const res = mapFn(items[i], i, false) || {};
+            const res = mapFn(mReactive(items[i]), i, false) || {};
             next[i] = { key: k, element: res.element, itemProxy: items[i], disposeEffect: res.disposeEffect };
             if (options.onInsert && next[i].element) options.onInsert(next[i].element, i);
           }
@@ -331,6 +349,24 @@ export function reconcile(arrayFn, mapFn, options = {}) {
     // classification), applies its operation against `prev`, and returns true; or
     // false so the next matcher (and ultimately the full reconcile) gets a turn.
     // Add a fast path by adding a matcher. Order: cheapest/most-specific first.
+    // Re-derive entry keys after a structural fast path mutates `prev`.
+    // Index-keyed entries (items without the key field, keyOf fell back to the
+    // index) otherwise keep their CREATION index as key: after a fast-path
+    // remove/swap/rotate, an entry can sit at position i carrying key j. The
+    // next FULL reconcile then mis-attributes rows by key — it "updates" a row
+    // to the wrong item and clears the stamps of an item it just re-homed,
+    // leaving a live row deaf to field writes (found via the style-parity
+    // matrix: positional remove-middle + append + mutate). For id-keyed items
+    // keyOf returns the id, so this rewrites each key with itself — O(range)
+    // plain property reads, sub-noise on the structural paths.
+    const rekeyPrev = (from, to) => {
+      const end = to == null ? prev.length : to;
+      for (let i = from; i < end; i++) {
+        const e = prev[i];
+        if (e) e.key = keyOf(mToRaw(e.itemProxy), i);
+      }
+    };
+
     const fastPathMatchers = useFastPaths ? [
       // In-place swap of two distinct rows (any A/B exchange):
       // exactly two index writes, length unchanged, values exchanged. Length-
@@ -355,6 +391,8 @@ export function reconcile(arrayFn, mapFn, options = {}) {
         prev[a] = eb; prev[b] = ea;
         prev[a].itemProxy = arr[a];
         prev[b].itemProxy = arr[b];
+        // Index-derived keys must follow the POSITION, not the row.
+        rekeyPrev(a, a + 1); rekeyPrev(b, b + 1);
         // Move the two elements into place. Process the higher index first so the
         // lower index's reference element is still settled when we move it.
         const lo = a < b ? a : b, hi = a < b ? b : a;
@@ -390,6 +428,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
         if (options.onRemove) options.onRemove(removed.element, removed.key);
         _disposeRow(removed);
         prev.splice(start, 1);
+        rekeyPrev(start);
         for (let i = start; i < prev.length; i++) {
           if (prev[i].element) options.onMove(prev[i].element, i, i + 1, null, true);
         }
@@ -439,6 +478,8 @@ export function reconcile(arrayFn, mapFn, options = {}) {
           prev[lo] = moved;
         }
         for (let i = lo; i <= hi; i++) prev[i].itemProxy = arr[i];
+        // Index-derived keys must follow the POSITION, not the row.
+        rekeyPrev(lo, hi + 1);
         // Single DOM move: place the moved element at its new slot; the rest of the
         // range shifts visually on their own. Then renumber the range (no DOM move).
         const movedIdx = leftRot ? hi : lo;

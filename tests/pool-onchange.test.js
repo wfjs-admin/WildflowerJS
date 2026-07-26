@@ -69,7 +69,7 @@ describeIfPools('pool.onChange Callback', () => {
     wildflower.component('onchange-add', {
       state: {},
       init() {
-        const pool = this.pool('items')
+        const pool = this.getPool('items')
         pool.onChange = (p) => {
           lastSize = p.size
           callCount++
@@ -100,7 +100,7 @@ describeIfPools('pool.onChange Callback', () => {
     wildflower.component('onchange-remove', {
       state: {},
       init() {
-        const pool = this.pool('items')
+        const pool = this.getPool('items')
         pool.add({ id: 1, name: 'First' })
         pool.add({ id: 2, name: 'Second' })
         pool.add({ id: 3, name: 'Third' })
@@ -132,7 +132,7 @@ describeIfPools('pool.onChange Callback', () => {
     wildflower.component('onchange-clear', {
       state: {},
       init() {
-        const pool = this.pool('items')
+        const pool = this.getPool('items')
         pool.add({ id: 1, name: 'First' })
         pool.add({ id: 2, name: 'Second' })
 
@@ -159,7 +159,7 @@ describeIfPools('pool.onChange Callback', () => {
     wildflower.component('onchange-null', {
       state: {},
       init() {
-        const pool = this.pool('items')
+        const pool = this.getPool('items')
         // No onChange set — should not throw
         pool.add({ id: 1, name: 'Test' })
         pool.remove(1)
@@ -189,7 +189,7 @@ describeIfPools('pool.onChange Callback', () => {
     wildflower.component('onchange-timing', {
       state: {},
       init() {
-        const pool = this.pool('items')
+        const pool = this.getPool('items')
         pool.onChange = (p) => { sizeAtCallback = p.size }
         pool.add({ id: 1, name: 'First' })
       }

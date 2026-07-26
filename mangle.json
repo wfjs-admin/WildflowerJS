@@ -16,6 +16,7 @@
       "$_hooks": "__hk",
       "$_pluginsByName": "__pn",
       "$_scanForComponents": "__sc",
+      "$_scanForComponentsAsync": "__sy",
       "$_stateVersions": "__sv",
       "$_computedDependsOn": "__co",
       "$_computedDepVersions": "__cv",

@@ -74,11 +74,13 @@ import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
 import { ListNestedMethods } from './ListNestedManager.js';
 import { ListItemBindingMethods } from './ListItemBinding.js';
 import { ListExpressionMethods } from './ListExpressionEval.js';
+import { ListEventDelegationMethods } from '../events/EventSystem.js';
 import { needsComponentInitSet, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
 import { SSRListMethods } from './ssr-list.js';
 import { DIRECT_WRITERS } from '../state/bindingConstants.js';
 import { applyAttrObj, applyStyleProp, applyStyleObj, applyClass } from '../core/BindingWriters.js';
-import { __wf_str, __wf_txt } from '../core/wfUtils.js';
+import { WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { __wf_str, __wf_txt, HAS_MOVE_BEFORE, wfYield } from '../core/wfUtils.js';
 import { getRowCompileMode, getTextEmitters, applyRowText, shadowCompareRow,
     createListSinkDispatcher, applyRowTextUpdate, getPureTextSpec } from './RowCompiler.js';
 
@@ -103,6 +105,7 @@ export const ListRendererMethods = {
     ...ListNestedMethods,
     ...ListItemBindingMethods,
     ...ListExpressionMethods,
+    ...ListEventDelegationMethods,
     // SSR list support (fingerprint diff, hydration adoption, one-shot SSR
     // binders). The flag is a compile-time constant, so in the 12 non-SSR
     // variants this spread folds away and rollup drops the whole module.
@@ -143,26 +146,20 @@ export const ListRendererMethods = {
             componentIndex++;
         }
 
+        // Budget-chunked with cooperative yields (wfYield). Replaced
+        // requestIdleCallback: idle priority starves under main-thread
+        // contention (418 ms -> 90 ms in the headroom probe; see wfYield in
+        // wfUtils). ~8 ms of mounting per chunk, input/paint serviced between.
         if (componentIndex < componentEntries.length) {
-            await new Promise(resolve => {
-                const scheduleIdle = window.requestIdleCallback ||
-                    ((cb) => setTimeout(() => cb({ timeRemaining: () => 10 }), 1));
-
-                const processQueue = (deadline) => {
-                    while (componentIndex < componentEntries.length && deadline.timeRemaining() > 2) {
-                        this._mountComponentLists(componentEntries[componentIndex]);
-                        componentIndex++;
-                    }
-
-                    if (componentIndex < componentEntries.length) {
-                        scheduleIdle(processQueue, { timeout: 100 });
-                    } else {
-                        resolve();
-                    }
-                };
-
-                scheduleIdle(processQueue, { timeout: 100 });
-            });
+            const CHUNK_BUDGET = 8;
+            while (componentIndex < componentEntries.length) {
+                await wfYield();
+                const chunkStart = performance.now();
+                while (componentIndex < componentEntries.length && performance.now() - chunkStart < CHUNK_BUDGET) {
+                    this._mountComponentLists(componentEntries[componentIndex]);
+                    componentIndex++;
+                }
+            }
         }
 
         this._setupListEventDelegation(listElements, false, null);
@@ -533,7 +530,6 @@ export const ListRendererMethods = {
         if (!items || items.length === 0) return;
 
         // Skip if no context system
-        const hasContextSystem = this._contextSystemInitialized;
         const hasCustomDirectives = this._customDirectives && this._customDirectives.size > 0;
 
         // PERF: Fast path for simple lists - check if ITEM cleanup is needed
@@ -583,7 +579,7 @@ export const ListRendererMethods = {
                             if (itemSet.has(el)) {
                                 const componentId = componentEl.dataset.componentId;
                                 if (componentId) {
-                                    this.destroyComponent(componentId);
+                                    this._destroyComponentQuiet(componentId);
                                 }
                                 break;
                             }
@@ -632,55 +628,10 @@ export const ListRendererMethods = {
         // This avoids N querySelectorAll calls in _destroyNestedComponentsInItem
         for (const el of allElements) {
             if (el.dataset?.componentId) {
-                this.destroyComponent(el.dataset.componentId);
+                this._destroyComponentQuiet(el.dataset.componentId);
             }
         }
 
-        // Defer context cleanup to requestIdleCallback
-        // Context cleanup is expensive (O(contexts) registry scan) but not user-visible
-        // By deferring, the DOM removal appears instant in benchmarks
-        if (hasContextSystem && allElements.size > 0) {
-            this._scheduleDeferredCleanup(allElements);
-        }
-    },
-    /**
-     * Schedule deferred cleanup for context registry
-     * DOM removal happens immediately, context cleanup deferred to idle time
-     * This makes removal/clear operations appear instant in benchmarks
-     * @param {Set} elements - Set of elements that need context cleanup
-     * @private
-     */
-    _scheduleDeferredCleanup(elements) {
-        if (!elements || elements.size === 0) return;
-
-        // Add to queue
-        this._deferredCleanupQueue.push(elements);
-
-        // Schedule processing if not already scheduled
-        if (!this._deferredCleanupScheduled) {
-            this._deferredCleanupScheduled = true;
-
-            // Use requestIdleCallback if available, fallback to setTimeout
-            if (typeof requestIdleCallback === 'function') {
-                requestIdleCallback((deadline) => this._processDeferredCleanup(deadline), { timeout: 50 });
-            } else {
-                setTimeout(() => this._processDeferredCleanup(null), 0);
-            }
-        }
-    },
-    /**
-     * Process deferred cleanup queue
-     * Runs during idle time to clean up contexts from removed elements
-     * @param {IdleDeadline|null} deadline - Idle deadline from requestIdleCallback
-     * @private
-     */
-    _processDeferredCleanup(deadline) {
-        // Registry contexts no longer exist (per-item bindings/conditionals are
-        // effect-driven + element-local; they GC with the removed elements), so
-        // there is nothing to sweep; just drain the bookkeeping queues.
-        this._deferredCleanupScheduled = false;
-        this._deferredCleanupQueue = [];
-        this._deferredCleanupContextIds = null;
     },
     /**
      * Main list rendering orchestrator - initializes mapArray for reactive list rendering.
@@ -950,7 +901,38 @@ export const ListRendererMethods = {
         }
 
         if (!templateContent) {
-            if (__DEV__) console.warn('[mapArray] No template found for list:', listPath);
+            // A3/A4 (DX diagnostics sweep): classify WHY there is no template —
+            // this sits after ALL resolution sources (inline child, named
+            // reference, inherited), so it cannot fire on a valid setup. We
+            // diagnose only our own resolution failure; templates anywhere
+            // HTML-legal are never policed.
+            if (__DEV__ && !element._wfNoTemplateWarned) {
+                element._wfNoTemplateWarned = true;
+                const cname = componentName || (instance && instance.name) || '(unknown)';
+                const SVG_NS = 'http://www.w3.org/2000/svg';
+                if (element.namespaceURI === SVG_NS || (element.closest && element.closest('svg'))) {
+                    wfError(WF_ERRORS.TEMPLATE_NOT_FOUND, {
+                        warn: true,
+                        context: `Component '${cname}': data-list="${listPath}" is inside an <svg> subtree. The HTML parser strips or inerts <template> elements there before any script runs, so this list has no template and rendered nothing`,
+                        suggestion: `For repeated SVG primitives, bind a fixed set of elements or precompute a single <path> 'd' string.`,
+                        data: element
+                    });
+                } else if (Array.from(element.children || []).some(c => c.tagName !== 'TEMPLATE')) {
+                    wfError(WF_ERRORS.TEMPLATE_NOT_FOUND, {
+                        warn: true,
+                        context: `Component '${cname}': data-list="${listPath}" has row markup as direct children, but rows must be wrapped in a <template> child. The list rendered nothing`,
+                        suggestion: `<div data-list="${listPath}"><template>...row markup...</template></div>`,
+                        data: element
+                    });
+                } else {
+                    wfError(WF_ERRORS.TEMPLATE_NOT_FOUND, {
+                        warn: true,
+                        context: `Component '${cname}': data-list="${listPath}" resolved no template (searched: inline <template> child, data-use-template reference, inherited templates). The list rendered nothing`,
+                        suggestion: `Add an inline <template> child or point data-use-template at a defined template.`,
+                        data: element
+                    });
+                }
+            }
             return;
         }
 
@@ -1394,7 +1376,7 @@ export const ListRendererMethods = {
                         rowEl._bindingElements = null;
                     }
                 }
-                self._bindWithCompiledMetadata(rowEl, rowProxy, md, context, idx, context, true);
+                self._bindWithCompiledMetadata(rowEl, rowProxy, md, context, idx, context);
                 const cs = sm.untrack(() => buildComponentState());
                 self._applyRowDecor(rowEl, rowProxy, md, idx, dataLen, cs, instance, context);
             };
@@ -1537,6 +1519,12 @@ export const ListRendererMethods = {
 
         const registerComputedRow = (itemEl, itemProxy) => {
             if (!sm.runInListFrame) return false;
+            // The registerWalk tracking frame discovers the row's dependency
+            // surface by READING through the proxy — a raw item (list create
+            // path stores raw) would register nothing and the row would go
+            // stale. Wrap on demand: cache-hit when the proxy exists,
+            // identity-stable either way.
+            if (sm.reactive) itemProxy = sm.reactive(itemProxy);
             const d = ensureComputedDispatcher(itemProxy);
             if (!d) return false;
             const raw = sm.toRaw(itemProxy);
@@ -1628,9 +1616,9 @@ export const ListRendererMethods = {
                         }
                         // ALL root-binding reads are heavy, INCLUDING the root
                         // class: row-root class drop-out routes through the
-                        // full-rebind executor chain
-                        // (_executeClassBindings/_toggleBoundClass), and a
-                        // stamped root class would miss removals
+                        // full-rebind decor pass
+                        // (_applyRowDecor -> _applyClassBindingsToRow -> applyClass),
+                        // and a stamped root class would miss removals
                         // (list-class-binding-reactivity pins this).
                         if (compiledMetadata.rootBindings?._deps) {
                             for (const d of compiledMetadata.rootBindings?._deps) collectHeavy(d);
@@ -1740,9 +1728,6 @@ export const ListRendererMethods = {
                 const hasDeco = hasClass || hasStyle || hasAttr;
                 const decoReads = hasDeco
                     ? self._extractDecorativeReadProps(compiledMetadata) : null;
-                const smhShows = compiledMetadata.shows;
-                const smhHtmls = compiledMetadata.htmlBindings;
-                const smhModels = compiledMetadata.models;
                 const hasSmh = !!(smhProps && smhProps.length);
                 const hasRenders = !!(renderProps && renderProps.length);
                 // Reusable executor ctx (per dispatcher; sink applies are
@@ -1784,7 +1769,7 @@ export const ListRendererMethods = {
                                     rowEl._bindingElements = null;
                                     const idx = rowEl._listIndex | 0;
                                     const dataLen = element.children.length;
-                                    self._bindWithCompiledMetadata(rowEl, rowProxy, compiledMetadata, context, idx, context, true);
+                                    self._bindWithCompiledMetadata(rowEl, rowProxy, compiledMetadata, context, idx, context);
                                     const cs = buildComponentState();
                                     self._applyRowDecor(rowEl, rowProxy, compiledMetadata, idx, dataLen, cs, instance, context);
                                 }
@@ -1803,20 +1788,14 @@ export const ListRendererMethods = {
                                 _armCtx.listLength = element.children.length;
                                 _armCtx.listContext = context;
                                 _armCtx.propsData = instance?._propsData;
-                                // Scope the executors' targeted-rebind filter to the
-                                // changed key so non-matching bindings skip their DOM
-                                // writes (an unrelated innerHTML rewrite is not
-                                // idempotent-cheap). Keys here are flat item props
-                                // (fast-touch), so prop === root.
-                                const prevTP = self._targetedProp, prevTPR = self._targetedPropRoot;
-                                if (!applyAll) { self._targetedProp = key; self._targetedPropRoot = key; }
-                                try {
-                                    if (smhHtmls && smhHtmls.length) self._executeHtmlBindings(els, smhHtmls, rowProxy, _armCtx);
-                                    if (smhModels && smhModels.length) self._executeModels(els, smhModels, rowProxy);
-                                    if (smhShows && smhShows.length) self._executeShows(els, smhShows, rowProxy, _armCtx);
-                                } finally {
-                                    self._targetedProp = prevTP; self._targetedPropRoot = prevTPR;
-                                }
+                                // Targeted rebind of the row's html/model/show records
+                                // through the applier engine (FILTER_KEY). Keys here are
+                                // flat item props (fast-touch): a non-null key repaints
+                                // only records whose dep set includes it (html/show also
+                                // bypass for a computed-name reference; model does not),
+                                // so an unrelated innerHTML rewrite is skipped; applyAll
+                                // passes null to repaint every html/model/show record.
+                                self._runAppliersKeyed(els, rowProxy, compiledMetadata._appProgram, _armCtx, applyAll ? null : key);
                             });
                         }
                         if (hasDeco && (applyAll || !decoReads || decoReads.has(key))) {
@@ -2013,7 +1992,7 @@ export const ListRendererMethods = {
                     itemTemplateContent = defaultPolyTemplate;
                     itemCompiledMetadata = compiledMetaByType?.get('__default__') || null;
                 } else if (__DEV__) {
-                    console.warn(`[mapArray] No template for type "${typeValue}" in polymorphic list`);
+                    wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `No template for type "${typeValue}" in polymorphic list` });
                 }
                 itemIsDocFrag = itemTemplateContent.nodeType === Node.DOCUMENT_FRAGMENT_NODE;
             }
@@ -2073,7 +2052,7 @@ export const ListRendererMethods = {
                 // Text + generic bindings; the decor sequence below owns every
                 // style/attr binding (evaluator coverage is total; see
                 // _applyRowDecor).
-                self._bindWithCompiledMetadata(itemEl, itemProxy, itemCompiledMetadata, context, index, context, true);
+                self._bindWithCompiledMetadata(itemEl, itemProxy, itemCompiledMetadata, context, index, context);
                 self._applyRowDecor(itemEl, itemProxy, itemCompiledMetadata, index, data?.length || 0,
                     componentState, instance, context);
             }
@@ -2267,10 +2246,16 @@ export const ListRendererMethods = {
                         compiledMetadata._outsideClickActions = outsideClickActions;
                     }
 
-                    // For append, start from rowStartIndex to skip existing rows
+                    // For append, start from rowStartIndex to skip existing rows.
+                    // Read items off the RAW array: the bulk path paints from
+                    // values (clone + setter writes), so no per-item Proxy is
+                    // needed — or allocated — at create. Consumers that need the
+                    // proxy (sink walks, action mutations) wrap on demand via the
+                    // cached sm.reactive().
+                    const rawNewArray = sm.toRaw(newArray) || newArray;
                     for (let i = rowStartIndex; i < rows.length; i++) {
                         const row = rows[i];
-                        const itemProxy = newArray[i];
+                        const itemProxy = rawNewArray[i];
                         if (!row || !itemProxy) continue;
 
                         const itemKey = itemProxy[keyProp] !== undefined ? itemProxy[keyProp] : i;
@@ -2477,18 +2462,29 @@ export const ListRendererMethods = {
                     // Release the removed row's dispatcher entry + stamped
                     // leaves so the detached element + item object are not pinned
                     // by the rows Map. clearLeaf dispatches directWriter vs listSink.
+                    //
+                    // OWNERSHIP GUARD: reconcile runs same-key UPDATES before this
+                    // removal sweep, and an update can re-home this row's item to
+                    // ANOTHER row (positional lists: remove-middle re-binds the
+                    // shifted item onto its neighbor's row, then ITS old row lands
+                    // here with _itemData still pointing at the re-homed item).
+                    // Releasing by _itemData alone would wipe the stamps the
+                    // update just wrote and leave a LIVE row deaf. Only release
+                    // when the item still maps to the row being removed.
                     const _d = element._wfListSinkDispatcher;
                     if (_d && _d.stampLeaf && el._itemData) {
                         const _proxy = el._itemData;
                         const _raw = sm.toRaw(_proxy);
-                        _d.rows.delete(_raw);
-                        if (_d.computedRows) {
-                            // Runtime-discovered stamps: clear + unpin (rawStamps
-                            // holds the raw strongly for cleanup bookkeeping).
-                            _d.clearRowStamps(_raw);
-                        } else {
-                            const _props = _d.stampProps;
-                            if (_props) for (let p = 0; p < _props.length; p++) _d.clearLeaf(_proxy, _props[p]);
+                        if (_d.rows.get(_raw) === el) {
+                            _d.rows.delete(_raw);
+                            if (_d.computedRows) {
+                                // Runtime-discovered stamps: clear + unpin (rawStamps
+                                // holds the raw strongly for cleanup bookkeeping).
+                                _d.clearRowStamps(_raw);
+                            } else {
+                                const _props = _d.stampProps;
+                                if (_props) for (let p = 0; p < _props.length; p++) _d.clearLeaf(_proxy, _props[p]);
+                            }
                         }
                     }
                     el.remove();
@@ -2527,6 +2523,11 @@ export const ListRendererMethods = {
                                 const _proxy = elements[i] && elements[i]._itemData;
                                 if (!_proxy) continue;
                                 const _raw = sm.toRaw(_proxy);
+                                // Ownership guard — see onRemove: an earlier
+                                // same-key update may have re-homed this item to
+                                // a surviving row; releasing by _itemData alone
+                                // would deafen it.
+                                if (_d.rows.get(_raw) !== elements[i]) continue;
                                 _d.rows.delete(_raw);
                                 if (_d.computedRows) {
                                     _d.clearRowStamps(_raw);
@@ -2554,6 +2555,18 @@ export const ListRendererMethods = {
                     }
 
                     if (isFullClear) {
+                        // Externally reparented rows first. replaceChildren()
+                        // below only empties THIS container, but a DOM-moving
+                        // library (SortableJS cross-list drag) may have moved a
+                        // tracked row into ANOTHER list before the state update
+                        // emptied this one. Left alone, that node survives next
+                        // to the destination list's own render of the same item
+                        // as a visible duplicate. Normal clears pay one
+                        // parentNode comparison per row and mutate nothing.
+                        for (let i = 0; i < elements.length; i++) {
+                            const el = elements[i];
+                            if (el && el.parentNode && el.parentNode !== element) el.remove();
+                        }
                         // Full clear: single DOM operation
                         // Template was removed from DOM during setup, so just clear everything
                         element.replaceChildren();
@@ -2590,8 +2603,15 @@ export const ListRendererMethods = {
                     if (!el) return;
                     // Only manipulate DOM if not skipped (element already in correct position)
                     if (!skipDomMove) {
-                        // Use refElement for stable positioning
-                        if (refElement) {
+                        // Atomic state-preserving move (focus/media/iframe/animation
+                        // survive) when available. The same-parent guard guarantees
+                        // the same shadow-including root, so moveBefore cannot throw;
+                        // a row a portal or user code reparented falls back to
+                        // insertBefore with today's semantics. moveBefore(el, null)
+                        // appends, matching the appendChild branch.
+                        if (HAS_MOVE_BEFORE && el.parentNode === element) {
+                            element.moveBefore(el, refElement || null);
+                        } else if (refElement) {
                             element.insertBefore(el, refElement);
                         } else {
                             element.appendChild(el);
@@ -2756,7 +2776,7 @@ export const ListRendererMethods = {
                         // Text + generic bindings, then the shared decor
                         // sequence (same composition as mapFn initial render and
                         // the computed dispatcher's applyRowFull).
-                        self._bindWithCompiledMetadata(itemEl, newItemProxy, compiledMetadata, context, index, context, true);
+                        self._bindWithCompiledMetadata(itemEl, newItemProxy, compiledMetadata, context, index, context);
                         self._applyRowDecor(itemEl, newItemProxy, compiledMetadata, index, listLength,
                             componentState, instance, context);
                     }
@@ -2765,19 +2785,17 @@ export const ListRendererMethods = {
                 // Called after all operations complete to update class bindings that use list context variables
                 // (_first, _last, _index, _length) which change when list length changes
                 onComplete: (newArray, oldLength, newLength) => {
-                    // Only update if list uses list context variables AND length actually changed
-                    // (even same length changes can affect _first/_last if items reordered)
-                    if (compiledMetadata?.usesListContextVariables) {
-                        // Update class bindings for all items
-                        self._updateListContextClassBindings(element, newArray, context);
-                    }
-                    // Re-evaluate position-frame conditionals that resolve through an
-                    // item-level computed (e.g. data-show="onLast"). These carry no
-                    // literal _last token, so the sweep above misses them; without
-                    // this the row that becomes last after an add/remove keeps a
-                    // stale info.last/info.length frame.
-                    if (self._listHasComputedConditional(compiledMetadata, instance)) {
-                        self._reEvalListItemComputedConditionals(element, newArray, context, instance);
+                    // Re-apply the per-row bindings whose value moves when list
+                    // positions shift: class/attr/text/show/render that read the
+                    // position frame (usesListContextVariables), PLUS show/render
+                    // conditionals that resolve through an item-level computed which
+                    // can read the frame internally (e.g. data-show="onLast", no
+                    // literal _last token). Both cases run through the one sweep now —
+                    // the applier engine's FILTER_INDEX pass covers the computed
+                    // conditional, so the former separate re-eval pass is gone.
+                    if (compiledMetadata?.usesListContextVariables
+                        || self._listHasComputedConditional(compiledMetadata, instance)) {
+                        self._updateListContextClassBindings(element, newArray, context, instance);
                     }
                 }
             }
@@ -3018,169 +3036,6 @@ export const ListRendererMethods = {
         }
 
         return listsByComponent;
-    },
-    /**
-     * Process conditional elements (data-show and data-render)
-     * @param {Object} instance - Component instance
-     * @private
-     */
-    _processConditionalElements(instance)
-    {
-        if (!this._contextSystemInitialized) {
-            return;
-        }
-
-        const {element} = instance;
-
-        // Find all conditional elements (both data-show and data-render) - support both prefixes
-        // IMPORTANT: Exclude elements inside <template> elements (they belong to list templates)
-        // and elements inside data-list containers (they're handled by _bindListItemConditionals)
-        const allConditionalElements = element.querySelectorAll(`${this._attrSelector('show')}, ${this._attrSelector('render')}`);
-
-        const conditionalElements = Array.from(allConditionalElements)
-            .filter(el =>
-            {
-                const closestComponent = this._getComponentElement(el);
-                if (closestComponent !== element) {
-                    return false;
-                }
-
-                // Also exclude elements inside uninitialized child components
-                // (components with data-component but no data-component-id yet)
-                const uninitializedParent = el.closest(this._attrSelector('component'));
-                if (uninitializedParent && uninitializedParent !== element && !uninitializedParent.dataset.componentId) {
-                    return false;
-                }
-
-                // Exclude elements inside <template> elements (list templates)
-                if (el.closest('template')) {
-                    return false;
-                }
-
-                // Exclude elements rendered by data-use-template (they have their own binding system)
-                if (el.closest('[data-use-template-rendered]')) {
-                    return false;
-                }
-
-                // Exclude elements INSIDE data-list containers (handled by list item binding)
-                // But DO process the list container itself if it has data-show
-                const closestList = el.closest(this._attrSelector('list'));
-                if (closestList && closestList !== el && closestList.closest(this._attrSelector('component')) === element) {
-                    return false;
-                }
-
-                return true;
-            });
-
-        conditionalElements.forEach(conditionalElement =>
-        {
-            // Determine mode: 'show' or 'render' (support both prefixes)
-            const isRenderMode = this._hasAttr(conditionalElement, 'render');
-            const condPath = isRenderMode
-                ? this._getAttr(conditionalElement, 'render')
-                : this._getAttr(conditionalElement, 'show');
-            if (!condPath) return;
-
-            // For data-render, we need to handle initial state
-            if (isRenderMode) {
-                const renderCtx = this._processDataRenderElement(conditionalElement, condPath, instance);
-                // Drive non-list data-render through the component render effect:
-                // track the context so a post-insert effect rescan can re-add it,
-                // and push its render meta so the effect observes the condition's
-                // computed/state directly (establishing the graph edge).
-                if (renderCtx && instance._effectMeta) {
-                    (instance._renderContexts || (instance._renderContexts = [])).push(renderCtx);
-                    instance._effectMeta.push(this._buildRenderMeta(renderCtx, instance));
-                }
-            } else {
-                // data-show: no registry-tracked conditional context. The component
-                // render effect owns initial paint and every update via this 'show'
-                // meta (_executeShowForEffect → applyShow, transitions included); the
-                // setup-time context paint was a redundant parallel build.
-                if (instance._effectMeta) {
-                    const negate = condPath.startsWith('!');
-                    const cleanPath = negate ? condPath.slice(1) : condPath;
-                    instance._effectMeta.push({
-                        element: conditionalElement,
-                        type: 'show',
-                        path: cleanPath,
-                        negate,
-                        isExpression: this.isExpression(cleanPath) || cleanPath.includes('$')
-                    });
-                }
-            }
-        });
-    },
-    /**
-     * Process a data-render element - handles initial state and context creation
-     * @param {HTMLElement} element - The element with data-render
-     * @param {string} path - The condition path
-     * @param {Object} instance - Component instance
-     * @private
-     */
-    _processDataRenderElement(element, path, instance)
-    {
-        // Evaluate the initial condition
-        let conditionValue = this._evaluateCondition(path, instance);
-
-        // Clone the element as template before any DOM manipulation
-        const templateClone = element.cloneNode(true);
-        // Strip data-cloak from template so re-insertions don't inherit it
-        templateClone.removeAttribute('data-cloak');
-
-        // Create the render record (plain object, not registered; the render
-        // effect holds it directly via its type:'render' meta).
-        const context = this._contextRecords.createRenderRecord(
-            path,
-            instance,
-            element
-        );
-
-        if (context) {
-            // Add render-specific properties
-            context.templateClone = templateClone;
-            context.isRendered = conditionValue;
-
-            // If condition is initially false, remove element and insert placeholder
-            if (!conditionValue) {
-                const placeholder = document.createComment(` data-render: ${path} `);
-                context.placeholder = placeholder;
-                element.parentNode.insertBefore(placeholder, element);
-                element.parentNode.removeChild(element);
-                context.element = null; // Element is not in DOM
-            } else {
-                context.placeholder = null; // No placeholder needed when rendered
-            }
-        }
-
-        return context;
-    },
-    /**
-     * Evaluate a condition path for data-show/data-render
-     * @param {string} path - The condition path (may include negation, computed:)
-     * @param {Object} instance - Component instance
-     * @returns {boolean} The evaluated condition
-     * @private
-     */
-    _evaluateCondition(path, instance)
-    {
-        // Strip obsolete computed: prefix (e.g., "computed:isVisible" → "isVisible",
-        // "computed:!isVisible" → "!isVisible"). evaluateExpression resolves
-        // computed properties by name automatically.
-        let expr = path;
-        if (expr.startsWith('computed:!')) {
-            expr = '!' + expr.slice(10);
-        } else if (expr.startsWith('computed:')) {
-            expr = expr.slice(9);
-        }
-        try {
-            return !!this.evaluateExpression(expr, instance.state, {
-                stateManager: instance.stateManager,
-                cacheKey: 'condition'
-            });
-        } catch (error) {
-            return false;
-        }
     },
 
     /**
@@ -3559,11 +3414,13 @@ export const ListRendererMethods = {
         }
         if (itemComputedValues) {
             if (!mergedCtx) {
-                // Build mergedCtx from item + componentState + list-context vars,
-                // then add the item-level computed values we already computed above.
+                // Build mergedCtx from componentState + item + list-context vars, then
+                // add the item-level computed values we already computed above. Item is
+                // spread AFTER componentState so a row field shadows a same-name
+                // component computed/state (CL-18; matches the lazy + eager builders).
                 mergedCtx = {
-                    ...item,
                     ...componentState,
+                    ...item,
                     _index: index,
                     _length: dataLen,
                     _first: index === 0,
@@ -3676,7 +3533,7 @@ export const ListRendererMethods = {
             // ONE application semantics for every class channel: the
             // BindingWriters applyClass kernel (diff-tracked via
             // _prevBoundClasses, early-exit on unchanged set, string/array/
-            // object normalization, falsy clears). _executeClassBindings and
+            // object normalization, falsy clears). _applyClassBindingsToRow and
             // every fallback route through the same kernel
             // (_toggleBoundClass -> applyClass), so mixed writers on one
             // element agree byte-for-byte; two writers with different
@@ -3718,11 +3575,18 @@ export const ListRendererMethods = {
                 if (prop === '_length') return _len;
                 if (prop === '_first') return _idx === 0;
                 if (prop === '_last') return _idx === _len - 1;
-                // Item-level computed whose name is NOT an own item key overrides
-                // componentState and item (matches the eager loop's `!(key in item)`
-                // guard). Use _evaluateComputedInListContext so dependency tracking
+                // Item field first (CL-18 / documented contract: read item[prop], fall
+                // back to a same-name computed only when the field is undefined). Mirrors
+                // the style/attr lazy ctx builders and data-bind text. Previously the
+                // componentState branch shadowed a same-name item field, silently
+                // diverging data-bind-class from every other binding kind.
+                const val = target[prop];
+                if (val !== undefined) return val;
+                // Computed whose name is not provided by a (defined) item field. This
+                // keeps computed-over-componentState precedence intact for names with no
+                // item field. Use _evaluateComputedInListContext so dependency tracking
                 // sees the reads (direct fn.call bypasses tracking).
-                if (origComputeds && !(prop in target)) {
+                if (origComputeds) {
                     const fn = origComputeds.get(prop);
                     if (fn && typeof fn === 'function') {
                         try {
@@ -3730,17 +3594,19 @@ export const ListRendererMethods = {
                         } catch (e) { return undefined; }
                     }
                 }
-                // componentState wins over item (eager spread order: item then componentState)
                 if (componentState && prop in componentState) return componentState[prop];
-                return target[prop];
+                return undefined;
             }
         });
     },
 
     _buildClassMergedCtx(item, componentState, instance, index, dataLen) {
+        // Item field first (CL-18): spread item AFTER componentState so a row field
+        // shadows a same-name component computed/state, matching data-bind text and
+        // the lazy builder. componentState still supplies names the item lacks.
         const ctx = {
-            ...item,
             ...componentState,
+            ...item,
             _index: index,
             _length: dataLen,
             _first: index === 0,
@@ -3749,11 +3615,9 @@ export const ListRendererMethods = {
         // Item-level computeds (both parameterised fn(item) and bare-form fn()
         // reading `this.X`): use _evaluateComputedInListContext so dependency
         // tracking sees the state reads (direct fn.call bypasses tracking and
-        // breaks reactive updates). Override the stale value the componentState
-        // spread placed in ctx for bare-form computeds (component-level eval
-        // produces wrong value when the body reads item state via `this.X`).
-        // Item own-properties win: if item has a key matching a computed name,
-        // keep the item value.
+        // breaks reactive updates). Fill in each computed whose name is NOT an item
+        // key (item own-properties win: a row field matching a computed name keeps
+        // the item value).
         const originals = instance?.stateManager?._originalComputedFunctions;
         if (originals) {
             for (const [key, fn] of originals) {
@@ -4594,20 +4458,6 @@ export const ListRendererMethods = {
         return leaves;
     },
 
-    /**
-     * Get the external() function bound to a component instance
-     * @private
-     */
-    _getExternalFn(componentInstance) {
-        if (componentInstance.context && typeof componentInstance.context.external === 'function') {
-            return componentInstance.context.external.bind(componentInstance.context);
-        }
-        const self = this;
-        const instanceId = componentInstance.id;
-        return function(componentNameOrId, path) {
-            return self._resolveExternalValue(componentNameOrId, path, instanceId);
-        };
-    },
 
     /**
      * Apply integration bindings to a list item element.
@@ -4621,9 +4471,15 @@ export const ListRendererMethods = {
             this._bindListItemConditionals(itemEl, instance, listPath, index, itemProxy, element, context);
         }
 
-        // Nested lists
+        // Nested lists. The child mapArray's structural effect reads
+        // item[childPath] — the read must go through the proxy to track
+        // (the create path stores raw items). Wrap on demand (cached,
+        // identity-stable, idempotent).
         if (hasChildLists) {
-            this._processNestedListsForItem(itemEl, itemProxy, index, context, instance);
+            const rsm = instance && instance.stateManager;
+            this._processNestedListsForItem(itemEl,
+                (rsm && rsm.reactive) ? rsm.reactive(itemProxy) : itemProxy,
+                index, context, instance);
         }
 
         // Custom directives (e.g. data-directive="highlight")
@@ -4672,7 +4528,7 @@ export const ListRendererMethods = {
         const allTemplates = element.querySelectorAll(':scope > template');
 
         if (allTemplates.length === 0) {
-            if (__DEV__) console.warn(`[polymorphic] No templates found for data-template-key="${templateKeyProp}"`);
+            if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `No templates found for data-template-key="${templateKeyProp}"` });
             return;
         }
 
@@ -4746,7 +4602,7 @@ export const ListRendererMethods = {
             matchedTemplate = defaultTemplate;
         }
         if (!matchedTemplate) {
-            if (__DEV__) console.warn(`[polymorphic] No template for type "${newType}" and no default`);
+            if (__DEV__) wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, { warn: true, context: `No template for type "${newType}" and no default` });
             // Clean up current content
             if (currentType !== null) {
                 this._cleanPolymorphicContent(instance);
@@ -4815,12 +4671,12 @@ export const ListRendererMethods = {
                 if (node.nodeType === 1) {
                     // Destroy nested components within this node
                     if (node.dataset?.componentId) {
-                        this.destroyComponent(node.dataset.componentId);
+                        this._destroyComponentQuiet(node.dataset.componentId);
                     }
                     const nested = node.querySelectorAll('[data-component-id]');
                     for (const compEl of nested) {
                         if (compEl.dataset.componentId) {
-                            this.destroyComponent(compEl.dataset.componentId);
+                            this._destroyComponentQuiet(compEl.dataset.componentId);
                         }
                     }
                 }
@@ -4835,7 +4691,7 @@ export const ListRendererMethods = {
             for (const compEl of nestedComponents) {
                 const compId = compEl.dataset.componentId;
                 if (compId) {
-                    this.destroyComponent(compId);
+                    this._destroyComponentQuiet(compId);
                 }
             }
             while (element.firstChild) {
@@ -4898,6 +4754,14 @@ export const ListRendererMethods = {
         // Ensure context system is initialized
         this._ensureContextSystem();
 
+        // data-query backstop (full tier): the primary transform runs in
+        // _processComponentBindings, before binding compilation. This
+        // idempotent repeat covers list setups that reach here without
+        // that pass (e.g., data-render re-insertion).
+        if (__FEATURE_QUERY__ && this._transformQueryElements) {
+            this._transformQueryElements(instance.element);
+        }
+
         // Initialize context collection
         if (!instance._listContexts)
         {
@@ -4911,8 +4775,13 @@ export const ListRendererMethods = {
         const templates = instance.element.querySelectorAll('template');
         const listsInTemplates = [];
 
-        // Search inside template content for nested lists
+        // Search inside template content for nested lists. Guard .content: a
+        // 'template'-named element inside foreign content (<svg>) is an inert
+        // SVG element with NO content fragment — reading through it crashed
+        // the whole component init (the "t.content is undefined" class). Skip
+        // it; the list-mount path diagnoses the cause in dev builds.
         templates.forEach(template => {
+            if (!template.content) return;
             const nestedLists = template.content.querySelectorAll(this._attrSelector('list'));
             nestedLists.forEach(list => listsInTemplates.push(list));
         });

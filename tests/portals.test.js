@@ -79,6 +79,27 @@ describeIfPortals('Portals', () => {
   // Basic Portal Functionality
   // ==========================================
   describe('Basic Functionality', () => {
+    // Divergence regression (accessor-normalization audit, 2026-07-15): a markup
+    // portal in a component with NO init() was never teleported on the batched
+    // page-load path. That path only runs the markup-portal pass inside
+    // _initWithStoreWait, which no-init components skip (they mark _initReady and
+    // never enter pendingInits); the incremental path has a separate markup pass.
+    // Drives _scanForComponents() (batched) to lock the behavior across both paths.
+    it('a markup portal in a no-init component teleports on the batched page-load path', async () => {
+      wildflower.component('portal-noinit', {}) // no init(); portal lives in markup
+      testContainer.innerHTML = `
+        <div data-component="portal-noinit">
+          <div data-portal="#portal-target">
+            <span class="portaled-content" data-portaled>hi</span>
+          </div>
+        </div>
+      `
+      wildflower._scanForComponents() // batched orchestrator, NOT scan()
+      await waitForUpdate(150)
+
+      expect(portalTarget.querySelector('.portaled-content')).not.toBeNull()
+    })
+
     it('renders content at target selector', async () => {
       wildflower.component('portal-source', {
         state: {},

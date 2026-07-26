@@ -165,7 +165,7 @@ export const ComponentRegistryMethods = {
         this.componentInstances.forEach((inst, id) => {
             if (inst && inst.name === name && !inst.isVirtual) ids.push(id);
         });
-        ids.forEach(id => this.destroyComponent(id));
+        ids.forEach(id => this._destroyComponentQuiet(id));
         this.componentDefinitions.delete(name);
         return true;
     },

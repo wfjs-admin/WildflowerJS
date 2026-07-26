@@ -34,9 +34,12 @@ function _keyTokenMatches(token, eventKeyLower)
 }
 
 /**
- * Methods to be mixed into WildflowerJS.prototype
+ * Core event methods (action binding, dispatch, config, parsing, public emitter).
+ * The list-delegation + list-conditional cluster lives in ListEventDelegationMethods
+ * (below) and is spread onto the prototype only by list-capable builds (via
+ * ListRenderer), so no-list builds tree-shake it out.
  */
-export const EventSystemMethods = {
+const _eventCore = {
 /**
      * Bind component actions to DOM elements
      * @private
@@ -138,7 +141,7 @@ export const EventSystemMethods = {
                 }
 
                 // Check if form is inside a list item (for passing details.index)
-                const listItem = this._findListItemAncestor(el);
+                const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(el) : null;
                 let formActionContext;
 
                 if (listItem && this._contextSystemInitialized)
@@ -224,7 +227,7 @@ export const EventSystemMethods = {
 
 
                 // Determine if this is in a list item
-                const listItem = this._findListItemAncestor(el);
+                const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(el) : null;
                 let actionContext;
 
                 if (listItem && this._contextSystemInitialized)
@@ -581,6 +584,10 @@ export const EventSystemMethods = {
         // Prepare detail object for list items
         let detail = {};
 
+        // List-item detail building is a list-tier concern; in the nano build
+        // (__FEATURE_LISTS__ = false) this whole block folds away and the core
+        // dispatcher falls straight through to the plain invoke below.
+        if (__FEATURE_LISTS__) {
         // Build the list-item detail straight off the row element: index/item
         // from _listIndex/_itemData (the reactive item-proxy the render effect
         // tracks), the array via getValue (top-level) or the parent row's
@@ -702,9 +709,7 @@ export const EventSystemMethods = {
                 }
             }
         }
-
-
-
+        } // end if (__FEATURE_LISTS__) — list-item detail building
 
         if (actionArgs && actionArgs.length > 0) { detail.args = actionArgs; }
         this._invokeActionHandler(componentInstance, methodName, event, element, detail, actionArgs, options);
@@ -746,129 +751,6 @@ export const EventSystemMethods = {
         } else {
             invoke();
         }
-    },
-    /**
-     * Resolve the live array a list element renders, identity-rooted through the
-     * item-proxy chain: a top-level list reads via getValue(path); a nested list
-     * reads the child path off its owning row's item-proxy. Returns null when the
-     * path does not resolve to an array (caller then falls back).
-     * @private
-     */
-    _resolveRowListArray(listEl, listPath, componentInstance) {
-        if (!listEl || !listPath) return null;
-        const ownerRow = this._findListItemAncestor(listEl);
-        if (ownerRow && ownerRow._listIndex !== undefined && ownerRow._itemData) {
-            const parentItem = ownerRow._itemData;
-            const nested = parentItem[listPath];
-            if (Array.isArray(nested)) return nested;
-            // Nested-list source that is an item-level computed (not a stored
-            // field): evaluate the path against the parent item, matching the
-            // implicit-computed fallback list rendering uses.
-            if (nested === undefined && this._resolveRawBinding) {
-                const parentListEl = this._findDirectParentList(ownerRow);
-                const parentListPath = parentListEl ? this._getAttr(parentListEl, 'list') : null;
-                const parentArray = this._resolveRowListArray(parentListEl, parentListPath, componentInstance);
-                const scope = {
-                    componentState: (componentInstance && componentInstance.state) || {},
-                    componentInstance,
-                    itemIndex: ownerRow._listIndex,
-                    listLength: Array.isArray(parentArray) ? parentArray.length : 0,
-                    listContext: parentListEl ? parentListEl._listContext : null,
-                    propsData: componentInstance && componentInstance._propsData
-                };
-                const computed = this._resolveRawBinding(listPath, parentItem, scope);
-                return Array.isArray(computed) ? computed : null;
-            }
-            return null;
-        }
-        // Top-level list: mirror the former list-context resolution: external(…)
-        // through the external fn, store shorthand normalized, then getValue
-        // (which already covers computed:/bare-computed/state paths).
-        const sm = componentInstance && componentInstance.stateManager;
-        if (!sm) return null;
-        let value;
-        if (listPath.includes('external(')) {
-            try {
-                value = this.evaluateExpression(listPath, sm.state || {}, {
-                    cacheKey: 'externalList',
-                    additionalContext: { external: this._getExternalFn(componentInstance) }
-                });
-            } catch (e) {
-                value = null;
-            }
-        } else {
-            const normalizedPath = (listPath.includes('$') && this._normalizeStoreShorthands)
-                ? this._normalizeStoreShorthands(listPath) : listPath;
-            value = sm.getValue(normalizedPath);
-        }
-        return Array.isArray(value) ? value : null;
-    },
-    /**
-     * Build the action `detail` for a list-row element without a CM list context.
-     * index/item come straight off the row (_listIndex / _itemData), the array
-     * from _resolveRowListArray, and the parent chain is walked through the DOM
-     * row ancestry. Returns null when the row's immediate list does not resolve to
-     * an array containing the row index (caller falls back to the DOM-hierarchy
-     * walk). Public event.detail contract:
-     * { index, item, list, length, first, last, context?, parent? }.
-     * @private
-     */
-    _buildListActionDetail(rowEl, componentInstance) {
-        const listEl = this._findDirectParentList(rowEl);
-        const listPath = listEl ? this._getAttr(listEl, 'list') : null;
-        const index = rowEl._listIndex;
-
-        // Cheap structural validity gate (no array resolution). A row missing its
-        // list element, path, item data, or index falls back to the caller's
-        // DOM-hierarchy walk, the cases that fallback exists for. The former
-        // index-in-bounds check is dropped: a live, freshly-rendered row's index
-        // is always within its source array.
-        if (!listEl || !listPath || rowEl._itemData === undefined || index == null || index < 0) {
-            return null;
-        }
-
-        // Resolve the row's list array LAZILY. Most handlers read only `item`
-        // (krausest select/remove), but resolving the array eagerly walks
-        // getValue -> getPath -> the reactive proxy on every dispatch; the
-        // dominant select-dispatch cost. list/length/last become getters that
-        // resolve (and cache) the array only when a handler actually reads them.
-        const self = this;
-        let _list, _resolved = false;
-        const getList = () => {
-            if (!_resolved) { _list = self._resolveRowListArray(listEl, listPath, componentInstance); _resolved = true; }
-            return _list;
-        };
-
-        const detail = {
-            index,
-            item: rowEl._itemData,
-            first: index === 0,
-            context: listEl ? listEl._listContext : undefined,
-            get list() { return getList(); },
-            get length() { const l = getList(); return Array.isArray(l) ? l.length : 0; },
-            get last() { const l = getList(); return Array.isArray(l) ? index === l.length - 1 : false; }
-        };
-
-        // Walk the DOM row ancestry to assemble detail.parent / .parent.parent…
-        let childDetail = detail;
-        let currentListEl = listEl;
-        while (currentListEl) {
-            const parentRow = this._findListItemAncestor(currentListEl);
-            if (!parentRow || parentRow._listIndex === undefined || parentRow._itemData === undefined) break;
-            const parentListEl = this._findDirectParentList(parentRow);
-            const parentListPath = parentListEl ? this._getAttr(parentListEl, 'list') : null;
-            const parentList = this._resolveRowListArray(parentListEl, parentListPath, componentInstance);
-            childDetail.parent = {
-                index: parentRow._listIndex,
-                item: parentRow._itemData,
-                list: Array.isArray(parentList) ? parentList : undefined,
-                context: parentListEl ? parentListEl._listContext : undefined
-            };
-            childDetail = childDetail.parent;
-            currentListEl = parentListEl;
-        }
-
-        return detail;
     },
     /**
      * Create enhanced context object for event handlers
@@ -975,6 +857,7 @@ export const EventSystemMethods = {
      * @private
      */
     _findActionElementViaMetadata(target, boundary) {
+        if (!__FEATURE_LISTS__) return null;
         // Find the list item ancestor
         const listItem = this._findListItemAncestor(target);
         if (!listItem) return null;
@@ -1000,6 +883,157 @@ export const EventSystemMethods = {
             current = current.parentElement;
         }
         return null;
+    }
+};
+
+/**
+ * List event delegation + list-item conditional cluster. Spread onto the
+ * prototype only by list-capable builds (via ListRendererMethods), so no-list
+ * builds tree-shake this whole object out. Entry points are list-side (mount
+ * sets up delegation; DOM events trigger the handlers); nothing outside the
+ * list pipeline calls into these methods.
+ */
+export const ListEventDelegationMethods = {
+    /**
+     * Resolve the live array a list element renders, identity-rooted through the
+     * item-proxy chain: a top-level list reads via getValue(path); a nested list
+     * reads the child path off its owning row's item-proxy. Returns null when the
+     * path does not resolve to an array (caller then falls back).
+     * @private
+     */
+    _resolveRowListArray(listEl, listPath, componentInstance) {
+        if (!listEl || !listPath) return null;
+        const ownerRow = this._findListItemAncestor(listEl);
+        if (ownerRow && ownerRow._listIndex !== undefined && ownerRow._itemData) {
+            const parentItem = ownerRow._itemData;
+            const nested = parentItem[listPath];
+            if (Array.isArray(nested)) return nested;
+            // Nested-list source that is an item-level computed (not a stored
+            // field): evaluate the path against the parent item, matching the
+            // implicit-computed fallback list rendering uses.
+            if (nested === undefined && this._resolveRawBinding) {
+                const parentListEl = this._findDirectParentList(ownerRow);
+                const parentListPath = parentListEl ? this._getAttr(parentListEl, 'list') : null;
+                const parentArray = this._resolveRowListArray(parentListEl, parentListPath, componentInstance);
+                const scope = {
+                    componentState: (componentInstance && componentInstance.state) || {},
+                    componentInstance,
+                    itemIndex: ownerRow._listIndex,
+                    listLength: Array.isArray(parentArray) ? parentArray.length : 0,
+                    listContext: parentListEl ? parentListEl._listContext : null,
+                    propsData: componentInstance && componentInstance._propsData
+                };
+                const computed = this._resolveRawBinding(listPath, parentItem, scope);
+                return Array.isArray(computed) ? computed : null;
+            }
+            return null;
+        }
+        // Top-level list: mirror the former list-context resolution: external(…)
+        // through the external fn, store shorthand normalized, then getValue
+        // (which already covers computed:/bare-computed/state paths).
+        const sm = componentInstance && componentInstance.stateManager;
+        if (!sm) return null;
+        let value;
+        if (listPath.includes('external(')) {
+            try {
+                value = this.evaluateExpression(listPath, sm.state || {}, {
+                    cacheKey: 'externalList',
+                    additionalContext: { external: this._getExternalFn(componentInstance) }
+                });
+            } catch (e) {
+                value = null;
+            }
+        } else {
+            const normalizedPath = (listPath.includes('$') && this._normalizeStoreShorthands)
+                ? this._normalizeStoreShorthands(listPath) : listPath;
+            value = sm.getValue(normalizedPath);
+        }
+        return Array.isArray(value) ? value : null;
+    },
+    /**
+     * Build the action `detail` for a list-row element without a CM list context.
+     * index/item come straight off the row (_listIndex / _itemData), the array
+     * from _resolveRowListArray, and the parent chain is walked through the DOM
+     * row ancestry. Returns null when the row's immediate list does not resolve to
+     * an array containing the row index (caller falls back to the DOM-hierarchy
+     * walk). Public event.detail contract:
+     * { index, item, list, length, first, last, context?, parent? }.
+     * @private
+     */
+    _buildListActionDetail(rowEl, componentInstance) {
+        const listEl = this._findDirectParentList(rowEl);
+        const listPath = listEl ? this._getAttr(listEl, 'list') : null;
+        const index = rowEl._listIndex;
+
+        // Cheap structural validity gate (no array resolution). A row missing its
+        // list element, path, item data, or index falls back to the caller's
+        // DOM-hierarchy walk, the cases that fallback exists for. The former
+        // index-in-bounds check is dropped: a live, freshly-rendered row's index
+        // is always within its source array.
+        if (!listEl || !listPath || rowEl._itemData === undefined || index == null || index < 0) {
+            return null;
+        }
+
+        // Resolve the row's list array LAZILY. Most handlers read only `item`
+        // (krausest select/remove), but resolving the array eagerly walks
+        // getValue -> getPath -> the reactive proxy on every dispatch; the
+        // dominant select-dispatch cost. list/length/last become getters that
+        // resolve (and cache) the array only when a handler actually reads them.
+        const self = this;
+        let _list, _resolved = false;
+        const getList = () => {
+            if (!_resolved) { _list = self._resolveRowListArray(listEl, listPath, componentInstance); _resolved = true; }
+            return _list;
+        };
+
+        const detail = {
+            index,
+            // The list create path stores RAW items on _itemData (no per-item
+            // proxy allocated at create). A handler that mutates
+            // details.item.field needs the reactive proxy so the set trap
+            // fires. Resolve through the state facade (the same read the
+            // user's own state[listPath][index] performs) so the handler
+            // receives THE tree proxy — identity-stable against user state
+            // reads (===, indexOf) and carrying the entity onStateChange
+            // dispatch on writes — regardless of which proxy kind _itemData
+            // happens to hold (a plain-cache proxy minted before the tree
+            // wrap exists would otherwise survive wrap-on-demand untouched).
+            // Lazy getter so a handler that never reads `item` pays nothing.
+            get item() {
+                const L = getList();
+                if (L) { const v = L[index]; if (v !== undefined) return v; }
+                const d = rowEl._itemData;
+                const rsm = componentInstance && componentInstance.stateManager;
+                if (rsm && rsm.reactive) return rsm.reactive(rsm.toRaw ? rsm.toRaw(d) : d);
+                return d;
+            },
+            first: index === 0,
+            context: listEl ? listEl._listContext : undefined,
+            get list() { return getList(); },
+            get length() { const l = getList(); return Array.isArray(l) ? l.length : 0; },
+            get last() { const l = getList(); return Array.isArray(l) ? index === l.length - 1 : false; }
+        };
+
+        // Walk the DOM row ancestry to assemble detail.parent / .parent.parent…
+        let childDetail = detail;
+        let currentListEl = listEl;
+        while (currentListEl) {
+            const parentRow = this._findListItemAncestor(currentListEl);
+            if (!parentRow || parentRow._listIndex === undefined || parentRow._itemData === undefined) break;
+            const parentListEl = this._findDirectParentList(parentRow);
+            const parentListPath = parentListEl ? this._getAttr(parentListEl, 'list') : null;
+            const parentList = this._resolveRowListArray(parentListEl, parentListPath, componentInstance);
+            childDetail.parent = {
+                index: parentRow._listIndex,
+                item: parentRow._itemData,
+                list: Array.isArray(parentList) ? parentList : undefined,
+                context: parentListEl ? parentListEl._listContext : undefined
+            };
+            childDetail = childDetail.parent;
+            currentListEl = parentListEl;
+        }
+
+        return detail;
     },
     /**
      * Ensures proper event delegation is set up for lists
@@ -2009,7 +2043,10 @@ export const EventSystemMethods = {
         }
 
         return context;
-    },
+    }
+};
+
+const _eventTail = {
     _normalizeEventsConfig(eventsConfig)
     {
         const defaultConfig = this._getDefaultEventsConfig();
@@ -2852,5 +2889,15 @@ export const EventSystemMethods = {
             }
         };
     }
+};
+
+/**
+ * Core event methods. The list-delegation cluster (ListEventDelegationMethods)
+ * is intentionally NOT included here — list-capable builds add it separately via
+ * ListRendererMethods, so no-list builds ship only these core methods.
+ */
+export const EventSystemMethods = {
+    ..._eventCore,
+    ..._eventTail
 };
 

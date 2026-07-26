@@ -864,7 +864,7 @@
     "_validateComponentBindings",
     "_validateActionMethods",
     "_validateInput",
-    "_validateStyleExpression",
+    "_validateObjectFormExpression",
     "_isValidPropType",
     "_getValidationTriggers",
     "_handleValidationBlur",

@@ -11,7 +11,7 @@
 
 import { getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
 import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
-import { applyShow, applyAttrObj, applyStyleObj, applyText } from '../core/BindingWriters.js';
+import { applyAttrObj, applyStyleObj } from '../core/BindingWriters.js';
 import { wfError, WF_ERRORS } from '../core/wfUtils.js';
 
 // WF-214 dedupe: one warning per (component name, computed name) per page life.
@@ -48,19 +48,6 @@ function _warnItemComputedThisMiss(instance, computedName, originalFn, item) {
         }
     }
 }
-
-/** Blocklisted attributes for data-bind-attr security (O(1) lookup, no per-call allocation) */
-const _LIST_BLOCKED_ATTRS = new Set([
-    'class', 'style', 'srcdoc',
-    'data-bind', 'data-action', 'data-list', 'data-if', 'data-show',
-    'data-render', 'data-component', 'data-template', 'data-slot',
-    'data-portal', 'data-bind-html', 'data-bind-class', 'data-bind-style',
-    'data-bind-attr', 'data-model', 'data-key',
-    'data-wf-bind', 'data-wf-action', 'data-wf-list', 'data-wf-if', 'data-wf-show',
-    'data-wf-render', 'data-wf-component', 'data-wf-template', 'data-wf-slot',
-    'data-wf-portal', 'data-wf-bind-html', 'data-wf-bind-class', 'data-wf-bind-style',
-    'data-wf-bind-attr', 'data-wf-model', 'data-wf-key'
-]);
 
 /**
  * Methods to be mixed into ListRendererMethods (and ultimately WildflowerJS.prototype)
@@ -582,56 +569,6 @@ export const ListExpressionMethods = {
     // Handles both data-bind-style and data-bind-attr with shared logic
     // =========================================================================
 
-    /**
-     * Check if an attribute name is blocklisted for security or framework integrity
-     * @param {string} attrName - Attribute name to check
-     * @returns {boolean} True if blocklisted
-     * @private
-     */
-    _isBlocklistedAttr(attrName) {
-        const lower = attrName.toLowerCase();
-
-        // Block event handlers (XSS prevention)
-        if (lower.startsWith('on')) return true;
-
-        // Block framework directives, class/style, srcdoc (O(1) Set lookup)
-        return _LIST_BLOCKED_ATTRS.has(lower);
-    },
-
-    /**
-     * Sanitize attribute value for security
-     * @param {string} attrName - Attribute name
-     * @param {*} value - Value to sanitize
-     * @returns {*} Sanitized value or null if blocked
-     * @private
-     */
-    _sanitizeAttrValue(attrName, value) {
-        if (value === null || value === undefined) return value;
-
-        const lower = attrName.toLowerCase();
-
-        // For URL-bearing attributes, normalize and check dangerous protocols
-        if (['href', 'src', 'formaction', 'action', 'poster', 'xlink:href'].includes(lower)) {
-            // Strip all whitespace and control characters before protocol check
-            // to prevent bypasses like "java\tscript:" or "java\nscript:"
-            const normalized = String(value).replace(/[\s\x00-\x1F\x7F]/g, '').toLowerCase();
-
-            if (normalized.startsWith('javascript:') || normalized.startsWith('vbscript:')) {
-                if (__DEV__) console.warn(`[WildflowerJS] Blocked dangerous protocol in ${attrName}`);
-                return null;
-            }
-
-            // Block all data: URIs in URL attributes EXCEPT raster image formats.
-            // data:image/svg+xml and data:image/xml can execute inline scripts
-            // when loaded via <object>/<iframe>/<embed>, so they are NOT allowed.
-            if (/^data:(?!image\/(png|jpe?g|gif|webp|avif|bmp|ico|tiff?|x-icon)[,;])/i.test(normalized)) {
-                if (__DEV__) console.warn(`[WildflowerJS] Blocked dangerous data: URI in ${attrName}`);
-                return null;
-            }
-        }
-
-        return value;
-    },
 
     /**
      * Unified object binding application
@@ -642,39 +579,8 @@ export const ListExpressionMethods = {
      * @private
      */
     /**
-     * Dev-mode once-per-(type, element) warning when data-bind-style/-attr gets a
-     * non-object value (e.g. a CSS string). Shared by the setup-write path
-     * (_applyObjectBinding) and the component render effect
-     * (_executeStyleBindForEffect/_executeAttrBindForEffect) so the warning fires
-     * exactly once regardless of which writer paints, without a per-binding
-     * context. No-op in production (__DEV__ folds).
      * @private
      */
-    _warnObjectBindingShape(type, element, value) {
-        if (!__DEV__) return;
-        // The shape mismatch is almost always a CSS-string passed to
-        // data-bind-style ('background:red' instead of {background:'red'});
-        // silently skipping it leaves the user wondering why colors never apply.
-        this._warnedBindingShape = this._warnedBindingShape || new WeakMap();
-        let perEl = this._warnedBindingShape.get(element);
-        if (!perEl) { perEl = new Set(); this._warnedBindingShape.set(element, perEl); }
-        if (perEl.has(type)) return;
-        perEl.add(type);
-        const example = type === 'style'
-            ? "{ background: '#5b8def' } or { backgroundColor: '#5b8def' }"
-            : "{ 'data-id': item.id, title: item.label }";
-        const sample = String(value).slice(0, 60);
-        const tag = element.tagName ? element.tagName.toLowerCase() : 'element';
-        const cls = element.className && typeof element.className === 'string'
-            ? '.' + element.className.split(/\s+/)[0] : '';
-        console.warn(
-            `[WildflowerJS] data-bind-${type} expected an object, got ${typeof value} ("${sample}").\n` +
-            `  Element: <${tag}${cls}>\n` +
-            `  Use object form: ${example}\n` +
-            `  CSS strings like "background:red" silently no-op.`
-        );
-    },
-
     _applyObjectBinding(type, element, object) {
         if (object == null) return; // null/undefined is intentional no-op
         if (typeof object !== 'object') {
@@ -742,79 +648,7 @@ export const ListExpressionMethods = {
      * @param {Array} data - The current list data
      * @param {Object} context - The list context
      */
-    /**
-     * Re-evaluate a list-item text data-bind that uses list-context variables
-     * (_index/_first/_last/_length) after a structure change, straight off the
-     * row's item-proxy; no per-element binding context. Mirrors the item-based
-     * eval the sibling class/attr re-evals use (_getMergedState +
-     * evaluateExpression), then writes the value like Context._updateBindingElement.
-     * @private
-     */
-    /**
-     * Evaluate a list-item expression in item context (item-proxy + component
-     * state/computeds + _index/_first/_last/_length) without a per-element
-     * binding context. Shared by the data-bind text and data-show re-evals.
-     * @private
-     */
-    _evalItemContextExpr(element, item, expression, itemIndex, enrichedContext) {
-        let expr = expression;
-        if (expr.includes('$') && this._normalizeStoreShorthands) {
-            expr = this._normalizeStoreShorthands(expr);
-        }
-        const instance = enrichedContext?.componentInstance;
-        const listLength = enrichedContext?.listLength ?? enrichedContext?._length ?? 0;
-        const mergedState = this._getMergedState(instance, item, itemIndex, listLength);
-        const options = { cacheKey: 'bind' };
-        if (expr.includes('external(') && instance) {
-            options.additionalContext = { external: this._getExternalFn(instance) };
-        }
-        return this.evaluateExpression(expr, mergedState, options);
-    },
-    _reEvalItemContextBind(element, item, expression, itemIndex, enrichedContext) {
-        if (this._hasAttr(element, 'bind-html')) return;
-        let value;
-        try {
-            value = this._evalItemContextExpr(element, item, expression, itemIndex, enrichedContext);
-        } catch (e) {
-            if (__DEV__) console.warn(`[WF] data-bind re-eval error:`, e.message);
-            return;
-        }
-        // Apply the value (mirrors Context._updateBindingElement)
-        const tagName = element.tagName.toLowerCase();
-        if (tagName.includes('-')) {
-            const adapter = this.getAdapter?.(tagName, element);
-            if (adapter && element[adapter.prop] !== value) element[adapter.prop] = value;
-            return;
-        }
-        if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
-            const elType = element.type;
-            if (elType !== 'radio' && elType !== 'checkbox') {
-                const stringValue = value !== undefined && value !== null ? String(value) : '';
-                if (element.value !== stringValue) element.value = stringValue;
-            }
-            return;
-        }
-        applyText(element, value);
-    },
-    /**
-     * Re-evaluate a list-item data-show that uses list-context variables after a
-     * structure change, off the row's item-proxy; no per-element conditional
-     * context (so it works even for child elements that never got one, which is
-     * why a list-row data-show="_last" previously failed to update on removal).
-     * data-render in lists is re-evaluated by per-item effects, not here.
-     * @private
-     */
-    _reEvalItemContextShow(element, item, expression, itemIndex, enrichedContext) {
-        let value;
-        try {
-            value = this._evalItemContextExpr(element, item, expression, itemIndex, enrichedContext);
-        } catch (e) {
-            if (__DEV__) console.warn(`[WF] data-show re-eval error:`, e.message);
-            return;
-        }
-        applyShow(element, value);
-    },
-    _updateListContextClassBindings(listElement, data, context, startIndex = 0) {
+    _updateListContextClassBindings(listElement, data, context, instance, startIndex = 0) {
         if (!listElement) return;
 
         const listLength = data?.length ?? 0;
@@ -828,6 +662,20 @@ export const ListExpressionMethods = {
 
         // OPTIMIZATION: Pre-create enriched context once (avoids object spread per item)
         const enrichedContext = { ...context, listLength };
+
+        // Reusable resolution scope for the applier-engine passes that repaint the
+        // row's position-frame text/show/render (itemIndex is set per row; the
+        // object is consumed synchronously). Mirrors _bindWithCompiledMetadata's
+        // reusable ctx.
+        const computed = instance?.stateManager?.computed || null;
+        const sweepCtx = {
+            componentState: instance?.state || {},
+            componentInstance: instance,
+            itemIndex: 0,
+            listLength,
+            listContext: context,
+            propsData: instance?._propsData
+        };
 
         // PERF: Skip items before startIndex - their indices haven't changed
         // For single removal at index 500, this skips processing 500 items
@@ -932,98 +780,16 @@ export const ListExpressionMethods = {
                 }
             }
 
-            // Re-evaluate data-bind expressions that use list context vars
-            if (cachedElements) {
-                // FAST PATH: check item element + iterate cached elements
-                if (itemEl.hasAttribute('data-bind')) {
-                    const expr = itemEl.dataset.bind;
-                    if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        this._reEvalItemContextBind(itemEl, item, expr, index, enrichedContext);
-                    }
-                }
-                for (let i = 0; i < cachedElements.length; i++) {
-                    const el = cachedElements[i];
-                    if (!el || !el.hasAttribute('data-bind')) continue;
-                    if (isInNestedList(el)) continue;
-                    const expr = el.dataset.bind;
-                    if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        this._reEvalItemContextBind(el, item, expr, index, enrichedContext);
-                    }
-                }
-            } else {
-                // FALLBACK: querySelectorAll
-                const bindElements = [
-                    ...(this._hasAttr(itemEl, 'bind') ? [itemEl] : []),
-                    ...itemEl.querySelectorAll(this._attrSelector('bind'))
-                ];
-                bindElements.forEach(el => {
-                    if (el !== itemEl && isInNestedList(el)) return;
-                    const expr = this._getAttr(el, 'bind');
-                    if (this._expressionUsesListContext(expr) && this.isExpression(expr)) {
-                        this._reEvalItemContextBind(el, item, expr, index, enrichedContext);
-                    }
-                });
-            }
-
-            // Re-evaluate data-show/data-render expressions that use list context vars
-            if (cachedElements) {
-                // FAST PATH: check item element + iterate cached elements
-                if (itemEl.hasAttribute('data-show')) {
-                    const expr = itemEl.dataset.show;
-                    if (this._expressionUsesListContext(expr)) {
-                        this._reEvalItemContextShow(itemEl, item, expr, index, enrichedContext);
-                    }
-                }
-                for (let i = 0; i < cachedElements.length; i++) {
-                    const el = cachedElements[i];
-                    if (!el || !el.hasAttribute('data-show')) continue;
-                    if (isInNestedList(el)) continue;
-                    const expr = el.dataset.show;
-                    if (this._expressionUsesListContext(expr)) {
-                        this._reEvalItemContextShow(el, item, expr, index, enrichedContext);
-                    }
-                }
-            } else {
-                // FALLBACK: querySelectorAll (data-show only; data-render in lists
-                // is re-evaluated by per-item effects)
-                const conditionalElements = [
-                    ...(this._hasAttr(itemEl, 'show') ? [itemEl] : []),
-                    ...itemEl.querySelectorAll(this._attrSelector('show'))
-                ];
-                conditionalElements.forEach(el => {
-                    if (el !== itemEl && isInNestedList(el)) return;
-                    const expr = this._getAttr(el, 'show');
-                    if (this._expressionUsesListContext(expr)) {
-                        this._reEvalItemContextShow(el, item, expr, index, enrichedContext);
-                    }
-                });
-            }
-
-            // Re-evaluate data-render bindings on a bare list-position token
-            // (data-render="_last"): the row that becomes (or ceases to be) last
-            // after an add/remove must toggle its rendered element. Mirrors the
-            // data-show handling above; renders go through the stored render context
-            // (insert/remove), not applyShow. (Expression / item-computed renders are
-            // covered by the per-item effect and _reEvalListItemComputedConditionals.)
-            const renderContexts = itemEl._renderContexts;
-            if (renderContexts) {
-                for (let r = 0; r < renderContexts.length; r++) {
-                    const rc = renderContexts[r];
-                    const rpath = rc && rc.binding && rc.binding.path;
-                    if (!rpath || !this._listContextVars.has(rpath)) continue;
-                    let fv;
-                    switch (rpath) {
-                        case '_index': fv = index; break;
-                        case '_length': fv = listLength; break;
-                        case '_first': fv = index === 0; break;
-                        case '_last': fv = index === listLength - 1; break;
-                    }
-                    const shouldRender = rc.binding.negate ? !fv : !!fv;
-                    if (rc.context && shouldRender !== rc.context.isRendered) {
-                        rc.context._updateConditionalElement(shouldRender);
-                    }
-                }
-            }
+            // Position-frame text/show + data-render conditionals re-eval through
+            // the applier engine (FILTER_INDEX): _runAppliersIndexed repaints
+            // TEXT/SHOW records that read a position token (SHOW also: a computed
+            // that can read the frame), _runRenderContextsIndexed toggles render
+            // conditionals. This replaces the former per-attribute _reEval sweep
+            // bodies and folds in the item-computed conditional pass — one owner,
+            // one loop, resolving through the canonical engine path.
+            sweepCtx.itemIndex = index;
+            this._runAppliersIndexed(cachedElements, item, itemMetadata?._appProgram, sweepCtx, computed);
+            this._runRenderContextsIndexed(itemEl._renderContexts, item, sweepCtx, computed);
         }
     },
     /**
@@ -1064,65 +830,6 @@ export const ListExpressionMethods = {
         }
         metadata._hasComputedConditional = result;
         return result;
-    },
-    /**
-     * Re-evaluate list-item data-show / data-render conditionals that resolve
-     * through an item-level computed, off the row proxy + the row's CURRENT
-     * index and the list length. The literal-token sweep
-     * (_updateListContextClassBindings) only catches expressions containing
-     * _index/_last/etc.; a computed NAMED e.g. onLast carries no such token, so
-     * a structural change (add/remove/reorder) would otherwise leave its
-     * info.last/info.length frame stale. Runs after the reconcile completes.
-     * @private
-     */
-    _reEvalListItemComputedConditionals(listElement, data, context, instance) {
-        const computed = instance?.stateManager?.computed;
-        if (!computed) return;
-        const items = this._getListItems(listElement);
-        const listLength = data?.length ?? items.length;
-        { // full re-eval of every row's computed conditionals
-            for (let index = 0; index < items.length; index++) {
-                const itemEl = items[index];
-                const item = itemEl._itemData || {};
-                const meta = itemEl._compiledMetadata;
-                const ctx = {
-                    componentState: instance?.state || {},
-                    componentInstance: instance,
-                    itemIndex: index,
-                    listLength,
-                    listContext: context
-                };
-                // data-show computeds: resolve and toggle display.
-                const shows = meta?.shows;
-                if (shows && shows.length) {
-                    const elements = itemEl._cachedElementsArray || itemEl._bindingElements;
-                    if (elements) {
-                        for (let s = 0; s < shows.length; s++) {
-                            const show = shows[s];
-                            if (!this._conditionalRefsComputed(show, computed)) continue;
-                            const el = elements[show.index];
-                            if (!el) continue;
-                            const raw = this._resolveCompiledBinding(show, item, ctx);
-                            applyShow(el, show.negate ? !raw : Boolean(raw));
-                        }
-                    }
-                }
-                // data-render computeds: resolve and insert/remove via the render context.
-                const renderContexts = itemEl._renderContexts;
-                if (renderContexts && renderContexts.length) {
-                    for (let r = 0; r < renderContexts.length; r++) {
-                        const rc = renderContexts[r];
-                        if (!rc || !rc.context || !rc.binding) continue;
-                        if (!this._conditionalRefsComputed(rc.binding, computed)) continue;
-                        const raw = this._resolveCompiledBinding(rc.binding, item, ctx);
-                        const shouldRender = rc.binding.negate ? !raw : Boolean(raw);
-                        if (shouldRender !== rc.context.isRendered) {
-                            rc.context._updateConditionalElement(shouldRender);
-                        }
-                    }
-                }
-            }
-        }
     },
     /**
      * Check if an expression uses list context variables
