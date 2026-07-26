@@ -2,7 +2,7 @@
 
 WildflowerJS is built without `npm install` in the framework's own build path. This document describes precisely what that buys you, what it doesn't, and how to verify the claims yourself.
 
-The honest summary: we close the post-publish tampering vector, remove the postinstall-script attack surface entirely, and, since v1.3.0, publish our own releases with Sigstore-signed SLSA provenance through npm trusted publishing, with token-based publishing disabled. We do **not** close the moment-of-publish vector against our three pinned upstreams (rollup, terser, acorn), because none of them currently ships SLSA provenance from upstream CI.
+The honest summary: we close the post-publish tampering vector, remove the postinstall-script attack surface entirely, and, since v1.3.0, publish our own releases with Sigstore-signed SLSA provenance through npm trusted publishing, with token-based publishing disabled. We do **not** close the moment-of-publish vector against our three pinned upstreams (rollup, terser, acorn): none of our pinned versions carries upstream provenance. Rollup began attesting its releases from 4.58.0, which puts verification on the roadmap; terser and acorn still ship none.
 
 ## What ships, and what's vendored
 
@@ -53,13 +53,15 @@ Net effect: 8 → 3 vendored tarballs, byte-identical build output, full test su
 
 SHA-512 pinning is robust against post-pinning tampering. It is **not** robust against the moment-of-publish vector, which is exactly how event-stream, ua-parser-js, and the Shai-Hulud worm worked: a malicious version was pushed to npm by a compromised account, and consumers who pinned at that moment locked in the malicious bytes faithfully forever.
 
-SLSA (Supply-chain Levels for Software Artifacts) closes this gap by binding the published artifact to a specific upstream CI run from a specific commit, verifiable through the rekor transparency log. As of an audit on 2026-05-05:
+SLSA (Supply-chain Levels for Software Artifacts) closes this gap by binding the published artifact to a specific upstream CI run from a specific commit, verifiable through the rekor transparency log. As of a re-audit on 2026-07-26 (previous audit 2026-05-05):
 
 | Package | Pinned version | SLSA provenance from upstream |
 |---------|----------------|-------------------------------|
-| rollup | 3.30.0 | ❌ none |
-| terser | 5.46.2 | ❌ none |
-| acorn | 8.16.0 | ❌ none |
+| rollup | 3.30.0 | ❌ none for our pinned version; upstream ships attestations from 4.58.0 onward |
+| terser | 5.46.2 | ❌ none (latest 5.49.0 also none) |
+| acorn | 8.16.0 | ❌ none (latest 8.17.0 also none) |
+
+Rollup adopting provenance is new since the previous audit and changes the roadmap below: the verification step is no longer hypothetical for one of the three. Our pinned 3.30.0 predates it, so verifying rollup's attestation requires the 3.x to 4.x toolchain migration first, a major-version bump gated on full matrix and benchmark validation.
 
 We have not solved this. We have minimized the attack surface (three packages, all widely used and watched) and locked the bytes against post-publish drift, but we cannot independently verify these three tarballs were built by their declared upstream CI. If `https://registry.npmjs.org/<pkg>/<ver>` had served a malicious tarball at the moment we pinned it, we would have faithfully locked that malicious version.
 
@@ -67,7 +69,7 @@ This is the gap. We name it because the alternative, claiming a stronger guarant
 
 ## How to verify the claims yourself
 
-Re-run the upstream provenance audit (the table above) before trusting it for any compliance purpose, since upstream state may have changed since 2026-05-05:
+Re-run the upstream provenance audit (the table above) before trusting it for any compliance purpose, since upstream state may have changed since 2026-07-26:
 
 ```bash
 for pkg in 'rollup/3.30.0' 'terser/5.46.2' 'acorn/8.16.0'; do
@@ -106,7 +108,7 @@ The same input commit produces the same bytes. If our published CDN artifact has
 The audit recommendation we are still working through, in priority order:
 
 1. **SLSA-attest our own releases. ✅ Done, v1.3.0 (2026-07-26).** Shipped via npm trusted publishing rather than the `slsa-github-generator` action originally sketched here. Releases are published exclusively by the tag-triggered workflow in this repository; npm exchanges the workflow's OIDC identity for publish rights and generates a Sigstore-signed SLSA build attestation automatically. No publish token exists, and token-based publishing is disabled on the package. Verify any installed copy with `npm audit signatures`, or fetch the attestation directly from `https://registry.npmjs.org/-/npm/v1/attestations/wildflowerjs@<version>`. jsDelivr and unpkg serve from npm, so the CDN path inherits the same guarantee. This closes our side of the chain. The upstream gap below is untouched by it.
-2. **Optional `--verify-attestations` step in the fetch scripts.** Once any of our three upstreams (rollup, terser, acorn) starts publishing provenance, add a verification step that checks the rekor signature and asserts the source repo matches an allowlist. Until at least one upstream opts in, this is mostly a no-op.
+2. **Optional `--verify-attestations` step in the fetch scripts.** The trigger condition fired on 2026-07-26: rollup publishes attestations from 4.58.0 onward. The step is now real work in two parts, in order: migrate the vendored toolchain from rollup 3.30.0 to a provenance-carrying 4.x (major bump; full test matrix and benchmark validation required before adoption), then add the verification that checks the rekor signature and asserts the source repo matches an allowlist. terser and acorn still publish nothing, so the pin plus hash remains their only guarantee.
 
 What we're explicitly **not** doing:
 
