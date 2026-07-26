@@ -57,7 +57,7 @@ export const ListNestedMethods = {
         nestedComponents.forEach(componentEl => {
             const componentId = componentEl.dataset.componentId;
             if (componentId) {
-                this.destroyComponent(componentId);
+                this._destroyComponentQuiet(componentId);
             }
         });
     },
@@ -164,27 +164,6 @@ export const ListNestedMethods = {
      * @param {Object} instance - Component instance
      * @private
      */
-    _updatePropsBindingsForComponent(instance) {
-        // NOTE: Caller (e.g., _updateNestedComponentPropsInItem) has already updated
-        // instance._propsData with the correct values. We just need to refresh
-        // the DOM bindings that use props.* paths.
-
-        // props.* DOM bindings are repainted by the component render effect (no
-        // registry binding contexts to refresh here). We still invalidate computed
-        // properties so they recalculate against the new props values.
-
-        // Invalidate all computed properties when props change
-        // Note: Props access doesn't track dependencies (props proxy has no get trap),
-        // so we must invalidate all computed properties to ensure they recalculate
-        // with the new props values
-        if (instance.stateManager) {
-            const sm = instance.stateManager;
-            sm.getComputedPropertyNames().forEach(propName => {
-                sm._invalidateCachedComputed?.(propName);
-                sm.scheduleComputedEvaluation(propName);
-            });
-        }
-    },
     /**
      * Process nested lists within a parent list item
      * @private

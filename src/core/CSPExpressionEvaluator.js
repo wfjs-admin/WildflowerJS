@@ -768,44 +768,6 @@ function evaluateCall(node, context) {
 // =============================================================================
 
 /**
- * Create a CSP-safe evaluator function for an expression
- * This returns a function that can be called with a context object
- *
- * @param {string} expression - The expression to compile
- * @param {Map} astCache - Cache for storing parsed ASTs
- * @param {string} cachePrefix - Cache key prefix
- * @returns {Function|null} An evaluator function, or null if parsing failed
- */
-function getCSPSafeEvaluator(expression, astCache, cachePrefix = 'csp') {
-    const cacheKey = `${cachePrefix}::${expression}`;
-
-    // Check cache first
-    if (astCache.has(cacheKey)) {
-        return astCache.get(cacheKey);
-    }
-
-    // Parse expression to AST
-    const ast = parseExpression(expression);
-    if (!ast) {
-        // Cache null to avoid repeated parse attempts
-        astCache.set(cacheKey, null);
-        return null;
-    }
-
-    // Create evaluator closure
-    const evaluator = (context) => evaluateAST(ast, context);
-
-    if (typeof __DEV__ !== 'undefined' && __DEV__) {
-        evaluator._ast = ast;
-        evaluator._isCSPSafe = true;
-    }
-
-    // Cache and return
-    astCache.set(cacheKey, evaluator);
-    return evaluator;
-}
-
-/**
  * Create a CSP-safe evaluator that takes individual arguments (like new Function())
  * This matches the signature expected by the existing expression evaluation code
  *
@@ -891,7 +853,6 @@ function getCSPSafeMergedContextEvaluator(expression, varNames, astCache, cacheP
 export {
     parseExpression,
     evaluateAST,
-    getCSPSafeEvaluator,
     getCSPSafeEvaluatorWithArgs,
     getCSPSafeMergedContextEvaluator,
     BLOCKED_PROPERTIES,

@@ -108,7 +108,7 @@ export const DomAbstractionMethods = {
                 const sanitized = framework._sanitizeOrPassHTML ? framework._sanitizeOrPassHTML(v) : v;
                 els.forEach(el => {
                     if (framework.debug && (el.hasAttribute('data-bind-html') || el.hasAttribute('data-list'))) {
-                        console.warn(`[WF] Warning: Manual .html() overwrite on reactive node:`, el);
+                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .html() overwrite on reactive node', data: el });
                     }
                     el.innerHTML = sanitized;
                     // Rescan for new components in injected HTML
@@ -122,7 +122,7 @@ export const DomAbstractionMethods = {
                 if (v === undefined) return els[0]?.textContent;
                 els.forEach(el => {
                     if (framework.debug && el.hasAttribute('data-bind')) {
-                        console.warn(`[WF] Warning: Manual .text() overwrite on bound node:`, el);
+                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .text() overwrite on bound node', data: el });
                     }
                     el.textContent = v;
                 });
@@ -211,7 +211,7 @@ export const DomAbstractionMethods = {
             remove() {
                 els.forEach(el => {
                     if (framework.debug && (el.hasAttribute('data-component') || el.hasAttribute('data-list-item'))) {
-                        console.warn(`[WF] Manual .remove() on managed node. Consider updating state instead.`);
+                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .remove() on managed node', suggestion: 'Consider updating state instead.', data: el });
                     }
                     el.remove();
                 });

@@ -194,7 +194,7 @@ describeIfPools('tick(dt) Lifecycle Hook', () => {
     wildflower.component('tick-before-flush', {
       state: {},
       init() {
-        this._pool = this.pool('items')
+        this._pool = this.getPool('items')
         this._pool.add({ id: 1, value: 'initial' })
       },
       tick(dt) {

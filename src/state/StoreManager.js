@@ -2,7 +2,11 @@
 // ES6 MODULE IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
-import { WF_ERRORS, objectUtils, wfError, definitionSignature } from '../core/wfUtils.js';
+import { WF_ERRORS, objectUtils, wfError, definitionSignature, validateEntityDefinition, warnDefinitionCollisions } from '../core/wfUtils.js';
+
+// Non-function definition keys the store factory actually consumes
+// (validateEntityDefinition allowlist — keep in sync with createStoreComponent).
+const STORE_CONTRACT_KEYS = ['state', 'computed', 'subscribe', 'storageKey', 'autoSave'];
 import { createStateManager } from './createStateManager.js';
 import { createContextProxy, patchSelfReferences, warnCollisions, RAW_TARGET } from './ContextProxy.js';
 
@@ -198,6 +202,15 @@ export class StoreManager {
                             }
                         }
                     }
+                }
+                // PROD PARITY: complete the entity-dependent registration that
+                // _setupStoreSubscriptions deferred because the store didn't
+                // exist yet (see the matching registration there — dev builds
+                // masked this via the dev-only computed-tracking marker).
+                const subTarget = this.framework._externalFindTarget
+                    ? this.framework._externalFindTarget(storeName) : null;
+                if (subTarget && subTarget.id && this.framework._registerEntityDependent) {
+                    this.framework._registerEntityDependent(subTarget.id, componentId);
                 }
                 // Invalidate ALL computed caches so they re-evaluate with the now-available store
                 if (instance.stateManager.computedCache) {
@@ -411,6 +424,28 @@ export class StoreManager {
             // This ensures methods are available in init()
             this.framework._bindEntityMethods(definition, context);
 
+            // Attach teardown lifecycle hooks explicitly. _bindEntityMethods
+            // deliberately skips lifecycle names (framework-driven, not
+            // user-callable actions), and unlike components — whose
+            // _bindMethods copies every definition function onto the context —
+            // nothing else attached them for stores. destroyComponent's
+            // `context.destroy` / _callBeforeDestroyHook's
+            // `context.beforeDestroy` checks therefore found nothing, and
+            // store teardown silently skipped user cleanup: intervals started
+            // in init() leaked as zombies on every unregister (the docs
+            // Store Lifecycle demo's exact bug). Bound to the proxied context
+            // so `this` resolves state/computed/methods like every other hook.
+            if (typeof definition.beforeDestroy === 'function') {
+                rawContext.beforeDestroy = function() {
+                    return definition.beforeDestroy.call(context);
+                };
+            }
+            if (typeof definition.destroy === 'function') {
+                rawContext.destroy = function() {
+                    return definition.destroy.call(context);
+                };
+            }
+
             // Add computed properties: bind to context but let errors propagate
             // so ComputedPropertyManager can set the ERRORED sentinel for caching
             if (definition.computed && Object.keys(definition.computed).length > 0) {
@@ -505,13 +540,22 @@ export class StoreManager {
                 }
             }
 
-            // Register tick lifecycle hook if defined (shared rAF loop with components)
+            // Register tick lifecycle hook if defined (shared rAF loop with
+            // components). Guarded: the frame loop lives in the pool module,
+            // absent from tiers without pools (see ComponentLifecycle twin).
             if (typeof definition.tick === 'function') {
-                instance._tickFn = definition.tick.bind(context);
                 const fw = this.framework;
-                if (!fw._tickableInstances) fw._tickableInstances = [];
-                fw._tickableInstances.push(instance);
-                fw._startPoolLoop();
+                if (fw._startPoolLoop) {
+                    instance._tickFn = definition.tick.bind(context);
+                    if (!fw._tickableInstances) fw._tickableInstances = [];
+                    fw._tickableInstances.push(instance);
+                    fw._startPoolLoop();
+                } else if (__DEV__) {
+                    wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
+                        warn: true,
+                        context: `Store '${name}': tick() is defined, but this build does not include the frame loop (pool module excluded from this tier); tick will never run`
+                    });
+                }
             }
 
             return instance;
@@ -550,7 +594,7 @@ export class StoreManager {
     subscribePath(storeName, path, componentInstance) {
         const store = this._namedStores.get(storeName);
         if (!store) {
-            if (__DEV__) console.warn(`[WF] Store '${storeName}' not found for path subscription`);
+            if (__DEV__) wfError(WF_ERRORS.STORE_NEVER_REGISTERED, { warn: true, context: `Store '${storeName}' not found for path subscription` });
             return false;
         }
 
@@ -892,6 +936,11 @@ export class StoreManager {
             }
             return existing.context;
         }
+
+        // Contract check on the RAW user config (createStoreComponent receives a
+        // rebuilt definition with placeholder keys, so it cannot be checked there).
+        if (__DEV__) validateEntityDefinition('Store', name, config, STORE_CONTRACT_KEYS);
+        if (__DEV__) warnDefinitionCollisions('Store', name, config);
 
         // Extract special properties from config
         // storageKey and autoSave enable localStorage persistence (like components)

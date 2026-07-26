@@ -101,7 +101,7 @@ suiteRunner('Binding Validation', () => {
                 // Only check warnings if debug mode is enabled and console warnings aren't stripped
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('nonExistent')
+                        msg.includes('[WF') && msg.includes('nonExistent')
                     );
                     expect(validationWarning).toBeDefined();
                 }
@@ -131,7 +131,7 @@ suiteRunner('Binding Validation', () => {
                 // Should not warn about valid properties
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation')
+                        msg.includes('[WF') && msg.includes('Binding validation')
                     );
                     expect(validationWarning).toBeUndefined();
                 }
@@ -165,7 +165,7 @@ suiteRunner('Binding Validation', () => {
                 // Should not warn - root 'user' exists
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation')
+                        msg.includes('[WF') && msg.includes('Binding validation')
                     );
                     expect(validationWarning).toBeUndefined();
                 }
@@ -193,7 +193,7 @@ suiteRunner('Binding Validation', () => {
                 // Should warn - 'user' doesn't exist
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('user')
+                        msg.includes('[WF') && msg.includes('user')
                     );
                     expect(validationWarning).toBeDefined();
                 }
@@ -233,7 +233,7 @@ suiteRunner('Binding Validation', () => {
                 // flagged as unknown — they're all defined in state.
                 if (hasConsoleWarnings()) {
                     const spurious = warnCapture.captured.find(msg => {
-                        if (!msg.includes('[WF]')) return false;
+                        if (!msg.includes('[WF')) return false;
                         // Look for the validator's "unknown path" wording
                         // applied to any of our defined identifiers.
                         return /loading|isShared|isLocked|count/.test(msg) &&
@@ -241,6 +241,66 @@ suiteRunner('Binding Validation', () => {
                     });
                     expect(spurious).toBeUndefined();
                 }
+            });
+
+            it('does not warn about UNQUOTED object-form class keys (they are class names, not variables)', async () => {
+                // Found by the AI-surface eval (F3, 2026-07-16): generated apps
+                // used the documented object form with bare keys —
+                // data-bind-class="{ active: isTab1 }" — and the expression
+                // validator flagged the KEY ("active", a class name) as an
+                // undefined state property. Quoted keys ('is-active') never
+                // tripped it because string-stripping removes them first, so
+                // the sibling regression above missed this. Keys must be
+                // exempt; VALUE-side identifiers must still be validated
+                // (see the companion typo test below).
+                const warnCapture = createWarnCapture();
+
+                wildflower.component('validation-test-objclass', {
+                    state: { isTab1: true, isTab2: false }
+                });
+
+                testContainer.innerHTML = `
+                    <div data-component="validation-test-objclass">
+                        <button data-bind-class="{ active: isTab1 }">one</button>
+                        <button data-bind-class="{ active: isTab2, dimmed: isTab1 }">two</button>
+                    </div>
+                `;
+
+                await wildflower.scan();
+                await waitForUpdate();
+                warnCapture.restore();
+
+                const spurious = warnCapture.captured.find(msg =>
+                    msg.includes('[WF') &&
+                    /"(active|dimmed)"/.test(msg) &&
+                    /undefined state property/i.test(msg)
+                );
+                expect(spurious).toBeUndefined();
+            });
+
+            it('still warns about undefined VALUE-side identifiers in object-form class bindings', async () => {
+                const warnCapture = createWarnCapture();
+
+                wildflower.component('validation-test-objclass-typo', {
+                    state: { isTab1: true }
+                });
+
+                testContainer.innerHTML = `
+                    <div data-component="validation-test-objclass-typo">
+                        <button data-bind-class="{ active: isTabb1 }">typo</button>
+                    </div>
+                `;
+
+                await wildflower.scan();
+                await waitForUpdate();
+                warnCapture.restore();
+
+                const caught = warnCapture.captured.find(msg =>
+                    msg.includes('[WF') &&
+                    /"isTabb1"/.test(msg) &&
+                    /undefined state property/i.test(msg)
+                );
+                expect(caught).toBeDefined();
             });
         });
 
@@ -273,7 +333,7 @@ suiteRunner('Binding Validation', () => {
                 // Should not warn - computed properties are handled differently
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation') && msg.includes('doubled')
+                        msg.includes('[WF') && msg.includes('Binding validation') && msg.includes('doubled')
                     );
                     expect(validationWarning).toBeUndefined();
                 }
@@ -309,7 +369,7 @@ suiteRunner('Binding Validation', () => {
                 // Should not warn - external() calls are special
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation') && msg.includes('external')
+                        msg.includes('[WF') && msg.includes('Binding validation') && msg.includes('external')
                     );
                     expect(validationWarning).toBeUndefined();
                 }
@@ -346,7 +406,7 @@ suiteRunner('Binding Validation', () => {
                 // Should not warn - these are built-in list context variables
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation') &&
+                        msg.includes('[WF') && msg.includes('Binding validation') &&
                         (msg.includes('_index') || msg.includes('_length') ||
                          msg.includes('_first') || msg.includes('_last'))
                     );
@@ -392,7 +452,7 @@ suiteRunner('Binding Validation', () => {
                 // Should NOT warn about props.title or props.count — these resolve via the props system
                 if (hasConsoleWarnings()) {
                     const propsWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation') &&
+                        msg.includes('[WF') && msg.includes('Binding validation') &&
                         (msg.includes('props.title') || msg.includes('props.count'))
                     );
                     expect(propsWarning).toBeUndefined();
@@ -424,7 +484,7 @@ suiteRunner('Binding Validation', () => {
                 // Should NOT warn about props:label
                 if (hasConsoleWarnings()) {
                     const propsWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation') &&
+                        msg.includes('[WF') && msg.includes('Binding validation') &&
                         msg.includes('props:label')
                     );
                     expect(propsWarning).toBeUndefined();
@@ -453,7 +513,7 @@ suiteRunner('Binding Validation', () => {
                 // Should not warn - negation prefix should be stripped before validation
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation')
+                        msg.includes('[WF') && msg.includes('Binding validation')
                     );
                     expect(validationWarning).toBeUndefined();
                 }
@@ -487,7 +547,7 @@ suiteRunner('Binding Validation', () => {
 
                 // When debug is false, should not warn
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Binding validation')
+                    msg.includes('[WF') && msg.includes('Binding validation')
                 );
                 expect(validationWarning).toBeUndefined();
             });
@@ -533,7 +593,7 @@ suiteRunner('Binding Validation', () => {
                 // Parent should NOT warn about trendClass — it belongs to the child scope
                 if (hasConsoleWarnings()) {
                     const scopeWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('scope-parent-1') &&
+                        msg.includes('[WF') && msg.includes('scope-parent-1') &&
                         msg.includes('trendClass')
                     );
                     expect(scopeWarning).toBeUndefined();
@@ -573,7 +633,7 @@ suiteRunner('Binding Validation', () => {
                 // Parent should NOT warn about showDetail — it belongs to the child
                 if (hasConsoleWarnings()) {
                     const scopeWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('scope-parent-2') &&
+                        msg.includes('[WF') && msg.includes('scope-parent-2') &&
                         msg.includes('showDetail')
                     );
                     expect(scopeWarning).toBeUndefined();
@@ -613,7 +673,7 @@ suiteRunner('Binding Validation', () => {
                 // Parent SHOULD still warn about its own typo (isVisble vs isVisible)
                 if (hasConsoleWarnings()) {
                     const typoWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('scope-parent-3') &&
+                        msg.includes('[WF') && msg.includes('scope-parent-3') &&
                         msg.includes('isVisble')
                     );
                     expect(typoWarning).toBeDefined();
@@ -654,7 +714,7 @@ suiteRunner('Binding Validation', () => {
                 // Grandparent should NOT warn about gcValue or midValue
                 if (hasConsoleWarnings()) {
                     const gpWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('scope-grandparent') &&
+                        msg.includes('[WF') && msg.includes('scope-grandparent') &&
                         (msg.includes('gcValue') || msg.includes('midValue'))
                     );
                     expect(gpWarning).toBeUndefined();
@@ -663,7 +723,7 @@ suiteRunner('Binding Validation', () => {
                 // Mid-level should NOT warn about gcValue
                 if (hasConsoleWarnings()) {
                     const midWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('scope-mid') &&
+                        msg.includes('[WF') && msg.includes('scope-mid') &&
                         msg.includes('gcValue')
                     );
                     expect(midWarning).toBeUndefined();
@@ -697,7 +757,7 @@ suiteRunner('Binding Validation', () => {
                 // Should warn and suggest similar names
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('cont')
+                        msg.includes('[WF') && msg.includes('cont')
                     );
                     expect(validationWarning).toBeDefined();
 
@@ -730,7 +790,7 @@ suiteRunner('Binding Validation', () => {
                 // Warning should list available properties
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('unknown')
+                        msg.includes('[WF') && msg.includes('unknown')
                     );
                     expect(validationWarning).toBeDefined();
 
@@ -814,7 +874,7 @@ suiteRunner('Binding Validation', () => {
                 // differently - they bind to the item context, not component state
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('Binding validation') &&
+                        msg.includes('[WF') && msg.includes('Binding validation') &&
                         (msg.includes('title') || msg.includes('cost'))
                     );
                     // This may or may not warn depending on how list item bindings are processed
@@ -847,7 +907,7 @@ suiteRunner('Binding Validation', () => {
                 // Should warn about typo in data-model
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('usernme')
+                        msg.includes('[WF') && msg.includes('usernme')
                     );
                     expect(validationWarning).toBeDefined();
                 }
@@ -875,7 +935,7 @@ suiteRunner('Binding Validation', () => {
                 // Should warn about typo in data-show
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('isLoadng')
+                        msg.includes('[WF') && msg.includes('isLoadng')
                     );
                     expect(validationWarning).toBeDefined();
                 }
@@ -903,7 +963,7 @@ suiteRunner('Binding Validation', () => {
                 // Should warn about typo in data-render
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('sholdRender')
+                        msg.includes('[WF') && msg.includes('sholdRender')
                     );
                     expect(validationWarning).toBeDefined();
                 }
@@ -931,7 +991,7 @@ suiteRunner('Binding Validation', () => {
                 // Should warn about typo in expression
                 if (hasConsoleWarnings()) {
                     const validationWarning = warnCapture.captured.find(msg =>
-                        msg.includes('[WF]') && msg.includes('isActve')
+                        msg.includes('[WF') && msg.includes('isActve')
                     );
                     expect(validationWarning).toBeDefined();
                 }
@@ -1165,7 +1225,7 @@ suiteRunner('Binding Validation', () => {
 
                 // Should warn about type mismatch
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type mismatch')
+                    msg.includes('[WF') && msg.includes('Type mismatch')
                 );
                 expect(typeWarning).toBeDefined();
                 expect(typeWarning).toContain('count');
@@ -1203,7 +1263,7 @@ suiteRunner('Binding Validation', () => {
 
                 // Should warn about type mismatch
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type mismatch')
+                    msg.includes('[WF') && msg.includes('Type mismatch')
                 );
                 expect(typeWarning).toBeDefined();
                 expect(typeWarning).toContain('name');
@@ -1239,7 +1299,7 @@ suiteRunner('Binding Validation', () => {
                 warnCapture.restore();
 
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type mismatch')
+                    msg.includes('[WF') && msg.includes('Type mismatch')
                 );
                 expect(typeWarning).toBeUndefined();
             });
@@ -1274,7 +1334,7 @@ suiteRunner('Binding Validation', () => {
                 warnCapture.restore();
 
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type mismatch')
+                    msg.includes('[WF') && msg.includes('Type mismatch')
                 );
                 expect(typeWarning).toBeUndefined();
             });
@@ -1312,7 +1372,7 @@ suiteRunner('Binding Validation', () => {
 
                 // Should not warn when debug is false
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type mismatch')
+                    msg.includes('[WF') && msg.includes('Type mismatch')
                 );
                 expect(typeWarning).toBeUndefined();
             });
@@ -1351,7 +1411,7 @@ suiteRunner('Binding Validation', () => {
 
                 // Should warn about type mismatch
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type mismatch')
+                    msg.includes('[WF') && msg.includes('Type mismatch')
                 );
                 expect(typeWarning).toBeDefined();
                 expect(typeWarning).toContain('items');
@@ -1430,7 +1490,7 @@ suiteRunner('Binding Validation', () => {
 
                 // Should warn that count is string but binding expects number
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type hint mismatch')
+                    msg.includes('[WF') && msg.includes('Type hint mismatch')
                 );
                 expect(typeWarning).toBeDefined();
                 expect(typeWarning).toContain('count');
@@ -1459,7 +1519,7 @@ suiteRunner('Binding Validation', () => {
 
                 // Should not warn about type hint mismatch since value matches
                 const typeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Type hint mismatch') && msg.includes('count')
+                    msg.includes('[WF') && msg.includes('Type hint mismatch') && msg.includes('count')
                 );
                 expect(typeWarning).toBeUndefined();
             });
@@ -1551,7 +1611,7 @@ suiteRunner('Binding Validation', () => {
             // Future: validation should check nested property existence, not just root
             if (hasConsoleWarnings()) {
                 const emalWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('emal')
+                    msg.includes('[WF') && msg.includes('emal')
                 );
                 expect(emalWarning).toBeDefined();
             }
@@ -1578,7 +1638,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('contnt')
+                    msg.includes('[WF') && msg.includes('contnt')
                 );
                 expect(validationWarning).toBeDefined();
             }
@@ -1605,7 +1665,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Binding validation') && msg.includes('content')
+                    msg.includes('[WF') && msg.includes('Binding validation') && msg.includes('content')
                 );
                 expect(validationWarning).toBeUndefined();
             }
@@ -1634,7 +1694,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('itms')
+                    msg.includes('[WF') && msg.includes('itms')
                 );
                 expect(validationWarning).toBeDefined();
             }
@@ -1663,7 +1723,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Binding validation') && msg.includes('items')
+                    msg.includes('[WF') && msg.includes('Binding validation') && msg.includes('items')
                 );
                 expect(validationWarning).toBeUndefined();
             }
@@ -1690,7 +1750,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('txtColor')
+                    msg.includes('[WF') && msg.includes('txtColor')
                 );
                 expect(validationWarning).toBeDefined();
             }
@@ -1717,7 +1777,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Binding validation') && msg.includes('textColor')
+                    msg.includes('[WF') && msg.includes('Binding validation') && msg.includes('textColor')
                 );
                 expect(validationWarning).toBeUndefined();
             }
@@ -1746,7 +1806,7 @@ suiteRunner('Binding Validation', () => {
             // Should NOT warn about backgroundColor or fontSize — those are CSS keys, not state refs
             if (hasConsoleWarnings()) {
                 const cssKeyWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Binding validation') &&
+                    msg.includes('[WF') && msg.includes('Binding validation') &&
                     (msg.includes('backgroundColor') || msg.includes('fontSize'))
                 );
                 expect(cssKeyWarning).toBeUndefined();
@@ -1784,7 +1844,7 @@ suiteRunner('Binding Validation', () => {
             // Parent should NOT warn about childColor
             if (hasConsoleWarnings()) {
                 const scopeWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('style-scope-parent') &&
+                    msg.includes('[WF') && msg.includes('style-scope-parent') &&
                     msg.includes('childColor')
                 );
                 expect(scopeWarning).toBeUndefined();
@@ -1811,7 +1871,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('incremnt')
+                    msg.includes('[WF') && msg.includes('incremnt')
                 );
                 expect(validationWarning).toBeDefined();
             }
@@ -1837,7 +1897,7 @@ suiteRunner('Binding Validation', () => {
 
             if (hasConsoleWarnings()) {
                 const validationWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Binding validation') && msg.includes('increment')
+                    msg.includes('[WF') && msg.includes('Binding validation') && msg.includes('increment')
                 );
                 expect(validationWarning).toBeUndefined();
             }
@@ -1867,14 +1927,14 @@ suiteRunner('Binding Validation', () => {
             if (hasConsoleWarnings()) {
                 // Should NOT warn about handleInput or save — they exist
                 const validMethodWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('Binding validation') &&
+                    msg.includes('[WF') && msg.includes('Binding validation') &&
                     (msg.includes('"handleInput"') || msg.includes('"save"'))
                 );
                 expect(validMethodWarning).toBeUndefined();
 
                 // SHOULD warn about svae — it's a typo
                 const typoWarning = warnCapture.captured.find(msg =>
-                    msg.includes('[WF]') && msg.includes('svae')
+                    msg.includes('[WF') && msg.includes('svae')
                 );
                 expect(typoWarning).toBeDefined();
             }

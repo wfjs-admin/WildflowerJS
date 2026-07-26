@@ -35,7 +35,7 @@ export const ListItemBindingMethods = {
      * Bind using compiled metadata (fast path)
      * @private
      */
-    _bindWithCompiledMetadata(itemEl, item, compiledMetadata, listContext, itemIndex, context, _skipStyleAttr) {
+    _bindWithCompiledMetadata(itemEl, item, compiledMetadata, listContext, itemIndex, context) {
         // Get or build cached elements array
         let allElementsArray = itemEl._cachedElementsArray;
 
@@ -54,37 +54,279 @@ export const ListItemBindingMethods = {
         ctx.listContext = listContext;
         ctx.propsData = componentInstance?._propsData;
 
-        // PERF: Only call execute functions if they have bindings to process
-        if (compiledMetadata.bindings.length > 0) {
-            this._executeBindings(allElementsArray, compiledMetadata.bindings, item, ctx);
-        }
-        if (compiledMetadata.htmlBindings && compiledMetadata.htmlBindings.length > 0) {
-            this._executeHtmlBindings(allElementsArray, compiledMetadata.htmlBindings, item, ctx);
-        }
-        if (compiledMetadata.models.length > 0) {
-            this._executeModels(allElementsArray, compiledMetadata.models, item);
-        }
-        if (compiledMetadata.shows.length > 0) {
-            this._executeShows(allElementsArray, compiledMetadata.shows, item, ctx);
-        }
-        if (compiledMetadata.classBindings.length > 0) {
-            this._executeClassBindings(allElementsArray, compiledMetadata.classBindings, item, ctx);
-        }
-        // List callers pass _skipStyleAttr: their style/attr apply runs through
-        // _applyRowDecor's evaluator fast paths, which cover every style/attr
-        // binding (_compileTemplate emits an evaluator entry for each binding,
-        // null-evaluator entries included). Slot/SSR callers omit the flag and
-        // use these generic executors.
-        if (!_skipStyleAttr &&
-            compiledMetadata.styleBindings && compiledMetadata.styleBindings.length > 0) {
-            this._executeStyleBindings(allElementsArray, compiledMetadata.styleBindings, item, itemIndex, context);
-        }
-        if (!_skipStyleAttr &&
-            compiledMetadata.attrBindings && compiledMetadata.attrBindings.length > 0) {
-            this._executeAttrBindings(allElementsArray, compiledMetadata.attrBindings, item, itemIndex, context);
+        // Paint text/html/model/show via the applier program (S3): one engine
+        // pass over the compiled record list. This is FILTER_ALL — every
+        // text-family record is repainted (initial bind / same-key replace).
+        // Decorative bindings (class/style/attr) are applied separately by the
+        // _applyRowDecor evaluator pass, which every caller runs after this one;
+        // render has its own conditional-context path. Both are skipped here.
+        // The applier program is emitted for every list/slot template in a
+        // __FEATURE_LISTS__ build, which is the only build where this method
+        // runs, so the record is always present; guard defensively rather than
+        // paint nothing if a future caller arrives without one.
+        const program = compiledMetadata._appProgram;
+        if (program) {
+            this._runAppliersAll(allElementsArray, item, program, ctx);
         }
 
         return allElementsArray;
+    },
+    /**
+     * Applier-program execution engine — full (FILTER_ALL) variant (S3). Paints
+     * a row by iterating the compiled _appProgram record list over the
+     * text-family kinds (TEXT/HTML/MODEL/SHOW): the initial-bind / same-key
+     * replace path, where every text-family record is repainted. CLASS/STYLE/
+     * ATTR (owned by _applyRowDecor) and RENDER (conditional-context path) are
+     * skipped here; the targeted counterpart is _runAppliersKeyed (FILTER_KEY).
+     * `spec` is the per-type binding object; each write path is the canonical
+     * BindingWriters kernel so the DOM output is byte-identical with the
+     * component path.
+     * @private
+     */
+    _runAppliersAll(elements, item, program, ctx) {
+        for (let i = 0; i < program.length; i++) {
+            const rec = program[i];
+            const kind = rec.kind;
+            // Text-family only in the full pass; decor + render paint elsewhere.
+            if (kind === 'CLASS' || kind === 'STYLE' || kind === 'ATTR' || kind === 'RENDER') continue;
+            const el = elements[rec.elementIndex];
+            if (!el) continue;
+            const spec = rec.spec;
+
+            if (kind === 'TEXT') {
+                let value;
+                // Fast path for simple property bindings; fall back to full
+                // resolution when item[path] is undefined (may be an implicit
+                // computed named on the component, not the item).
+                if (spec.isSimplePath) {
+                    value = item[spec.path];
+                    if (value === undefined) {
+                        value = this._resolveCompiledBinding(spec, item, ctx);
+                        if (value === undefined) continue;
+                    }
+                } else {
+                    value = this._resolveCompiledBinding(spec, item, ctx);
+                    if (value === undefined && !spec.isExpression && !spec.isComputed &&
+                        !spec.isListContextVar && !spec.isPropsPath && !spec.isLengthProperty &&
+                        spec.path && item && typeof item === 'object') {
+                        continue;
+                    }
+                }
+                if (this._applyCustomElementAdapter(el, value)) {
+                    listBoundElements.add(el);
+                    continue;
+                }
+                const strValue = __wf_str(value);
+                if (spec.isInput) {
+                    if (el.value !== strValue) el.value = strValue;
+                } else {
+                    __wf_txt(el, strValue);
+                }
+                listBoundElements.add(el);
+            } else if (kind === 'HTML') {
+                const value = this._resolveCompiledBinding(spec, item, ctx);
+                const htmlStr = value == null ? '' : value;
+                el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
+            } else if (kind === 'MODEL') {
+                const value = this._getValueFromItem(item, spec.path);
+                if (this._applyCustomElementAdapter(el, value)) continue;
+                applyModel(el, value, spec.type);
+            } else if (kind === 'SHOW') {
+                const rawValue = this._resolveCompiledBinding(spec, item, ctx);
+                const value = spec.negate ? !rawValue : Boolean(rawValue);
+                applyShow(el, value);
+            }
+        }
+    },
+    /**
+     * Applier-program execution engine — targeted (FILTER_KEY) variant (S3).
+     * Repaints the row's HTML/MODEL/SHOW records for a single changed key,
+     * the update-path counterpart to _runAppliersAll. TEXT is excluded (row
+     * text targeting is owned by RowCompiler's applyRowTextUpdate); CLASS/
+     * STYLE/ATTR (decor) and RENDER are painted on their own paths.
+     *
+     * `key` is the changed item prop (always flat here — the dispatcher's smh
+     * arm keys are fast-touch reads, so prop === root); a record matches when
+     * its dep set includes the key, OR — for HTML/SHOW only — it references a
+     * component computed by name (the bypass MODEL deliberately lacks: a model
+     * value is item-only, so a computed-name collision must not repaint it).
+     * That single per-kind rule replaces the three divergent _targetedProp
+     * filter bodies the typed executors used to carry. `key === null` repaints
+     * every HTML/MODEL/SHOW record (the applyAll case). Writes mirror
+     * _runAppliersAll verbatim, so the DOM output is byte-identical.
+     * @private
+     */
+    _runAppliersKeyed(elements, item, program, ctx, key) {
+        if (!program) return;
+        let hasComputeds = false, computeds = null;
+        if (key !== null) {
+            const componentInstance = ctx?.componentInstance;
+            hasComputeds = this._instanceHasComputeds(componentInstance);
+            computeds = hasComputeds ? componentInstance.stateManager.computed : null;
+        }
+        for (let i = 0; i < program.length; i++) {
+            const rec = program[i];
+            const kind = rec.kind;
+            if (kind !== 'HTML' && kind !== 'MODEL' && kind !== 'SHOW') continue;
+            const el = elements[rec.elementIndex];
+            if (!el) continue;
+            const spec = rec.spec;
+
+            if (key !== null) {
+                let m = spec.isExpression
+                    ? (spec.expressionVars && spec.expressionVars.indexOf(key) !== -1)
+                    : (spec.path === key);
+                // Computed-name bypass: HTML/SHOW may read the changed prop
+                // transitively through a computed; MODEL is item-only and never
+                // bypasses (omitting this once froze per-row data-show on an
+                // item-level computed when component state mutated — RS-33).
+                if (!m && hasComputeds && kind !== 'MODEL') {
+                    if (spec.isExpression && spec.expressionVars) {
+                        for (let v = 0; v < spec.expressionVars.length; v++) {
+                            if (computeds[spec.expressionVars[v]]) { m = true; break; }
+                        }
+                    } else if (spec.path && computeds[spec.path]) {
+                        m = true;
+                    }
+                }
+                if (!m) continue;
+            }
+
+            if (kind === 'HTML') {
+                const value = this._resolveCompiledBinding(spec, item, ctx);
+                const htmlStr = value == null ? '' : value;
+                el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
+            } else if (kind === 'MODEL') {
+                const value = this._getValueFromItem(item, spec.path);
+                if (this._applyCustomElementAdapter(el, value)) continue;
+                applyModel(el, value, spec.type);
+            } else if (kind === 'SHOW') {
+                const rawValue = this._resolveCompiledBinding(spec, item, ctx);
+                const value = spec.negate ? !rawValue : Boolean(rawValue);
+                applyShow(el, value);
+            }
+        }
+    },
+    /**
+     * Applier-program execution engine — positional (FILTER_INDEX) variant (S3).
+     * The structural-change counterpart run per row from the onComplete sweep:
+     * repaints TEXT/SHOW records whose value can move when list positions shift.
+     * TEXT matches an expression that reads a position token (_index/_first/_last/
+     * _length); SHOW matches that OR a conditional that resolves through an
+     * item-level computed (which can read the frame internally). The predicate is
+     * the SAME _expressionUsesListContext the attribute sweep used (spec.path IS
+     * the expression string), so the selected set is unchanged; resolve + write go
+     * through the canonical engine path (matching initial bind). RENDER is handled
+     * by _runRenderContextsIndexed; CLASS/ATTR stay on the decor sweep.
+     * @private
+     */
+    _runAppliersIndexed(elements, item, program, ctx, computed) {
+        if (!program) return;
+        for (let i = 0; i < program.length; i++) {
+            const rec = program[i];
+            const kind = rec.kind;
+            if (kind !== 'TEXT' && kind !== 'SHOW') continue;
+            const spec = rec.spec;
+            const expr = spec.path;
+            let match;
+            if (kind === 'TEXT') {
+                match = this._expressionUsesListContext(expr) && this.isExpression(expr);
+            } else {
+                match = this._expressionUsesListContext(expr)
+                    || (computed && this._conditionalRefsComputed(spec, computed));
+            }
+            if (!match) continue;
+            const el = elements[rec.elementIndex];
+            if (!el) continue;
+
+            if (kind === 'TEXT') {
+                let value;
+                if (spec.isSimplePath) {
+                    value = item[spec.path];
+                    if (value === undefined) {
+                        value = this._resolveCompiledBinding(spec, item, ctx);
+                        if (value === undefined) continue;
+                    }
+                } else {
+                    value = this._resolveCompiledBinding(spec, item, ctx);
+                    if (value === undefined && !spec.isExpression && !spec.isComputed &&
+                        !spec.isListContextVar && !spec.isPropsPath && !spec.isLengthProperty &&
+                        spec.path && item && typeof item === 'object') {
+                        continue;
+                    }
+                }
+                if (this._applyCustomElementAdapter(el, value)) {
+                    listBoundElements.add(el);
+                    continue;
+                }
+                const strValue = __wf_str(value);
+                if (spec.isInput) {
+                    if (el.value !== strValue) el.value = strValue;
+                } else {
+                    __wf_txt(el, strValue);
+                }
+                listBoundElements.add(el);
+            } else {
+                let rawValue;
+                // A bare position token (data-show="_last") is left a non-expression
+                // path by the compiler, so the path resolver returns undefined;
+                // resolve it straight off the frame like the render pass (the old
+                // sweep did this implicitly by evaluating it against a merged-state
+                // proxy). Compound expressions (data-show="_index > 2") carry
+                // isExpression and resolve through the engine's own frame switch.
+                if (!spec.isExpression && spec.path && this._listContextVars.has(spec.path)) {
+                    switch (spec.path) {
+                        case '_index': rawValue = ctx.itemIndex; break;
+                        case '_length': rawValue = ctx.listLength; break;
+                        case '_first': rawValue = ctx.itemIndex === 0; break;
+                        case '_last': rawValue = ctx.itemIndex === ctx.listLength - 1; break;
+                    }
+                } else {
+                    rawValue = this._resolveCompiledBinding(spec, item, ctx);
+                }
+                applyShow(el, spec.negate ? !rawValue : Boolean(rawValue));
+            }
+        }
+    },
+    /**
+     * Positional/computed re-eval of a row's data-render conditionals from the
+     * onComplete sweep. A render whose token is a bare position frame value
+     * (_index/_first/_last/_length) is resolved from the frame directly; one that
+     * resolves through an item-level computed goes through the canonical resolver.
+     * Either way the row's stored render context toggles only on a real change,
+     * unifying the two former render sweep bodies. Render targets the context
+     * (insert/remove), not the elements array, so it stays out of the record loop.
+     * @private
+     */
+    _runRenderContextsIndexed(renderContexts, item, ctx, computed) {
+        if (!renderContexts) return;
+        const listContextVars = this._listContextVars;
+        const index = ctx.itemIndex;
+        const listLength = ctx.listLength;
+        for (let r = 0; r < renderContexts.length; r++) {
+            const rc = renderContexts[r];
+            if (!rc || !rc.context || !rc.binding) continue;
+            const b = rc.binding;
+            let shouldRender;
+            if (b.path && listContextVars.has(b.path)) {
+                let fv;
+                switch (b.path) {
+                    case '_index': fv = index; break;
+                    case '_length': fv = listLength; break;
+                    case '_first': fv = index === 0; break;
+                    case '_last': fv = index === listLength - 1; break;
+                }
+                shouldRender = b.negate ? !fv : !!fv;
+            } else if (computed && this._conditionalRefsComputed(b, computed)) {
+                const raw = this._resolveCompiledBinding(b, item, ctx);
+                shouldRender = b.negate ? !raw : Boolean(raw);
+            } else {
+                continue;
+            }
+            if (shouldRender !== rc.context.isRendered) {
+                rc.context._updateConditionalElement(shouldRender);
+            }
+        }
     },
     /**
      * Build elements array from compiled DOM paths
@@ -156,208 +398,6 @@ export const ListItemBindingMethods = {
         return true;
     },
     /**
-     * Nested-change path-overlap test for the targeted-rebind filter. Used ONLY
-     * when the changed prop `tp` is itself a dotted nested path (the rare case):
-     * callers handle the common flat case inline with a plain `path === tp` so
-     * the hot flat update path stays call-free.
-     *
-     * Returns true when a path binding must be re-evaluated because the changed
-     * nested path and the binding `path` overlap:
-     *  - ANCESTOR: `path` is a strict prefix of `tp` at a '.' boundary; the
-     *    binding reads a parent object that now contains the changed leaf.
-     *  - DESCENDANT: `tp` is a strict prefix of `path` at a '.' boundary; the
-     *    changed value is an object the binding reads further into.
-     * Exact equality (`path === tp`) is the caller's fast path. Allocation-free
-     * (charCodeAt(46) === '.' tests the boundary before a prefix compare).
-     *
-     * @param {string|null} path - the binding's data path
-     * @param {string} tp - the changed nested path (contains at least one '.')
-     * @returns {boolean} true to re-evaluate, false to skip
-     * @private
-     */
-    _pathTouchedByNestedChange(path, tp) {
-        if (!path) return false;
-        if (tp.length > path.length && tp.charCodeAt(path.length) === 46 && tp.startsWith(path)) return true;
-        if (path.length > tp.length && path.charCodeAt(tp.length) === 46 && path.startsWith(tp)) return true;
-        return false;
-    },
-    /**
-     * Execute data-bind bindings from compiled metadata
-     * @private
-     */
-    _executeBindings(elementsArray, bindings, item, ctx) {
-        for (let i = 0; i < bindings.length; i++) {
-            const binding = bindings[i];
-
-            const el = elementsArray[binding.index];
-            if (!el) continue;
-
-            let value;
-
-            // PERF: Fast path for simple property bindings (e.g., data-bind="label")
-            // Bypasses _resolveCompiledBinding entirely: no destructuring, no branch checks,
-            // just a direct property read. Covers the majority of list bindings.
-            //
-            // Fall back to full resolution when item[path] is undefined: the path may
-            // refer to an implicit computed property defined on the component (e.g.,
-            // data-bind="fullName" where fullName is a computed). Compile-time
-            // isSimplePath cannot detect this because computed names live on the
-            // component definition, not the template.
-            if (binding.isSimplePath) {
-                value = item[binding.path];
-                if (value === undefined) {
-                    value = this._resolveCompiledBinding(binding, item, ctx);
-                    if (value === undefined) continue;
-                }
-            } else {
-                value = this._resolveCompiledBinding(binding, item, ctx);
-
-                // Skip undefined values for simple paths (backwards compatibility)
-                if (value === undefined && !binding.isExpression && !binding.isComputed &&
-                    !binding.isListContextVar && !binding.isPropsPath && !binding.isLengthProperty &&
-                    binding.path && item && typeof item === 'object') {
-                    continue;
-                }
-            }
-
-            if (this._applyCustomElementAdapter(el, value)) {
-                listBoundElements.add(el);
-                continue;
-            }
-
-            // PERF: Skip DOM write if value unchanged
-            const strValue = __wf_str(value);
-            if (binding.isInput) {
-                if (el.value !== strValue) {
-                    el.value = strValue;
-                }
-            } else {
-                __wf_txt(el, strValue);
-            }
-            listBoundElements.add(el);
-        }
-    },
-    /**
-     * Execute data-bind-html bindings from compiled metadata
-     * @private
-     */
-    _executeHtmlBindings(elementsArray, htmlBindings, item, ctx) {
-        const targetedProp = this._targetedProp;
-        const targetedPropRoot = this._targetedPropRoot;
-        const componentInstance = ctx?.componentInstance;
-        const hasComputeds = this._instanceHasComputeds(componentInstance);
-        const computeds = hasComputeds ? componentInstance.stateManager.computed : null;
-        for (let i = 0; i < htmlBindings.length; i++) {
-            const binding = htmlBindings[i];
-            const el = elementsArray[binding.index];
-            if (!el) continue;
-
-            const value = this._resolveCompiledBinding(binding, item, ctx);
-
-            // Targeted rebind: skip DOM write for bindings not matching the changed
-            // prop. Expressions match the changed ROOT in expressionVars (vars are
-            // roots, not dotted paths); flat path bindings use a call-free exact
-            // match, nested consults the helper. Computed references bypass (the body
-            // may read the changed prop transitively). Mirrors _executeBindings.
-            if (targetedProp) {
-                let m = binding.isExpression
-                    ? (binding.expressionVars && binding.expressionVars.indexOf(targetedPropRoot) !== -1)
-                    : (binding.path === targetedProp
-                        || (targetedProp !== targetedPropRoot && this._pathTouchedByNestedChange(binding.path, targetedProp)));
-                if (!m && hasComputeds) {
-                    if (binding.isExpression && binding.expressionVars) {
-                        for (let v = 0; v < binding.expressionVars.length; v++) {
-                            if (computeds[binding.expressionVars[v]]) { m = true; break; }
-                        }
-                    } else if (binding.path && computeds[binding.path]) {
-                        m = true;
-                    }
-                }
-                if (!m) continue;
-            }
-
-            const htmlStr = value == null ? '' : value;
-            el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
-        }
-    },
-    /**
-     * Execute data-model bindings from compiled metadata
-     * @private
-     */
-    _executeModels(elementsArray, models, item) {
-        const targetedProp = this._targetedProp;
-        const targetedPropRoot = this._targetedPropRoot;
-        for (let i = 0; i < models.length; i++) {
-            const modelBinding = models[i];
-            const el = elementsArray[modelBinding.index];
-            if (!el) continue;
-
-            const value = this._getValueFromItem(item, modelBinding.path);
-
-            // Targeted rebind: skip DOM write for non-matching bindings. Flat
-            // change uses a call-free exact match; nested consults the helper.
-            // Models have no computed-name bypass.
-            if (targetedProp) {
-                const m = modelBinding.path === targetedProp
-                    || (targetedProp !== targetedPropRoot && this._pathTouchedByNestedChange(modelBinding.path, targetedProp));
-                if (!m) continue;
-            }
-
-            if (this._applyCustomElementAdapter(el, value)) {
-                continue;
-            }
-
-            applyModel(el, value, modelBinding.type);
-        }
-    },
-    /**
-     * Execute data-show bindings from compiled metadata
-     * @private
-     */
-    _executeShows(elementsArray, shows, item, ctx) {
-        const targetedProp = this._targetedProp;
-        const targetedPropRoot = this._targetedPropRoot;
-        // Fast-path: skip computed-name bypass when component declares no computeds
-        const componentInstance = ctx?.componentInstance;
-        const hasComputeds = this._instanceHasComputeds(componentInstance);
-        const computeds = hasComputeds ? componentInstance.stateManager.computed : null;
-        for (let i = 0; i < shows.length; i++) {
-            const binding = shows[i];
-            const el = elementsArray[binding.index];
-            if (!el) continue;
-
-            // Resolve value using consolidated helper
-            const rawValue = this._resolveCompiledBinding(binding, item, ctx);
-
-            // Targeted rebind: skip DOM write for non-matching bindings. Flat
-            // change uses a call-free exact match; nested consults the helper.
-            // Expressions match the changed ROOT. The computed bypass matters
-            // here; omitting it once caused per-row data-show on item-level
-            // computeds to freeze when component-own state mutated (the popover
-            // open/close case in the PM tracker).
-            if (targetedProp) {
-                let m = binding.isExpression
-                    ? (binding.expressionVars && binding.expressionVars.indexOf(targetedPropRoot) !== -1)
-                    : (binding.path === targetedProp
-                        || (targetedProp !== targetedPropRoot && this._pathTouchedByNestedChange(binding.path, targetedProp)));
-                if (!m && hasComputeds) {
-                    if (binding.isExpression && binding.expressionVars) {
-                        for (let v = 0; v < binding.expressionVars.length; v++) {
-                            if (computeds[binding.expressionVars[v]]) { m = true; break; }
-                        }
-                    } else if (binding.path && computeds[binding.path]) {
-                        m = true;
-                    }
-                }
-                if (!m) continue;
-            }
-
-            // Apply negate flag and convert to display style
-            const value = binding.negate ? !rawValue : Boolean(rawValue);
-            applyShow(el, value);
-        }
-    },
-    /**
      * Execute data-render bindings via stored conditional contexts
      * Unlike other execute* methods, this uses conditional contexts (not elementsArray)
      * because data-render elements may be removed from DOM (replaced by placeholders).
@@ -386,105 +426,6 @@ export const ListItemBindingMethods = {
             }
         }
         return changed;
-    },
-    /**
-     * Execute data-bind-class bindings from compiled metadata
-     * PERF: Uses pre-computed binding type flags to skip runtime checks
-     * @private
-     */
-    _executeClassBindings(elementsArray, classBindings, item, ctx) {
-        // PERF: Hoist componentInstance lookup out of loop
-        const componentInstance = ctx.componentInstance;
-        const itemIndex = ctx.itemIndex;
-        const listContext = ctx.listContext;
-        // Fast-path: skip computed-name bypass when component has no computeds
-        const hasComputeds = this._instanceHasComputeds(componentInstance);
-
-        for (let i = 0; i < classBindings.length; i++) {
-            const classBinding = classBindings[i];
-            const el = elementsArray[classBinding.index];
-            if (!el) continue;
-
-            // PERF: Use pre-computed flags from compile time
-            if (classBinding.isSimpleProperty !== undefined) {
-                // Fast path: use pre-computed metadata
-                if (classBinding.isSimpleProperty) {
-                    // Simple property binding - check for implicit computed first.
-                    // Skip the computed lookup entirely when the component declares
-                    // no computeds (fast path for templates with only data props).
-                    const expression = classBinding.expression;
-                    const isComputedName = hasComputeds
-                        ? !!(expression && componentInstance.stateManager.computed[expression])
-                        : false;
-
-                    let value;
-                    if (isComputedName) {
-                        value = this._evaluateComputedInListContext(
-                            componentInstance, expression, item, itemIndex, listContext
-                        );
-                    } else {
-                        value = this._getValueFromItem(item, expression);
-                    }
-                    this._toggleBoundClass(el, value ? String(value) : '');
-                } else if (classBinding.isComputed) {
-                    // Computed property with list item context
-                    if (componentInstance) {
-                        const value = this._evaluateComputedInListContext(
-                            componentInstance,
-                            classBinding.computedName,
-                            item,
-                            itemIndex,
-                            listContext
-                        );
-                        // Computed deps can't be checked cheaply; always write
-                        this._toggleBoundClass(el, value ? String(value) : '');
-                    }
-                } else if (classBinding.compiledFn && classBinding.expressionVars) {
-                    // PERF: Reuse args array; cached on the binding to avoid allocation per call
-                    const vars = classBinding.expressionVars;
-                    const args = classBinding._args || (classBinding._args = new Array(vars.length));
-                    this._resolveListExprArgs(args, vars, item, componentInstance);
-                    try {
-                        const result = classBinding.compiledFn(...args);
-                        this._toggleBoundClass(el, this._classResultToString(result));
-                    } catch (e) {
-                        this._toggleBoundClass(el, '');
-                    }
-                } else {
-                    // Expression needing component state or list context - use full path
-                    this._processOptimizedClassBinding(el, item, classBinding.expression, itemIndex, listContext);
-                }
-            } else {
-                // Fallback path for bindings without pre-computed metadata
-                this._processOptimizedClassBinding(el, item, classBinding.expression, itemIndex, listContext);
-            }
-        }
-    },
-    /**
-     * Execute data-bind-style bindings from compiled metadata
-     * @private
-     */
-    _executeStyleBindings(elementsArray, styleBindings, item, itemIndex, context) {
-        for (let i = 0; i < styleBindings.length; i++) {
-            const styleBinding = styleBindings[i];
-            const el = elementsArray[styleBinding.index];
-            if (!el) continue;
-
-            this._processStyleBinding(el, item, styleBinding.expression, itemIndex, context);
-        }
-    },
-    /**
-     * Execute data-bind-attr bindings from compiled metadata
-     * @private
-     */
-    _executeAttrBindings(elementsArray, attrBindings, item, itemIndex, context) {
-        for (let i = 0; i < attrBindings.length; i++) {
-            const attrBinding = attrBindings[i];
-            const el = elementsArray[attrBinding.index];
-            if (!el) continue;
-
-            this._processAttrBinding(el, item, attrBinding.expression, itemIndex, context);
-        }
     },
     /**
      * Build the per-item resolution scope shared by the fallback / root-element
@@ -925,65 +866,6 @@ export const ListItemBindingMethods = {
         return depth;
     },
 
-    _updateModelValue(context, newValue)
-    {
-        if (!context || !context.element) {
-            return false;
-        }
-
-        // Defensive fallback: if no value was passed, read from the element.
-        // Callers pass the input value captured at event-dispatch time so a
-        // mid-tick list re-render that swaps context.element doesn't cause a
-        // stale/empty read here.
-        if (newValue === undefined) {
-            newValue = this._getInputValue(context.element);
-        }
-        if (newValue === undefined) return false; // Skip unchecked radio
-
-        // Determine where to update based on context hierarchy
-        if (context.parent && context.parent.type === 'list' && context._parentIndex !== undefined)
-        {
-            // List-item model: write straight through the row's reactive
-            // item-proxy (the SAME proxy the render effect tracks), so the set
-            // propagates through the graph for top-level, computed-source, and
-            // nested lists alike; no immutable copy/replace/writeback or manual
-            // binding refresh required. Converges on the mapArray mutation path.
-            const rowEl = this._findListItemAncestor(context.element);
-            const item = (rowEl && rowEl._itemData) || context._itemData;
-            if (item) {
-                this._applyMapArrayMutation(item, context.path, newValue);
-                return true;
-            }
-            return false;
-        } else if (context.componentInstance)
-        {
-            // Check if this is a store path (e.g., "checkout.firstName")
-            const modelPath = context.path;
-            const firstDot = modelPath.indexOf('.');
-            if (firstDot > 0) {
-                const possibleStoreName = modelPath.slice(0, firstDot);
-                const storeComponent = this.storeManager?.getStoreComponentByName(possibleStoreName);
-                if (storeComponent) {
-                    // Route to store state
-                    const storePath = modelPath.slice(firstDot + 1);
-                    // Use pathResolver for nested paths within store
-                    pathResolver.set(storeComponent.state, storePath, newValue);
-                    return true;
-                }
-            }
-
-            // Regular model - update component state directly
-            // Handle nested paths using pathResolver
-            if (modelPath.includes('.')) {
-                pathResolver.set(context.componentInstance.state, modelPath, newValue);
-            } else {
-                context.componentInstance.state[modelPath] = newValue;
-            }
-            return true;
-        }
-
-        return false;
-    },
     /**
      * Refresh bindings containing external() in a list item when external state changes
      * This is called when a component that provides external() data has its state updated

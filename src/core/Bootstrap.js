@@ -8,6 +8,7 @@
  */
 
 import { startTimelineRecording, stopTimelineRecording, getTimelineSnapshot } from '../state/TimelineRecorder.js';
+import { WF_ERRORS, wfError } from './wfUtils.js';
 
 // Read configuration from script tag before creating instance
 // Usage: <script src="wildflower.js" data-debug="true" data-error-handling="throw"></script>
@@ -27,7 +28,10 @@ if (typeof document !== 'undefined' && document.currentScript) {
         if (errorVal === 'log' || errorVal === 'throw' || errorVal === 'silent') {
             _scriptConfig.errorHandling = errorVal;
         } else if (__DEV__) {
-            console.warn(`[WF] Invalid data-error-handling="${errorVal}". Must be 'log', 'throw', or 'silent'.`);
+            wfError(WF_ERRORS.CONFIG_INVALID, {
+                warn: true,
+                context: `Invalid data-error-handling="${errorVal}". Must be 'log', 'throw', or 'silent'`
+            });
         }
     }
 
@@ -84,7 +88,7 @@ function _createDevToolsHook(wf) {
         // detects capabilities off this, NOT the framework version. Start at 1.
         // dev: true on development builds; false on minified production builds
         // (the extension uses it to show which introspection is available).
-        version: '1.2.0', schemaVersion: 1, dev: __DEV__, framework: wf,
+        version: '1.3.0', schemaVersion: 1, dev: __DEV__, framework: wf,
         getComponents() {
             const r = [];
             wf.componentInstances.forEach((i, id) => {

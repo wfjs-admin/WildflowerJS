@@ -151,12 +151,6 @@ export class WildflowerJS
         // Queue for deferred reactive updates during component initialization
         this._deferredReactiveUpdates = new Map(); // componentId -> Array of {path, newValue, oldValue}
 
-        // Deferred cleanup for better removal/clear performance
-        // Context cleanup is deferred to requestIdleCallback so DOM removal appears instant
-        this._deferredCleanupQueue = [];
-        this._deferredCleanupScheduled = false;
-
-
         this.storeManager = new StoreManager(this);
 
         // Directive + hook state: these features ship in every build.
@@ -630,7 +624,7 @@ export class WildflowerJS
         // Mount any lists whose scheduled discovery-time mount hasn't fired yet
         // (this helper is called synchronously between scan and the initial-render
         // macrotask); "complete render" must include list bootstrap.
-        if (this._mountLists)
+        if (__FEATURE_LISTS__ && this._mountLists)
         {
             this._mountLists(this.domElements.lists);
         }

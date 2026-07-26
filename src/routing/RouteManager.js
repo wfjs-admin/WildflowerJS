@@ -395,7 +395,11 @@ export class RouteManager {
                 outlet.innerHTML = wf._sanitizeOrPassHTML(content);
             } else {
                 if (typeof __DEV__ !== 'undefined' && __DEV__) {
-                    console.warn('[WF] Router outlet rendering unsanitized HTML. Configure wildflower.setHtmlSanitizer() to prevent XSS.');
+                    wfError(WF_ERRORS.SEC_SANITIZER, {
+                        warn: true,
+                        context: 'Router outlet rendering unsanitized HTML',
+                        suggestion: 'Configure wildflower.setHtmlSanitizer() to prevent XSS.'
+                    });
                 }
                 outlet.innerHTML = content;
             }

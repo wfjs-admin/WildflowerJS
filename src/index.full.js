@@ -43,6 +43,7 @@ import { HookSystemMethods } from './features/HookSystem.js';
 
 // Optional features (included in full)
 import { PortalSystemMethods } from './features/PortalSystem.js';
+import { QuerySystemMethods } from './features/QuerySystem.js';
 import { TransitionSystemMethods } from './features/TransitionSystem.js';
 // Full-specific: RouteManager and SSRManager
 import { RouteManager } from './routing/RouteManager.js';
@@ -89,7 +90,8 @@ Object.assign(WildflowerJS.prototype,
 
     // Optional features
     PortalSystemMethods,
-    TransitionSystemMethods
+    TransitionSystemMethods,
+    QuerySystemMethods
 );
 
 // =============================================================================

@@ -375,7 +375,7 @@ describeIfPools('Pool Props (Parent-Injected Shared Data)', () => {
       wildflower.component('form-input-pool-test', {
         state: {},
         init() {
-          pool = this.pool('rows')
+          pool = this.getPool('rows')
           pool.add([
             { id: 'a', label: 'alpha' },
             { id: 'b', label: 'bravo' }
@@ -414,7 +414,7 @@ describeIfPools('Pool Props (Parent-Injected Shared Data)', () => {
       wildflower.component('checkbox-pool-test', {
         state: {},
         init() {
-          pool = this.pool('items')
+          pool = this.getPool('items')
           pool.add([
             { id: 1, done: true },
             { id: 2, done: false }

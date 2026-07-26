@@ -17,8 +17,10 @@ import {
   setListSink as mSetListSink,
   runInListFrame as mRunInListFrame,
   toRaw as mToRaw, runEffect as mRunEffect,
+  reactive as mReactive,
   untrack as mUntrack,
   setFlushObserver as mSetFlushObserver,
+  __setDevHotReadReporter as mSetDevHotReadReporter,
   COMPUTED_MISS,
   F_REENTERED,
 } from './core.js';
@@ -33,6 +35,15 @@ import { reconcile } from './list-reconciler.js';
 // goes unused and tree-shakes out.
 if (__DEV__) {
   mSetFlushObserver((n) => { if (__tlOn) __tlFlush(n); });
+  // WF-216 (sealing row 6): the core detects sustained hot-loop facade reads
+  // but is clean-room, so the structured warning is emitted from here.
+  mSetDevHotReadReporter((key, perFrame) => {
+    wfError(WF_ERRORS.HOT_LOOP_FACADE_READS, {
+      warn: true,
+      context: `state '${key}' is being read ~${perFrame} times per frame through the reactive facade, sustained across frames`,
+      suggestion: `A facade read costs ~100x a plain property read (proxy physics; every fine-grained framework pays it). In per-frame loops, hoist the value to a local before the loop (const ${key} = this.state.${key}) and read the local; for per-entity hot data, use pool entities (plain objects, zero proxy cost).`
+    });
+  });
 }
 
 const NO_VALUE = Symbol('no-value');
@@ -414,6 +425,10 @@ class EntityHandle {
       });
       this._getters[name] = getter;
       selfNode = getter.__node;
+      // Name the node after the computed: Node.key is the debug identity, and
+      // the F5 write-during-evaluation warning names the offender through it
+      // (mComputed creates nodes with key=null; sources derive keys elsewhere).
+      selfNode.key = name;
 
       // Install the computed:NAME pulse notifier LAZILY: only when this computed
       // is observed (a watcher/subscription recorded its name via
@@ -498,12 +513,18 @@ class EntityHandle {
     const getter = this._getters[name];
     if (!getter) return undefined;
     const node = getter.__node;
-    // ERRORED-cache recovery (framework parity): a computed that threw before reading
-    // any state has no tracked deps, so the graph can never wake it: it cannot
-    // know when its error condition clears. Re-run it on every read so it can
-    // recover (and so a no-dep error keeps surfacing). Computeds WITH deps stay
-    // cached on the sentinel until a dep changes and wakes them normally.
-    if (node && node.value === COMPUTED_ERROR && node.sources.length === 0) {
+    // Zero-source cache distrust: a computed with NO tracked deps can never be
+    // woken by the graph — nothing exists that could mark it dirty — so its
+    // cache is untrustworthy however the last evaluation ended. Re-run on
+    // every read. This generalizes the old ERRORED-only recovery: previously
+    // a computed that THREW while source-less healed on the next read, but
+    // one that RETURNED a value while source-less (e.g. eagerly evaluated
+    // before init() set the `_` fields it reads) was cached forever —
+    // succeeding with a wrong value was strictly worse than throwing.
+    // Consequence: source-less computeds get METHOD semantics (fresh on every
+    // pull read, no push), which matches the `_` non-reactive mental model.
+    // Computeds WITH sources are untouched: cached until a dep wakes them.
+    if (node && node.sources.length === 0) {
       node.color = 2; // DIRTY: force re-eval on the read below
     }
     const v = getter();
@@ -727,6 +748,14 @@ class EntityHandle {
     return mToRaw(objOrProxy);
   }
 
+  // Inverse of toRaw: the reactive proxy for a raw object (cache-hit when one
+  // already exists — one proxy per raw object; identity-stable). Idempotent on
+  // proxies. Consumers that need tracking or the set trap wrap on demand here;
+  // the list create path stores raw items and never pays proxy allocation.
+  reactive(objOrRaw) {
+    return mReactive(objOrRaw);
+  }
+
   // state-manager surface: register the active effect as a dependent of a component path
   // (ListRenderer calls this for per-item effects that read a component computed,
   // and seeds the framework's _itemReadComputeds item-wake backstop). ReactiveGraph forms that
@@ -740,7 +769,13 @@ class EntityHandle {
   // drives. The implementation is a free function (closes only over core
   // primitives, no facade state); this method is a one-line shim so sm.mapArray
   // stays the call surface.
-  mapArray(arrayFn, mapFn, options = {}) { return reconcile(arrayFn, mapFn, options); }
+  mapArray(arrayFn, mapFn, options = {}) {
+    // __FEATURE_LISTS__ = false (nano) folds this out, dropping the reconcile
+    // reference so the whole list-reconciler.js module tree-shakes away — its
+    // only caller is ListRenderer, which is itself gated out of nano.
+    if (!__FEATURE_LISTS__) return;
+    return reconcile(arrayFn, mapFn, options);
+  }
 
   untrack(fn) { return mUntrack(fn); }
 }

@@ -10,7 +10,7 @@
  * @module
  */
 
-import { pathResolver } from '../core/wfUtils.js';
+import { pathResolver, wfError, WF_ERRORS } from '../core/wfUtils.js';
 
 export const DirectiveSystemMethods = {
     /**
@@ -30,7 +30,7 @@ export const DirectiveSystemMethods = {
         }
 
         if (this._customDirectives.has(name)) {
-            if (__DEV__) console.warn(`[WF] Directive "${name}" is being overwritten`);
+            if (__DEV__) wfError(WF_ERRORS.REGISTRATION_OVERWRITTEN, { warn: true, context: `Directive "${name}" is being overwritten` });
         }
 
         this._customDirectives.set(name, {

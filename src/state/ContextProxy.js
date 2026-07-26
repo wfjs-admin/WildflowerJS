@@ -7,6 +7,26 @@
  * @module
  */
 
+import { WF_ERRORS, wfError, QUERY_ENGINE_WRITE } from '../core/wfUtils.js';
+
+/**
+ * WF-950: dev diagnostic for writes to a query-owned store from
+ * application code. Query stores (stamped _wfQueryOwned by the query
+ * system) are engine-owned by contract; the documented pattern is
+ * mutate-the-source-then-invalidate(). The write still lands (a
+ * deliberate optimistic update is legitimate), and each store warns
+ * once per lifetime to avoid loop spam.
+ */
+function warnQueryExternalWrite(target, prop) {
+    if (target._wfQueryWriteWarned) return;
+    target._wfQueryWriteWarned = true;
+    wfError(WF_ERRORS.QUERY_STORE_EXTERNAL_WRITE, {
+        warn: true,
+        context: `"${String(prop)}" on query store "${target._wfQueryOwned}" was written from application code`,
+        suggestion: `Query stores are engine-owned: mutate the data source, then call wildflower.getQuery('${target._wfQueryOwned}').invalidate() to sync. Ignore this warning if the write is a deliberate optimistic update.`
+    });
+}
+
 /**
  * Symbol used to access the raw (unwrapped) context object through the proxy.
  * Internal code that needs to write properties directly on the context
@@ -26,7 +46,7 @@ const ESSENTIAL_FRAMEWORK_PROPERTIES = new Set([
     'find', 'findAll', 'closest',
     'saveToStorage', 'loadFromStorage', 'getItemFromEvent', 'debug',
     'store', 'getStore', 'emit', 'components',
-    'props', 'resetError', 'framework', 'pool', 'pools'
+    'props', 'resetError', 'framework', 'getPool', 'pools'
 ]);
 
 /**
@@ -94,6 +114,9 @@ function createContextProxy(rawContext, stateManager) {
                 if (typeof prop === 'string' && !ESSENTIAL_FRAMEWORK_PROPERTIES.has(prop) &&
                     typeof target[prop] !== 'function' &&
                     state && !prop.startsWith('_') && prop in state) {
+                    if (__DEV__ && target._wfQueryOwned && QUERY_ENGINE_WRITE.depth === 0) {
+                        warnQueryExternalWrite(target, prop);
+                    }
                     state[prop] = value;
                     return true;
                 }
@@ -102,12 +125,18 @@ function createContextProxy(rawContext, stateManager) {
 
             // Block computed writes (dev warning, no-op)
             if (stateManager.computed && stateManager.computed[prop]) {
-                if (__DEV__) console.warn(`[WF] Cannot set computed property "${prop}"; computed properties are read-only`);
+                if (__DEV__) wfError(WF_ERRORS.COMPUTED_ASSIGNMENT, {
+                    warn: true,
+                    context: `Cannot set computed property "${prop}"; computed properties are read-only`
+                });
                 return true;
             }
 
             // State write (reactive via proxy)
             if (state && typeof prop === 'string' && !prop.startsWith('_') && prop in state) {
+                if (__DEV__ && target._wfQueryOwned && QUERY_ENGINE_WRITE.depth === 0) {
+                    warnQueryExternalWrite(target, prop);
+                }
                 state[prop] = value;
                 return true;
             }

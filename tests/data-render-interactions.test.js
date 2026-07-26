@@ -332,7 +332,7 @@ describe('Data-Render Interactions', () => {
       await waitForUpdate()
 
       const comp = wildflower.getComponent('dr-pool-reveal')
-      const pool = comp.pool('sprites')
+      const pool = comp.getPool('sprites')
       // Pool handle exists (setup happens before data-render removes element)
       expect(pool).not.toBeNull()
     })
@@ -354,7 +354,7 @@ describe('Data-Render Interactions', () => {
       await waitForUpdate()
 
       const comp = wildflower.getComponent('dr-pool-render')
-      const pool = comp.pool('sprites')
+      const pool = comp.getPool('sprites')
       pool.add({ id: 1, name: 'Entity 1' })
 
       await new Promise(resolve => requestAnimationFrame(() => {

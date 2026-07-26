@@ -28,7 +28,7 @@ describe('DevTools hook v1.2 surface', () => {
     it('Phase 0 contract: version/schemaVersion/dev ship in all builds; getters are dev-only', () => {
         const h = hook()
         expect(h, 'global hook should exist in every build').toBeTruthy()
-        expect(h.version).toBe('1.2.0')
+        expect(h.version).toBe('1.3.0')
         expect(h.schemaVersion).toBe(1)
         expect(typeof h.dev).toBe('boolean')
         // dev builds are the non-minified ones; min builds strip the dev surface.

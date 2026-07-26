@@ -247,6 +247,11 @@ export const SSRListMethods = {
                             // FAST PATH: Use cached element references and execute functions
                             const listContext = itemEl._listContext || context;
                             this._bindWithCompiledMetadata(itemEl, item, compiledMetadata, listContext, index, context);
+                            // Decorative bindings (class/style/attr) go through the shared
+                            // evaluator pass, the sole list-path owner since the executors
+                            // were retired; its evaluators cover child + root targets.
+                            const decorInst = listContext?.componentInstance;
+                            this._applyRowDecor(itemEl, item, compiledMetadata, index, data.length, decorInst?.state || {}, decorInst, listContext);
                             return; // Skip fallback path
                         }
 
@@ -611,6 +616,13 @@ export const SSRListMethods = {
         if (compiledMetadata) {
             // FAST PATH: Use compiled metadata
             allElements = this._bindWithCompiledMetadata(itemEl, item, compiledMetadata, listContext, itemIndex, context);
+            // Decorative bindings (class/style/attr) go through the shared evaluator
+            // pass (the sole list-path owner since the executors were retired). Root
+            // decor is also painted above by _bindRootElementData; the evaluator pass
+            // runs last and wins, matching the list path. listContext === context here
+            // (set on the itemEl immediately before the sole caller invokes this).
+            const decorInst = listContext?.componentInstance;
+            this._applyRowDecor(itemEl, item, compiledMetadata, itemIndex, listContext?.data?.length || 0, decorInst?.state || {}, decorInst, listContext);
         } else {
             // FALLBACK: Use querySelectorAll
             allElements = this._bindWithFallback(itemEl, item, listContext, itemIndex, context, skipNestedCheck);

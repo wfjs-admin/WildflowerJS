@@ -416,7 +416,7 @@ describeIfPools('Pool Bulk Add', () => {
       let pool = null
       wildflower.component('bulk-remove-timing', {
         state: {},
-        init() { pool = this.pool('items') }
+        init() { pool = this.getPool('items') }
       })
 
       ensureComponentScanning(wildflower)

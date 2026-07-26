@@ -346,6 +346,10 @@ describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
       const span = testContainer.querySelector('#c6-span')
       expect(span.textContent).toBe('0')
 
+      // Blessed teardown order (remove element, then destroy) — also keeps
+      // the A6 auto-resurrect dev warning out of this test's zero-warning
+      // assertion, which pins destroy-hook ORDERING, not teardown hygiene.
+      root.remove()
       wildflower.destroyComponent(id)
       // Allow microtask drain so any queued post-destroy effect runs.
       await waitForUpdate()

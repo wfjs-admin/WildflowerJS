@@ -221,6 +221,7 @@ class RenderRecord
      * @private
      */
     _processListElement(el, wildflower) {
+        if (!__FEATURE_LISTS__) return;
         const listPath = _cmGetAttr(el, 'list');
         if (!listPath) return;
 
@@ -314,7 +315,7 @@ class RenderRecord
         nestedComponents.forEach(compEl => {
             const compId = compEl.dataset.componentId;
             if (compId && wildflower.hasComponentInstance(compId)) {
-                wildflower.destroyComponent(compId);
+                wildflower._destroyComponentQuiet(compId);
             }
         });
 
@@ -578,6 +579,7 @@ export class ContextRecords
      * @private
      */
     _findDeepestParentListContext(element) {
+        if (!__FEATURE_LISTS__) return null;
         if (!element) return null;
 
         // Use JS property-based lookup instead of DOM attribute selector

@@ -26,6 +26,53 @@ const LIFECYCLE_HOOK_NAMES = new Set([
     'tick'
 ]);
 
+// A2 (DX diagnostics sweep): a data-action wired to a lifecycle hook name is
+// ~always unintended — the framework already drives these on its own schedule
+// (tick runs on the frame loop, init at mount), and lifecycle-named methods
+// bypass the pre-init action queue, so they also lose the replay guarantee
+// ordinary handlers get. Scans the mounted element plus <template> contents
+// (list-row markup is invisible to a plain querySelectorAll). Only called
+// inside __DEV__ blocks, so it never runs in production.
+const _warnedLifecycleActions = new Set();
+
+// A6: >0 while a framework-internal teardown flow is running (see
+// _destroyComponentQuiet); suppresses the auto-resurrect warning.
+let _quietDestroyDepth = 0;
+export function warnLifecycleActionNames(rootEl, componentName) {
+    if (!rootEl || !rootEl.querySelectorAll) return;
+    const values = [];
+    if (rootEl.hasAttribute && rootEl.hasAttribute('data-action')) values.push(rootEl.getAttribute('data-action'));
+    const collect = (root) => {
+        for (const el of root.querySelectorAll('[data-action]')) values.push(el.getAttribute('data-action'));
+        for (const t of root.querySelectorAll('template')) { if (t.content) collect(t.content); }
+    };
+    collect(rootEl);
+    for (const value of values) {
+        if (!value) continue;
+        // data-action supports "method", "method('arg')", and multi-event
+        // "input:methodA change:methodB" forms — reduce to bare method names.
+        for (let token of value.split(/\s+/)) {
+            const colon = token.indexOf(':');
+            if (colon !== -1) token = token.slice(colon + 1);
+            const paren = token.indexOf('(');
+            if (paren !== -1) token = token.slice(0, paren);
+            if (!LIFECYCLE_HOOK_NAMES.has(token)) continue;
+            const guard = componentName + ':' + token;
+            if (_warnedLifecycleActions.has(guard)) continue;
+            _warnedLifecycleActions.add(guard);
+            let detail;
+            if (token === 'tick') detail = 'tick() already runs on the frame loop, not on events — this handler will fire every animation frame.';
+            else if (token === 'destroy') detail = 'destroy() tears the component down, and with its element still in the DOM the next scan auto-resurrects it (fresh instance, init() re-fired).';
+            else detail = `${token}() runs at framework-defined lifecycle points, not on events.`;
+            wfError(WF_ERRORS.LIFECYCLE_NAME_ACTION, {
+                warn: true,
+                context: `Component '${componentName}': data-action="${value}" targets the lifecycle hook '${token}'. ${detail}`,
+                suggestion: 'Use a different method name for the handler.'
+            });
+        }
+    }
+}
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
@@ -111,6 +158,10 @@ export const ComponentLifecycleMethods = {
         // Inject store references early so they're available in computed properties and beforeInit
         this._injectStoreReferences(instance);
 
+        // Inject pool references (this.pools.name getters) with the same timing, so a
+        // computed reading this.pools.x before pool setup gets the registry-pulse rescue.
+        this._injectPoolReferences(instance);
+
         // Declarative store subscriptions MUST run before computed setup.
         // addComputed enqueues initial evals via microtask; if subscribePath
         // ran after that, store mutations between the two could miss the
@@ -139,7 +190,7 @@ export const ComponentLifecycleMethods = {
         }
         // Process polymorphic templates (data-template-key) BEFORE bindings
         // because template insertion adds the DOM that bindings need to find
-        if (this._processPolymorphicTemplates) {
+        if (__FEATURE_LISTS__ && this._processPolymorphicTemplates) {
             this._processPolymorphicTemplates(instance);
         }
         this._processComponentBindings(instance);
@@ -174,7 +225,9 @@ export const ComponentLifecycleMethods = {
         }
 
         // Setup list contexts and schedule render
-        this._setupListContexts(instance);
+        if (__FEATURE_LISTS__) {
+            this._setupListContexts(instance);
+        }
         this._scheduleInitialRender(instanceId);
 
         // SSR: Complete integration and schedule activation for late-registered SSR components
@@ -540,7 +593,9 @@ export const ComponentLifecycleMethods = {
                     error.storeName = result.storeName;
                     error.type = 'subscribe_store_not_found';
 
-                    if (__DEV__) console.error(`[WF] Component '${componentName}' subscribes to store '${result.storeName}' which does not exist`);
+                    if (__DEV__) wfError(WF_ERRORS.STORE_NEVER_REGISTERED, {
+                        context: `Component '${componentName}' subscribes to store '${result.storeName}' which does not exist`
+                    });
 
                     // Call onError if defined
                     if (typeof instance.context.onError === 'function') {
@@ -557,7 +612,10 @@ export const ComponentLifecycleMethods = {
 
                 if (result.timedOut) {
                     // Store exists but didn't become ready in time
-                    if (__DEV__) console.warn(`[WF] Component '${componentName}' timed out waiting for store '${result.storeName}' (${timeout}ms)`);
+                    if (__DEV__) wfError(WF_ERRORS.STORE_WAIT_TIMEOUT, {
+                        warn: true,
+                        context: `Component '${componentName}' timed out waiting for store '${result.storeName}' (${timeout}ms)`
+                    });
 
                     const error = new Error(`Timeout waiting for store '${result.storeName}'`);
                     error.storeName = result.storeName;
@@ -623,12 +681,22 @@ export const ComponentLifecycleMethods = {
             }
         }
 
-        // Register tick lifecycle hook if defined
+        // Register tick lifecycle hook if defined. The frame loop lives in the
+        // pool module — in tiers without pools (e.g. mini), a bare call here
+        // crashed component init with an unhandled TypeError (latent until the
+        // DX sweep's tests defined tick() on those tiers). Guard + dev-warn.
         if (typeof instance.definition.tick === 'function') {
-            instance._tickFn = instance.definition.tick.bind(instance.context);
-            if (!this._tickableInstances) this._tickableInstances = [];
-            this._tickableInstances.push(instance);
-            this._startPoolLoop();
+            if (this._startPoolLoop) {
+                instance._tickFn = instance.definition.tick.bind(instance.context);
+                if (!this._tickableInstances) this._tickableInstances = [];
+                this._tickableInstances.push(instance);
+                this._startPoolLoop();
+            } else if (__DEV__) {
+                wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
+                    warn: true,
+                    context: `Component '${instance.name}': tick() is defined, but this build does not include the frame loop (pool module excluded from this tier); tick will never run`
+                });
+            }
         }
 
         // Process portals created dynamically in init()
@@ -827,7 +895,9 @@ export const ComponentLifecycleMethods = {
 
         // Mount lists discovered since the last pass (dynamically scanned
         // components' lists mount here, not in _render's sweep)
-        this._mountLists(this.domElements.lists);
+        if (__FEATURE_LISTS__) {
+            this._mountLists(this.domElements.lists);
+        }
 
         // Render all queued components
         this._render();
@@ -1035,13 +1105,32 @@ export const ComponentLifecycleMethods = {
             // Stores declared in `subscribe: { storeName: [...] }` are available via this.stores.storeName
             stores: {},
 
-            // Entity pool access: this.pool('enemies') or this.pool('enemies', { onAdd, onRemove, onClear })
+            // Auto-injected pools container (populated by _injectPoolReferences).
+            // Declared pools are reachable via this.pools.name; the injected getters
+            // delegate to getPool() so a computed reading this.pools.x before pool setup
+            // inherits the same registry-pulse rescue the method form has (parity with
+            // this.stores.x -> getStore). Overwritten with plain handles post-setup.
+            pools: {},
+
+            // Entity pool access: this.getPool('enemies') or this.getPool('enemies', { onAdd, onRemove, onClear }).
+            // The escape hatch for reaching ANY pool by name — including markup-only
+            // pools (a data-pool element with no pools: block) and the imperative hooks
+            // form — that the declared this.pools.name container does not cover. Named
+            // getPool for symmetry with getStore (both fetch any instance; this.pools /
+            // this.stores are the declared-collection containers).
             // Uses instanceId + framework lookup since `instance` doesn't exist yet at context creation time
-            pool: (name, options) => {
+            getPool: (name, options) => {
                 if (!self._getPool) return null;
                 const inst = self.componentInstances.get(instanceId);
                 if (!inst) return null;
                 const handle = self._getPool(inst, name);
+                // A pool read from a computed/effect BEFORE _setupPools ran
+                // would otherwise leave the reader dependency-free — evaluated
+                // once against null, never again (B2: reactive aggregates).
+                // Track the instance's pool-registry pulse so registration
+                // re-runs the reader; no-op outside tracking and in tiers
+                // without the pool module.
+                if (!handle && self._poolRegistryTrack) self._poolRegistryTrack(inst);
                 // Apply imperative hooks if provided
                 if (handle && options) {
                     const ctx = inst.context;
@@ -1683,6 +1772,40 @@ export const ComponentLifecycleMethods = {
         // Mark that injection has happened (so _setupStoreSubscriptions can skip)
         instance._storesInjected = true;
     },
+    /**
+     * Inject this.pools.name getters that delegate to pool(name), mirroring
+     * _injectStoreReferences. Runs before computed setup so a computed reading
+     * this.pools.x.length before _setupPools resolves the handle still tracks the
+     * pool-registry pulse (via pool()'s rescue) and re-evaluates on registration.
+     * PoolRenderer overwrites these getters with plain handle values post-setup, so
+     * the per-frame tick path reads plain properties with zero getter overhead.
+     */
+    _injectPoolReferences(instance) {
+        const { definition, context } = instance;
+        if (!definition.pools) return;
+        // IMPORTANT: context.pools aliases definition.pools (the user's pool
+        // definition block) at this point in init. Defining getters directly on it
+        // would corrupt the definitions that _setupPools reads to build entities and
+        // props. Build a dedicated container and point context.pools at it instead,
+        // leaving definition.pools pristine.
+        const container = {};
+        for (const poolName of Object.keys(definition.pools)) {
+            // Enumerable, configurable getter delegating to getPool(name), mirroring
+            // _injectStoreReferences. The delegation carries getPool()'s pre-setup
+            // registry-pulse rescue, so a computed reading this.pools.x before
+            // _setupPools re-evaluates on pool registration. _setupPools later
+            // reassigns context.pools to the plain handle map (poolsObj), so the
+            // per-frame tick path reads plain properties with zero getter overhead.
+            Object.defineProperty(container, poolName, {
+                get() { return context.getPool(poolName); },
+                enumerable: true,
+                configurable: true
+            });
+        }
+        // 'pools' is an essential framework property; the proxy SET trap forwards
+        // this to the raw context, repointing it off the definition-block alias.
+        context.pools = container;
+    },
     _setupStoreSubscriptions(instance) {
         const { definition, context } = instance;
 
@@ -1717,6 +1840,37 @@ export const ComponentLifecycleMethods = {
 
         // Process each store subscription
         for (const [storeName, paths] of Object.entries(parsed)) {
+            // PROD PARITY: declaring subscribe means "I depend on this store" —
+            // register as an entity dependent so the change sweep (props refresh,
+            // portals, path-scoped invalidation) reaches this component in
+            // production. Dev builds masked a gap here: the DEV-ONLY computed-
+            // tracking marker routes this.stores reads through the legacy
+            // getStore path, which registers the dependent as a side effect — so
+            // array-form ("wait only") subscribers were swept in dev and silently
+            // NOT swept in prod (first pinned by props-refresh-store-computed
+            // .test.js failing on min variants only).
+            const subTarget = this._externalFindTarget ? this._externalFindTarget(storeName) : null;
+            if (subTarget && subTarget.id && this._registerEntityDependent) {
+                this._registerEntityDependent(subTarget.id, instance.id);
+            }
+            // A subscribe: declaration is lifecycle interest (an observer
+            // edge, per the data-query design ruling). If this store backs
+            // a query, activate it and count the component's root element
+            // as an observer; it disconnects on destroy, so the query's
+            // lazy lifecycle check prunes it naturally.
+            if (__FEATURE_QUERY__ && this._queryControllers && this._queryControllers.has(storeName)) {
+                const qc = this._queryControllers.get(storeName);
+                if (instance.element) qc.elements.add(instance.element);
+                this._queryActivate(qc);
+            }
+            if (!(subTarget && subTarget.id && this._registerEntityDependent) && instance.id) {
+                // Store not created yet: ensure a pending entry exists even for
+                // the wait-only form (the paths loop below never runs for it, so
+                // the existing on-failure registration can't fire).
+                this.storeManager.registerPendingStoreDependency(
+                    storeName, instance.id, '_subscribe_', null
+                );
+            }
             // Ensure paths is an array
             const pathsArray = Array.isArray(paths) ? paths : [paths];
 
@@ -1853,7 +2007,10 @@ export const ComponentLifecycleMethods = {
         // Get the store
         const storeComponent = this.storeManager?.getStoreComponentByName(storeName);
         if (!storeComponent) {
-            if (__DEV__) console.warn(`[WildflowerJS] Store watcher: Store '${storeName}' not found for path '${fullPath}'`);
+            if (__DEV__) wfError(WF_ERRORS.STORE_NEVER_REGISTERED, {
+                warn: true,
+                context: `Store watcher: store '${storeName}' not found for path '${fullPath}'`
+            });
             return;
         }
 
@@ -1898,6 +2055,28 @@ export const ComponentLifecycleMethods = {
             // we're already inside a known execution frame.
             if (!isLifecycle && !instance._initReady && !instance._inMethodExecution) {
                 if (!instance._pendingActions) instance._pendingActions = [];
+                // A8 (DX diagnostics sweep, dev only): the queued call replays
+                // AFTER init, when the browser has long since processed the
+                // event's default action — preventDefault()/stopPropagation()
+                // at replay time execute fine and do nothing. Stub them on the
+                // stale event so the silent no-op becomes a pointed warning
+                // (data-event-prevent on the element is the reliable tool: the
+                // framework applies it synchronously, before user code).
+                if (__DEV__) {
+                    for (const a of args) {
+                        if (a && typeof a.preventDefault === 'function' && typeof a.type === 'string') {
+                            for (const m of ['preventDefault', 'stopPropagation', 'stopImmediatePropagation']) {
+                                if (typeof a[m] === 'function') {
+                                    a[m] = () => wfError(WF_ERRORS.REPLAY_STALE_EVENT, {
+                                        warn: true,
+                                        context: `Component '${instance.name}': action '${methodName}' was queued before init and replayed after it; ${m}() at replay time is a no-op (the browser already processed the ${a.type} event)`,
+                                        suggestion: 'Put data-event-prevent on the element to block the default reliably.'
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 // Capture a replay closure that re-enters this wrapper. Once
                 // _initReady is true, replay loops and each call falls through
                 // to the immediate-execution branch below.
@@ -1972,6 +2151,7 @@ export const ComponentLifecycleMethods = {
      * @private
      */
     _handleComponentListStateChange(instance, path, newValue, oldValue) {
+        if (!__FEATURE_LISTS__) return false;
         const instanceId = instance.id;
 
         // Check if this change affects lists
@@ -2178,10 +2358,37 @@ export const ComponentLifecycleMethods = {
      * // Destroy component and let framework clean up children
      * wildflower.destroyComponent(instance.id);
      */
+    // A6 (DX diagnostics sweep): internal teardown flows (list reconcile, child
+    // recursion, GC sweeps, framework destroy()) legitimately destroy instances
+    // whose elements are momentarily still connected — they route through this
+    // quiet wrapper so the auto-resurrect warning below fires only for direct
+    // user calls.
+    _destroyComponentQuiet(componentId)
+    {
+        if (__DEV__) {
+            _quietDestroyDepth++;
+            try { return this.destroyComponent(componentId); }
+            finally { _quietDestroyDepth--; }
+        }
+        return this.destroyComponent(componentId);
+    },
+
     destroyComponent(componentId)
     {
         const instance = this.componentInstances.get(componentId);
         if (!instance) return false;
+
+        // Auto-resurrect is a feature (cached-HTML replay), but calling
+        // destroyComponent while the element is still in the document is the
+        // intent-mismatch moment: the next scan re-inits a fresh instance.
+        if (__DEV__ && _quietDestroyDepth === 0 && !instance.isVirtual &&
+            instance.element && instance.element.isConnected) {
+            wfError(WF_ERRORS.DESTROY_RESURRECT, {
+                warn: true,
+                context: `destroyComponent('${componentId}'): the component's element is still in the document, so the next scan will auto-resurrect it (fresh instance, init() re-fired)`,
+                suggestion: 'For a real teardown remove the element as well: instance.element.remove(). If you wanted a reset, re-initialize state instead.'
+            });
+        }
 
         // Trigger plugin beforeDestroy hook (only if plugin system is loaded)
         if (this._triggerHook) {
@@ -2205,7 +2412,7 @@ export const ComponentLifecycleMethods = {
             if (childInstance && childInstance.element && childInstance.element.hasAttribute('data-external')) {
                 return;
             }
-            this.destroyComponent(childId);
+            this._destroyComponentQuiet(childId);
         });
 
         // Clean up entity pools (data-pool)
@@ -2584,7 +2791,7 @@ export const ComponentLifecycleMethods = {
         // Clean up each orphaned component
         orphanedIds.forEach(id =>
         {
-            const result = this.destroyComponent(id);
+            const result = this._destroyComponentQuiet(id);
             if (result) stats.orphanedComponentsRemoved++;
         });
 
@@ -2686,7 +2893,7 @@ export const ComponentLifecycleMethods = {
     {
         // Destroy all components
         const componentIds = [...this.componentInstances.keys()];
-        componentIds.forEach(id => this.destroyComponent(id));
+        componentIds.forEach(id => this._destroyComponentQuiet(id));
 
         // Clear all collections
         this.componentInstances.clear();

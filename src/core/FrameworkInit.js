@@ -88,19 +88,23 @@ export const FrameworkInitMethods = {
      */
     _completeInitialization()
     {
-        this._mountLists(this.domElements.lists);
+        if (__FEATURE_LISTS__) {
+            this._mountLists(this.domElements.lists);
+        }
 
         this._processDeferredDependencies();
 
         // Set up event delegation for lists
-        this.domElements.lists.forEach(list =>
-        {
-            const instance = this.componentInstances.get(list.componentId);
-            if (instance && list.element)
+        if (__FEATURE_LISTS__) {
+            this.domElements.lists.forEach(list =>
             {
-                this._ensureListEventDelegation(list.element, instance, list.path);
-            }
-        });
+                const instance = this.componentInstances.get(list.componentId);
+                if (instance && list.element)
+                {
+                    this._ensureListEventDelegation(list.element, instance, list.path);
+                }
+            });
+        }
 
         // Framework is now fully initialized
         this._initPhase = 'ready';
