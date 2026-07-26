@@ -2,7 +2,7 @@
 
 WildflowerJS is built without `npm install` in the framework's own build path. This document describes precisely what that buys you, what it doesn't, and how to verify the claims yourself.
 
-The honest summary: we close the post-publish tampering vector and remove the postinstall-script attack surface entirely. We do **not** close the moment-of-publish vector against our three pinned upstreams (rollup, terser, acorn), because none of them currently ships SLSA provenance from upstream CI.
+The honest summary: we close the post-publish tampering vector, remove the postinstall-script attack surface entirely, and, since v1.3.0, publish our own releases with Sigstore-signed SLSA provenance through npm trusted publishing, with token-based publishing disabled. We do **not** close the moment-of-publish vector against our three pinned upstreams (rollup, terser, acorn), because none of them currently ships SLSA provenance from upstream CI.
 
 ## What ships, and what's vendored
 
@@ -46,7 +46,8 @@ Net effect: 8 → 3 vendored tarballs, byte-identical build output, full test su
 | Registry pin | "Could a typo or hijacked mirror slip in modified tarballs?" | ✅ canonical npm only |
 | Dependency-tree minimization | "How many third parties have to be trustworthy?" | ✅ three (rollup, terser, acorn) |
 | npm registry signature | "Did this tarball come through npm's signing infrastructure?" | ✅ inherited from npm |
-| **SLSA provenance** | **"Was this tarball produced by the upstream's declared CI workflow, not hand-uploaded by a compromised maintainer account?"** | ❌ **upstream gap (see below)** |
+| SLSA provenance, our releases | "Was `wildflowerjs` itself built and published by this repo's declared CI workflow?" | ✅ since v1.3.0, via npm trusted publishing |
+| **SLSA provenance, upstream toolchain** | **"Was this tarball produced by the upstream's declared CI workflow, not hand-uploaded by a compromised maintainer account?"** | ❌ **upstream gap (see below)** |
 
 ## The gap we don't close
 
@@ -104,7 +105,7 @@ The same input commit produces the same bytes. If our published CDN artifact has
 
 The audit recommendation we are still working through, in priority order:
 
-1. **SLSA-attest our own releases.** Use the OpenSSF `slsa-github-generator` action to produce signed provenance for `wildflower.full.min.js` and friends as part of the publish workflow. Doesn't address the upstream gap, but completes the chain on our side: anyone pulling our CDN or npm package can verify the artifact came from our publish workflow on this repo. Targeted for v1.2 or v1.3.
+1. **SLSA-attest our own releases. ✅ Done, v1.3.0 (2026-07-26).** Shipped via npm trusted publishing rather than the `slsa-github-generator` action originally sketched here. Releases are published exclusively by the tag-triggered workflow in this repository; npm exchanges the workflow's OIDC identity for publish rights and generates a Sigstore-signed SLSA build attestation automatically. No publish token exists, and token-based publishing is disabled on the package. Verify any installed copy with `npm audit signatures`, or fetch the attestation directly from `https://registry.npmjs.org/-/npm/v1/attestations/wildflowerjs@<version>`. jsDelivr and unpkg serve from npm, so the CDN path inherits the same guarantee. This closes our side of the chain. The upstream gap below is untouched by it.
 2. **Optional `--verify-attestations` step in the fetch scripts.** Once any of our three upstreams (rollup, terser, acorn) starts publishing provenance, add a verification step that checks the rekor signature and asserts the source repo matches an allowlist. Until at least one upstream opts in, this is mostly a no-op.
 
 What we're explicitly **not** doing:
