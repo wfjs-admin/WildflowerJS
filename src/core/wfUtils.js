@@ -213,6 +213,9 @@ export const WF_ERRORS = {
     DEFINITION_KEY_IGNORED: { code: 'WF-219', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Definition key is not part of the contract and was ignored' }) },
     COMPUTED_ASSIGNMENT: { code: 'WF-220', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Assignment to a computed property was ignored (computeds are read-only)' }) },
     BATCH_ARG_INVALID: { code: 'WF-221', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'wildflower.batch(fn) requires a function argument' }) },
+    RULE_CONFIG: { code: 'WF-228', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule declaration invalid; rule disabled' }) },
+    RULE_EVAL_ERROR: { code: 'WF-229', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule check threw; rule skipped for this pass' }) },
+    RULE_VERDICT_INVALID: { code: 'WF-234', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule check returned something that is not a verdict; rule skipped' }) },
 
     // Context system (300-399)
     CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
@@ -307,6 +310,8 @@ export const WF_ERRORS = {
     QUERY_NULL_RECORD: { code: 'WF-959', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Record query resolved null/undefined; bound fields render empty' }) },
     QUERY_APPEND_UNKEYED: { code: 'WF-960', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Append received rows without the declared key; applied as a replace' }) },
     QUERY_REFRESH_SHAPE: { code: 'WF-961', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'refresh() received unexpected options; request parameters belong inside params' }) },
+    QUERY_EXPECT_DRIFT: { code: 'WF-962', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Incoming rows drifted from the data-expect declaration' }) },
+    QUERY_ORPHAN: { code: 'WF-963', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-query element has no component ancestor, so nothing will ever process it' }) },
 
     // CSP-safe expression evaluator (non-numeric codes: separate category
     // from the 1xx-9xx ranges because they describe parser / security

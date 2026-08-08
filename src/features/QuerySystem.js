@@ -123,6 +123,14 @@ export const QuerySystemMethods = {
             elements: new Set(),      // bound [data-query] elements (observers)
             unobservedSince: null,    // timestamp when observers last hit zero
             lastRead: null,           // last getQuery() read (also an observer edge)
+            lastSource: null,         // R1 provenance descriptor: 'fetch'|'stream'|'ssr'|'patch' (dev introspection only)
+            // §2 auto-retry: opt-in count, fixed doubling curve, no policy
+            // object (a configurable policy is the retry library we ruled
+            // out of core). Clamped 0..10; 0 = off.
+            retryMax: Math.max(0, Math.min(10, config.retry | 0)),
+            retryAttempt: 0,
+            retryTimerId: null,
+            _retryOnline: null,       // one-shot 'online' resume while the ladder is suspended offline
             _activationQueued: false,
         };
         this._queryControllers.set(name, controller);
@@ -158,6 +166,15 @@ export const QuerySystemMethods = {
                 });
             },
             invalidate() { return wf._queryFetch(controller, { conditional: true }); },
+            // patch() is the engine-sanctioned optimistic write (the WF-950
+            // hatch formalized, V1_4_ROADMAP §4): the payload is bare data
+            // (a row, rows, or a record — the same shapes every source
+            // ships), applied through the choke point with source 'patch'.
+            // Keyed rows update in place, unseen keys append, tombstones
+            // remove, unkeyed payloads replace. The store goes isStale
+            // until the next confirming sync. lastSync, error, syncError,
+            // and pagination accumulation are untouched.
+            patch(data) { return wf._queryIngest(controller, data, { patch: true, source: 'patch' }); },
         });
 
         // Return the handle WITHOUT getQuery's observer side effects:
@@ -245,6 +262,15 @@ export const QuerySystemMethods = {
                     suggestion: `Register it with wildflower.query('${name}', { from: ... })`
                 });
                 continue;
+            }
+            if (__DEV__) {
+                // data-expect (§4b, WF-962): dev-only shape-drift warn.
+                // Parsed once per query, first declaring element wins; the
+                // attribute is never read in production builds.
+                const expectSpec = el.getAttribute('data-expect') || el.getAttribute('data-wf-expect');
+                if (expectSpec && !controller.expect) {
+                    controller.expect = this._parseQueryExpect(expectSpec, name);
+                }
             }
             const hasTemplate = !!el.querySelector(':scope > template');
             // SSR adoption: inside data-ssr="true", the server-rendered DOM
@@ -375,10 +401,10 @@ export const QuerySystemMethods = {
                 const row = readFields(child, {});
                 if (Object.keys(row).length > 0) rows.push(row);
             }
-            if (rows.length > 0) this._queryIngest(controller, rows, { seed: true });
+            if (rows.length > 0) this._queryIngest(controller, rows, { seed: true, source: 'ssr' });
         } else {
             const record = readFields(el, {});
-            if (Object.keys(record).length > 0) this._queryIngest(controller, [record], { seed: true });
+            if (Object.keys(record).length > 0) this._queryIngest(controller, [record], { seed: true, source: 'ssr' });
         }
     },
 
@@ -400,7 +426,11 @@ export const QuerySystemMethods = {
      * writes rows only, leaving flags untouched so seeded rows keep
      * their stale-refresh semantics.
      */
-    _queryIngest(controller, data, { append = false, gentle = false, seed = false } = {}) {
+    _queryIngest(controller, data, { append = false, gentle = false, seed = false, patch = false, source = null } = {}) {
+        // Envelope provenance ruling: every caller declares where the
+        // rows came from. Behavior flags keep sole authority over apply
+        // mode; the descriptor feeds dev introspection and diagnostics.
+        if (source) controller.lastSource = source;
         const store = this.getStore(controller.name);
         if (!store) return;
         const incoming = Array.isArray(data) ? data : (data == null ? [] : [data]);
@@ -419,7 +449,11 @@ export const QuerySystemMethods = {
             }
         }
 
-        let mode = append ? 'append' : (controller.accumulated && gentle ? 'merge' : 'replace');
+        if (__DEV__ && controller.expect && live.length > 0) {
+            this._queryExpectCheck(controller, live, source);
+        }
+
+        let mode = patch ? 'patch' : append ? 'append' : (controller.accumulated && gentle ? 'merge' : 'replace');
         if (append && live.length > 0 && keyOf(live[0]) === undefined) {
             if (__DEV__) wfError(WF_ERRORS.QUERY_APPEND_UNKEYED, {
                 warn: true,
@@ -431,20 +465,26 @@ export const QuerySystemMethods = {
 
         const current = store.rows || [];
         let nextRows;
-        if (mode === 'append') {
-            const fresh = new Map();
-            for (const r of live) fresh.set(keyOf(r), r);
-            nextRows = [];
-            for (const r of current) {
-                const k = keyOf(r);
-                if (dead.has(k)) continue;
-                nextRows.push(fresh.has(k) ? fresh.get(k) : r); // keyed dedup: update in place
+        if (mode === 'append' || mode === 'patch') {
+            if (mode === 'patch' && live.length > 0 && keyOf(live[0]) === undefined) {
+                // Unkeyed patch payload: in-place identity needs a key, so
+                // this is a wholesale replace — the record-query case.
+                nextRows = live;
+            } else {
+                const fresh = new Map();
+                for (const r of live) fresh.set(keyOf(r), r);
+                nextRows = [];
+                for (const r of current) {
+                    const k = keyOf(r);
+                    if (dead.has(k)) continue;
+                    nextRows.push(fresh.has(k) ? fresh.get(k) : r); // keyed dedup: update in place
+                }
+                const seen = new Set(nextRows.map(keyOf));
+                for (const r of live) {
+                    if (!seen.has(keyOf(r))) nextRows.push(r);
+                }
             }
-            const seen = new Set(nextRows.map(keyOf));
-            for (const r of live) {
-                if (!seen.has(keyOf(r))) nextRows.push(r);
-            }
-            controller.accumulated = true;
+            if (mode === 'append') controller.accumulated = true;
         } else if (mode === 'merge') {
             const freshKeys = new Set(live.map(keyOf));
             const tail = [];
@@ -460,7 +500,12 @@ export const QuerySystemMethods = {
 
         // Flags first, rows LAST (standing subscriber-ordering contract).
         engineWrite(() => {
-            if (!seed) {
+            if (mode === 'patch') {
+                // An optimistic write is not a sync: nothing is confirmed,
+                // so only the staleness flag moves. The next confirming
+                // sync (fetch/stream) clears it below.
+                store.isStale = true;
+            } else if (!seed) {
                 store.isLoading = false;
                 store.isStale = false;
                 store.error = null;
@@ -469,6 +514,103 @@ export const QuerySystemMethods = {
             }
             store.rows = nextRows;
         });
+    },
+
+    /**
+     * data-expect declaration parser (dev-only; §4b scope: field presence
+     * and primitive type, nothing else). "id:number, name:string, active"
+     * → [['id','number'],['name','string'],['active',null]]. A token that
+     * is not `field` or `field:string|number|boolean` is ignored with a
+     * WF-962 warn — the declaration never grows a vocabulary.
+     */
+    _parseQueryExpect(spec, name) {
+        if (!__DEV__) return null;
+        const out = [];
+        for (const tok of String(spec).split(',')) {
+            const t = tok.trim();
+            if (!t) continue;
+            const m = t.match(/^([a-zA-Z_$][\w$]*)(?::(string|number|boolean))?$/);
+            if (!m) {
+                wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
+                    warn: true,
+                    context: `Query "${name}": data-expect token "${t}" is not "field" or "field:string|number|boolean"; token ignored`,
+                    suggestion: 'data-expect declares shape only — presence and primitive type. Validation, coercion, and refinement belong in a wrapper around the source'
+                });
+                continue;
+            }
+            out.push([m[1], m[2] || null]);
+        }
+        return out.length > 0 ? out : null;
+    },
+
+    /**
+     * Shape-drift check at the choke point (dev-only). Missing = the field
+     * is absent from a row; drift = present, non-null, wrong primitive
+     * typeof. Null is a data condition, not drift. One warn per query per
+     * field per kind, forever — polls and streams must not flood the
+     * console with the same fact.
+     */
+    _queryExpectCheck(controller, rows, source) {
+        if (!__DEV__) return;
+        const warned = controller._expectWarned || (controller._expectWarned = new Set());
+        const src = source || 'unknown';
+        for (const [field, type] of controller.expect) {
+            for (const row of rows) {
+                if (row == null || typeof row !== 'object') continue;
+                if (!(field in row)) {
+                    if (!warned.has(field + ':missing')) {
+                        warned.add(field + ':missing');
+                        wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
+                            warn: true,
+                            context: `Query "${controller.name}": declared field "${field}" is missing from incoming rows (source: ${src})`,
+                            suggestion: `Fix the source's response mapping, or remove "${field}" from data-expect if the source no longer ships it`
+                        });
+                    }
+                    break;
+                }
+                const v = row[field];
+                if (type && v != null && typeof v !== type) {
+                    if (!warned.has(field + ':type')) {
+                        warned.add(field + ':type');
+                        wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
+                            warn: true,
+                            context: `Query "${controller.name}": declared field "${field}" expected ${type}, got ${typeof v} (source: ${src})`,
+                            suggestion: src === 'ssr'
+                                ? `SSR-adopted cells parse as strings unless the bound element declares data-type="${type}"`
+                                : `Align the source field type or update the data-expect declaration`
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    },
+
+    /**
+     * WF-963 (§7): a [data-query] element outside any component is a
+     * silent no-op — the transform runs during component binding, so
+     * nothing ever processes it. Dev-only post-scan sweep, no standing
+     * observer. The predicate is structural (presence of a component
+     * ATTRIBUTE on an ancestor), so a component whose async init has not
+     * finished yet never false-positives.
+     */
+    _queryOrphanSweep(root) {
+        if (!__DEV__) return;
+        if (!root || !root.querySelectorAll) return;
+        const els = [];
+        if (root.matches && root.matches('[data-query],[data-wf-query]')) els.push(root);
+        root.querySelectorAll('[data-query],[data-wf-query]').forEach((el) => els.push(el));
+        for (const el of els) {
+            if (el._wfQueryBound || el._wfQueryOrphanWarned) continue;
+            if (el.closest('[data-component],[data-wf-component]')) continue;
+            el._wfQueryOrphanWarned = true;
+            const name = el.getAttribute('data-query') || el.getAttribute('data-wf-query') || '(unnamed)';
+            wfError(WF_ERRORS.QUERY_ORPHAN, {
+                warn: true,
+                context: `data-query="${name}" has no component ancestor; queries bind during component binding, so this element renders nothing`,
+                suggestion: `Wrap it in a component — an empty definition is enough: wildflower.component('shell', {}) + <div data-component="shell">`
+            });
+        }
     },
 
     /**
@@ -577,7 +719,7 @@ export const QuerySystemMethods = {
                 // so it merges over an accumulated store (live feeds keep
                 // the user's place) and honors tombstones. Same flags-first
                 // rows-last ordering, owned by the choke point.
-                this._queryIngest(controller, parsed, { gentle: true });
+                this._queryIngest(controller, parsed, { gentle: true, source: 'stream' });
             } else {
                 this._queryFetch(controller, { conditional: true });
             }
@@ -654,8 +796,51 @@ export const QuerySystemMethods = {
             controller.abort.abort();
             controller.abort = null;
         }
+        this._queryRetryCancel(controller);
+        controller.retryAttempt = 0;
         controller.active = false;
         controller.unobservedSince = null;
+    },
+
+    /**
+     * §2 retry ladder: a failed fetch re-runs on a fixed doubling curve
+     * (base 1s, cap 30s). While the ladder runs neither error nor
+     * syncError is written and rows are never wiped; the failure state
+     * lands only on exhaustion. Offline SUSPENDS the ladder — the pending
+     * attempt is not burned; a one-shot 'online' listener (independent of
+     * the opt-in reconnect rung) resumes it.
+     */
+    _queryRetrySchedule(controller, fetchArgs) {
+        const wf = this;
+        const fire = () => {
+            controller.retryTimerId = null;
+            wf._queryFetch(controller, fetchArgs);
+        };
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+            const resume = () => {
+                window.removeEventListener('online', resume);
+                controller._retryOnline = null;
+                fire();
+            };
+            controller._retryOnline = resume;
+            window.addEventListener('online', resume);
+            return;
+        }
+        controller.retryAttempt++;
+        const base = this._queryRetryBaseMs || 1000;
+        const delay = Math.min(30000, base * Math.pow(2, controller.retryAttempt - 1));
+        controller.retryTimerId = setTimeout(fire, delay);
+    },
+
+    _queryRetryCancel(controller) {
+        if (controller.retryTimerId !== null) {
+            clearTimeout(controller.retryTimerId);
+            controller.retryTimerId = null;
+        }
+        if (controller._retryOnline) {
+            window.removeEventListener('online', controller._retryOnline);
+            controller._retryOnline = null;
+        }
     },
 
     /**
@@ -663,10 +848,18 @@ export const QuerySystemMethods = {
      * last-call-wins, AbortController on supersede, previous rows preserved
      * with isStale during transitions, hard/transient error split.
      */
-    _queryFetch(controller, { params, conditional, append } = {}) {
+    _queryFetch(controller, { params, conditional, append, _retry } = {}) {
         const wf = this;
         const store = this.getStore(controller.name);
         if (!store) return Promise.resolve();
+        // A fresh call (refresh, invalidate, rung tick) is a new episode:
+        // any pending retry is cancelled and the ladder resets. A ladder-
+        // fired call (_retry) continues the current episode.
+        if (!_retry) {
+            this._queryRetryCancel(controller);
+            controller.retryAttempt = 0;
+        }
+        const fetchArgs = { params, conditional, append, _retry: true };
         const cfg = controller.config;
         const id = ++controller.runId;
         if (controller.abort) controller.abort.abort();
@@ -682,6 +875,7 @@ export const QuerySystemMethods = {
 
         const applyRows = (data) => {
             if (id !== controller.runId) return; // superseded: last call wins
+            controller.retryAttempt = 0;         // any success resets the ladder
             if (__DEV__ && controller.hasRecord && data == null) {
                 wfError(WF_ERRORS.QUERY_NULL_RECORD, {
                     warn: true,
@@ -694,11 +888,18 @@ export const QuerySystemMethods = {
             // guarantees a rows subscriber (the documented dependent-query
             // trigger) observes every other field already final. The
             // choke point owns the ordering along with mode dispatch.
-            wf._queryIngest(controller, data, { append: !!append, gentle: !!conditional });
+            wf._queryIngest(controller, data, { append: !!append, gentle: !!conditional, source: 'fetch' });
         };
         const applyError = (err) => {
             if (id !== controller.runId) return;
-            if (err && err.name === 'AbortError') return;
+            if (err && err.name === 'AbortError') return; // supersession is not failure; no retry
+            if (controller.retryMax > 0 && controller.retryAttempt < controller.retryMax) {
+                // Ladder still has rungs: hold the failure state (isLoading/
+                // isStale stay as the fetch left them, rows untouched) and
+                // schedule the next attempt.
+                wf._queryRetrySchedule(controller, fetchArgs);
+                return;
+            }
             const msg = err && err.message ? err.message : String(err);
             engineWrite(() => {
                 if (hadData) {
@@ -734,6 +935,7 @@ export const QuerySystemMethods = {
             .then((resp) => {
                 if (id !== controller.runId) return;
                 if (resp.status === 304) {
+                    controller.retryAttempt = 0; // a 304 is a successful sync
                     engineWrite(() => {
                         store.isStale = false;
                         store.syncError = null;

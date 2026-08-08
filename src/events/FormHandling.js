@@ -5,7 +5,12 @@
  */
 
 import { handlingSubmitSet, validationCache } from '../core/DomMetadata.js';
-import { pathResolver } from '../core/wfUtils.js';
+import { pathResolver, WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { parseExpression, getCSPSafeEvaluatorWithArgs, extractIdentifiers } from '../core/CSPExpressionEvaluator.js';
+
+// Compiled-evaluator cache for cross-field rule expressions (shared across
+// components; keyed by expression + arg names inside the evaluator).
+const _ruleAstCache = new Map();
 import { reactive as rgReactive, toRaw as rgToRaw } from '../state/reactive-graph/core.js';
 
 /**
@@ -660,6 +665,214 @@ export const FormHandlingMethods = {
      * Enhanced form validation support (optional enhancement)
      * This can be added if validation is desired as part of the form handling system
      */
+    /**
+     * Parse a component's rules: block into evaluable form, once per
+     * instance. Rule name is the user-facing message unless message:
+     * overrides it. check: and when: accept the same two forms: a string,
+     * compiled through the CSP evaluator (every identifier must be a state
+     * or computed name; WF-228 refuses unknowns at parse, so a typo cannot
+     * silently gate a form), or a function bound to the component. fields:
+     * defaults to the state variables a string check reads; a function
+     * check with no fields: marks nothing.
+     * @returns {Array|null} Parsed rules, or null when none are declared
+     * @private
+     */
+    _parseComponentRules(instance)
+    {
+        if (instance._parsedRules !== undefined) return instance._parsedRules;
+        const def = instance.definition;
+        const defRules = def && def.rules;
+        if (!defRules || typeof defRules !== 'object') { instance._parsedRules = null; return null; }
+        const stateKeys = Object.keys(def.state || {}).filter(k => !k.startsWith('_'));
+        const known = new Set([...stateKeys, ...Object.keys(def.computed || {})]);
+        const out = [];
+        for (const [name, spec] of Object.entries(defRules))
+        {
+            const isObj = spec && typeof spec === 'object';
+            const message = (isObj && spec.message) || name;
+            const check = (typeof spec === 'string') ? spec : (isObj ? spec.check : null);
+            const refuse = (why) => {
+                if (typeof __DEV__ !== 'undefined' && __DEV__) wfError(WF_ERRORS.RULE_CONFIG, { warn: true, context: `rule "${name}" in component "${instance.name}": ${why}` });
+            };
+            const compile = (expr) => {
+                let ast;
+                try { ast = parseExpression(expr); } catch (e) { refuse(`parse error (${e.message})`); return null; }
+                const ids = [...extractIdentifiers(ast, new Set())];
+                const unknown = ids.filter(v => !known.has(v));
+                if (unknown.length) { refuse(`unknown variable${unknown.length > 1 ? 's' : ''} "${unknown.join('", "')}"`); return null; }
+                const fn = getCSPSafeEvaluatorWithArgs(expr, ids, _ruleAstCache, 'rule');
+                if (!fn) { refuse('expression not evaluable'); return null; }
+                return { vars: ids, fn };
+            };
+            let checkC = null, fnCheck = null;
+            if (typeof check === 'function') fnCheck = check;
+            else if (typeof check === 'string') { checkC = compile(check); if (!checkC) continue; }
+            else { refuse('no check expression or function'); continue; }
+            // when: accepts the same two forms as check: (string or function),
+            // since a gate is a boolean fact about state exactly like a check.
+            let whenC = null, fnWhen = null;
+            if (isObj && spec.when !== undefined)
+            {
+                if (typeof spec.when === 'function') fnWhen = spec.when;
+                else if (typeof spec.when === 'string') { whenC = compile(spec.when); if (!whenC) continue; }
+                else { refuse('when: must be a string or function'); continue; }
+            }
+            const fields = (isObj && Array.isArray(spec.fields))
+                ? spec.fields
+                : (checkC ? checkC.vars.filter(v => stateKeys.includes(v)) : []);
+            out.push({ name, message, fnCheck, checkC, fnWhen, whenC, fields, evalWarned: false });
+        }
+        instance._parsedRules = out.length ? out : null;
+        return instance._parsedRules;
+    },
+
+    /**
+     * The return value of a function check: or when: IS the verdict, and
+     * three returns are never a real one: a promise (always truthy, so an
+     * async function would report success no matter what it resolves to),
+     * undefined (always falsy, usually a missing return), and a string
+     * (truthy even when it reads like a failure message). Shared by both
+     * surfaces since the failure modes are identical regardless of which
+     * boolean the function is deciding.
+     * @returns {string|null} the bad-verdict reason, or null when valid
+     * @private
+     */
+    _badFnVerdict(verdict)
+    {
+        return (verdict && typeof verdict.then === 'function') ? 'a promise (async checks are not supported; rules run synchronously)'
+            : (verdict === undefined) ? 'undefined (did you forget to return?)'
+            : (typeof verdict === 'string') ? `the string ${JSON.stringify(verdict)} (a rule returns true when it HOLDS; put the wording in the rule name or message:)`
+            : null;
+    },
+
+    /**
+     * Evaluate a component's cross-field rules against current state and
+     * apply the standard status plumbing: .invalid on the fields' inputs,
+     * data-error-for elements (per field and per rule name), entries in
+     * validationErrors when a collector is given. A rule whose when: gate
+     * is off passes; a throwing function check is skipped for the pass
+     * (WF-229, once per rule).
+     * @returns {boolean} True when any rule failed
+     * @private
+     */
+    _applyComponentRules(formElement, instance, validationErrors, elementsToUpdate)
+    {
+        const rules = this._parseComponentRules(instance);
+        if (!rules) return false;
+        const ctx = instance.context;
+        let anyFailed = false;
+        for (const rule of rules)
+        {
+            let inForce = true;
+            let holds = true;
+            try
+            {
+                if (rule.fnWhen)
+                {
+                    const verdict = rule.fnWhen.call(ctx);
+                    const badVerdict = this._badFnVerdict(verdict);
+                    if (badVerdict)
+                    {
+                        if (typeof __DEV__ !== 'undefined' && __DEV__ && !rule.verdictWarned)
+                        {
+                            rule.verdictWarned = true;
+                            wfError(WF_ERRORS.RULE_VERDICT_INVALID, { warn: true, context: `rule "${rule.name}" in component "${instance.name}": when: returned ${badVerdict}` });
+                        }
+                        continue;
+                    }
+                    inForce = !!verdict;
+                }
+                else if (rule.whenC) inForce = !!rule.whenC.fn(...rule.whenC.vars.map(v => ctx[v]));
+                if (inForce)
+                {
+                    if (rule.fnCheck)
+                    {
+                        const verdict = rule.fnCheck.call(ctx);
+                        const badVerdict = this._badFnVerdict(verdict);
+                        if (badVerdict)
+                        {
+                            if (typeof __DEV__ !== 'undefined' && __DEV__ && !rule.verdictWarned)
+                            {
+                                rule.verdictWarned = true;
+                                wfError(WF_ERRORS.RULE_VERDICT_INVALID, { warn: true, context: `rule "${rule.name}" in component "${instance.name}" returned ${badVerdict}` });
+                            }
+                            continue;
+                        }
+                        holds = !!verdict;
+                    } else {
+                        holds = !!rule.checkC.fn(...rule.checkC.vars.map(v => ctx[v]));
+                    }
+                }
+            } catch (e)
+            {
+                if (typeof __DEV__ !== 'undefined' && __DEV__ && !rule.evalWarned)
+                {
+                    rule.evalWarned = true;
+                    wfError(WF_ERRORS.RULE_EVAL_ERROR, { warn: true, context: `rule "${rule.name}" in component "${instance.name}" threw (${e.message}); skipped for this pass` });
+                }
+                continue;
+            }
+            const ruleErrorEl = formElement.querySelector(`[data-error-for="${CSS.escape(rule.name)}"]`);
+            if (inForce && !holds)
+            {
+                anyFailed = true;
+                if (validationErrors) validationErrors[rule.name] = rule.message;
+                if (ruleErrorEl && ruleErrorEl.textContent !== rule.message)
+                {
+                    ruleErrorEl.textContent = rule.message;
+                    ruleErrorEl.style.display = '';
+                    if (elementsToUpdate) elementsToUpdate.push(ruleErrorEl);
+                }
+                for (const field of rule.fields)
+                {
+                    if (validationErrors) validationErrors[field] = rule.message;
+                    const input = formElement.querySelector(`[data-model="${CSS.escape(field)}"], [data-wf-model="${CSS.escape(field)}"]`);
+                    if (input && !input.classList.contains('invalid'))
+                    {
+                        input.classList.add('invalid');
+                        if (elementsToUpdate) elementsToUpdate.push(input);
+                    }
+                    const fieldErrorEl = formElement.querySelector(`[data-error-for="${CSS.escape(field)}"]`);
+                    if (fieldErrorEl && fieldErrorEl.textContent !== rule.message)
+                    {
+                        fieldErrorEl.textContent = rule.message;
+                        fieldErrorEl.style.display = '';
+                        if (elementsToUpdate) elementsToUpdate.push(fieldErrorEl);
+                    }
+                }
+            } else
+            {
+                // The per-input pass owns field-level clearing; the rule-name
+                // element is this pass's own and clears here.
+                if (ruleErrorEl && ruleErrorEl.textContent)
+                {
+                    ruleErrorEl.textContent = '';
+                    ruleErrorEl.style.display = 'none';
+                    if (elementsToUpdate) elementsToUpdate.push(ruleErrorEl);
+                }
+                // A rule that just started passing must also release inputs
+                // and field messages the per-input pass did not touch on this
+                // run (blur path touches only the blurred input).
+                for (const field of rule.fields)
+                {
+                    const input = formElement.querySelector(`[data-model="${CSS.escape(field)}"], [data-wf-model="${CSS.escape(field)}"]`);
+                    if (input && input.classList.contains('invalid') && input.validity && input.validity.valid && !this._validateInput(input))
+                    {
+                        input.classList.remove('invalid');
+                        const fieldErrorEl = formElement.querySelector(`[data-error-for="${CSS.escape(field)}"]`);
+                        if (fieldErrorEl && fieldErrorEl.textContent)
+                        {
+                            fieldErrorEl.textContent = '';
+                            fieldErrorEl.style.display = 'none';
+                        }
+                        if (elementsToUpdate) elementsToUpdate.push(input);
+                    }
+                }
+            }
+        }
+        return anyFailed;
+    },
+
     _validateForm(formElement, instance)
     {
         if (!formElement || !instance) return true;
@@ -723,6 +936,13 @@ export const FormHandlingMethods = {
                 }
             }
         });
+
+        // Cross-field rules: declared facts about form state, checked on the
+        // same pass and folded into the same status plumbing.
+        if (this._applyComponentRules(formElement, instance, validationErrors, elementsToUpdate))
+        {
+            hasErrors = true;
+        }
 
         // Store validation results in component state
         if (instance.state)
@@ -859,19 +1079,29 @@ export const FormHandlingMethods = {
 
         const modelPath = input.dataset.model || input.dataset.wfModel;
         const errorEl = form.querySelector(`[data-error-for="${modelPath}"]`);
-        if (!errorEl) return;
 
-        const error = this._validateInput(input);
+        if (errorEl) {
+            const error = this._validateInput(input);
 
-        if (error) {
-            input.classList.add('invalid');
-            errorEl.textContent = error;
-            errorEl.style.display = '';
-        } else {
-            input.classList.remove('invalid');
-            errorEl.textContent = '';
-            errorEl.style.display = 'none';
+            if (error) {
+                input.classList.add('invalid');
+                errorEl.textContent = error;
+                errorEl.style.display = '';
+            } else {
+                input.classList.remove('invalid');
+                errorEl.textContent = '';
+                errorEl.style.display = 'none';
+            }
         }
+
+        // Cross-field rules: live status on blur/change. data-model has
+        // already synced this input to state on the input event, so rules
+        // read current values. Visual pass only — formValid and
+        // validationErrors are rebuilt by the next full validation.
+        const componentElement = this._getComponentElement(form);
+        const componentId = componentElement && componentElement.dataset.componentId;
+        const instance = componentId ? this.componentInstances.get(componentId) : null;
+        if (instance) this._applyComponentRules(form, instance, null, null);
     },
 
     // #endregion FEATURE_VALIDATION

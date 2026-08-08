@@ -41,7 +41,8 @@ const binaryPrecedence = {
     '<': 7, '>': 7, '<=': 7, '>=': 7,
     '<<': 8, '>>': 8, '>>>': 8,
     '+': 9, '-': 9,
-    '*': 10, '/': 10, '%': 10
+    '*': 10, '/': 10, '%': 10,
+    '**': 11
 };
 
 // Unary operators
@@ -164,7 +165,11 @@ function parseExpression(expr) {
             let curPrec = binaryPrecedence[curBiop];
             if (!curPrec) break;
 
-            while (stack.length > 2 && curPrec <= binaryPrecedence[stack[stack.length - 2]]) {
+            // '**' is right-associative: an incoming '**' must NOT reduce a
+            // stacked operator of equal precedence (only '**' itself sits at
+            // that precedence), so 2 ** 3 ** 2 folds right to 512.
+            while (stack.length > 2 && (curPrec < binaryPrecedence[stack[stack.length - 2]] ||
+                (curPrec === binaryPrecedence[stack[stack.length - 2]] && curBiop !== '**'))) {
                 right = stack.pop();
                 biop = stack.pop();
                 left = stack.pop();
@@ -600,7 +605,8 @@ const binops = {
     '-': (a, b) => a - b,
     '*': (a, b) => a * b,
     '/': (a, b) => a / b,
-    '%': (a, b) => a % b
+    '%': (a, b) => a % b,
+    '**': (a, b) => a ** b
 };
 
 /**
@@ -764,6 +770,200 @@ function evaluateCall(node, context) {
 }
 
 // =============================================================================
+// Closure Compiler
+// =============================================================================
+//
+// The AST never changes after parse, so everything derivable from it alone is
+// hoisted out of the per-call path: operator dispatch, the BLOCKED_GLOBALS /
+// static BLOCKED_PROPERTIES checks, and identifier resolution all happen once
+// here, at compile time. Evaluation is then a tree of plain monomorphic
+// closures — no switch, no context-object allocation, no Set lookups per call.
+// Dynamic computed-member properties (obj[key]) keep their security check per
+// call because the property name isn't known until runtime. Still zero
+// new Function — CSP safety is untouched. evaluateAST above remains the
+// reference implementation; the two factory functions below compile instead
+// of walking, and must stay behavior-identical to it.
+
+const binopCompilers = {
+    '===': (l, r) => (v) => l(v) === r(v),
+    '!==': (l, r) => (v) => l(v) !== r(v),
+    '==':  (l, r) => (v) => l(v) ==  r(v),
+    '!=':  (l, r) => (v) => l(v) !=  r(v),
+    '<':   (l, r) => (v) => l(v) <   r(v),
+    '>':   (l, r) => (v) => l(v) >   r(v),
+    '<=':  (l, r) => (v) => l(v) <=  r(v),
+    '>=':  (l, r) => (v) => l(v) >=  r(v),
+    '+':   (l, r) => (v) => l(v) +   r(v),
+    '-':   (l, r) => (v) => l(v) -   r(v),
+    '*':   (l, r) => (v) => l(v) *   r(v),
+    '/':   (l, r) => (v) => l(v) /   r(v),
+    '%':   (l, r) => (v) => l(v) %   r(v),
+    '**':  (l, r) => (v) => l(v) **  r(v),
+    '|':   (l, r) => (v) => l(v) |   r(v),
+    '^':   (l, r) => (v) => l(v) ^   r(v),
+    '&':   (l, r) => (v) => l(v) &   r(v),
+    '<<':  (l, r) => (v) => l(v) <<  r(v),
+    '>>':  (l, r) => (v) => l(v) >>  r(v),
+    '>>>': (l, r) => (v) => l(v) >>> r(v)
+};
+
+const unopCompilers = {
+    '-': (a) => (v) => -a(v),
+    '+': (a) => (v) => +a(v),
+    '!': (a) => (v) => !a(v),
+    '~': (a) => (v) => ~a(v)
+};
+
+const _COMPILED_UNDEF = () => undefined;
+
+/**
+ * Compile an AST node to a closure. The closure receives one value `v` whose
+ * meaning is defined by `resolveIdentifier`: the args array (positional mode)
+ * or the merged context object (merged mode).
+ *
+ * @param {Object} node - AST node
+ * @param {Function} resolveIdentifier - (name) => closure | null; null means
+ *        the identifier can never resolve (compiles to undefined, matching
+ *        the walker's context-only lookup)
+ * @returns {Function} closure (v) => value
+ */
+function compileNode(node, resolveIdentifier) {
+    if (!node) return _COMPILED_UNDEF;
+
+    switch (node.type) {
+        case 'Literal': {
+            const val = node.value;
+            return () => val;
+        }
+
+        case 'Identifier': {
+            // Same check as evaluateIdentifier, moved to compile time —
+            // warns once instead of on every call.
+            if (BLOCKED_GLOBALS.has(node.name)) {
+                if (typeof __DEV__ !== 'undefined' && __DEV__) {
+                    wfError(WF_ERRORS.CSP_SECURITY, {
+                        context: `blocked global "${node.name}"`,
+                        suggestion: 'Use external() for cross-component data access.',
+                        warn: true
+                    });
+                }
+                return _COMPILED_UNDEF;
+            }
+            return resolveIdentifier(node.name) || _COMPILED_UNDEF;
+        }
+
+        case 'MemberExpression': {
+            const objC = compileNode(node.object, resolveIdentifier);
+            if (node.computed) {
+                // items[key]: property unknown until runtime — the security
+                // check must stay per-call.
+                const propC = compileNode(node.property, resolveIdentifier);
+                return (v) => {
+                    const obj = objC(v);
+                    if (obj == null) return undefined;
+                    const prop = propC(v);
+                    if (BLOCKED_PROPERTIES.has(prop)) {
+                        if (typeof __DEV__ !== 'undefined' && __DEV__) {
+                            wfError(WF_ERRORS.CSP_SECURITY, {
+                                context: `blocked property "${prop}"`,
+                                warn: true
+                            });
+                        }
+                        return undefined;
+                    }
+                    return obj[prop];
+                };
+            }
+            const prop = node.property.name;
+            if (BLOCKED_PROPERTIES.has(prop)) {
+                if (typeof __DEV__ !== 'undefined' && __DEV__) {
+                    wfError(WF_ERRORS.CSP_SECURITY, {
+                        context: `blocked property "${prop}"`,
+                        warn: true
+                    });
+                }
+                return _COMPILED_UNDEF;
+            }
+            return (v) => {
+                const obj = objC(v);
+                return obj == null ? undefined : obj[prop];
+            };
+        }
+
+        case 'BinaryExpression': {
+            const compile = binopCompilers[node.operator];
+            if (!compile) return _COMPILED_UNDEF;
+            return compile(
+                compileNode(node.left, resolveIdentifier),
+                compileNode(node.right, resolveIdentifier)
+            );
+        }
+
+        case 'LogicalExpression': {
+            const l = compileNode(node.left, resolveIdentifier);
+            const r = compileNode(node.right, resolveIdentifier);
+            // Short-circuit semantics preserved: right side only runs when taken
+            if (node.operator === '||') return (v) => { const a = l(v); return a ? a : r(v); };
+            if (node.operator === '&&') return (v) => { const a = l(v); return a ? r(v) : a; };
+            return _COMPILED_UNDEF;
+        }
+
+        case 'UnaryExpression': {
+            const compile = unopCompilers[node.operator];
+            if (!compile) return _COMPILED_UNDEF;
+            return compile(compileNode(node.argument, resolveIdentifier));
+        }
+
+        case 'ConditionalExpression': {
+            const test = compileNode(node.test, resolveIdentifier);
+            const consequent = compileNode(node.consequent, resolveIdentifier);
+            const alternate = compileNode(node.alternate, resolveIdentifier);
+            return (v) => (test(v) ? consequent(v) : alternate(v));
+        }
+
+        case 'CallExpression': {
+            // Only external() is permitted, same as evaluateCall
+            if (node.callee.type === 'Identifier' && node.callee.name === 'external') {
+                const argCs = node.arguments.map((a) => compileNode(a, resolveIdentifier));
+                const extC = resolveIdentifier('external');
+                if (!extC) return _COMPILED_UNDEF;
+                return (v) => {
+                    const fn = extC(v);
+                    if (typeof fn !== 'function') return undefined;
+                    return fn(...argCs.map((c) => c(v)));
+                };
+            }
+            if (typeof __DEV__ !== 'undefined' && __DEV__) {
+                const calleeName = node.callee.type === 'Identifier'
+                    ? node.callee.name
+                    : 'anonymous';
+                wfError(WF_ERRORS.CSP_SECURITY, {
+                    context: `blocked call to "${calleeName}()"`,
+                    suggestion: 'Only external() is allowed in CSP-mode expressions.',
+                    warn: true
+                });
+            }
+            return _COMPILED_UNDEF;
+        }
+
+        case 'ArrayExpression': {
+            const elems = node.elements.map((el) => compileNode(el, resolveIdentifier));
+            return (v) => elems.map((c) => c(v));
+        }
+
+        default:
+            if (typeof __DEV__ !== 'undefined' && __DEV__) {
+                wfError(WF_ERRORS.CSP_UNSUPPORTED, {
+                    context: node.type,
+                    suggestion: 'Use a computed property or component method instead.',
+                    warn: true
+                });
+            }
+            return _COMPILED_UNDEF;
+    }
+}
+
+// =============================================================================
 // Public API for Framework Integration
 // =============================================================================
 
@@ -792,14 +992,17 @@ function getCSPSafeEvaluatorWithArgs(expression, contextKeys, astCache, cachePre
         return null;
     }
 
-    // Create evaluator that maps args to context object
-    const evaluator = function(...args) {
-        const context = {};
-        for (let i = 0; i < contextKeys.length; i++) {
-            context[contextKeys[i]] = args[i];
-        }
-        return evaluateAST(ast, context);
-    };
+    // Identifiers resolve to argument indices at compile time; a per-call
+    // context object is never built. Duplicate keys keep last-wins semantics
+    // (Map assignment), matching the walker's context-building loop.
+    const keyIndex = new Map();
+    for (let i = 0; i < contextKeys.length; i++) keyIndex.set(contextKeys[i], i);
+    const root = compileNode(ast, (name) => {
+        const idx = keyIndex.get(name);
+        return idx === undefined ? null : (v) => v[idx];
+    });
+
+    const evaluator = (...args) => root(args);
 
     if (typeof __DEV__ !== 'undefined' && __DEV__) {
         evaluator._ast = ast;
@@ -834,8 +1037,11 @@ function getCSPSafeMergedContextEvaluator(expression, varNames, astCache, cacheP
         return null;
     }
 
-    // Create evaluator that uses context directly (merged context pattern)
-    const evaluator = (ctx) => evaluateAST(ast, ctx);
+    // Merged-context pattern: identifiers read straight off the context
+    // object per call, but dispatch and security checks are still hoisted
+    // to compile time by the closure compiler.
+    const root = compileNode(ast, (name) => (ctx) => ctx[name]);
+    const evaluator = (ctx) => root(ctx);
     if (typeof __DEV__ !== 'undefined' && __DEV__) {
         evaluator._ast = ast;
         evaluator._isCSPSafe = true;
@@ -846,6 +1052,27 @@ function getCSPSafeMergedContextEvaluator(expression, varNames, astCache, cacheP
     return evaluator;
 }
 
+/**
+ * Collect the identifier names an AST reads. Member expressions contribute
+ * only their base object, so `form.w` yields `form`. Lives here rather than
+ * with any one consumer because relations, validation rules, and checked
+ * facts all need it, and they ship in different build tiers.
+ * @param {Object} node - AST node
+ * @param {Set<string>} out - accumulator
+ * @returns {Set<string>} the accumulator
+ */
+function extractIdentifiers(node, out) {
+    if (!node || typeof node !== 'object') return out;
+    if (node.type === 'Identifier') { out.add(node.name); return out; }
+    if (node.type === 'MemberExpression') { extractIdentifiers(node.object, out); return out; }
+    for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (Array.isArray(v)) v.forEach(c => extractIdentifiers(c, out));
+        else if (v && typeof v === 'object') extractIdentifiers(v, out);
+    }
+    return out;
+}
+
 // =============================================================================
 // Exports
 // =============================================================================
@@ -853,6 +1080,7 @@ function getCSPSafeMergedContextEvaluator(expression, varNames, astCache, cacheP
 export {
     parseExpression,
     evaluateAST,
+    extractIdentifiers,
     getCSPSafeEvaluatorWithArgs,
     getCSPSafeMergedContextEvaluator,
     BLOCKED_PROPERTIES,

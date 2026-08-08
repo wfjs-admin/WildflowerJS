@@ -11,7 +11,7 @@ import { warnLifecycleActionNames } from './ComponentLifecycle.js';
 // Non-function definition keys the component factory actually consumes
 // (validateEntityDefinition allowlist — keep in sync with the reads in
 // ComponentScanning/ComponentLifecycle/ComponentRegistry/EntitySystem).
-const COMPONENT_CONTRACT_KEYS = ['state', 'computed', 'watch', 'subscribe', 'subscribeTimeout', 'types', 'events', 'props', 'stores', 'pools'];
+const COMPONENT_CONTRACT_KEYS = ['state', 'computed', 'watch', 'subscribe', 'subscribeTimeout', 'types', 'events', 'props', 'stores', 'pools', 'rules'];
 
 const GC_DELAY_MS = 40; // Delay before GC runs (allows DOM to settle)
 
@@ -232,6 +232,11 @@ _setupDynamicComponentDetection()
                 });
             });
         }
+
+        // WF-963: orphan [data-query] sweep. Runs even when nothing
+        // initialized — an orphan produces exactly zero components, which
+        // is the case being diagnosed.
+        if (__DEV__ && this._queryOrphanSweep) this._queryOrphanSweep(searchRoot);
 
         return initializedCount;
     },

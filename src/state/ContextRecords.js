@@ -249,6 +249,13 @@ class RenderRecord
         const actionAttr = _cmGetAttr(el, 'action');
         const actionDefs = wildflower._parseActions(actionAttr);
 
+        // A form's data-action is its SUBMIT handler, and the form-handling
+        // path binds it that way (with validation and state sync attached).
+        // Binding it here as well would attach the default click event, so
+        // every click inside a form re-inserted by data-render would fire the
+        // submit handler.
+        if (el.tagName === 'FORM') return;
+
         for (const {methodName, eventType} of actionDefs) {
             if (methodName && typeof instance.context[methodName] === 'function') {
                 // GUARD: Prevent duplicate event binding (same guard used by EventSystem._bindComponentActions)

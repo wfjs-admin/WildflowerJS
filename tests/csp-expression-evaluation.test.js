@@ -132,6 +132,28 @@ describe('CSP Expression Parser (JSEP)', () => {
             expect(ast.operator).toBe('+');
         });
 
+        it('should parse exponentiation', () => {
+            const ast = parseExpression('a ** b');
+            expect(ast).toBeTruthy();
+            expect(ast.type).toBe('BinaryExpression');
+            expect(ast.operator).toBe('**');
+        });
+
+        it('should give exponentiation higher precedence than multiplication', () => {
+            // 2 * 3 ** 2 must parse as 2 * (3 ** 2)
+            const ast = parseExpression('2 * 3 ** 2');
+            expect(ast.operator).toBe('*');
+            expect(ast.right.operator).toBe('**');
+        });
+
+        it('should parse exponentiation right-associatively', () => {
+            // 2 ** 3 ** 2 must parse as 2 ** (3 ** 2)
+            const ast = parseExpression('2 ** 3 ** 2');
+            expect(ast.operator).toBe('**');
+            expect(ast.left.type).toBe('Literal');
+            expect(ast.right.operator).toBe('**');
+        });
+
         it('should parse subtraction', () => {
             const ast = parseExpression('a - b');
             expect(ast).toBeTruthy();
@@ -390,6 +412,21 @@ describe('AST Evaluator', () => {
         it('should evaluate multiplication', () => {
             const ast = parseExpression('price * quantity');
             expect(evaluateAST(ast, { price: 10, quantity: 5 })).toBe(50);
+        });
+
+        it('should evaluate exponentiation', () => {
+            const ast = parseExpression('side ** 2');
+            expect(evaluateAST(ast, { side: 4 })).toBe(16);
+        });
+
+        it('should evaluate chained exponentiation right-to-left', () => {
+            const ast = parseExpression('2 ** 3 ** 2');
+            expect(evaluateAST(ast, {})).toBe(512);
+        });
+
+        it('should evaluate exponentiation above multiplication', () => {
+            const ast = parseExpression('2 * 3 ** 2');
+            expect(evaluateAST(ast, {})).toBe(18);
         });
 
         it('should evaluate complex arithmetic', () => {

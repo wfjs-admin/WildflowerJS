@@ -88,7 +88,7 @@ function _createDevToolsHook(wf) {
         // detects capabilities off this, NOT the framework version. Start at 1.
         // dev: true on development builds; false on minified production builds
         // (the extension uses it to show which introspection is available).
-        version: '1.3.0', schemaVersion: 1, dev: __DEV__, framework: wf,
+        version: '1.4.0', schemaVersion: 1, dev: __DEV__, framework: wf,
         getComponents() {
             const r = [];
             wf.componentInstances.forEach((i, id) => {
@@ -142,6 +142,22 @@ function _createDevToolsHook(wf) {
         hook.startTimelineRecording = function (opts) { startTimelineRecording(opts || {}); return true; };
         hook.stopTimelineRecording = function () { return stopTimelineRecording(); };
         hook.getTimelineSnapshot = function () { return getTimelineSnapshot(); };
+
+        // Registered queries with the source descriptor (envelope
+        // provenance ruling): lastSource says where the last ingested rows
+        // came from ('fetch'|'stream'|'ssr'|'patch'). Dev-only surface; the
+        // descriptor never appears on the public query store.
+        hook.getQueries = function () {
+            const r = [];
+            const qc = wf._queryControllers;
+            if (!qc) return r;
+            qc.forEach((c, name) => {
+                let rows = 0;
+                try { const st = wf.getStore(name); if (st && Array.isArray(st.rows)) rows = st.rows.length; } catch {}
+                r.push({ name, active: !!c.active, accumulated: !!c.accumulated, lastSource: c.lastSource || null, observers: c.elements ? c.elements.size : 0, rows, retry: c.retryMax > 0 ? { max: c.retryMax, attempt: c.retryAttempt, pending: c.retryTimerId !== null || !!c._retryOnline } : null });
+            });
+            return r;
+        };
 
         // Registered component + store definitions (for an anti-pattern validator).
         hook.getDefinitions = function () {

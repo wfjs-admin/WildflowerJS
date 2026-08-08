@@ -707,4 +707,49 @@ describe('Form Validation', () => {
       expect(errorEl.textContent).not.toBe('')
     })
   })
+
+  // A form inside data-render is removed and re-inserted rather than merely
+  // hidden. Its data-action must stay bound to SUBMIT across that round trip:
+  // if the re-bind treats it as a click action, every click inside the form
+  // (a label, an input, whitespace) fires the submit handler.
+  describe('form actions survive data-render', () => {
+    it('a re-inserted form binds submit, not click', async () => {
+      let saves = 0
+      testContainer.innerHTML = `
+        <div data-component="render-form-test">
+          <button class="opener" data-action="open">Open</button>
+          <div data-render="showForm">
+            <form data-action="save" novalidate>
+              <label class="lbl">Name</label>
+              <input type="text" data-model="name">
+              <button type="submit">Save</button>
+            </form>
+          </div>
+        </div>
+      `
+      wildflower.component('render-form-test', {
+        state: { showForm: false, name: '' },
+        open() { this.showForm = true },
+        save() { saves++ }
+      })
+      ensureComponentScanning(wildflower)
+      await waitForUpdate(100)
+
+      testContainer.querySelector('.opener').click()
+      await waitForUpdate(120)
+      expect(testContainer.querySelector('form'), 'form rendered').toBeTruthy()
+
+      testContainer.querySelector('.lbl').click()
+      await waitForUpdate(60)
+      expect(saves, 'clicking inside the form must not invoke the submit action').toBe(0)
+
+      testContainer.querySelector('input').click()
+      await waitForUpdate(60)
+      expect(saves, 'clicking an input must not invoke it either').toBe(0)
+
+      testContainer.querySelector('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+      await waitForUpdate(60)
+      expect(saves, 'a real submit still fires the action exactly once').toBe(1)
+    })
+  })
 })

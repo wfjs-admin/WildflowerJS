@@ -88,6 +88,10 @@ export const FrameworkInitMethods = {
      */
     _completeInitialization()
     {
+        // WF-963: orphan [data-query] sweep for the auto-init path (the
+        // manual/observer path sweeps in _scanForDynamicComponents).
+        if (__DEV__ && this._queryOrphanSweep) this._queryOrphanSweep(this.root);
+
         if (__FEATURE_LISTS__) {
             this._mountLists(this.domElements.lists);
         }

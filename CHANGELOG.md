@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.4.0] - 2026-08-08
+
+### Added
+- [Cross-field validation rules](https://www.wildflowerjs.com/changelog.html#cross-field-validation-rules): a `rules:` block on a component declares facts about the form as a whole ("the return date must be on or after departure"), running on the existing `data-validate` surface: same submit gate, same invalid class, same `data-error-for` plumbing. Three dev-mode diagnostics (WF-228/229/234) catch invalid declarations, throwing checks, and non-boolean returns.
+- [`**` in the CSP-safe expression evaluator](https://www.wildflowerjs.com/changelog.html#csp-exponent-operator): the exponentiation operator now parses at precedence 11, right-associative, matching JavaScript, in every build including CSP-locked pages. Previously an expression using `**` parsed as something else entirely instead of being refused.
+- [`getItemFromEvent` resolves pool entities](https://www.wildflowerjs.com/changelog.html#pool-get-item-from-event): a delegated event handler on a pool container can now resolve the entity and its element that the event originated from. `index` is deliberately left `undefined`. Pool storage is index-unstable by design (swap-with-last removal), so reporting a position would be a lie.
+- [Variadic `add()` / `push()` on pools](https://www.wildflowerjs.com/changelog.html#pool-variadic-push): both methods now accept multiple arguments like `Array.prototype.push`, instead of silently dropping every argument after the first.
+- [Auto-retry with backoff for data queries](https://www.wildflowerjs.com/changelog.html#query-auto-retry): an opt-in `retry: N` (clamped 0-10) on a query declaration re-runs a failed fetch on a fixed doubling curve (1s base, 30s cap) before the failure ever reaches `error` or `syncError`. Rows on screen are never wiped while the ladder runs. Going offline suspends the ladder without burning an attempt; the pending call resumes on the browser's `online` event. Any successful response, including a 304, resets the ladder for the next failure.
+- [`patch()` for sanctioned optimistic writes](https://www.wildflowerjs.com/changelog.html#query-optimistic-patch): `getQuery(name).patch(data)` writes local data through the same choke point as a fetch: keyed rows update in place, unseen keys append, a declared `deleted:` field removes by key, and an unkeyed payload replaces wholesale. The store is marked `isStale` until the next confirming sync; nothing else about the query (`lastSync`, `error`, `syncError`, pagination state) changes. Formalizes the `WF-950` interim pattern (mutate-then-invalidate) into a named, engine-owned write.
+- [`data-expect` shape-drift warning for data queries](https://www.wildflowerjs.com/changelog.html#query-data-expect) (WF-962): a dev-only `data-expect="field:type, …"` declaration on a query element warns once per query per field when incoming rows drift from it: a declared field missing, or present with the wrong primitive type. `null` is treated as data, never drift, and a token with no type checks presence only. Nothing is coerced, transformed, or rejected, and rendering proceeds unchanged; it's a console tripwire for development. Stripped entirely from production builds.
+- [Diagnostic for a `data-query` with no component ancestor](https://www.wildflowerjs.com/changelog.html#query-orphan-diagnostic) (WF-963): a `[data-query]` element outside any component previously failed silently. The transform runs during component binding, so nothing ever processed it, and even dev builds said nothing. A post-scan sweep now warns and names the fix. Dev-mode only.
+
+### Fixed
+- [A form's `data-action` no longer double-fires as a click handler](https://www.wildflowerjs.com/changelog.html#form-data-action-click-leak): a form's `data-action` is its submit handler, but the binding path also registered it a second time as a default click action, so a form re-inserted by `data-render` fired its submit handler on any click inside it, including a label. Present since v1.3.0.
+
+### Performance
+- [CSP-safe expressions compile to closures](https://www.wildflowerjs.com/changelog.html#csp-closure-compiled-evaluator): the CSP-safe evaluator now compiles each parsed expression once into a tree of plain closures instead of re-walking the AST on every evaluation. Per-call overhead versus the standard `new Function` path drops from 46x to under 3x, and typical expression shapes evaluate 2.4x to 4.7x faster. Security semantics are unchanged; dynamic `obj[key]` property access keeps its per-call guard. Cross-field validation rules evaluate through this path in every build, so they inherit the speedup everywhere.
+
+
 ## [1.3.0] - 2026-07-26
 
 ### Added

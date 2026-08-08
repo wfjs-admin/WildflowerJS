@@ -82,9 +82,12 @@ Pin a specific version with `wildflowerjs@1.1.0`.
 - **Reactive State**: Automatic UI updates when state changes, with computed properties and dependency tracking.
 - **Component System**: Declarative components with lifecycle hooks, props, and cross-component communication.
 - **Store Management**: Global reactive stores for shared state across components.
+- **Data Queries**: Point an element at a named server source and the view stays current. Polling, conditional GET, refetch on focus and reconnect, Server-Sent Events, automatic retry with backoff, and optimistic writes with `patch()`.
 - **Entity Pools**: Pull-based rendering for high-frequency DOM updates at 60fps. Game-ready.
 - **List Rendering**: Efficient array rendering with keyed reconciliation.
 - **Event Handling**: Declarative event binding with modifiers and form handling.
+- **Form Validation**: Declarative per-input validation plus cross-field rules, gating submit through one shared error surface.
+- **Strict-CSP Ready**: Every build runs under a strict Content-Security-Policy with no `unsafe-eval`, via a compiled CSP-safe expression evaluator.
 - **Conditional Rendering**: Show/hide and insert/remove elements based on state.
 - **Client-Side Routing**: History and hash mode routing with guards and transitions.
 - **Server-Side Rendering**: SSR support with hydration.

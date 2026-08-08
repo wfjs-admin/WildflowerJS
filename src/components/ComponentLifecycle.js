@@ -1535,14 +1535,26 @@ export const ComponentLifecycleMethods = {
             // Event target helpers
             getItemFromEvent: (event) =>
             {
-                // Walk up DOM to find list item (element with _listIndex property)
+                // Walk up to a list row (_listIndex) or a pool entity root
+                // (_poolItem), whichever encloses the event target.
                 let current = event.target;
                 while (current && current !== document.body) {
                     if (current._listIndex !== undefined) {
                         return {
                             element: current,
                             index: current._listIndex,
-                            id: current._itemData?.id
+                            id: current._itemData?.id,
+                            item: current._itemData
+                        };
+                    }
+                    // Pool entities carry no stable index — storage reshuffles on
+                    // removal — so the descriptor deliberately omits one.
+                    if (current._poolItem !== undefined) {
+                        return {
+                            element: current,
+                            index: undefined,
+                            id: current._poolItem?.id,
+                            item: current._poolItem
                         };
                     }
                     current = current.parentElement;

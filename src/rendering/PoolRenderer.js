@@ -318,6 +318,11 @@ class PoolHandle {
             this._devAssertItemsConsistency();
             this._everAdded = true; // suppresses the never-populated settle note
         }
+        // Varargs like Array.push: add(a, b, c) — the name push invites the
+        // Array mental model, so honor it rather than silently dropping args.
+        if (arguments.length > 1) {
+            return this._addBulk(Array.prototype.slice.call(arguments));
+        }
         // Bulk add: array of objects → DocumentFragment for single DOM operation
         try {
             if (Array.isArray(objOrArray)) {
@@ -797,7 +802,7 @@ class PoolHandle {
      * @returns {number} The new length of the pool (matches Array.prototype.push).
      */
     push(objOrArray) {
-        this.add(objOrArray);
+        this.add.apply(this, arguments);
         return this._entities.size;
     }
 
