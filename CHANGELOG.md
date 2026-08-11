@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.4.1] - 2026-08-11
+
+### Fixed
+- [Lists no longer double their rows after a `data-render` re-insertion](https://www.wildflowerjs.com/changelog.html#list-dirty-container-sweep): `data-render` re-inserts its subtree from a snapshot, and a snapshot captured after a list inside had rendered carries the rendered rows as inert copies with no bindings. The fresh mount then rendered the array again beside them, so every row appeared twice and the duplicate set ignored clicks. A list now sweeps every non-template child once its template resolves, before first render, the same cleanup the SSR path already performed. Only lists under the bulk-create threshold of 10 rows were affected; larger lists replace their children wholesale. Present since v1.2.0.
+- [Components wait for stores registered later in the document](https://www.wildflowerjs.com/changelog.html#subscribe-wait-late-registration): a component whose `subscribe:` store was not yet registered received an immediate, permanent not-found and ran `init()` without it, with no recovery when the store arrived moments later. That ordering is ordinary in a streamed response where a later chunk carries the store. While the document is still parsing, the wait now holds until the store lands, up to `subscribeTimeout`; once loading completes, a missing store still fails fast, so a mistyped name is reported at parse end instead of stalling init for the full timeout.
+- [Streaming adoption works with the framework loaded from `<head>`](https://www.wildflowerjs.com/changelog.html#head-streaming-observation): loading from `<head>` deferred component observation until DOMContentLoaded, which a streamed response only fires at its final chunk, so every component in the stream waited for the response to close before initializing. Observation now starts immediately against the document root, and `<head>` placement behaves identically to `<body>`.
+
+
 ## [1.4.0] - 2026-08-08
 
 ### Added

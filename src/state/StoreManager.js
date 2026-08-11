@@ -1233,14 +1233,27 @@ export class StoreManager {
         return new Promise((resolve) => {
             const store = this._namedStores.get(storeName);
 
-            // Store doesn't exist
+            // Store isn't registered yet.
             if (!store) {
-                resolve({ ready: false, timedOut: false, error: 'not_found' });
-                return;
+                // While the document is still parsing, a <script> later in the
+                // page may yet register it. That ordering is ordinary in a
+                // streamed response, where a later chunk carries the store.
+                // Reporting a permanent miss here would init the component
+                // against a store that is about to exist, and it would never
+                // recover, since nothing re-runs init once the store lands.
+                //
+                // Once the document has loaded, an absent store is genuinely
+                // absent, so resolve at once and let the caller report it. That
+                // keeps a mistyped store name failing fast instead of stalling
+                // init for the whole subscribeTimeout.
+                if (typeof document === 'undefined' || document.readyState === 'complete') {
+                    resolve({ ready: false, timedOut: false, error: 'not_found' });
+                    return;
+                }
+                // Otherwise fall through and wait for it to arrive.
             }
-
-            // Already ready
-            if (!store.state._internal || store.state._internal.ready !== false) {
+            // Registered and already ready
+            else if (!store.state._internal || store.state._internal.ready !== false) {
                 resolve({ ready: true, timedOut: false });
                 return;
             }
@@ -1271,6 +1284,13 @@ export class StoreManager {
                     if (!resolved) {
                         resolved = true;
                         cleanup();
+                        // A store that never registered is a different fault from
+                        // one that registered and never became ready. Report it as
+                        // not_found so the caller raises the accurate diagnostic.
+                        if (!this._namedStores.get(storeName)) {
+                            resolve({ ready: false, timedOut: true, error: 'not_found' });
+                            return;
+                        }
                         resolve({ ready: false, timedOut: true });
                     }
                 }, timeout);
@@ -1283,11 +1303,27 @@ export class StoreManager {
                     clearInterval(pollInterval);
                     return;
                 }
-                if (!store.state._internal || store.state._internal.ready !== false) {
+                // Re-read the registry: when this wait began for a store that was
+                // not registered yet, the captured reference is undefined.
+                const current = store || this._namedStores.get(storeName);
+                if (current && (!current.state._internal || current.state._internal.ready !== false)) {
                     resolved = true;
                     cleanup();
                     clearInterval(pollInterval);
                     resolve({ ready: true, timedOut: false });
+                    return;
+                }
+                // Still unregistered and the document has finished loading: no
+                // more parser-delivered scripts are coming, so the store is
+                // genuinely absent. Fail fast rather than running out the full
+                // subscribeTimeout — and rather than hanging forever when the
+                // timeout is 0 (wait indefinitely), which would otherwise leak
+                // this interval and leave init uncalled for good.
+                if (!current && document.readyState === 'complete') {
+                    resolved = true;
+                    cleanup();
+                    clearInterval(pollInterval);
+                    resolve({ ready: false, timedOut: false, error: 'not_found' });
                 }
             }, 50);
 

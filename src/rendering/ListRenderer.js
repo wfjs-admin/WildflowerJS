@@ -749,15 +749,12 @@ export const ListRendererMethods = {
                 }
             }
 
-            // SSR cleanup: If this list was SSR-hydrated (phase is 'complete' or 'activated'),
-            // remove the SSR items before mapArray initialization creates framework-rendered ones
-            if (ssrComponent && element._ssrPhase) {
-                const template = element.querySelector('template');
-                const ssrItems = Array.from(element.children).filter(c => c !== template && c.tagName !== 'TEMPLATE');
-                ssrItems.forEach(item => item.remove());
-                element._ssrPhase = null; // Clear SSR phase; framework fully owns this list now
-            }
+            // Framework fully owns this list from here on; clear any SSR phase
+            // (the sweep below removes already-hydrated SSR rows before
+            // mapArray initialization creates framework-rendered ones).
+            if (element._ssrPhase) element._ssrPhase = null;
         }
+
 
         // Get template from cache
         const listPath = context?.path || this._getAttr(element, 'list');
@@ -934,6 +931,24 @@ export const ListRendererMethods = {
                 }
             }
             return;
+        }
+
+        // Mount-time sweep: a template resolved, so mapArray owns this
+        // container from here on, and any element child that is not a
+        // <template> predates this mount and cannot be adopted. That covers
+        // SSR rows being replaced after activation, and stale copies of a
+        // previously rendered list. The stale-copy case comes from
+        // data-render, whose toggle re-inserts a cloneNode snapshot of its
+        // subtree: a snapshot taken after this list first rendered carries
+        // the rendered rows as inert clones with no bindings and no
+        // delegation, and leaving them in place doubles every row with a
+        // dead duplicate. Only lists under the bulk-create threshold showed
+        // the bug, because the bulk path replaces children wholesale while
+        // the per-item path appends. Runs after the no-template diagnostics
+        // above, which need the stray children as evidence.
+        for (let child = element.firstElementChild, next; child; child = next) {
+            next = child.nextElementSibling;
+            if (child.tagName !== 'TEMPLATE') child.remove();
         }
 
         // Disable innerHTML fast path when text bindings reference implicit computed properties.

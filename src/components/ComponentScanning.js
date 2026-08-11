@@ -106,14 +106,19 @@ _setupDynamicComponentDetection()
             }
         });
 
-        // Start observing - ensure document.body exists
-        if (document.body) {
-            this._mutationObserver.observe(document.body, {
+        // Start observing immediately. When the framework loads from <head>,
+        // document.body does not exist yet, but documentElement always does and
+        // subtree covers everything the parser will later append to body.
+        // Deferring to DOMContentLoaded instead would hold off adoption until a
+        // streamed response closes, which is precisely when it is least useful.
+        const observeTarget = document.body || document.documentElement;
+        if (observeTarget) {
+            this._mutationObserver.observe(observeTarget, {
                 childList: true,
                 subtree: true
             });
         } else {
-            // Wait for document.body to be available
+            // Neither exists yet (document not yet parsed at all)
             document.addEventListener('DOMContentLoaded', () => {
                 if (document.body && this._mutationObserver) {
                     this._mutationObserver.observe(document.body, {
