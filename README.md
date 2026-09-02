@@ -74,6 +74,21 @@ Pin a specific version with `wildflowerjs@1.1.0`.
 - Robust and performant as major frameworks
 - The ease-of-use of jQuery
 
+## Performance
+
+Build steps optimize bundle delivery, not the runtime work that follows it. WildflowerJS writes directly to the DOM, with no virtual DOM and no reconciliation pass between a state change and the screen.
+
+WildflowerJS entered the official Krausest [js-framework-benchmark](https://krausest.github.io/js-framework-benchmark/2026/chrome152.html) with the Chrome 152 run, published September 1, 2026, on the then-current v1.4.0. Both entries measure the framework exactly as it ships from this package, script tag and all.
+
+- **`wildflowerjs-v1.4.0`** posted a **1.16** weighted geomean slowdown, level with the fastest signal-based compilers, between Solid at 1.13 and Svelte at 1.17. This entry renders through `data-list`, the same fully reactive model every framework on the board benchmarks.
+- **`wildflowerjs-pool-v1.4.0`** posted a **1.09**, ahead of every major framework, rendering the same markup through entity pools, the per-frame primitive WildflowerJS ships for bulk and high-frequency workloads.
+
+Neither entry carries an issue flag, and all results were run on the benchmark maintainer's hardware.
+
+![The official js-framework-benchmark results table for Chrome 152, showing all nine duration benchmarks and the weighted geometric mean for vanillajs (1.04), wildflowerjs-pool-v1.4.0 (1.09), vue-vapor-v3.6.0-beta.17 (1.12), solid-v1.9.3 (1.13), wildflowerjs-v1.4.0 (1.16), svelte-v5.42.1 (1.17), vue-v3.5.39 (1.31), and react-hooks-v19.2.0 (1.58).](assets/benchmarks/krausest-chrome152-official.png)
+
+*The official results table, framework selection made with the results page's own picker. Verify against the [interactive board](https://krausest.github.io/js-framework-benchmark/2026/chrome152.html).*
+
 ## Features
 
 - **Zero Build Step**: Drop a `<script>` tag and start building. No CLI, no compilation, no transpilation.
