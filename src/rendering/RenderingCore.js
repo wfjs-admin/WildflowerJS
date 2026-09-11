@@ -39,6 +39,81 @@ export const RenderingCoreMethods = {
     // modules, so this makes the whole conditional path list-independent.
     // -------------------------------------------------------------------------
     /**
+     * True when `el` sits under a component-level data-render element whose
+     * condition evaluates false right now. Component init runs the query
+     * transform, the binding pass, and early list mounting before the
+     * conditional pass removes such a section, so callers use this to avoid
+     * observing, mounting, or fetching for a subtree that is about to leave;
+     * insertion binds the section's clone when it appears. Row-level
+     * data-render (inside a list row) is item-scoped and is not evaluated.
+     * @param {HTMLElement} el - The element to test
+     * @param {HTMLElement} rootEl - The component element (walk stops here)
+     * @param {Object} instance - Component instance
+     * @returns {boolean}
+     * @private
+     */
+    _insideHiddenRender(el, rootEl, instance) {
+        const listSelector = this._attrSelector('list');
+        // Collect the chain, then evaluate it outermost first: once an outer
+        // section is false the inner conditions are not evaluated at all (an
+        // inner condition naming a $query would otherwise touch and activate
+        // it for a section that is about to leave).
+        const chain = [];
+        for (let cur = el; cur && cur !== rootEl; cur = cur.parentElement) {
+            if (this._hasAttr(cur, 'render')) chain.push(cur);
+        }
+        for (let i = chain.length - 1; i >= 0; i--) {
+            const cur = chain[i];
+            const container = cur.parentElement ? cur.parentElement.closest(listSelector) : null;
+            if (container && rootEl.contains(container)) continue; // row-level: item-scoped
+            const path = this._getAttr(cur, 'render');
+            if (path && !this._conditionVerdict(path, instance, cur)) return true;
+        }
+        return false;
+    },
+
+    /**
+     * Mark the render-effect metadata of every binding inside `root`, a
+     * subtree a data-render just removed, so the effect skips them until
+     * insertion re-creates it with fresh metadata. Covers the init-time
+     * removal (metadata still in instance._effectMeta) and a mid-life one
+     * (the live array the effect iterates, instance._renderMeta). Render
+     * metadata is left alone: its placeholder must keep evaluating.
+     * @param {Object} instance - Component instance
+     * @param {HTMLElement} root - The removed subtree's root
+     * @private
+     */
+    _markHiddenRenderMetas(instance, root) {
+        if (!instance || !root) return;
+        // The root itself is marked too, for list mounting: a list entry
+        // collected before this removal must not mount into the removed
+        // subtree (ListRenderer.mountList), while a list detached by hand
+        // carries no mark and mounts as it always did.
+        root._wfRenderHidden = true;
+        const lists = [instance._effectMeta, instance._renderMeta];
+        for (const metas of lists) {
+            if (!metas) continue;
+            for (const meta of metas) {
+                if (meta._hidden) continue;
+                if (meta.type === 'render') {
+                    // The removed section's OWN record stays live: its
+                    // placeholder is what brings the section back. A nested
+                    // section's record (element or placeholder inside the
+                    // removed subtree) is re-created at insertion; until then
+                    // evaluating it would only move nodes nobody sees and touch
+                    // any query its condition names.
+                    const ctx = meta.context;
+                    const node = ctx && (ctx.element || ctx.placeholder);
+                    if (node && node !== root && root.contains(node)) meta._hidden = true;
+                    continue;
+                }
+                if (!meta.element) continue;
+                if (root === meta.element || root.contains(meta.element)) meta._hidden = true;
+            }
+        }
+    },
+
+    /**
      * Process conditional elements (data-show and data-render)
      * @param {Object} instance - Component instance
      * @private
@@ -93,6 +168,13 @@ export const RenderingCoreMethods = {
 
         conditionalElements.forEach(conditionalElement =>
         {
+            // Document order puts an outer data-render before the conditionals
+            // inside it. Once that outer section evaluated false and was
+            // removed, its inner conditionals are detached: registering them
+            // would have the render effect evaluate them on every run (and
+            // touch any query they name) for a section nobody sees, and
+            // insertion re-creates them from the section's clone anyway.
+            if (!conditionalElement.isConnected) return;
             // Determine mode: 'show' or 'render' (support both prefixes)
             const isRenderMode = this._hasAttr(conditionalElement, 'render');
             const condPath = isRenderMode
@@ -117,14 +199,13 @@ export const RenderingCoreMethods = {
                 // meta (_executeShowForEffect → applyShow, transitions included); the
                 // setup-time context paint was a redundant parallel build.
                 if (instance._effectMeta) {
-                    const negate = condPath.startsWith('!');
-                    const cleanPath = negate ? condPath.slice(1) : condPath;
+                    const parsed = this._parseConditionPath(condPath);
                     instance._effectMeta.push({
                         element: conditionalElement,
                         type: 'show',
-                        path: cleanPath,
-                        negate,
-                        isExpression: this.isExpression(cleanPath) || cleanPath.includes('$')
+                        path: parsed.path,
+                        negate: parsed.negate,
+                        isExpression: parsed.isExpression
                     });
                 }
             }
@@ -146,6 +227,7 @@ export const RenderingCoreMethods = {
         const templateClone = element.cloneNode(true);
         // Strip data-cloak from template so re-insertions don't inherit it
         templateClone.removeAttribute('data-cloak');
+        templateClone.removeAttribute('data-wf-cloak');
 
         // Create the render record (plain object, not registered; the render
         // effect holds it directly via its type:'render' meta).
@@ -167,6 +249,7 @@ export const RenderingCoreMethods = {
                 element.parentNode.insertBefore(placeholder, element);
                 element.parentNode.removeChild(element);
                 context.element = null; // Element is not in DOM
+                this._markHiddenRenderMetas(instance, element);
             } else {
                 context.placeholder = null; // No placeholder needed when rendered
             }
@@ -174,6 +257,58 @@ export const RenderingCoreMethods = {
 
         return context;
     },
+    /**
+     * Parse a data-show / data-render condition into the shape every
+     * evaluator shares: the obsolete `computed:` prefix stripped, a leading
+     * `!` lifted into a negate flag for a single simple term only, and the
+     * expression / simple-path split. For a compound expression the `!`
+     * stays in the text: stripping it would negate the WHOLE expression
+     * ("!a && b" is not "!(a && b)").
+     * @param {string} condition
+     * @returns {{path: string, negate: boolean, isExpression: boolean}}
+     * @private
+     */
+    _parseConditionPath(condition) {
+        let expr = condition;
+        if (expr.startsWith('computed:!')) expr = '!' + expr.slice(10);
+        else if (expr.startsWith('computed:')) expr = expr.slice(9);
+        const negate = expr.startsWith('!') && /^[\w.$:]+$/.test(expr.slice(1));
+        const path = negate ? expr.slice(1) : expr;
+        return { path, negate, isExpression: this.isExpression(path) || path.includes('$') };
+    },
+
+    /**
+     * The one verdict for a data-show / data-render condition read outside
+     * the effect: the same read the component render effect performs
+     * (_buildRenderMeta + _resolveEffectExpression, or getValue for a simple
+     * path), so an initial verdict, a hidden-section check, a scanner skip,
+     * a cloak strip and a portal condition all agree with the effect that
+     * drives the element afterwards. There used to be a second evaluator
+     * here with no external(); it answered false to every $store expression,
+     * so a $route-gated section that was true at init was removed and then
+     * re-inserted as a clone by the effect, and a slot template inside it was
+     * skipped for good.
+     * @param {string} condition
+     * @param {Object} instance - Component instance
+     * @param {HTMLElement} [element] - The conditional element (record-query scope)
+     * @returns {boolean}
+     * @private
+     */
+    _conditionVerdict(condition, instance, element) {
+        const { path, negate, isExpression } = this._parseConditionPath(condition);
+        // A bare path on a record-marked element reads the row, as in the effect.
+        const rowScoped = !!(__FEATURE_QUERY__ && element && element._wfRecordQuery);
+        let value;
+        try {
+            value = (isExpression || rowScoped)
+                ? this._resolveEffectExpression(path, instance, element)
+                : instance.stateManager.getValue(path);
+        } catch (error) {
+            value = undefined;
+        }
+        return negate ? !value : !!value;
+    },
+
     /**
      * Evaluate a condition path for data-show/data-render
      * @param {string} path - The condition path (may include negation, computed:)
@@ -183,23 +318,7 @@ export const RenderingCoreMethods = {
      */
     _evaluateCondition(path, instance)
     {
-        // Strip obsolete computed: prefix (e.g., "computed:isVisible" → "isVisible",
-        // "computed:!isVisible" → "!isVisible"). evaluateExpression resolves
-        // computed properties by name automatically.
-        let expr = path;
-        if (expr.startsWith('computed:!')) {
-            expr = '!' + expr.slice(10);
-        } else if (expr.startsWith('computed:')) {
-            expr = expr.slice(9);
-        }
-        try {
-            return !!this.evaluateExpression(expr, instance.state, {
-                stateManager: instance.stateManager,
-                cacheKey: 'condition'
-            });
-        } catch (error) {
-            return false;
-        }
+        return this._conditionVerdict(path, instance);
     },
     /**
      * Get the external() function bound to a component instance
@@ -399,7 +518,7 @@ export const RenderingCoreMethods = {
         // ssr-list.js and drops out of the 12 non-SSR variants. Collection
         // happens BEFORE deferred dependencies (matching the historical
         // ordering); the sweep runs after.
-        const ssrListContexts = __FEATURE_SSR__ ? this._ssrCollectListContexts() : null;
+        const ssrListContexts = (__FEATURE_SSR__ && __FEATURE_LISTS__) ? this._ssrCollectListContexts() : null;
 
         if (this._contextSystemInitialized && this._deferredDependencies && this._deferredDependencies.length > 0)
         {
@@ -626,8 +745,16 @@ export const RenderingCoreMethods = {
                 if (listBoundElements.has(el)) {
                     return false;
                 }
-                // Skip elements inside list containers (they're list item bindings, not component bindings)
-                if (el.closest('[data-list], [data-wf-list]') && el.closest('[data-list], [data-wf-list]').closest('[data-component]') === element) {
+                // Skip elements inside list containers (they're list item bindings, not component bindings).
+                // BOTH halves must be prefix-aware. The list half always was; the component half read
+                // bare `[data-component]` only, so on a data-wf-* page it resolved to null, the row was
+                // never skipped, and the component effect claimed the row's own binding. It then wrote
+                // the row's path in COMPONENT scope, where the field does not exist, and __wf_txt set
+                // the existing text node's .data to '' in place. Invisible on a list rendered from
+                // state (the renderer repaints the correct value straight after) and fatal on rows that
+                // arrived pre-rendered, where the emptied text IS the content: the server's own markup.
+                const listAncestor = el.closest(this._attrSelector('list'));
+                if (listAncestor && listAncestor.closest(this._attrSelector('component')) === element) {
                     return false;
                 }
                 // Skip slot template bindings (handled by slot template system)
@@ -982,9 +1109,15 @@ export const RenderingCoreMethods = {
     _querySelfAndDescendants(element, selector) {
         const results = Array.from(element.querySelectorAll(selector));
         if (element.matches(selector)) {
-            // Only include root if no parent component/list owns this element's bindings
+            // Only include root if no parent component/list owns this element's bindings.
+            // Both attribute halves must be prefix-aware: a parent declared after this
+            // child has no data-component-id yet, so its data-wf-component attribute is
+            // the only thing that identifies it as the owner (plain-page canary
+            // "a binding on a child root belongs to the parent").
             const parent = element.parentElement;
-            const parentOwner = parent ? parent.closest('[data-component], [data-component-id], [data-list], [data-wf-list]') : null;
+            const parentOwner = parent
+                ? parent.closest(`${this._attrSelector('component')}, [data-component-id], ${this._attrSelector('list')}`)
+                : null;
             if (!parentOwner) {
                 results.unshift(element);
             }
@@ -1005,6 +1138,12 @@ export const RenderingCoreMethods = {
      */
     _isOwnedBindingElement(el, componentElement) {
         if (el.closest('[data-use-template-rendered]')) return false;
+        // Elements inside a <template> belong to a list or pool template, not
+        // to the component. An HTML <template> keeps its content in an inert
+        // fragment that querySelectorAll never sees, so this only bites for the
+        // foreign-content case: <template> inside <svg> parses as an inert SVG
+        // element whose children are live DOM until the pool lifts them out.
+        if (el.closest('template')) return false;
         // Only exclude elements INSIDE a list: the list root itself owns its own bindings
         // (bind-style, bind-class, bind-attr on the container are authored by the component,
         // not by the list renderer, which only manages children).
@@ -1217,7 +1356,7 @@ export const RenderingCoreMethods = {
         // snapshot (which feeds domElements.lists and therefore list
         // mounting) always sees the transformed attribute. Idempotent.
         if (__FEATURE_QUERY__ && this._transformQueryElements) {
-            this._transformQueryElements(element);
+            this._transformQueryElements(element, instance);
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -1284,7 +1423,7 @@ export const RenderingCoreMethods = {
             const el = this._getElementByPath(element, binding.elementPath);
             // Skip elements that have been bound by a list (prevent component from overwriting)
             // Also skip SSR list items (real DOM elements inside data-list within data-ssr components)
-            const inSSRList = el && el.closest('[data-list],[data-wf-list]')?.closest('[data-ssr="true"]');
+            const inSSRList = el && el.closest(this._attrSelector('list'))?.closest(this._attrSelector('ssr', 'true'));
             if (el && !listBoundElements.has(el) && !inSSRList) {
                 this.domElements.bindings.push({
                     element: el,
@@ -1431,6 +1570,11 @@ export const RenderingCoreMethods = {
 
             for (const binding of collection) {
                 if (binding.componentId !== componentId) continue;
+                // Inside a record-shape query subtree a bare path reads the
+                // row (data-model excepted), so component state cannot judge
+                // it. WF-997 names a field neither scope carries, once the row
+                // has arrived.
+                if (__FEATURE_QUERY__ && type !== 'data-model' && binding.element && binding.element._wfRecordQuery) continue;
 
                 const path = binding[pathKey];
                 if (!path) continue;
@@ -1453,6 +1597,10 @@ export const RenderingCoreMethods = {
                 // via the same closest() guard — see the call sites around
                 // _processBindingElements / _processClassBindingElements.
                 if (el.closest('[data-use-template-rendered]')) return false;
+                // Same for children of a <template>: only reachable when the
+                // template sits inside <svg> (parsed as an inert element with
+                // live children); they belong to the pool, not to state.
+                if (el.closest('template')) return false;
 
                 let parent = el.parentElement;
                 while (parent && parent !== componentElement) {
@@ -1476,6 +1624,7 @@ export const RenderingCoreMethods = {
             const classBindingElements = componentElement.querySelectorAll('[data-bind-class],[data-wf-bind-class]');
             classBindingElements.forEach(el => {
                 if (!isOwnedByThisComponent(el)) return;
+                if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
                 const expression = this._getAttr(el, 'bind-class');
                 if (expression) {
                     this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-class');
@@ -1486,6 +1635,7 @@ export const RenderingCoreMethods = {
             const styleBindingElements = componentElement.querySelectorAll('[data-bind-style],[data-wf-bind-style]');
             styleBindingElements.forEach(el => {
                 if (!isOwnedByThisComponent(el)) return;
+                if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
                 const expression = this._getAttr(el, 'bind-style');
                 if (expression) {
                     this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-style');
@@ -1558,6 +1708,17 @@ export const RenderingCoreMethods = {
         const rootVar = pathParts[0];
 
         if (listContextVars.includes(rootVar)) return;
+
+        // Skip store-alias data-model paths ("storeName.field"): FormHandling
+        // routes these writes to the named store's state, not this component's
+        // (mirrored on the read side in _executeComponentBindingsForEffect),
+        // so the root legitimately has no matching component state key. Scoped
+        // to REGISTERED stores only — an unregistered root still warns, which
+        // is what actually catches typos and genuine component-state mistakes.
+        if (bindingType === 'data-model' && pathParts.length > 1
+            && this.storeManager?.getStoreComponentByName(rootVar)) {
+            return;
+        }
 
         // Check if root property exists in state
         if (!stateKeys.includes(rootVar)) {
@@ -1825,16 +1986,28 @@ export const RenderingCoreMethods = {
     _findSimilarPropertyNames(name, candidates) {
         if (!__DEV__) return [];
         const maxDistance = Math.max(2, Math.floor(name.length / 3));
+        const lowerName = name.toLowerCase();
         const similar = [];
 
         for (const candidate of candidates) {
-            const distance = this._levenshteinDistance(name.toLowerCase(), candidate.toLowerCase());
-            if (distance <= maxDistance && distance > 0) {
-                similar.push(candidate);
+            // Guard on the raw strings, NOT on distance > 0. Comparison is
+            // case-insensitive, so a pure case slip ("selectedid" written for
+            // "selectedId") scores 0 — excluding zero-distance matches dropped
+            // the single most common typo class, leaving the WF-509 warning with
+            // no suggestion at all on exactly the case the author can fix fastest.
+            if (candidate === name) continue;
+            const distance = this._levenshteinDistance(lowerName, candidate.toLowerCase());
+            if (distance <= maxDistance) {
+                similar.push({ candidate, distance });
             }
         }
 
-        return similar.slice(0, 3); // Return top 3 suggestions
+        // Nearest first. Unsorted, candidates arrive in declaration order and the
+        // 3-item cut can discard a distance-1 match in favour of a distance-3 one
+        // that happened to be declared earlier. Sort is stable, so equal-distance
+        // candidates keep declaration order.
+        similar.sort((a, b) => a.distance - b.distance);
+        return similar.slice(0, 3).map(entry => entry.candidate); // Top 3 suggestions
     },
     /**
      * Calculate Levenshtein distance between two strings
@@ -2007,6 +2180,9 @@ export const RenderingCoreMethods = {
         if (!bindingMeta || bindingMeta.length === 0) {
             return null;
         }
+        // Kept reachable so a data-render removal can mark the metadata of
+        // the subtree it takes out (_markHiddenRenderMetas).
+        instance._renderMeta = bindingMeta;
 
         // data-render writers may insert a cloned subtree and recreate THIS effect
         // (see _executeRenderForEffect → _insertRenderElement). Process render metas
@@ -2064,8 +2240,25 @@ export const RenderingCoreMethods = {
             // SSR lists: Skip elements inside data-list containers within SSR components
             // (SSR list items exist as real DOM elements before the list renderer runs,
             // so listBoundElements won't catch them yet; use DOM check instead)
-            const listAncestor = el.closest('[data-list], [data-wf-list]');
-            if (listAncestor && listAncestor.closest('[data-ssr="true"]')) return false;
+            const listAncestor = el.closest(this._attrSelector('list'));
+            if (listAncestor && listAncestor.closest(this._attrSelector('ssr', 'true'))) return false;
+            // List INTERIORS are row-owned in every mode, not just SSR. This
+            // scan runs on data-render re-insertion, when rendered rows exist
+            // as real DOM: collecting a row element here makes the component
+            // effect re-evaluate its expressions in COMPONENT scope, where
+            // item fields are undefined — a fallback ternary then clobbers
+            // the row's correct value (the Conduit avatar paint-then-revert).
+            // The container itself (listAncestor === el) stays collectible:
+            // data-show on a data-list element is a component binding.
+            // Ownership-scoped, mirroring the init-time guard in
+            // _processConditionalElements: closest() walks past this
+            // component's root, so for a component living in ANOTHER
+            // component's row, every element finds the ancestor's list.
+            // Excluding on mere presence stripped that nested component's
+            // whole meta on rescan. Only rows of a list THIS
+            // component owns are row-owned from its point of view.
+            if (listAncestor && listAncestor !== el
+                && listAncestor.closest('[data-component], [data-wf-component]') === element) return false;
             // Use data-component (not data-component-id) to detect component boundaries.
             // Nested components may not have data-component-id yet during init batches.
             const closestComp = el.closest('[data-component], [data-wf-component]');
@@ -2106,14 +2299,13 @@ export const RenderingCoreMethods = {
                 isExpression: needsExprEval(path)
             })],
             ['show', (el, path) => {
-                const negate = path.startsWith('!');
-                const cleanPath = negate ? path.slice(1) : path;
+                const parsed = this._parseConditionPath(path);
                 return {
                     element: el,
                     type: 'show',
-                    path: cleanPath,
-                    negate: negate,
-                    isExpression: needsExprEval(cleanPath)
+                    path: parsed.path,
+                    negate: parsed.negate,
+                    isExpression: parsed.isExpression
                 };
             }],
             ['bind-class', (el, path) => ({
@@ -2189,11 +2381,26 @@ export const RenderingCoreMethods = {
         const renderToken = instance._renderToken | 0;
 
         for (const meta of bindingMeta) {
-            // Read value via reactive proxy (establishes dependency tracking)
+            // A binding inside a data-render section that is hidden (marked at
+            // removal by _markHiddenRenderMetas). Insertion re-creates this
+            // effect with fresh metadata, so evaluating it here would only
+            // write to a detached node and, for a $query path, wake a query
+            // nothing on the page shows. An element detached by hand is NOT
+            // marked and keeps its writes, so it is current when reattached.
+            if (meta._hidden) continue;
+            // Read value via reactive proxy (establishes dependency tracking).
+            // Inside a record-shape query subtree (element marked by the query
+            // transform) a BARE path in data-show / -class / -style / -attr /
+            // -html reads the row the same way an expression there does: the
+            // rewrite reaches only data-bind, and the merged scope is the one
+            // rule for everything else in that subtree. A computed: prefix
+            // names a component computed on purpose (the transform leaves it
+            // alone for that reason), so it keeps the component read.
             let value;
             try {
-                value = meta.isExpression
-                    ? this._resolveEffectExpression(meta.path, instance)
+                value = (meta.isExpression || (__FEATURE_QUERY__ && meta.element && meta.element._wfRecordQuery
+                        && meta.type !== 'model' && !/^!?computed:/.test(meta.path)))
+                    ? this._resolveEffectExpression(meta.path, instance, meta.element)
                     : stateManager.getValue(meta.path);
             } catch (e) {
                 if (__DEV__) wfError(WF_ERRORS.EFFECT_PATH, {
@@ -2202,6 +2409,66 @@ export const RenderingCoreMethods = {
                     warn: true
                 });
                 continue;
+            }
+
+            // Store-backed data-model ("storeName.field"): the WRITE path
+            // (FormHandling) routes these to the named store's state, but
+            // getValue above resolves only component state — so the state→DOM
+            // direction never repainted on programmatic store writes. Mirror
+            // the write-side resolution here. Lazily detected (stores may
+            // register after the component scanned), cached by name only so
+            // unregister/re-register stays correct; the read goes through the
+            // store's reactive state, so the effect tracks it and re-runs on
+            // store changes without requiring subscribe:.
+            // Detection is independent of the resolved value (a collision
+            // resolves component state, so a value gate would never let the
+            // WF-512 note fire); the store READ below stays gated on the
+            // value.
+            if (meta.type === 'model' && meta._storeAlias === undefined) {
+                    meta._storeAlias = null;
+                    const dot = meta.path.indexOf('.');
+                    if (dot > 0) {
+                        const root = meta.path.slice(0, dot);
+                        if (this.storeManager?.getStoreComponentByName(root)) {
+                            // Component-first, the same
+                            // discriminator as the write path: a root the
+                            // component's own state declares is component
+                            // scope, and the same-named store is never read —
+                            // without this, a state-owned root whose leaf was
+                            // still undefined painted the STORE's value into
+                            // a component-state input. The store alias is the
+                            // fallback for unowned roots only.
+                            const ownState = instance.state;
+                            const rootOwned = ownState != null && (root in ownState);
+                            if (!rootOwned) {
+                                meta._storeAlias = root;
+                                meta._storeFieldPath = meta.path.slice(dot + 1).split('.');
+                            } else if (__DEV__) {
+                                // WF-512: a name serving two masters is
+                                // confusing even now that it is coherent —
+                                // say once, per component and root, which
+                                // one wins.
+                                if (!instance._warnedModelShadow) instance._warnedModelShadow = new Set();
+                                if (!instance._warnedModelShadow.has(root)) {
+                                    instance._warnedModelShadow.add(root);
+                                    wfError(WF_ERRORS.MODEL_STORE_SHADOW, {
+                                        warn: true,
+                                        context: `data-model="${meta.path}": the component's own state declares "${root}", so this binds component state; the store named "${root}" is not involved`,
+                                        suggestion: 'Rename the state key or the store if you meant the store-backed form pattern'
+                                    });
+                                }
+                            }
+                        }
+                    }
+            }
+            if (meta.type === 'model' && value === undefined && meta._storeAlias) {
+                const sc = this.storeManager.getStoreComponentByName(meta._storeAlias);
+                if (sc) {
+                    let v = sc.state;
+                    const segs = meta._storeFieldPath;
+                    for (let s = 0; s < segs.length && v != null; s++) v = v[segs[s]];
+                    value = v;
+                }
             }
 
             // Update the DOM based on binding type
@@ -2271,17 +2538,13 @@ export const RenderingCoreMethods = {
      * @private
      */
     _buildRenderMeta(context, instance) {
-        let expr = context.path;
-        if (expr.startsWith('computed:!')) expr = '!' + expr.slice(10);
-        else if (expr.startsWith('computed:')) expr = expr.slice(9);
-        const negate = expr.startsWith('!');
-        const cleanPath = negate ? expr.slice(1) : expr;
+        const parsed = this._parseConditionPath(context.path);
         return {
             element: context.element,
             type: 'render',
-            path: cleanPath,
-            negate,
-            isExpression: this.isExpression(cleanPath) || cleanPath.includes('$'),
+            path: parsed.path,
+            negate: parsed.negate,
+            isExpression: parsed.isExpression,
             context
         };
     },
@@ -2296,7 +2559,57 @@ export const RenderingCoreMethods = {
      * @returns {*} The resolved value
      * @private
      */
-    _resolveEffectExpression(path, instance) {
+    /**
+     * WF-997: a binding inside a record-shape query subtree naming something
+     * neither the row nor the component provides. Scope-merge makes almost
+     * everything resolve, so what is left is a genuine authoring miss (a typo,
+     * or a field the endpoint does not return) that renders empty in silence.
+     *
+     * Only runs once per element, only in dev, and only once a row exists, so
+     * "still loading" is never mistaken for "misspelled". Precision matters
+     * more than coverage here: firing on correct code is the WF-975/976 shape
+     * this project ruled against. Identifiers preceded by a dot (member access
+     * like .toLocaleDateString) and followed by a colon (object-literal keys
+     * like {href: ...}) are skipped, string literals are stripped first, and
+     * known globals are excluded. Anything ambiguous is left alone.
+     * @private
+     */
+    _warnRecordFieldMisses(element, path, scopeState) {
+        if (!path || typeof path !== 'string') return;
+        // Strip string literals, then $name.path store shorthands. A shorthand
+        // resolves through external() and names an entity, not a scope field,
+        // so scanning it reports the query's own name as a missing field. Entity
+        // names may contain hyphens, which would also split into fragments.
+        const stripped = path
+            .replace(/'[^']*'|"[^"]*"|`[^`]*`/g, '')
+            .replace(/\$[A-Za-z_][\w-]*(?:\.[\w.]+)*/g, '');
+        const GLOBALS = this._recordDiagGlobals || (this._recordDiagGlobals = new Set([
+            'true', 'false', 'null', 'undefined', 'NaN', 'Infinity', 'typeof',
+            'instanceof', 'new', 'this', 'in', 'void', 'delete',
+            'Math', 'Date', 'String', 'Number', 'Boolean', 'Array', 'Object',
+            'JSON', 'RegExp', 'Map', 'Set', 'Intl', 'parseInt', 'parseFloat',
+            'isNaN', 'isFinite', 'encodeURIComponent', 'decodeURIComponent',
+            'external', 'computed'
+        ]));
+        const missing = [];
+        const re = /(^|[^.\w$'"`])([A-Za-z_$][\w$]*)\s*(:?)/g;
+        let m;
+        while ((m = re.exec(stripped)) !== null) {
+            const name = m[2];
+            if (m[3] === ':') continue;            // object-literal key
+            if (GLOBALS.has(name)) continue;
+            if (name in scopeState) continue;
+            if (missing.indexOf(name) === -1) missing.push(name);
+        }
+        if (missing.length === 0) return;
+        wfError(WF_ERRORS.QUERY_RECORD_FIELD_MISSING, {
+            warn: true,
+            context: `Query "${element._wfRecordQuery}": the binding "${path}" names ${missing.map((n) => `"${n}"`).join(', ')}, which the row and the component both lack; it renders empty`,
+            suggestion: 'Check the spelling against the row the endpoint returns. A field the server only sometimes sends needs a fallback in the expression'
+        });
+    },
+
+    _resolveEffectExpression(path, instance, element) {
         const stateManager = instance.stateManager;
 
         // Normalize $store.path → external('store', 'path')
@@ -2315,7 +2628,26 @@ export const RenderingCoreMethods = {
             ? { external: this._getExternalFn(instance) }
             : undefined;
 
-        return this.evaluateExpression(normalized, instance.state || {}, {
+        // Record-shape query subtree: merge the single row into scope so a bare
+        // field name resolves the same way it does inside a data-list template
+        // (BindingResolver's item branch does `{...componentState, ...item}`).
+        // The row shadows component state, matching that precedent. Reading the
+        // row through the store facade inside the effect is what registers the
+        // dependency, so a new row re-runs these bindings.
+        let scopeState = instance.state || {};
+        if (__FEATURE_QUERY__ && element && element._wfRecordQuery && this.getStore) {
+            const rowStore = this.getStore(element._wfRecordQuery);
+            const rows = rowStore && rowStore.rows;
+            if (rows && rows.length > 0 && rows[0] && typeof rows[0] === 'object') {
+                scopeState = Object.assign({}, scopeState, rows[0]);
+                if (__DEV__ && !element._wfRecordChecked) {
+                    element._wfRecordChecked = true;
+                    this._warnRecordFieldMisses(element, path, scopeState);
+                }
+            }
+        }
+
+        return this.evaluateExpression(normalized, scopeState, {
             stateManager: stateManager,
             cacheKey: 'effect',
             additionalContext
@@ -2461,12 +2793,9 @@ export const RenderingCoreMethods = {
         const componentId = componentEl.dataset && componentEl.dataset.componentId;
         if (!componentId) return true;
         const instance = this.componentInstances.get(componentId);
-        if (!instance || !this._resolveEffectExpression) return true;
+        if (!instance || !this._conditionVerdict) return true;
         try {
-            const negate = showAttr.charAt(0) === '!';
-            const path = negate ? showAttr.slice(1) : showAttr;
-            const value = this._resolveEffectExpression(path, instance);
-            return negate ? !value : Boolean(value);
+            return this._conditionVerdict(showAttr, instance, el);
         } catch (e) {
             // Fail open: don't hide if evaluation throws (preserves prior behavior
             // where show effect's `continue` left display unchanged on error).
@@ -2509,6 +2838,7 @@ export const RenderingCoreMethods = {
             if (el.style.display !== 'none') el.style.display = 'none';
         }
         el.removeAttribute('data-cloak');
+        el.removeAttribute('data-wf-cloak');
         return true;
     },
 

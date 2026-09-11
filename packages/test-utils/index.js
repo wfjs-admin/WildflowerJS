@@ -243,6 +243,8 @@ export function getFrameworkScripts(mode) {
       return [`${dir}/wildflower.nano.min.js`]
     case 'mini':
       return [`${dir}/wildflower.mini.min.js`]
+    case 'mini-pool':
+      return [`${dir}/wildflower.mini-pool.min.js`]
     case 'lite':
       return [`${dir}/wildflower.lite.min.js`]
     case 'spa':
@@ -256,6 +258,8 @@ export function getFrameworkScripts(mode) {
       return [`${dir}/wildflower.nano.min.js`]
     case 'mini-min':
       return [`${dir}/wildflower.mini.min.js`]
+    case 'mini-pool-min':
+      return [`${dir}/wildflower.mini-pool.min.js`]
     case 'lite-min':
       return [`${dir}/wildflower.lite.min.js`]
     case 'spa-min':
@@ -271,6 +275,8 @@ export function getFrameworkScripts(mode) {
       return [`${dir}/wildflower.nano.dev.js`]
     case 'mini-dev':
       return [`${dir}/wildflower.mini.dev.js`]
+    case 'mini-pool-dev':
+      return [`${dir}/wildflower.mini-pool.dev.js`]
     case 'lite-dev':
       return [`${dir}/wildflower.lite.dev.js`]
     case 'spa-dev':
@@ -284,6 +290,8 @@ export function getFrameworkScripts(mode) {
       return [`${dir}/wildflower.nano.js`]
     case 'mini-raw':
       return [`${dir}/wildflower.mini.js`]
+    case 'mini-pool-raw':
+      return [`${dir}/wildflower.mini-pool.js`]
     case 'lite-raw':
       return [`${dir}/wildflower.lite.js`]
     case 'spa-raw':
@@ -373,7 +381,7 @@ export function hasFeature(feature) {
   // on all variants. Same for CSP evaluation (never listed here).
   const liteStrippedFeatures = ['portals', 'transitions', 'modals', 'plugins']
 
-  if ((baseMode === 'lite' || baseMode === 'mini' || baseMode === 'nano') && liteStrippedFeatures.includes(feature)) {
+  if ((baseMode === 'lite' || baseMode === 'mini' || baseMode === 'mini-pool' || baseMode === 'nano') && liteStrippedFeatures.includes(feature)) {
     return false
   }
 
@@ -390,7 +398,8 @@ export function hasFeature(feature) {
   // Nano is the below-mini widget tier: no data-list render cluster (and the
   // features that ride it — polymorphic templates, scoped-slot read bindings).
   // data-show / data-render / data-model / external() remain (core widget features).
-  if (baseMode === 'nano' && (feature === 'lists' || feature === 'data-list' || feature === 'polymorphic-templates')) {
+  // Mini-pool shares nano's list-less shape (pools in place of lists).
+  if ((baseMode === 'nano' || baseMode === 'mini-pool') && (feature === 'lists' || feature === 'data-list' || feature === 'polymorphic-templates')) {
     return false
   }
 
@@ -405,13 +414,13 @@ export function hasFeature(feature) {
 
   // SSR is only in full builds (and source)
   // Experimental build is based on core, so no SSR
-  if (feature === 'ssr' && (baseMode === 'core' || baseMode === 'nano' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'spa' || baseMode === 'experimental')) {
+  if (feature === 'ssr' && (baseMode === 'core' || baseMode === 'nano' || baseMode === 'mini' || baseMode === 'mini-pool' || baseMode === 'lite' || baseMode === 'spa' || baseMode === 'experimental')) {
     return false
   }
 
   // Router is only in spa and full builds (and source)
   // Experimental build is based on core, so no router
-  if (feature === 'router' && (baseMode === 'core' || baseMode === 'nano' || baseMode === 'mini' || baseMode === 'lite' || baseMode === 'experimental')) {
+  if (feature === 'router' && (baseMode === 'core' || baseMode === 'nano' || baseMode === 'mini' || baseMode === 'mini-pool' || baseMode === 'lite' || baseMode === 'experimental')) {
     return false
   }
 
@@ -637,6 +646,18 @@ export function resetFramework() {
   }
   if (wildflower.componentInstances) {
     wildflower.componentInstances.clear()
+  }
+
+  // Tear down and clear query controllers BEFORE the stores they back.
+  // Without this, controllers (and their poll timers, SSE streams, and
+  // persistence state) leak across resets, and re-registering a query
+  // name from a previous test hits the duplicate guard and resurrects
+  // stale state instead of starting fresh.
+  if (wildflower._queryControllers) {
+    wildflower._queryControllers.forEach((c) => {
+      try { wildflower._queryTeardown(c) } catch { /* mid-flight teardown */ }
+    })
+    wildflower._queryControllers.clear()
   }
 
   // Clear store manager

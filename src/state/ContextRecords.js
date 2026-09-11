@@ -128,17 +128,30 @@ class RenderRecord
             // Scan for nested components first (uses correct initialization path)
             wildflower.scan(newElement);
 
-            // Recreate the component's render effect BEFORE processing inserted
-            // bindings. _processInsertedElement strips data-bind-class (and similar)
-            // attributes after one-time setup, so the effect must collect its
-            // metadata while attributes are still on the DOM.
             const instance = this.componentInstance;
-            if (instance && this._parentIndex === undefined && wildflower._disposeComponentRenderEffect && wildflower._createComponentRenderEffect) {
+            const componentLevel = !!instance && this._parentIndex === undefined;
+
+            // The init pipeline, in init order, for the clone: the query
+            // transform (scope markers, observation, activation), then the
+            // nested data-render records, both BEFORE the render effect is
+            // recreated so the fresh metadata drives them. A nested section
+            // that is false now leaves now, as at init, so its bindings are
+            // never collected.
+            if (componentLevel) this._prepareInsertedSubtree(wildflower);
+
+            // Recreate the component's render effect BEFORE processing inserted
+            // lists and actions, so its metadata is collected against the
+            // subtree as inserted.
+            if (componentLevel && wildflower._disposeComponentRenderEffect && wildflower._createComponentRenderEffect) {
                 // Bump the render token BEFORE recreating: an in-progress render
                 // effect that triggered this insert reads the token after its
                 // _executeRenderForEffect call and bails the stale meta loop, so
                 // the freshly created effect below owns the remaining bindings.
                 instance._renderToken = (instance._renderToken | 0) + 1;
+                // Records of earlier generations (a nested section of a subtree
+                // that has since been removed) point into detached DOM; drop
+                // them so the rescan neither drives nor retains them.
+                this._pruneRenderContexts(instance);
                 // Re-scan DOM for effect metadata (can't reuse init-time _effectMeta
                 // because only the data-render subtree was re-inserted; the full
                 // component needs a fresh scan)
@@ -147,14 +160,88 @@ class RenderRecord
                 wildflower._createComponentRenderEffect(instance);
             }
 
-            // Process bindings and actions within the new element
+            // Process lists, actions and pools within the new element
             this._processInsertedElement(wildflower);
 
             // Process custom directives on the entire re-inserted subtree (only if plugin system is loaded)
             if (wildflower._processCustomDirectivesInSubtree && wildflower._customDirectives && wildflower._customDirectives.size > 0) {
                 wildflower._processCustomDirectivesInSubtree(newElement, this.componentInstance);
             }
+
+            // Portals are set up at component init only. A portal inside this
+            // subtree teleports now (after the effect collected its content's
+            // bindings in place), and its conditions follow the component's
+            // state from here on.
+            if (componentLevel && wildflower._processPortalsInSubtree) {
+                wildflower._processPortalsInSubtree(newElement, instance);
+            }
         }
+    }
+
+    /**
+     * The parts of the init pipeline a re-inserted subtree needs before the
+     * render effect is recreated: the data-query transform and the nested
+     * data-render records. Mirrors _processComponentBindings (transform) and
+     * _processConditionalElements (records pushed to instance._renderContexts
+     * so _collectComponentBindingMeta drives them). Without this, a nested
+     * section was created by _processRenderElement and then dropped, frozen
+     * at its insertion-time verdict, and a record-shape query lost the scope
+     * marker its clone does not carry.
+     * @private
+     */
+    _prepareInsertedSubtree(wildflower) {
+        const root = this.element;
+        const instance = this.componentInstance;
+        if (!root || !instance) return;
+
+        if (__FEATURE_QUERY__ && wildflower._transformQueryElements) {
+            wildflower._transformQueryElements(root, instance);
+        }
+
+        const listSelector = _cmAttrSelector('list');
+        const renderEls = root.querySelectorAll(_cmAttrSelector('render'));
+        for (const el of renderEls) {
+            // Document order puts an outer nested section before the ones
+            // inside it; once it evaluated false and left, skip those.
+            if (!el.isConnected) continue;
+            // Owned by this component (not by a nested component), not slot
+            // content, not a row-level conditional (item-scoped, list-owned).
+            const closest = wildflower._getComponentElement(el);
+            if (closest && closest !== instance.element && root.contains(closest)) continue;
+            if (el.closest('[data-use-template-rendered]')) continue;
+            const container = el.parentElement ? el.parentElement.closest(listSelector) : null;
+            if (container && instance.element.contains(container)) continue;
+            const path = _cmGetAttr(el, 'render');
+            if (!path) continue;
+            const ctx = wildflower._processDataRenderElement(el, path, instance);
+            if (ctx) (instance._renderContexts || (instance._renderContexts = [])).push(ctx);
+        }
+    }
+
+    /**
+     * Drop render records that belong to a removed generation: their element
+     * or placeholder sits under a subtree data-render took out (marked
+     * _wfRenderHidden at removal), so they are outside the component now.
+     * A section detached by other code carries no mark and keeps its record.
+     * @private
+     */
+    _pruneRenderContexts(instance) {
+        const list = instance._renderContexts;
+        if (!list || list.length === 0) return;
+        const rootEl = instance.element;
+        const stale = (ctx) => {
+            const node = ctx && (ctx.element || ctx.placeholder);
+            if (!node || node === rootEl || rootEl.contains(node)) return false;
+            for (let cur = node; cur; cur = cur.parentNode) {
+                if (cur._wfRenderHidden) return true;
+            }
+            return false;
+        };
+        let write = 0;
+        for (let i = 0; i < list.length; i++) {
+            if (!stale(list[i])) list[write++] = list[i];
+        }
+        list.length = write;
     }
 
     /**
@@ -173,6 +260,9 @@ class RenderRecord
         // Clean up nested components and directives before removing
         const wildflower = this._wf;
         if (wildflower) {
+            // The render effect keeps evaluating the bindings of this subtree
+            // until insertion re-creates it; mark them so it skips them.
+            if (wildflower._markHiddenRenderMetas) wildflower._markHiddenRenderMetas(this.componentInstance, this.element);
             this._cleanupNestedContent(wildflower);
             // Clean up custom directives on this element and its children
             if (wildflower._cleanupCustomDirectivesInSubtree) {
@@ -193,10 +283,13 @@ class RenderRecord
 
         // Only process bindings the render effect does NOT handle.
         // The effect (recreated before this method) owns: bind, bind-html,
-        // show, class, style, attr, model. We only need to set up render
-        // (conditional DOM insertion), list, and action (event handlers).
+        // show, class, style, attr, model, and (component level) the nested
+        // data-render records _prepareInsertedSubtree registered. We only
+        // need to set up list, action (event handlers) and pool here; a
+        // row-level record still creates its nested render records here.
+        const componentLevel = this._parentIndex === undefined;
         const selector = [
-            _cmAttrSelector('render'), _cmAttrSelector('list'), _cmAttrSelector('action')
+            _cmAttrSelector('render'), _cmAttrSelector('list'), _cmAttrSelector('action'), _cmAttrSelector('pool')
         ].join(', ');
         const queried = this.element.querySelectorAll(selector);
 
@@ -205,15 +298,38 @@ class RenderRecord
             const closest = wildflower._getComponentElement(el);
             if (closest && closest !== instance.element && this.element.contains(closest)) return;
 
-            if (_cmHasAttr(el, 'render')) this._processRenderElement(el, wildflower);
+            if (!componentLevel && _cmHasAttr(el, 'render')) this._processRenderElement(el, wildflower);
             if (_cmHasAttr(el, 'list')) this._processListElement(el, wildflower);
             if (_cmHasAttr(el, 'action')) this._processActionElement(el, wildflower);
+            if (_cmHasAttr(el, 'pool')) this._processPoolElement(el);
         };
 
         processEl(this.element);
         queried.forEach(processEl);
 
         if (wildflower._processSlotTemplates) wildflower._processSlotTemplates(instance);
+    }
+
+    /**
+     * Re-bind a data-pool container inside a re-inserted data-render block.
+     * Pools are set up once at component init (_setupPools) and the handle
+     * keeps rendering into the container it was given, so after a toggle the
+     * entities lived in the detached first-generation element and the fresh
+     * clone stayed empty. The handle already compiled the template, so drop
+     * the clone's copy and adopt the live entity elements in order (the pool
+     * addresses its children by index).
+     * @private
+     */
+    _processPoolElement(el) {
+        const path = _cmGetAttr(el, 'pool');
+        const instance = this.componentInstance;
+        const handle = path && instance && instance._pools && instance._pools.get(path);
+        if (!handle || !handle._container || handle._container === el) return;
+        const template = el.querySelector(':scope > template');
+        if (template) template.remove();
+        const previous = handle._container;
+        while (previous.firstChild) el.appendChild(previous.firstChild);
+        handle._container = el;
     }
 
     /**
@@ -232,9 +348,22 @@ class RenderRecord
             componentId: instance.id
         };
 
-        // Register in domElements so the list system can find it
+        // Register in domElements so the list system can find it. Prune this
+        // component's entries whose element has left the document first: each
+        // reveal registers a fresh entry for the cloned subtree, and every
+        // later scan re-walks the whole registry (_mountLists), so without
+        // the prune the registry grew by one detached list per toggle.
         if (!wildflower.domElements.lists) wildflower.domElements.lists = [];
-        wildflower.domElements.lists.push(listEntry);
+        const lists = wildflower.domElements.lists;
+        let write = 0;
+        for (let i = 0; i < lists.length; i++) {
+            const entry = lists[i];
+            const stale = entry && entry.componentId === instance.id &&
+                entry.element && !entry.element.isConnected;
+            if (!stale) lists[write++] = entry;
+        }
+        lists.length = write;
+        lists.push(listEntry);
 
         // Trigger list mounting
         wildflower._mountLists([listEntry], instance);
@@ -317,6 +446,14 @@ class RenderRecord
     {
         if (!this.element) return;
 
+        // Withdraw this component's portals whose source sits in the removed
+        // subtree. The teleported content would otherwise stay on the page
+        // after the section left, and re-insertion would teleport the
+        // clone's copy beside it.
+        if (wildflower._withdrawPortalsInSubtree) {
+            wildflower._withdrawPortalsInSubtree(this.element, this.componentInstance);
+        }
+
         // Find and destroy nested components
         const nestedComponents = this.element.querySelectorAll('[data-component-id]');
         nestedComponents.forEach(compEl => {
@@ -325,6 +462,26 @@ class RenderRecord
                 wildflower._destroyComponentQuiet(compId);
             }
         });
+
+        // Dispose the data-list reconcilers in this subtree, the element itself
+        // included. Re-insertion clones the template and mounts a fresh list,
+        // so a removed list's structural effect would otherwise stay subscribed
+        // to its source and reconcile off-DOM for the life of the component
+        // (one orphaned effect per toggle; for a data-query list, one that
+        // re-stamps the query as observed and keeps it polling). The wrapped
+        // dispose cascades into nested lists; the component-destroy cleanups
+        // registered at list init are idempotent, so running them later is safe.
+        // Lists of the nested components destroyed above are already gone.
+        const listSelector = _cmAttrSelector('list');
+        const listEls = this.element.querySelectorAll(listSelector);
+        const disposeList = (listEl) => {
+            if (!listEl._disposeMapArray) return;
+            try { listEl._disposeMapArray(); } catch (e) { /* already gone */ }
+            listEl._mapArrayInitialized = false;
+            listEl._disposeMapArray = null;
+        };
+        if (this.element.matches && this.element.matches(listSelector)) disposeList(this.element);
+        listEls.forEach(disposeList);
 
         // Clean up action records for elements within this render element - respects useWfPrefixOnly mode
         const cleanupSelector = [

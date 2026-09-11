@@ -329,51 +329,6 @@ export const ListItemBindingMethods = {
         }
     },
     /**
-     * Build elements array from compiled DOM paths
-     * PERF: Uses pre-computed elementPaths array for single-loop resolution
-     * instead of iterating through 7 separate binding type arrays
-     * @private
-     */
-    _buildElementsArrayFromMetadata(itemEl, compiledMetadata) {
-        const paths = compiledMetadata.elementPaths;
-
-        // FAST PATH: Use pre-computed elementPaths (7x fewer loop iterations)
-        // Instead of looping through bindings, htmlBindings, models, shows, actions,
-        // classBindings, styleBindings separately with undefined checks,
-        // we just resolve each unique element once
-        if (paths && paths.length > 0) {
-            const allElementsArray = new Array(paths.length);
-            // PERF OPTIMIZATION 2.1: Inline element path resolution to eliminate function call overhead
-            // For 1000 items × 5 bindings = 5000 function calls saved
-            for (let i = 0; i < paths.length; i++) {
-                const path = paths[i];
-                const plen = path ? path.length : 0;
-                if (plen === 0) {
-                    allElementsArray[i] = itemEl;
-                    continue;
-                }
-                // Resolve each child index by element node-pointers
-                // (firstElementChild + nextElementSibling) rather than fetching the live
-                // HTMLCollection (current.children) and indexing it per hop. elementPaths
-                // are element-child indices, and *ElementSibling traverse element-only
-                // nodes, so this is semantically identical to children[idx] (text/comment
-                // nodes excluded the same way) while avoiding the collection wrapper +
-                // index walk on each step (~58% faster per row at create10k).
-                let current = itemEl;
-                for (let p = 0; p < plen; p++) {
-                    let next = current.firstElementChild;
-                    for (let k = path[p]; k > 0 && next; k--) next = next.nextElementSibling;
-                    if (!next) { current = null; break; }
-                    current = next;
-                }
-                allElementsArray[i] = current;
-            }
-            return allElementsArray;
-        }
-
-        return [];
-    },
-    /**
      * Check if element is a custom element and apply its adapter.
      * Returns true if handled (caller should skip normal binding).
      * @private
@@ -1083,72 +1038,180 @@ export const ListItemBindingMethods = {
 
         const el = instance.element;
 
-        // Helper to detect external dependencies: both external() and $store.path shorthand
-        const hasExternalRef = (expr) => expr.includes('external(') || /\$[a-zA-Z]/.test(expr);
+        const buckets = this._collectStandaloneExternalBindings(el);
 
-        // Helper to check if an element is inside a list
+        if (__DEV__) {
+            // Differential oracle: the pre-2026-08-24 selector-and-filter
+            // implementation kept verbatim, run alongside the pruning walk on
+            // identical DOM in the same tick. Divergence in membership OR order
+            // means the retained-set characterization the walk is built on is
+            // incomplete, which is the only thing that could make this change
+            // unsafe. Dev-only; stripped from production builds.
+            this._assertStandaloneCollectorsAgree(el, buckets);
+        }
+
+        // Application order is load-bearing and unchanged: attr, root attr,
+        // bind, class, style, html. Collecting up front is only equivalent
+        // because _executeFallbackBindHtml is the sole structure-mutating
+        // application and runs last, so no earlier pass can alter what a later
+        // query would have matched.
+        for (let i = 0; i < buckets.attr.length; i++) {
+            const bindEl = buckets.attr[i];
+            // Standalone element - pass null for list-specific context
+            this._processAttrBinding(bindEl, instance.state, this._getAttr(bindEl, 'bind-attr'), 0, null);
+        }
+
+        // Also check the component root element itself. NOTE: only bind-attr is
+        // checked on the root — a root carrying data-bind/-class/-style/-html
+        // with an external ref has never been refreshed here. That asymmetry is
+        // preserved deliberately; adding the missing kinds is a behavior change
+        // and must not ride along with a walk-equivalence refactor.
+        const rootAttrExpr = this._getAttr(el, 'bind-attr');
+        if (rootAttrExpr && this._hasExternalRefExpr(rootAttrExpr)) {
+            this._processAttrBinding(el, instance.state, rootAttrExpr, 0, null);
+        }
+
+        for (let i = 0; i < buckets.bind.length; i++) {
+            const bindEl = buckets.bind[i];
+            const isInput = bindEl.tagName === 'INPUT' || bindEl.tagName === 'TEXTAREA' || bindEl.tagName === 'SELECT';
+            this._executeFallbackBind(bindEl, instance.state, this._getAttr(bindEl, 'bind'), isInput, null, 0);
+        }
+
+        for (let i = 0; i < buckets.cls.length; i++) {
+            const bindEl = buckets.cls[i];
+            this._processOptimizedClassBinding(bindEl, instance.state, this._getAttr(bindEl, 'bind-class'), 0, null);
+        }
+
+        for (let i = 0; i < buckets.style.length; i++) {
+            const bindEl = buckets.style[i];
+            this._processStyleBinding(bindEl, instance.state, this._getAttr(bindEl, 'bind-style'), 0, null);
+        }
+
+        for (let i = 0; i < buckets.html.length; i++) {
+            const bindEl = buckets.html[i];
+            this._executeFallbackBindHtml(bindEl, instance.state, this._getAttr(bindEl, 'bind-html'), null, 0);
+        }
+    },
+    /**
+     * True when a binding expression references external state, by either
+     * spelling: `external(...)` or the `$store.path` shorthand.
+     * @private
+     */
+    _hasExternalRefExpr(expr) {
+        return expr.includes('external(') || /\$[a-zA-Z]/.test(expr);
+    },
+    /**
+     * Collect the standalone (non-list-interior) external bindings under a
+     * component root, one pre-order walk, five buckets in document order.
+     *
+     * Replaces five whole-subtree querySelectorAll calls that matched every
+     * list row's bindings and then discarded them via a per-match parent-chain
+     * rescan — O(all DOM) per store write, which a 1,000-row list turned into
+     * ~113ns/row of pure waste (measured 2026-08-24).
+     *
+     * The retained set is defined exactly as the old filter defined it:
+     * descendants of `el` carrying the binding attribute, whose expression
+     * references external state, and with no element STRICTLY BETWEEN the node
+     * and `el` carrying a `list` attribute. Two consequences the walk must
+     * honor, both load-bearing:
+     *   - A node is TESTED BEFORE its subtree is pruned. The old `isInsideList`
+     *     started at `element.parentElement`, so a list root that also carries
+     *     a binding (`<ul data-list="rows" data-bind-class="external(theme)">`)
+     *     was retained. Pruning before testing — what a TreeWalker with
+     *     FILTER_REJECT would do — silently stops refreshing it.
+     *   - The walk is seeded from `el.children`, never `el` itself, because the
+     *     old parent loop stopped AT `el` and so never consulted `el`'s own
+     *     list attribute. A component root that is itself a list still has its
+     *     descendants refreshed.
+     * `_getAttr` is used rather than an attribute selector so prefix-alias
+     * handling cannot drift from the old filter's. `.children` excludes
+     * `<template>` content, matching querySelectorAll.
+     * @private
+     */
+    _collectStandaloneExternalBindings(el) {
+        const buckets = { attr: [], bind: [], cls: [], style: [], html: [] };
+        const stack = [];
+        // Seed in reverse so the stack pops in document order.
+        for (let i = el.children.length - 1; i >= 0; i--) stack.push(el.children[i]);
+
+        while (stack.length > 0) {
+            const node = stack.pop();
+
+            const attrExpr = this._getAttr(node, 'bind-attr');
+            if (attrExpr && this._hasExternalRefExpr(attrExpr)) buckets.attr.push(node);
+            const bindExpr = this._getAttr(node, 'bind');
+            if (bindExpr && this._hasExternalRefExpr(bindExpr)) buckets.bind.push(node);
+            const clsExpr = this._getAttr(node, 'bind-class');
+            if (clsExpr && this._hasExternalRefExpr(clsExpr)) buckets.cls.push(node);
+            const styleExpr = this._getAttr(node, 'bind-style');
+            if (styleExpr && this._hasExternalRefExpr(styleExpr)) buckets.style.push(node);
+            const htmlExpr = this._getAttr(node, 'bind-html');
+            if (htmlExpr && this._hasExternalRefExpr(htmlExpr)) buckets.html.push(node);
+
+            // Prune AFTER testing: this node's own bindings still count, its
+            // descendants are list interior and belong to the sibling walk.
+            if (this._getAttr(node, 'list')) continue;
+
+            for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]);
+        }
+        return buckets;
+    },
+    /**
+     * Dev-only differential oracle for _collectStandaloneExternalBindings.
+     *
+     * Reproduces the pre-2026-08-24 selector-and-filter collection verbatim
+     * (five whole-subtree queries, per-match parent-chain `isInsideList`) and
+     * asserts the pruning walk retained the same elements in the same order,
+     * per kind. Both run on identical DOM in the same tick, so any divergence
+     * is a real characterization error rather than a timing artifact.
+     *
+     * Emits a console.error rather than throwing: a divergence must be loud and
+     * must fail a test asserting a clean console, but must not take down an app
+     * running a dev build. Stripped entirely from production.
+     * @private
+     */
+    _assertStandaloneCollectorsAgree(el, walked) {
         const isInsideList = (element) => {
             let parent = element.parentElement;
             while (parent && parent !== el) {
-                if (this._getAttr(parent, 'list')) {
-                    return true;
-                }
+                if (this._getAttr(parent, 'list')) return true;
                 parent = parent.parentElement;
             }
             return false;
         };
-
-        // Find all attr bindings with external refs that are NOT inside lists
-        const attrBindings = el.querySelectorAll('[data-bind-attr],[data-wf-bind-attr]');
-        attrBindings.forEach(bindEl => {
-            const attrExpr = this._getAttr(bindEl, 'bind-attr');
-            if (attrExpr && hasExternalRef(attrExpr) && !isInsideList(bindEl)) {
-                // Standalone element - pass null for list-specific context
-                this._processAttrBinding(bindEl, instance.state, attrExpr, 0, null);
+        const legacyFor = (selector, attr) => {
+            const out = [];
+            const found = el.querySelectorAll(selector);
+            for (let i = 0; i < found.length; i++) {
+                const node = found[i];
+                const expr = this._getAttr(node, attr);
+                if (expr && this._hasExternalRefExpr(expr) && !isInsideList(node)) out.push(node);
             }
-        });
-
-        // Also check the component root element itself
-        const rootAttrExpr = this._getAttr(el, 'bind-attr');
-        if (rootAttrExpr && hasExternalRef(rootAttrExpr)) {
-            this._processAttrBinding(el, instance.state, rootAttrExpr, 0, null);
+            return out;
+        };
+        const legacy = {
+            attr: legacyFor('[data-bind-attr],[data-wf-bind-attr]', 'bind-attr'),
+            bind: legacyFor('[data-bind],[data-wf-bind]', 'bind'),
+            cls: legacyFor('[data-bind-class],[data-wf-bind-class]', 'bind-class'),
+            style: legacyFor('[data-bind-style],[data-wf-bind-style]', 'bind-style'),
+            html: legacyFor('[data-bind-html],[data-wf-bind-html]', 'bind-html'),
+        };
+        const kinds = ['attr', 'bind', 'cls', 'style', 'html'];
+        for (let k = 0; k < kinds.length; k++) {
+            const kind = kinds[k];
+            const a = walked[kind], b = legacy[kind];
+            let same = a.length === b.length;
+            if (same) {
+                for (let i = 0; i < a.length; i++) {
+                    if (a[i] !== b[i]) { same = false; break; }
+                }
+            }
+            if (!same) {
+                console.error('[WF standalone-external collector divergence] kind=' + kind +
+                    ' walk=' + a.length + ' legacy=' + b.length +
+                    ' — the pruning walk and the legacy selector filter disagree; ' +
+                    'the retained-set characterization is incomplete. Component:', el);
+            }
         }
-
-        // Handle other binding types that might have external refs - text bindings
-        const textBindings = el.querySelectorAll('[data-bind],[data-wf-bind]');
-        textBindings.forEach(bindEl => {
-            const bindPath = this._getAttr(bindEl, 'bind');
-            if (bindPath && hasExternalRef(bindPath) && !isInsideList(bindEl)) {
-                const isInput = bindEl.tagName === 'INPUT' || bindEl.tagName === 'TEXTAREA' || bindEl.tagName === 'SELECT';
-                this._executeFallbackBind(bindEl, instance.state, bindPath, isInput, null, 0);
-            }
-        });
-
-        // Class bindings
-        const classBindings = el.querySelectorAll('[data-bind-class],[data-wf-bind-class]');
-        classBindings.forEach(bindEl => {
-            const expr = this._getAttr(bindEl, 'bind-class');
-            if (expr && hasExternalRef(expr) && !isInsideList(bindEl)) {
-                this._processOptimizedClassBinding(bindEl, instance.state, expr, 0, null);
-            }
-        });
-
-        // Style bindings
-        const styleBindings = el.querySelectorAll('[data-bind-style],[data-wf-bind-style]');
-        styleBindings.forEach(bindEl => {
-            const styleExpr = this._getAttr(bindEl, 'bind-style');
-            if (styleExpr && hasExternalRef(styleExpr) && !isInsideList(bindEl)) {
-                this._processStyleBinding(bindEl, instance.state, styleExpr, 0, null);
-            }
-        });
-
-        // HTML bindings
-        const htmlBindings = el.querySelectorAll('[data-bind-html],[data-wf-bind-html]');
-        htmlBindings.forEach(bindEl => {
-            const htmlPath = this._getAttr(bindEl, 'bind-html');
-            if (htmlPath && hasExternalRef(htmlPath) && !isInsideList(bindEl)) {
-                this._executeFallbackBindHtml(bindEl, instance.state, htmlPath, null, 0);
-            }
-        });
     },
 };

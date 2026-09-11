@@ -84,7 +84,20 @@ export const FormHandlingMethods = {
             const firstDot = modelPath.indexOf('.');
             if (firstDot > 0) {
                 const possibleStoreName = modelPath.slice(0, firstDot);
-                const storeComponent = this.storeManager?.getStoreComponentByName(possibleStoreName);
+                // Component-first: a bare name is component
+                // scope everywhere in the framework, so a root the
+                // component's own state declares binds COMPONENT state and
+                // the same-named store is never touched. The store route is
+                // the FALLBACK for roots the component does not own — the
+                // store-backed form pattern ($store.path is refused in
+                // data-model, WF-501, so the bare root is its only store
+                // spelling). Same discriminator as the state→DOM mirror in
+                // RenderingCore, so both directions of data-model tell one
+                // story; before this, a collision sent keystrokes to the
+                // store while the repaint read state's empty string.
+                const ownState = context.componentInstance.state;
+                const rootOwned = ownState != null && (possibleStoreName in ownState);
+                const storeComponent = rootOwned ? null : this.storeManager?.getStoreComponentByName(possibleStoreName);
                 if (storeComponent) {
                     // Route to store state
                     const storePath = modelPath.slice(firstDot + 1);

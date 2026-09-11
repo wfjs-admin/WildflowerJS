@@ -152,6 +152,13 @@ const configs = [
     { entry: 'index.nano.js', file: 'wildflower.nano.dev.js',  features: FEATURES_NANO, dev: true,  minify: true,  mangleProps: false, footer: 'core' },
     { entry: 'index.nano.js', file: 'wildflower.nano.min.js',  features: FEATURES_NANO, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
 
+    // MINI-POOL (mini's composition with pools in place of lists) — the lean
+    // games/simulation tier. Same FEATURES_NANO flags: __FEATURE_LISTS__ = false
+    // folds list call-sites out; PoolRenderer comes in via the entry point.
+    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.js',     features: FEATURES_NANO, dev: true,  minify: false, mangleProps: false, footer: 'core' },
+    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.dev.js', features: FEATURES_NANO, dev: true,  minify: true,  mangleProps: false, footer: 'core' },
+    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.min.js', features: FEATURES_NANO, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
+
     // CORE
     { entry: 'index.js',      file: 'wildflower.js',           features: FEATURES_ALL,  dev: true,  minify: false, mangleProps: false, footer: 'core' },
     { entry: 'index.js',      file: 'wildflower.dev.js',       features: FEATURES_ALL,  dev: true,  minify: true,  mangleProps: false, footer: 'core' },

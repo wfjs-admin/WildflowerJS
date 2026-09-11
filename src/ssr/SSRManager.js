@@ -173,6 +173,20 @@ export class SSRManager {
     constructor(wildflower) {
         this.wildflower = wildflower;
 
+        /**
+         * Prefix-aware attribute access, delegated to the core.
+         *
+         * SSR reads the page's markup the same way scanning does, so it has
+         * to honor `data-wf-*` and exclusive mode identically. These delegate
+         * rather than hand-rolling `dataset.x || dataset.wfX`, which is how
+         * this file drifted: a few selectors matched both prefixes while the
+         * reads beside them matched one, so a prefixed page adopted nothing
+         * and the bindings then overwrote the server's own HTML with empty
+         * declared state.
+         */
+        this._sel = (baseName, value) => wildflower._attrSelector(baseName, value);
+        this._attr = (el, baseName) => wildflower._getAttr(el, baseName);
+
         // Protection tracking
         this.protectedElements = new Set();     // elements protected from framework ops
         this.ssrComponents = new Map();         // component -> SSR data
@@ -248,7 +262,7 @@ export class SSRManager {
     _registerContentProtectionHook() {
         this.wildflower.addBeforeContentUpdateHook((element, newValue) => {
             // Find the closest SSR component ancestor
-            const ssrComponent = element.closest('[data-ssr="true"]');
+            const ssrComponent = element.closest(this._sel('ssr', 'true'));
 
             // Protect during PROTECTED phase (before activation)
             if (ssrComponent && ssrComponent._ssrPhase === SSRPhase.PROTECTED) {
@@ -283,8 +297,7 @@ export class SSRManager {
         const isSSR = this.config.enabled &&
             element &&
             element.hasAttribute &&
-            element.hasAttribute('data-ssr') &&
-            element.getAttribute('data-ssr') === 'true';
+            this._attr(element, 'ssr') === 'true';
 
         return isSSR;
     }
@@ -336,13 +349,13 @@ export class SSRManager {
         // [data-query] elements transform into data-list during component
         // init (after this protection pass), so they must be protected by
         // their own attribute here for the SSR handoff to hold.
-        const listElements = element.querySelectorAll('[data-list], [data-wf-list], [data-query], [data-wf-query]');
+        const listElements = element.querySelectorAll(this._sel('list') + ',' + this._sel('query'));
         listElements.forEach(listEl => {
             listEl._ssrPhase = SSRPhase.PROTECTED;
             ssrAdoptedElements.add(listEl);
             this.protectedLists.add(listEl);
             this.stats.listsProtected++;
-            this._log('Protected SSR list:', listEl.dataset.list || listEl.dataset.wfList);
+            this._log('Protected SSR list:', this._attr(listEl, 'list'));
         });
     }
 
@@ -390,11 +403,11 @@ export class SSRManager {
      * Only protect during PROTECTED phase, then hand off to framework
      */
     shouldSkipBindingUpdate(element) {
-        const ssrComponent = element.closest('[data-ssr="true"]');
+        const ssrComponent = element.closest(this._sel('ssr', 'true'));
         if (!ssrComponent) return false;
 
         // Check if this element is inside an SSR list in PROTECTED phase
-        const ssrList = element.closest('[data-list]');
+        const ssrList = element.closest(this._sel('list'));
         if (ssrList && ssrList._ssrPhase === SSRPhase.PROTECTED) {
             return true; // Protect during PROTECTED phase only
         }
@@ -456,16 +469,28 @@ export class SSRManager {
      * Transitions lists to COMPLETE phase
      */
     _activateListsInComponent(element) {
-        const listElements = element.querySelectorAll('[data-list], [data-wf-list], [data-query], [data-wf-query]');
+        const listElements = element.querySelectorAll(this._sel('list') + ',' + this._sel('query'));
         listElements.forEach(listEl => {
             if (listEl._ssrPhase === SSRPhase.PROTECTED) {
+
+                // Framework init mounts lists before it schedules activation, so
+                // adopted rows are hydrated (row metadata, per-row bindings,
+                // nested component props) by the time the list is handed off.
+                // A late-registered component races two timers instead, and
+                // activation can win: the list would then be marked rendered
+                // without ever being hydrated. Mount it now, in that same
+                // order, if the first render pass has not reached it yet.
+                if (!listEl._initialRenderDone && this.wildflower._mountLists) {
+                    const entry = (this.wildflower.domElements?.lists || []).find(l => l.element === listEl);
+                    if (entry) this.wildflower._mountLists([entry]);
+                }
 
                 // Mark as already rendered so framework won't re-render
                 listEl._initialRenderDone = true;
 
                 // Set initial fingerprint based on current SSR content to detect future changes
-                const listName = listEl.dataset.list;
-                const componentElement = listEl.closest('[data-component]');
+                const listName = this._attr(listEl, 'list');
+                const componentElement = listEl.closest(this._sel('component'));
                 if (componentElement) {
                     const instance = this.wildflower.componentInstances.get(componentElement.dataset.componentId);
                     let data = null;
@@ -482,8 +507,12 @@ export class SSRManager {
                         }
                     }
                     if (data) {
-                        // Calculate initial fingerprint for SSR data
-                        listEl._lastDataFingerprint = this.wildflower._getDataFingerprint(data);
+                        // Calculate initial fingerprint for SSR data. _getDataFingerprint
+                        // is list-only (ssr-list.js) — absent when the list feature isn't
+                        // built in (e.g. SSR + data-query with no data-list on the page).
+                        if (this.wildflower._getDataFingerprint) {
+                            listEl._lastDataFingerprint = this.wildflower._getDataFingerprint(data);
+                        }
                         // Set previous data to enable fast removal optimizations
                         listEl._previousData = [...data];
                     }
@@ -538,7 +567,7 @@ export class SSRManager {
      */
     _addDataIndexToSSRLists(elements = this.protectedElements) {
         elements.forEach(element => {
-            const listElements = element.querySelectorAll('[data-list]');
+            const listElements = element.querySelectorAll(this._sel('list'));
 
             listElements.forEach(listEl => {
                 // Process lists that have been adopted
@@ -563,13 +592,13 @@ export class SSRManager {
      * Clear action contexts for component before re-binding
      */
     _clearActionContextsForComponent(instance) {
-        const actionElements = instance.element.querySelectorAll('[data-action]');
+        const actionElements = instance.element.querySelectorAll(this._sel('action'));
 
         actionElements.forEach(el => {
             // Action records are element-local (el._actionContext), not registered.
             if (el._actionContext) {
                 // CRITICAL: Remove event handlers before clearing the record
-                const actionName = el.dataset.action;
+                const actionName = this._attr(el, 'action');
                 const eventHandlersToRemove = [];
 
                 // Find matching event handlers in the framework's eventHandlers Map
@@ -634,10 +663,10 @@ export class SSRManager {
         this._parseListsIntoState(element, state);
 
         // Then parse individual bindings that are NOT inside lists
-        const bindElements = element.querySelectorAll('[data-bind], [data-model]');
+        const bindElements = element.querySelectorAll(this._sel('bind') + ',' + this._sel('model'));
 
         bindElements.forEach(el => {
-            const path = el.dataset.bind || el.dataset.model;
+            const path = this._attr(el, 'bind') || this._attr(el, 'model');
 
             // Skip computed properties (they're calculated, not stored)
             if (path.startsWith('computed:')) {
@@ -645,7 +674,7 @@ export class SSRManager {
             }
 
             // Skip if this element is inside a list (already parsed)
-            if (el.closest('[data-list]')) {
+            if (el.closest(this._sel('list'))) {
                 return;
             }
 
@@ -672,7 +701,7 @@ export class SSRManager {
      * and by the data-query adoption path (row/record fields).
      */
     _readSeedAttribute(el) {
-        const raw = el.getAttribute && (el.getAttribute('data-seed') || el.getAttribute('data-wf-seed'));
+        const raw = el.getAttribute && this._attr(el, 'seed');
         if (!raw) return null;
         try {
             const parsed = JSON.parse(raw);
@@ -687,16 +716,16 @@ export class SSRManager {
      * Parse lists from SSR DOM into state arrays
      */
     _parseListsIntoState(element, state) {
-        const listElements = element.querySelectorAll('[data-list]');
+        const listElements = element.querySelectorAll(this._sel('list'));
 
         listElements.forEach(listEl => {
             // Only parse TOP-LEVEL lists here. A nested list (one with a [data-list]
             // ancestor inside this component) is parsed recursively into its parent
             // item's state by _parseListElement, NOT flattened into top-level state.
-            if (listEl.parentElement && listEl.parentElement.closest('[data-list]')) {
+            if (listEl.parentElement && listEl.parentElement.closest(this._sel('list'))) {
                 return;
             }
-            pathResolver.set(state, listEl.dataset.list, this._parseListElement(listEl));
+            pathResolver.set(state, this._attr(listEl, 'list'), this._parseListElement(listEl));
         });
     }
 
@@ -723,22 +752,23 @@ export class SSRManager {
             // not clobber the parent item's fields. The item element ITSELF may carry
             // the binding (e.g. <li data-bind="title">); querySelectorAll only matches
             // descendants, so include the item element explicitly.
+            const bindOrModel = this._sel('bind') + ',' + this._sel('model');
             const itemBindings = [
-                ...(itemEl.matches('[data-bind], [data-model]') ? [itemEl] : []),
-                ...itemEl.querySelectorAll('[data-bind], [data-model]')
+                ...(itemEl.matches(bindOrModel) ? [itemEl] : []),
+                ...itemEl.querySelectorAll(bindOrModel)
             ];
             itemBindings.forEach(bindEl => {
-                const path = bindEl.dataset.bind || bindEl.dataset.model;
+                const path = this._attr(bindEl, 'bind') || this._attr(bindEl, 'model');
                 if (path.startsWith('computed:')) return;
-                if (bindEl.closest('[data-list]') !== listEl) return;
+                if (bindEl.closest(this._sel('list')) !== listEl) return;
                 pathResolver.set(itemState, path, this._parseValueFromElement(bindEl));
             });
 
             // First-level nested lists inside this item → recurse into item state.
-            const nestedLists = itemEl.querySelectorAll('[data-list]');
+            const nestedLists = itemEl.querySelectorAll(this._sel('list'));
             nestedLists.forEach(nl => {
-                if (nl.parentElement && nl.parentElement.closest('[data-list]') === listEl) {
-                    pathResolver.set(itemState, nl.dataset.list, this._parseListElement(nl));
+                if (nl.parentElement && nl.parentElement.closest(this._sel('list')) === listEl) {
+                    pathResolver.set(itemState, this._attr(nl, 'list'), this._parseListElement(nl));
                 }
             });
 
@@ -803,7 +833,7 @@ export class SSRManager {
      */
     _setupEventIntegration(instance) {
         // Find action elements and ensure they have event handlers
-        const actionElements = instance.element.querySelectorAll('[data-action]');
+        const actionElements = instance.element.querySelectorAll(this._sel('action'));
         actionElements.forEach(el => {
             // Let normal framework handle action binding
             // We just ensure SSR protection doesn't interfere

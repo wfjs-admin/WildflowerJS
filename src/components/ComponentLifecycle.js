@@ -6,7 +6,7 @@
 
 import { createStateManager } from '../state/createStateManager.js';
 import { RAW_TARGET } from '../state/ContextProxy.js';
-import { objectUtils, pathResolver, wfError, WF_ERRORS } from '../core/wfUtils.js';
+import { objectUtils, pathResolver, wfError, WF_ERRORS, COMPUTED_EVAL } from '../core/wfUtils.js';
 
 // Named constants (replaces magic numbers)
 const LARGE_ARRAY_THRESHOLD = 500;     // Arrays above this size use synchronous render
@@ -109,8 +109,13 @@ export const ComponentLifecycleMethods = {
      */
     _initializeComponentElements(componentName)
     {
-        // Find all elements with matching data-component attribute
-        const elements = this.root.querySelectorAll(`[data-component="${componentName}"]:not([data-component-id])`);
+        // Find all uninitialized elements naming this component, under
+        // either prefix (respects useWfPrefixOnly via _attrSelector).
+        const selector = this._attrSelector('component', componentName)
+            .split(',')
+            .map(s => `${s}:not([data-component-id])`)
+            .join(',');
+        const elements = this.root.querySelectorAll(selector);
 
         elements.forEach(element =>
         {
@@ -132,7 +137,7 @@ export const ComponentLifecycleMethods = {
     {
         // SSR: Prepare element if it has data-ssr="true" (late-registered components
         // miss the page-load SSR preparation pass, so we handle it here)
-        const isSSR = __FEATURE_SSR__ && this.ssrManager && element.hasAttribute('data-ssr') && element.getAttribute('data-ssr') === 'true';
+        const isSSR = __FEATURE_SSR__ && this.ssrManager && this._getAttr(element, 'ssr') === 'true';
         if (isSSR) {
             this._prepareSSRElement(element);
         }
@@ -250,10 +255,10 @@ export const ComponentLifecycleMethods = {
         // data-component-id and deferred. We pick up the deferred work here, plus
         // the element itself in case it was registered as the cloak host.
         if (this._stripCloakWithVerdict) {
-            if (element.hasAttribute('data-cloak')) {
+            if (this._hasAttr(element, 'cloak')) {
                 this._stripCloakWithVerdict(element);
             }
-            element.querySelectorAll('[data-cloak]').forEach(el => {
+            element.querySelectorAll(this._attrSelector('cloak')).forEach(el => {
                 this._stripCloakWithVerdict(el);
             });
         }
@@ -277,7 +282,60 @@ export const ComponentLifecycleMethods = {
             parentInstance = this.componentInstances.get(parentId);
         }
 
-        return { parentInstance, parentId };
+        // parentElement without parentId: a component ancestor whose
+        // definition has not registered yet (see _deferParentLink).
+        return { parentInstance, parentId, parentElement };
+    },
+    /**
+     * Declaration order must not decide whether props arrive. A child whose
+     * definition registers BEFORE its parent's is initialized under a component
+     * element that has no instance yet, so its props cannot resolve and there
+     * is no parent id to key a deferred dependency on. Record the link on the
+     * parent ELEMENT instead; _adoptPendingChildren drains it when that element
+     * gets its instance. WeakMap: an element whose definition never registers
+     * takes its entry with it.
+     * @private
+     */
+    _deferParentLink(parentElement, childInstance) {
+        if (!this._pendingParentLinks) this._pendingParentLinks = new WeakMap();
+        let waiting = this._pendingParentLinks.get(parentElement);
+        if (!waiting) {
+            waiting = [];
+            this._pendingParentLinks.set(parentElement, waiting);
+        }
+        waiting.push(childInstance.id);
+    },
+    /**
+     * A component element just received its instance: attach the children that
+     * initialized under it earlier, then re-resolve their props against the
+     * parent that now exists. Reuses the parent-state-change follow-up
+     * (_refreshChildProps), so props-dependent computeds, the child's render
+     * effect, and onPropsChange all see the resolved values.
+     * @private
+     */
+    _adoptPendingChildren(parentInstance) {
+        const links = this._pendingParentLinks;
+        const parentElement = parentInstance.element;
+        const waiting = links && links.get(parentElement);
+        if (!waiting) return;
+        links.delete(parentElement);
+
+        for (const childId of waiting) {
+            const child = this.componentInstances.get(childId);
+            // Destroyed, moved, or now under a closer component: not ours.
+            if (!child || !child.element ||
+                this._getComponentElement(child.element.parentElement) !== parentElement) continue;
+
+            child.parent = parentInstance;
+            const rawContext = child.context && (child.context[RAW_TARGET] || child.context);
+            if (rawContext) rawContext.parent = parentInstance.context;
+            this._setupHierarchyTracking(childId, parentInstance.id, parentInstance, child);
+
+            if (child._propPaths) {
+                for (const info of Object.values(child._propPaths)) info.parentId = parentInstance.id;
+                this._refreshChildProps(child, { parentPath: null, newValue: undefined, oldValue: undefined });
+            }
+        }
     },
     /**
      * Create reactive state manager for component
@@ -357,6 +415,18 @@ export const ComponentLifecycleMethods = {
                 // Item-level computeds (fn.length > 0) need list item context
                 // They can't be evaluated at component level - only via _evaluateComputedInListContext
                 const isItemLevel = fn.length > 0;
+
+                // Recorded here, beside the registry itself, because the
+                // store-change path in EntitySystem walks EVERY list row calling
+                // _refreshListItemComputedBindings, and every mutation inside that
+                // walk is already gated on this same fn.length > 0 test. Without
+                // this flag the walk still pays ~5-6 querySelectorAll per row on
+                // every store write to repaint nothing: measured ~191ns x row
+                // count, so a 1,000-row list charged ~191us to a keystroke on an
+                // unrelated field. Set at setup (definition.computed is static and
+                // this runs once) rather than lazily, so the gate has no ordering
+                // hazard to observe.
+                if (isItemLevel) stateManager._hasItemComputeds = true;
 
                 enhancedComputedProps[name] = function() {
                     try {
@@ -710,6 +780,9 @@ export const ComponentLifecycleMethods = {
         // because _processBindingElements runs before the deferred init().
         const portalMeta = instance._deferredEffectMeta;
         instance._deferredEffectMeta = null;
+        // This is the only consumer. Portals teleported from here on
+        // (PortalSystem) stop queueing metadata nobody would read.
+        instance._deferredEffectConsumed = true;
         if (portalMeta?.length) {
             if (this._createComponentRenderEffect && this._collectComponentBindingMeta) {
                 // Re-scan component DOM (catches original + any non-portal init bindings)
@@ -864,6 +937,9 @@ export const ComponentLifecycleMethods = {
         const instance = this.componentInstances.get(instanceId);
         if (instance) {
             instance._isInitialSetup = false;
+            // State and computeds are in place: adopt children whose
+            // definitions registered before this one (see _adoptPendingChildren).
+            this._adoptPendingChildren(instance);
         }
 
         // Process any deferred reactive updates
@@ -1472,7 +1548,9 @@ export const ComponentLifecycleMethods = {
                 // structure with no maintained context tree / scan-time hierarchy
                 // rebuild, and works during init (the element is already in the DOM).
                 const handlerName = `on${eventName.charAt(0).toUpperCase()}${eventName.slice(1)}`;
-                let ancestorEl = componentInstance.element?.parentElement?.closest('[data-component]') || null;
+                // Both prefixes: a data-wf-component parent is an ancestor too.
+                const componentSelector = self._attrSelector('component');
+                let ancestorEl = componentInstance.element?.parentElement?.closest(componentSelector) || null;
                 while (ancestorEl)
                 {
                     const ancestor = self.componentInstances.get(ancestorEl.dataset.componentId);
@@ -1486,7 +1564,7 @@ export const ComponentLifecycleMethods = {
                             if (__DEV__) console.error(`Error in parent event handler ${handlerName}:`, error);
                         }
                     }
-                    ancestorEl = ancestorEl.parentElement?.closest('[data-component]') || null;
+                    ancestorEl = ancestorEl.parentElement?.closest(componentSelector) || null;
                 }
 
                 return true;
@@ -2065,7 +2143,22 @@ export const ComponentLifecycleMethods = {
             // replay them after init completes. Re-entrant calls (a method
             // invoking another method during execution) bypass the queue;
             // we're already inside a known execution frame.
-            if (!isLifecycle && !instance._initReady && !instance._inMethodExecution) {
+            // COMPUTED_EVAL.owners holding THIS instance means one of its
+            // own computeds is evaluating right now and is waiting on this
+            // return value. Queueing the call would hand it undefined, which
+            // it would then treat as an answer and cache: a wrong number, a
+            // hidden element, or an empty list on first paint, persisting
+            // until some unrelated dependency happens to invalidate the
+            // computed. Same reasoning as the re-entrancy exemption beside
+            // it: we are already inside a known synchronous execution frame,
+            // and a value is owed to it now. Owner-scoped rather than the
+            // bare depth: a computed on ANOTHER component
+            // reaching this one's method pre-init gets the queue, exactly
+            // like any other external caller — the shared counter used to
+            // lift every component's queue at once.
+            if (!isLifecycle && !instance._initReady
+                && !instance._inMethodExecution
+                && COMPUTED_EVAL.owners.lastIndexOf(instance.id) === -1) {
                 if (!instance._pendingActions) instance._pendingActions = [];
                 // A8 (DX diagnostics sweep, dev only): the queued call replays
                 // AFTER init, when the browser has long since processed the
@@ -2570,11 +2663,15 @@ export const ComponentLifecycleMethods = {
         // and registering fresh per-item effects forever. Each cleanup is
         // idempotent (disposeNode short-circuits on F_DISPOSED), so stale
         // entries from a list re-init are safe to re-run.
+        // Detach the array before running it: each cleanup removes itself from
+        // instance._mapArrayCleanups when it runs (wrappedDispose), which
+        // would shift the entries under an index loop.
         if (instance._mapArrayCleanups) {
-            for (let i = 0; i < instance._mapArrayCleanups.length; i++) {
-                try { instance._mapArrayCleanups[i](); } catch (e) { /* already gone */ }
-            }
+            const cleanups = instance._mapArrayCleanups;
             instance._mapArrayCleanups = null;
+            for (let i = 0; i < cleanups.length; i++) {
+                try { cleanups[i](); } catch (e) { /* already gone */ }
+            }
         }
 
         // Dispose every effect on this component's reactive surface. createEffect
@@ -2912,6 +3009,7 @@ export const ComponentLifecycleMethods = {
         this.componentDefinitions.clear();
         this.componentParents.clear();
         this.componentChildren.clear();
+        this._pendingParentLinks = null;
         this._templateCache.general.clear();
         this._templateCache.lists.clear();
         this._templateCache.compiled.clear();

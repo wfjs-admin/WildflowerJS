@@ -129,7 +129,7 @@ export const FrameworkInitMethods = {
         // The verdict uses the same evaluator the render effect uses, so a
         // subsequent effect re-run writes the same value (idempotent).
         requestAnimationFrame(() => {
-            document.querySelectorAll('[data-cloak]').forEach(el => {
+            document.querySelectorAll(this._attrSelector('cloak')).forEach(el => {
                 this._stripCloakWithVerdict(el);
             });
         });

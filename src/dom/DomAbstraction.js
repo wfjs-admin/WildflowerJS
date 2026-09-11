@@ -383,7 +383,7 @@ export const DomAbstractionMethods = {
 
             // Skip children of data-list containers in SSR components; SSR list items
             // exist as real DOM elements before the list renderer runs
-            if (this._hasAttr(current, 'list') && current.closest('[data-ssr="true"]'))
+            if (this._hasAttr(current, 'list') && current.closest(this._attrSelector('ssr', 'true')))
             {
                 continue; // Skip this entire subtree
             }

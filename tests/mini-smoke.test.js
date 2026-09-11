@@ -14,10 +14,12 @@ import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
 import { loadFramework, resetFramework } from './helpers/load-framework.js'
 
 // Skip this entire file unless we're actually running the mini build
-// (matches 'mini', 'mini-dev', 'mini-min')
+// (matches 'mini', 'mini-dev', 'mini-min' — but NOT 'mini-pool*', which HAS
+// pools and would fail this file's "pools throw on mini" assertions)
 const IS_MINI = (typeof __WILDFLOWER_DIST__ !== 'undefined') &&
   typeof __WILDFLOWER_DIST__ === 'string' &&
-  __WILDFLOWER_DIST__.startsWith('mini')
+  __WILDFLOWER_DIST__.startsWith('mini') &&
+  !__WILDFLOWER_DIST__.startsWith('mini-pool')
 
 async function waitForCompleteRender() {
   if (window.wildflower?._forceCompleteRender) {

@@ -285,14 +285,16 @@ class PoolHandle {
         /** @type {number} Maximum recycled nodes to retain */
         this._maxFreeListSize = 100;
 
-        // Snapshot template's original className/cssText for recycling restoration
+        // Snapshot template's original class/cssText for recycling restoration.
+        // Read the class ATTRIBUTE, not .className: on SVG entities .className
+        // is an SVGAnimatedString object, not a string.
         const snapEl = templateContent.cloneNode(true).firstElementChild;
         this._templateSnapshot = null;
         if (snapEl) {
-            const snap = [{ className: snapEl.className, cssText: snapEl.style.cssText }];
+            const snap = [{ className: snapEl.getAttribute('class') || '', cssText: snapEl.style.cssText }];
             const snapChildren = snapEl.querySelectorAll('*');
             for (let i = 0; i < snapChildren.length; i++) {
-                snap.push({ className: snapChildren[i].className, cssText: snapChildren[i].style.cssText });
+                snap.push({ className: snapChildren[i].getAttribute('class') || '', cssText: snapChildren[i].style.cssText });
             }
             this._templateSnapshot = snap;
         }
@@ -904,7 +906,9 @@ class PoolHandle {
             // adding class="" or style="" attributes that weren't on the original template.
             // Bootstrap and other CSS frameworks may style elements differently when
             // the attribute is present-but-empty vs absent.
-            if (snap[0].className) { el.className = snap[0].className; }
+            // setAttribute rather than .className: assigning .className throws
+            // on SVG entities (read-only SVGAnimatedString).
+            if (snap[0].className) { el.setAttribute('class', snap[0].className); }
             else { el.removeAttribute('class'); }
             if (snap[0].cssText) { el.style.cssText = snap[0].cssText; }
             else { el.removeAttribute('style'); }
@@ -912,7 +916,7 @@ class PoolHandle {
             const children = el.querySelectorAll('*');
             for (let i = 0; i < children.length && i + 1 < snap.length; i++) {
                 const s = snap[i + 1];
-                if (s.className) { children[i].className = s.className; }
+                if (s.className) { children[i].setAttribute('class', s.className); }
                 else { children[i].removeAttribute('class'); }
                 if (s.cssText) { children[i].style.cssText = s.cssText; }
                 else { children[i].removeAttribute('style'); }
@@ -1459,8 +1463,10 @@ export const PoolRendererMethods = {
                 sortDesc = parts[1] === 'desc';
             }
 
-            // Find and extract template
-            const template = this._findTemplate(element, instance);
+            // Find and extract template. Pools accept the parser's inert SVG
+            // template (a <template> inside <svg>); its children are real SVG
+            // elements and the entity pipeline renders them as they are.
+            const template = this._findTemplate(element, instance, { acceptForeign: true });
             if (!template) {
                 if (__DEV__) wfError(WF_ERRORS.TEMPLATE_NOT_FOUND, { warn: true, context: `No <template> found in data-pool="${path}"` });
                 continue;

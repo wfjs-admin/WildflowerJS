@@ -71,6 +71,13 @@ const _eventCore = {
                     return false;
                 }
 
+                // Skip elements inside a <template>: they belong to a list or
+                // pool template. Only reachable for <template> inside <svg>,
+                // which the parser leaves as an inert element with live children.
+                if (actionEl.closest('template')) {
+                    return false;
+                }
+
                 // Check if this action element is part of a nested list (support both prefixes)
                 const nestedListParent = actionEl.closest(this._attrSelector('list'));
 
@@ -103,7 +110,7 @@ const _eventCore = {
 
                 // CRITICAL: Skip SSR list actions during initial binding phase
                 // They should only be bound during the SSR re-binding phase when list items exist
-                const ssrComponent = actionEl.closest('[data-ssr="true"]');
+                const ssrComponent = actionEl.closest(this._attrSelector('ssr', 'true'));
                 if (ssrComponent && nestedListParent) {
                     const listItem = this._findListItemAncestor(actionEl);
                     if (!listItem || listItem._listIndex === undefined) {
@@ -1150,7 +1157,13 @@ export const ListEventDelegationMethods = {
      */
     _dispatchDelegatedListEvent(event, listElement, instance, listContext, path, resolveDispatchType)
     {
-        let actionEl = event.target.closest('[data-action],[data-wf-action]');
+        // Must honor exclusive mode. A literal both-prefix selector matches a
+        // BARE data-action even when the author asked the framework to ignore
+        // bare attributes, which is the whole purpose of the mode: it exists so
+        // WildflowerJS can sit beside a library that owns data-action. The
+        // element then reached the name read, which IS mode-aware and returned
+        // null, and the dispatch crashed on null.length.
+        let actionEl = event.target.closest(this._attrSelector('action'));
         if (actionEl && !listElement.contains(actionEl)) {
             actionEl = null;
         }
@@ -1165,7 +1178,7 @@ export const ListEventDelegationMethods = {
         const dispatchEventType = resolveDispatchType(actionEl, event);
         if (!dispatchEventType) return;
 
-        let closestList = actionEl.closest('[data-list],[data-wf-list]');
+        let closestList = actionEl.closest(this._attrSelector('list'));
         if (closestList !== listElement) {
             const stripped = this._findActionElementViaMetadata(event.target, listElement);
             if (!stripped) return;
@@ -2005,6 +2018,7 @@ export const ListEventDelegationMethods = {
         const templateClone = element.cloneNode(true);
         // Strip data-cloak from template so re-insertions don't inherit it
         templateClone.removeAttribute('data-cloak');
+        templateClone.removeAttribute('data-wf-cloak');
 
         // Create the render record (plain object, not registered). The list-item
         // index is the parentIndex used for placeholder labelling / data resolution.

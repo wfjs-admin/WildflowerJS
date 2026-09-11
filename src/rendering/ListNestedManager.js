@@ -174,10 +174,28 @@ export const ListNestedMethods = {
 
         childListPaths.forEach(childPath => {
             const escapedPath = CSS.escape ? CSS.escape(childPath) : childPath.replace(/([!"#$%&'()*+,./:;<=>?@[\\\]^`{|}~])/g, '\\$1');
-            const nestedListElements = itemEl.querySelectorAll(`[data-list="${escapedPath}"]`);
+            // Prefix-aware, and the value form matters here: a nested list is
+            // found by its declared path, so a bare `[data-list="..."]` literal
+            // made every `data-wf-list` inside a row invisible and the nested
+            // list simply never rendered. No warning, because nothing was
+            // looking for it.
+            const nestedListElements = itemEl.querySelectorAll(this._attrSelector('list', escapedPath));
 
             nestedListElements.forEach(nestedListEl => {
-                let nestedData = item[childPath];
+                let nestedData;
+                if (childPath.charCodeAt(0) === 36 /* $ */) {
+                    // $store.path / $query.rows: a shared source, not a field
+                    // of the row. Resolve it the way a top-level list does and
+                    // mount even when the source is empty or not yet
+                    // registered, so the nested mapArray's live read (arrayFn,
+                    // shared-source branch) picks the data up when it lands.
+                    nestedData = this._normalizeStoreShorthands
+                        ? this._evaluateExternalListPath(this._normalizeStoreShorthands(childPath), instance)
+                        : [];
+                    if (!Array.isArray(nestedData)) nestedData = [];
+                } else {
+                    nestedData = item[childPath];
+                }
 
                 // Fallback: implicit item-level computed evaluation when the
                 // path isn't a raw field on the item. Mirrors data-bind's
@@ -287,6 +305,13 @@ export const ListNestedMethods = {
         const searchContainer = parentTemplate.tagName === 'TEMPLATE' && parentTemplate.content
             ? parentTemplate.content
             : parentTemplate;
+
+        // data-query inside a row template: the per-component transform never
+        // sees template content, so rewrite here, before the nested lists are
+        // collected, and the cloned rows carry data-list="$name.rows".
+        if (__FEATURE_QUERY__ && this._transformQueryElementsInTemplate) {
+            this._transformQueryElementsInTemplate(searchContainer);
+        }
 
         // Find all nested list templates within this template
         const nestedLists = searchContainer.querySelectorAll(this._attrSelector('list'));

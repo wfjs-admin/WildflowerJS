@@ -5,7 +5,7 @@
  */
 
 import { RAW_TARGET } from '../state/ContextProxy.js';
-import { pathResolver, wfError, WF_ERRORS } from '../core/wfUtils.js';
+import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING } from '../core/wfUtils.js';
 import { beginBatchScope, endBatchScope, discardScheduled } from '../state/reactive-graph/core.js';
 
 /**
@@ -202,25 +202,33 @@ export const EntitySystemMethods = {
     },
     /**
      * Shared pending-store-dependency registration for external() misses:
-     * when called during a computed evaluation and the target store doesn't
-     * exist yet, register so the computed re-evaluates on store creation.
-     * Keys off the tracking context set during list/computed eval.
+     * the target entity doesn't exist yet, so record who was asking and let
+     * StoreManager._resolvePendingStoreDependencies wake them when it is
+     * created. Keys off the tracking context set during list/computed eval.
+     *
+     * A miss inside a computed names that computed, and the drain re-evaluates
+     * it. A miss from anywhere else — a data-list path, a data-bind expression,
+     * a class or attr expression — has no computed to name, and used to
+     * register NOTHING: the entity arrived, the drain found nobody waiting,
+     * and the binding stayed inert for the life of the page while the store
+     * sat there holding data. PENDING_BINDING is that missing registration,
+     * and it is what makes late entity registration work at all.
+     *
+     * Cheap by construction: this runs only on a MISS, the composite key
+     * dedupes repeats, and a resolved entity never reaches here.
      * @private
      */
     _externalRegisterPending(entityNameOrId, fallbackComponentId, stateManager) {
+        if (!this.storeManager) return;
         const trackingContext = this._computedTrackingContext;
-        if (this.storeManager && trackingContext) {
-            const componentId = trackingContext.componentId || fallbackComponentId;
-            const computedName = trackingContext.computedName;
-            if (componentId && computedName) {
-                this.storeManager.registerPendingStoreDependency(
-                    entityNameOrId,
-                    componentId,
-                    computedName,
-                    null // listElement will be associated during list binding
-                );
-            }
-        }
+        const componentId = (trackingContext && trackingContext.componentId) || fallbackComponentId;
+        if (!componentId) return;
+        this.storeManager.registerPendingStoreDependency(
+            entityNameOrId,
+            componentId,
+            (trackingContext && trackingContext.computedName) || PENDING_BINDING,
+            null // listElement will be associated during list binding
+        );
     },
     /**
      * Register an external dependency between components
@@ -671,9 +679,16 @@ export const EntitySystemMethods = {
             }
 
             // Refresh item-level computed bindings in lists
-            // Per-item effects handle this for effect-backed components
+            // Per-item effects handle this for effect-backed components.
+            // Gated on _hasItemComputeds (set beside the computed registry in
+            // _setupComputedProperties): this walk visits every row and issues
+            // ~5-6 querySelectorAll per row, but every mutation it can make is
+            // already conditioned on the same parameterized-computed test, so a
+            // component without one repaints nothing and pays O(rows) DOM
+            // queries per store write. Same shape as the _hasPortals gate above.
             if (__FEATURE_LISTS__ && dependentInstance.element && this._refreshListItemComputedBindings
-                && !dependentInstance._renderEffect) {
+                && !dependentInstance._renderEffect
+                && dependentInstance.stateManager?._hasItemComputeds) {
                 const listElements = dependentInstance.element.querySelectorAll('[data-list]');
                 listElements.forEach(listEl => {
                     if (listEl._listContext) {

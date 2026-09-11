@@ -284,6 +284,23 @@ export const ListRendererMethods = {
             return;
         }
 
+        // A list in a data-render section that starts hidden: list entries are
+        // mounted early in the scan, before the component's conditional pass
+        // removes the section, and mounting would render rows nobody sees and,
+        // for a $query path, activate the query. Insertion mounts the section's
+        // clone instead.
+        if (instance.element) {
+            if (element.isConnected) {
+                if (this._insideHiddenRender && this._insideHiddenRender(element, instance.element, instance)) return;
+            } else {
+                // Already removed by data-render (the removal marks the
+                // subtree root); a list detached by hand carries no mark.
+                for (let cur = element; cur; cur = cur.parentElement) {
+                    if (cur._wfRenderHidden) return;
+                }
+            }
+        }
+
         // Check if this list is a template-defined child list
         let isTemplateChild = false;
         if (this._listRelationships) {
@@ -741,7 +758,7 @@ export const ListRendererMethods = {
             // NOTE: We only check element._ssrPhase (not ssrComponent._ssrPhase) because the component's
             // phase transitions to 'activated' via setTimeout(0) before scan() runs, but list elements
             // remain protected until explicitly activated
-            const ssrComponent = element.closest('[data-ssr="true"]');
+            const ssrComponent = element.closest(this._attrSelector('ssr', 'true'));
             if (ssrComponent && element._ssrPhase === 'protected') {
                 // SSR mode: Hydrate existing items without clearing DOM
                 if (this._trySSRHydrationForMapArray(element, data, context, instance, sm)) {
@@ -911,7 +928,7 @@ export const ListRendererMethods = {
                     wfError(WF_ERRORS.TEMPLATE_NOT_FOUND, {
                         warn: true,
                         context: `Component '${cname}': data-list="${listPath}" is inside an <svg> subtree. The HTML parser strips or inerts <template> elements there before any script runs, so this list has no template and rendered nothing`,
-                        suggestion: `For repeated SVG primitives, bind a fixed set of elements or precompute a single <path> 'd' string.`,
+                        suggestion: `For repeated SVG primitives, use a data-pool (its template works inside <svg>), bind a fixed set of elements, or precompute a single <path> 'd' string.`,
                         data: element
                     });
                 } else if (Array.from(element.children || []).some(c => c.tagName !== 'TEMPLATE')) {
@@ -946,9 +963,17 @@ export const ListRendererMethods = {
         // the bug, because the bulk path replaces children wholesale while
         // the per-item path appends. Runs after the no-template diagnostics
         // above, which need the stray children as evidence.
+        // SSR takeover: rows hydrated by _trySSRHydrationForMapArray are NOT
+        // stale — mapFn below reuses them by key, so the sweep must spare
+        // them. Anything left in the map after init (keys gone from the data)
+        // is removed right after the mapArray call.
+        let ssrAdoptedSweepSkip = null;
+        if (__FEATURE_SSR__ && element._ssrAdoptedByKey && element._ssrAdoptedByKey.size) {
+            ssrAdoptedSweepSkip = new Set(element._ssrAdoptedByKey.values());
+        }
         for (let child = element.firstElementChild, next; child; child = next) {
             next = child.nextElementSibling;
-            if (child.tagName !== 'TEMPLATE') child.remove();
+            if (child.tagName !== 'TEMPLATE' && !(ssrAdoptedSweepSkip && ssrAdoptedSweepSkip.has(child))) child.remove();
         }
 
         // Disable innerHTML fast path when text bindings reference implicit computed properties.
@@ -1013,6 +1038,20 @@ export const ListRendererMethods = {
         // For nested lists, use the data passed directly since the path (e.g., "tasks")
         // doesn't exist at component root level - it's relative to the parent item
         const isNestedList = context && context.parent && context.parent.type === 'list';
+        // A nested list whose path is a $store / $query shorthand reads a
+        // shared source, not a field of its row: it resolves like a top-level
+        // list (normalize, external(), query observation) while keeping its
+        // row context for bindings, events, and teardown.
+        const isSharedSourceNested = isNestedList && listPath.includes('$');
+
+        // Cached $-shorthand normalization of listPath (see arrayFn). Normalizing
+        // also stamps a query as observed (_queryTouchByShorthand), and a list
+        // that is off the DOM (removed by hand, or orphaned) is not observation:
+        // left unchecked, its own reconcile on every ingest re-stamped lastRead
+        // and kept the query's rungs alive forever. The first run always
+        // normalizes so activation is unchanged; later runs re-normalize (and
+        // re-stamp) only while the element is connected.
+        let normalizedListPath = null;
 
         const arrayFn = () => {
             // Forced template rerender (rescanItemTemplates): the flag is consumed
@@ -1028,7 +1067,7 @@ export const ListRendererMethods = {
                 });
             }
             // Nested lists: Access data through parent item proxy for reactive tracking
-            if (isNestedList) {
+            if (isNestedList && !isSharedSourceNested) {
                 // Use _parentItemProxy to access nested data reactively
                 // This creates a dependency so mapArray re-runs when nested data changes
                 if (context._parentItemProxy && context._childPath) {
@@ -1055,9 +1094,13 @@ export const ListRendererMethods = {
             }
 
             // Handle different path types for top-level lists
-            const normalizedPath = listPath.includes('$') && self._normalizeStoreShorthands
-                ? self._normalizeStoreShorthands(listPath)
-                : listPath;
+            let normalizedPath = listPath;
+            if (listPath.includes('$') && self._normalizeStoreShorthands) {
+                if (normalizedListPath === null || element.isConnected) {
+                    normalizedListPath = self._normalizeStoreShorthands(listPath);
+                }
+                normalizedPath = normalizedListPath;
+            }
 
             // Determine computed property name:
             // 1. Explicit computed: prefix (e.g., "computed:cards")
@@ -2012,9 +2055,28 @@ export const ListRendererMethods = {
                 itemIsDocFrag = itemTemplateContent.nodeType === Node.DOCUMENT_FRAGMENT_NODE;
             }
 
-            // Clone template
-            const clonedContent = itemTemplateContent.cloneNode(true);
-            const itemEl = itemIsDocFrag ? clonedContent.firstElementChild : clonedContent;
+            // SSR takeover: reuse the server-rendered element for this key if
+            // hydration adopted one — the wiring below (metadata refs, element
+            // arrays, initial bind, decor, contexts) runs identically on it,
+            // repainting any stale server values from the current item.
+            let itemEl = null;
+            if (__FEATURE_SSR__ && !isPolymorphic && element._ssrAdoptedByKey && element._ssrAdoptedByKey.size) {
+                // Key fallback mirrors _trySSRHydrationForMapArray exactly:
+                // keyless rows were mapped by index at hydration, so they must
+                // be looked up by index here or keyless lists never reuse.
+                const adoptKey = itemProxy && itemProxy[keyProp] !== undefined ? itemProxy[keyProp] : index;
+                const adopted = element._ssrAdoptedByKey.get(adoptKey);
+                if (adopted) {
+                    element._ssrAdoptedByKey.delete(adoptKey);
+                    itemEl = adopted;
+                }
+            }
+
+            // Clone template (fresh rows, and any item without an adopted match)
+            if (!itemEl) {
+                const clonedContent = itemTemplateContent.cloneNode(true);
+                itemEl = itemIsDocFrag ? clonedContent.firstElementChild : clonedContent;
+            }
 
             if (!itemEl) return { element: null };
 
@@ -2028,13 +2090,15 @@ export const ListRendererMethods = {
             // template sources that bypassed that strip. Belt-and-suspenders
             // so no list-item creation path ever leaves data-cloak alive on
             // a row added after the initial scan.
-            if (itemEl.hasAttribute && itemEl.hasAttribute('data-cloak')) {
+            if (itemEl.hasAttribute && this._hasAttr(itemEl, 'cloak')) {
                 itemEl.removeAttribute('data-cloak');
+                itemEl.removeAttribute('data-wf-cloak');
             }
             if (itemEl.querySelectorAll) {
-                const cloakedDescendants = itemEl.querySelectorAll('[data-cloak]');
+                const cloakedDescendants = itemEl.querySelectorAll(this._attrSelector('cloak'));
                 for (let ci = 0; ci < cloakedDescendants.length; ci++) {
                     cloakedDescendants[ci].removeAttribute('data-cloak');
+                    cloakedDescendants[ci].removeAttribute('data-wf-cloak');
                 }
             }
 
@@ -2158,6 +2222,11 @@ export const ListRendererMethods = {
                 // templates (polymorphic / custom-element / no innerHTML parts) return
                 // null and fall back to the per-item mapFn loop.
                 onBulkCreate: (newArray, keyProp, startIndex = 0) => {
+                    // SSR takeover mount: adopted elements must be reused by
+                    // key, which only the per-item mapFn path does. One-time
+                    // cost on the adoption mount only.
+                    if (__FEATURE_SSR__ && element._ssrAdoptedByKey && element._ssrAdoptedByKey.size) return null;
+
                     // Polymorphic lists: different items use different templates,
                     // so innerHTML fast path cannot be used
                     if (isPolymorphic) return null;
@@ -2816,6 +2885,16 @@ export const ListRendererMethods = {
             }
         );
 
+        // SSR takeover cleanup: adopted elements whose keys are gone from the
+        // data were not reused by mapFn — remove them and drop the map so
+        // later renders never consult it.
+        if (__FEATURE_SSR__ && element._ssrAdoptedByKey) {
+            element._ssrAdoptedByKey.forEach((el) => {
+                if (el && el.parentNode === element) el.remove();
+            });
+            element._ssrAdoptedByKey = null;
+        }
+
         // Store dispose function and mark as initialized
         element._mapArrayInitialized = true;
         element._disposeMapArray = disposeMapArray;
@@ -2975,6 +3054,13 @@ export const ListRendererMethods = {
         // alive. PM-demo measurement showed ~900 leaked effects per priority
         // change, ballooning subsequent select/deselect latency.
         const baseDisposeMapArray = disposeMapArray;
+        // The destroy-time cleanup registered below; wrappedDispose drops it
+        // from instance._mapArrayCleanups once it has run, so a list disposed
+        // mid-life (data-render removal, template re-render, late-entity wake)
+        // does not leave a closure retaining its detached element until
+        // component destroy. Measured: one retained list per data-render
+        // reveal before this.
+        let registeredCleanup = null;
         const wrappedDispose = () => {
             // Walk descendants for nested mapArrays. querySelectorAll returns
             // document order; each nested dispose nulls its own _disposeMapArray
@@ -3003,6 +3089,10 @@ export const ListRendererMethods = {
                 element._wfListSinkDispatcher = null;
             }
             baseDisposeMapArray();
+            if (registeredCleanup && instance && instance._mapArrayCleanups) {
+                const idx = instance._mapArrayCleanups.indexOf(registeredCleanup);
+                if (idx !== -1) instance._mapArrayCleanups.splice(idx, 1);
+            }
         };
         element._disposeMapArray = wrappedDispose;
 
@@ -3021,12 +3111,13 @@ export const ListRendererMethods = {
             instance._mapArrayCleanups = [];
         }
         if (instance) {
-            instance._mapArrayCleanups.push(() => {
+            registeredCleanup = () => {
                 wrappedDispose();
                 element._mapArrayInitialized = false;
                 element._disposeMapArray = null;
                 element._mapArrayItemElements = null;
-            });
+            };
+            instance._mapArrayCleanups.push(registeredCleanup);
         }
     },
 
@@ -3973,17 +4064,29 @@ export const ListRendererMethods = {
             reads: b.expressionVars || (b.expression ? this._extractExpressionVars(b.expression) : []),
             paths: b.expressionPaths || (b.expression ? this._extractExpressionPaths(b.expression) : null)
         });
-        // show / html / render: an expression (with vars) is 'expr', else a path.
-        // Applying this uniformly to html is the drift fix; the old static
-        // extractors treated html as path-only and ignored html expressions.
+        // A `computed:`-prefixed binding IS a computed reference: classify it
+        // as 'computedName' (bare name) so the dependency walk evaluates it
+        // under the tracking frame — exactly how class bindings have always
+        // classified. The old 'skip'/prefixed-'path' classification formed NO
+        // edges, so the upstream computed sat DIRTY with zero observers and
+        // rows never woke.
+        const computedNameDeps = (b) =>
+            ({ kind: 'computedName', reads: [b.computedName || b.path.slice(9)], paths: null });
+        // show / html / render: an expression (with vars) is 'expr', a
+        // computed: reference is 'computedName', else a path. Applying expr
+        // uniformly to html is the drift fix; the old static extractors
+        // treated html as path-only and ignored html expressions.
         const exprOrPath = (b) => (b.isExpression && b.expressionVars)
             ? { kind: 'expr', reads: b.expressionVars, paths: b.expressionPaths || null }
-            : { kind: 'path', reads: [b.path], paths: null };
+            : (b.isComputed ? computedNameDeps(b)
+                            : { kind: 'path', reads: [b.path], paths: null });
 
         for (const b of (metadata.bindings || [])) {
             if (b.isExpression) {
                 b._deps = b.expressionVars ? exprDeps(b) : skip;
-            } else if (b.isComputed || b.isPropsPath || b.isListContextVar) {
+            } else if (b.isComputed) {
+                b._deps = computedNameDeps(b);
+            } else if (b.isPropsPath || b.isListContextVar) {
                 b._deps = skip;
             } else {
                 b._deps = { kind: 'path', reads: [b.path], paths: null };
@@ -4021,8 +4124,21 @@ export const ListRendererMethods = {
         const rbm = metadata.rootBindings;
         if (rbm) {
             const rootDeps = [];
-            if (rbm.bindPath) rootDeps.push({ field: 'bindPath', kind: 'path', reads: [rbm.bindPath], paths: null });
-            if (rbm.showPath) rootDeps.push({ field: 'showPath', kind: 'path', reads: [rbm.showPath], paths: null });
+            // Root bind/show: strip the computed: prefix into 'computedName'
+            // (mirrors bindClassExpr below); prefixed forms previously stayed
+            // 'path' with the prefix intact, which every walk consumer no-ops
+            // on. showPath may carry a leading negation.
+            if (rbm.bindPath) {
+                rootDeps.push(rbm.bindPath.startsWith('computed:')
+                    ? { field: 'bindPath', kind: 'computedName', reads: [rbm.bindPath.slice(9)], paths: null }
+                    : { field: 'bindPath', kind: 'path', reads: [rbm.bindPath], paths: null });
+            }
+            if (rbm.showPath) {
+                const sp = rbm.showPath.charAt(0) === '!' ? rbm.showPath.slice(1) : rbm.showPath;
+                rootDeps.push(sp.startsWith('computed:')
+                    ? { field: 'showPath', kind: 'computedName', reads: [sp.slice(9)], paths: null }
+                    : { field: 'showPath', kind: 'path', reads: [rbm.showPath], paths: null });
+            }
             if (rbm.modelPath) rootDeps.push({ field: 'modelPath', kind: 'itemPath', reads: [rbm.modelPath], paths: null });
             if (rbm.bindClassExpr) {
                 const e = rbm.bindClassExpr;
@@ -4774,7 +4890,7 @@ export const ListRendererMethods = {
         // idempotent repeat covers list setups that reach here without
         // that pass (e.g., data-render re-insertion).
         if (__FEATURE_QUERY__ && this._transformQueryElements) {
-            this._transformQueryElements(instance.element);
+            this._transformQueryElements(instance.element, instance);
         }
 
         // Initialize context collection

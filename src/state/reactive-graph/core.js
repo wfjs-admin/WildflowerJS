@@ -7,15 +7,18 @@
  * The model: reactivity is ONE global graph of nodes whose edges are object
  * references, whose freshness is decided by graph-coloring (CLEAN/CHECK/DIRTY)
  * plus value comparison: a push-pull validation engine under a proxy surface
- * with COARSE effect granularity (one effect per "component", one per "row")
- * instead of one effect per binding.
+ * with COARSE effect granularity (one render effect per component, one per
+ * LIST) instead of one effect per binding.
  *
  * Two invariants enforced throughout:
  *   1. Source VALUES live on the raw object; nodes are sidecars. Keeps
  *      JSON.stringify / spread / devtools key-iteration working, and makes
  *      unread/unbound state cost ZERO nodes (lazy materialization).
  *   2. Effect granularity stays coarse. Node count scales with BOUND LEAVES,
- *      like a dep-map's entries, not with bindings.
+ *      like a dep-map's entries, not with bindings. Rows carry no effect of
+ *      their own: item-leaf writes route through a per-list dispatch sink
+ *      (listSink) or the direct text writer, so a list of N rows holds ONE
+ *      shared-deps effect plus the structural reconcile effect, not N.
  */
 
 // ---------------------------------------------------------------------------
@@ -782,6 +785,7 @@ const handlers = {
     // Unwrap proxies on write (see reactiveTree set): keep the raw graph free of
     // nested proxies so splice/reverse/sort can't corrupt path + NODES lookups.
     if (value !== null && typeof value === 'object' && value[RAW]) value = value[RAW];
+    if (__DEV__) warnFacadeElements(value, key);
     const old = target[key];
     if (Object.is(old, value)) return true; // no-op writes are free
     if (__DEV__ && activeObserver !== null) warnComputedWrite('wrote to reactive state ("' + String(key) + '")');
@@ -892,6 +896,82 @@ const ARRAY_MUTATORS = new Set(['splice', 'push', 'pop', 'shift', 'unshift', 're
 // naming the computed and the write, with the copy-first fix inline. Writes
 // inside untrack() are the sanctioned escape and stay silent; production
 // builds compile the call sites out entirely.
+// __DEV__ diagnostic (WF-966): facade-into-raw smuggling. The set traps
+// unwrap the assigned VALUE, but a container's ELEMENTS can smuggle facade
+// proxies into the raw graph — each later read then re-wraps them
+// (proxy-over-proxy), which corrupts path + NODES routing (bindings wake
+// the wrong fields) and deepens every ownKeys walk until reads crawl (the
+// 2026-08-16 query-ingest freeze was exactly this, one layer per write).
+// Bounded scan (first 20 elements/values), one warn per stored container.
+// Write-time invariant: the raw graph never holds a facade. The set trap
+// unwraps the assigned VALUE; this unwraps what the value CONTAINS, so the
+// immutable idioms store raw elements without the author knowing facades
+// exist: items.filter(...), [...items, x], items.map(i => ({ ...i, done })).
+// Two levels are covered: the container's own values, and the values of any
+// fresh plain object or array among them (the spread-a-facade case, whose
+// nested objects arrive one level down). Facades found are replaced in place,
+// which is safe because the container becomes the raw graph object itself.
+// Frozen containers are left as they are. Anything deeper is the dev scan's
+// job (warnFacadeElements below).
+function unwrapContained(container) {
+    if (Object.isFrozen(container)) return;
+    if (Array.isArray(container)) {
+        for (let i = 0; i < container.length; i++) unwrapSlot(container, i, true);
+    } else {
+        for (const k in container) unwrapSlot(container, k, true);
+    }
+}
+function unwrapSlot(holder, key, descend) {
+    const v = holder[key];
+    if (v === null || typeof v !== 'object') return;
+    const raw = v[RAW];
+    if (raw !== undefined && raw !== v) { holder[key] = raw; return; }
+    if (!descend || Object.isFrozen(v)) return;
+    if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) unwrapSlot(v, i, false);
+    } else if (Object.getPrototypeOf(v) === Object.prototype) {
+        for (const k in v) unwrapSlot(v, k, false);
+    }
+}
+
+// __DEV__ diagnostic (WF-966), now for what unwrapContained does not reach:
+// a facade three or more levels inside the written container. Bounded scan
+// (20 per level), one warn per stored container.
+let _facadeElementWarned = null;
+function warnFacadeElements(value, key) {
+    if (value === null || typeof value !== 'object') return;
+    if (_facadeElementWarned === null) _facadeElementWarned = new WeakSet();
+    if (_facadeElementWarned.has(value)) return;
+    const isFacade = (x) => x !== null && typeof x === 'object' && x[RAW] !== undefined && x[RAW] !== x;
+    const childrenOf = (x) => {
+        if (Array.isArray(x)) return x.slice(0, 20);
+        if (x !== null && typeof x === 'object' && Object.getPrototypeOf(x) === Object.prototype) {
+            const out = [];
+            for (const k in x) { out.push(x[k]); if (out.length >= 20) break; }
+            return out;
+        }
+        return [];
+    };
+    let hit = false;
+    outer:
+    for (const l1 of childrenOf(value)) {
+        for (const l2 of childrenOf(l1)) {
+            for (const l3 of childrenOf(l2)) {
+                if (isFacade(l3)) { hit = true; break outer; }
+            }
+        }
+    }
+    if (hit) {
+        _facadeElementWarned.add(value);
+        console.warn(
+            '[WF WF-966] The value written to reactive state ("' + String(key) + '") holds a ' +
+            'facade-wrapped object three or more levels deep. The engine unwraps the first two ' +
+            'levels on write; deeper copies of state must be unwrapped first (wildflower.toRaw) ' +
+            'or the nested proxy corrupts update routing and slows every read.'
+        );
+    }
+}
+
 let _computedWriteWarned = null;
 function warnComputedWrite(desc) {
     if (activeObserver === null || suppressTracking || activeObserver.kind !== COMPUTED) return;
@@ -1051,7 +1131,13 @@ function wrapTree(obj, prefix, notify, computedResolver) {
       // elements THROUGH the proxy (get returns a wrapped child) and re-store
       // them, which would nest proxies and corrupt path + NODES lookups. Unwrap
       // to the raw target first (same stance as Vue toRaw / Solid unwrap).
-      if (value !== null && typeof value === 'object' && value[RAW]) value = value[RAW];
+      if (value !== null && typeof value === 'object') {
+        if (value[RAW]) value = value[RAW];
+        // ...and what it holds: items.filter(...) / [...items, x] / map with a
+        // spread all carry facades in as elements. See unwrapContained.
+        unwrapContained(value);
+        if (__DEV__) warnFacadeElements(value, key);
+      }
       const old = target[key];
       if (Object.is(old, value)) return true;
       if (__DEV__ && activeObserver !== null) warnComputedWrite('wrote to reactive state ("' + prefix + String(key) + '")');

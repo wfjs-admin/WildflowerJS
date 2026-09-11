@@ -48,9 +48,9 @@ export const PortalSystemMethods = {
 
             // Fall back to instance's _listContexts map
             if (!listContext && instance._listContexts) {
-                const listElement = element.closest('[data-list]');
+                const listElement = element.closest(this._attrSelector('list'));
                 if (listElement) {
-                    const listPath = listElement.dataset.list;
+                    const listPath = this._getAttr(listElement, 'list');
                     listContext = instance._listContexts.get(listPath);
                 }
             }
@@ -85,8 +85,8 @@ export const PortalSystemMethods = {
     {
         const { element, id: componentId } = instance;
 
-        // Find all portal elements within this component
-        const portalElements = element.querySelectorAll('[data-portal]');
+        // Find all portal elements within this component (either prefix)
+        const portalElements = element.querySelectorAll(this._attrSelector('portal'));
         // Cache the discovery result so _scheduleComponentRender can skip the
         // per-state-change querySelectorAll inside _updatePortalVisibility for
         // components that have no portals. PM-demo profile (2026-05-16) showed
@@ -114,6 +114,82 @@ export const PortalSystemMethods = {
         });
     },
     /**
+     * Portals inside a subtree that arrived after init (a data-render
+     * section inserted by RenderRecord._insertRenderElement). Same ownership
+     * rules as _processPortals, scoped to the subtree. The instance is
+     * marked so the state-change path keeps re-evaluating the portal's
+     * conditions; _processPortals set the flag false when the only portal
+     * sat in a section that was hidden at init.
+     * @param {HTMLElement} root - The inserted subtree
+     * @param {Object} instance - The owning component instance
+     * @private
+     */
+    _processPortalsInSubtree(root, instance)
+    {
+        if (!root || !instance || !root.querySelectorAll) return;
+        const { element, id: componentId } = instance;
+        const found = [];
+        const portalSelector = this._attrSelector('portal');
+        if (root.matches && root.matches(portalSelector)) found.push(root);
+        root.querySelectorAll(portalSelector).forEach(el => found.push(el));
+        if (found.length === 0) return;
+
+        if (!this._activePortals.has(componentId)) {
+            this._activePortals.set(componentId, []);
+        }
+        for (const portalElement of found) {
+            if (this._getComponentElement(portalElement) !== element) continue;
+            if (portalElement.closest('template')) continue;
+            if (portalElement.getAttribute('data-portal-active') === 'true') continue;
+            instance._hasPortals = true;
+            this._processPortalElement(portalElement, instance);
+        }
+    },
+
+    /**
+     * Withdraw the portals whose source element sits inside a subtree that
+     * data-render is removing: the teleported content leaves with it and the
+     * record goes, so a later insertion teleports the clone's copy alone.
+     * Listener stripping mirrors _cleanupComponentPortals.
+     * @param {HTMLElement} root - The subtree being removed
+     * @param {Object} instance - The owning component instance
+     * @private
+     */
+    _withdrawPortalsInSubtree(root, instance)
+    {
+        if (!root || !instance) return;
+        const portals = this._activePortals.get(instance.id);
+        if (!portals || portals.length === 0) return;
+        let write = 0;
+        for (let i = 0; i < portals.length; i++) {
+            const record = portals[i];
+            const source = record.source;
+            if (!source || !(source === root || root.contains(source))) {
+                portals[write++] = record;
+                continue;
+            }
+            record.content.forEach(child => {
+                const allEls = child.querySelectorAll
+                    ? [child, ...child.querySelectorAll('*')]
+                    : [child];
+                for (const el of allEls) {
+                    const handlers = portalHandlersCache.get(el);
+                    if (handlers && handlers.length > 0) {
+                        for (const { eventType, handler } of handlers) {
+                            el.removeEventListener(eventType, handler);
+                        }
+                        portalHandlersCache.delete(el);
+                    }
+                }
+                child.removeAttribute('data-portaled-from');
+                if (child.parentNode) child.remove();
+            });
+            source.removeAttribute('data-portal-active');
+        }
+        portals.length = write;
+    },
+
+    /**
      * Process portals inside list items after list render
      * Called from _renderList after items are in the DOM
      * @param {Object} ctx - Render context with element and instance
@@ -125,7 +201,7 @@ export const PortalSystemMethods = {
         if (!instance) return;
 
         // Find all portal elements within list items (not the list container itself)
-        const portalElements = element.querySelectorAll('[data-portal]');
+        const portalElements = element.querySelectorAll(this._attrSelector('portal'));
         if (portalElements.length === 0) return;
 
         // Promote the cached flag: list items can introduce portals after the
@@ -167,9 +243,9 @@ export const PortalSystemMethods = {
         let pm = portalMetaCache.get(portalElement);
         if (!pm) {
             pm = {
-                target: portalElement.dataset.portal || 'body',
-                show: portalElement.dataset.show || null,
-                render: portalElement.dataset.render || null
+                target: this._getAttr(portalElement, 'portal') || 'body',
+                show: this._getAttr(portalElement, 'show') || null,
+                render: this._getAttr(portalElement, 'render') || null
             };
             portalMetaCache.set(portalElement, pm);
         }
@@ -287,7 +363,7 @@ export const PortalSystemMethods = {
             source: portalElement,
             target: targetElement,
             content: [],
-            targetSelector: portalMetaCache.get(portalElement)?.target || portalElement.dataset.portal || 'body',
+            targetSelector: portalMetaCache.get(portalElement)?.target || this._getAttr(portalElement, 'portal') || 'body',
             listItemContext: listItemContext  // Store list context for later use
         };
 
@@ -331,7 +407,7 @@ export const PortalSystemMethods = {
     _processNestedPortals(contentElement, instance)
     {
         // Find any nested portal elements within the teleported content
-        const nestedPortals = contentElement.querySelectorAll('[data-portal]');
+        const nestedPortals = contentElement.querySelectorAll(this._attrSelector('portal'));
         if (nestedPortals.length === 0) return;
 
         nestedPortals.forEach(portalElement => {
@@ -402,7 +478,11 @@ export const PortalSystemMethods = {
             // Build deferred effect metadata (component-level portals only). This drives
             // ongoing reactivity through the render effect, INDEPENDENT of whether a binding
             // context exists, so the portal stays reactive as context creation is retired.
-            if (!listItemContext) {
+            // Only until the post-init consumer has run: a portal teleported later (a
+            // data-show flip, a re-inserted section) has its content's bindings in the
+            // component effect already, collected while the content sat in the tree, and
+            // entries pushed now would never be read (they grew by one per toggle).
+            if (!listItemContext && !instance._deferredEffectConsumed) {
                 if (!instance._deferredEffectMeta) instance._deferredEffectMeta = [];
                 const entry = {
                     element: bindingElement,
@@ -416,9 +496,10 @@ export const PortalSystemMethods = {
             }
         });
 
-        // Also check the content element itself if it has data-bind
-        if (contentElement.dataset && contentElement.dataset.bind) {
-            const bindPath = contentElement.dataset.bind;
+        // Also check the content element itself if it has data-bind (either prefix)
+        const selfBindPath = contentElement.dataset ? this._getAttr(contentElement, 'bind') : null;
+        if (selfBindPath) {
+            const bindPath = selfBindPath;
             if (!bindingContextCache.has(contentElement)) {
                 // List-item: plain record with the row's list context as parent.
                 // Component-level: no record (deferred effect meta drives it).
@@ -441,7 +522,7 @@ export const PortalSystemMethods = {
                 bindingContextCache.set(contentElement, bindingContext || true);
                 // Build deferred effect metadata (component-level portals only),
                 // independent of the binding context (the effect drives reactivity).
-                if (!listItemContext) {
+                if (!listItemContext && !instance._deferredEffectConsumed) {
                     if (!instance._deferredEffectMeta) instance._deferredEffectMeta = [];
                     const entry = {
                         element: contentElement,
@@ -456,11 +537,12 @@ export const PortalSystemMethods = {
             }
         }
 
-        // Only build deferred effect metadata for component-level portals (not list-item portals)
-        const metaFlag = !listItemContext;
+        // Only build deferred effect metadata for component-level portals (not list-item
+        // portals), and only until the post-init consumer has run (see above).
+        const metaFlag = !listItemContext && !instance._deferredEffectConsumed;
 
         // Process data-bind-html elements (children + self)
-        this._processPortalBindingType(contentElement, instance, '[data-bind-html]', 'bindHtml', bindingContextCache, (el, ctx, path) => {
+        this._processPortalBindingType(contentElement, instance, 'bind-html', bindingContextCache, (el, ctx, path) => {
             ctx._isHTMLBinding = true;
             if (instance._htmlContextsReady) {
                 const propertyName = path.startsWith('computed:') ? path.slice(9) : path;
@@ -469,13 +551,13 @@ export const PortalSystemMethods = {
         }, metaFlag ? 'html' : null);
 
         // Process data-bind-class elements (children + self)
-        this._processPortalBindingType(contentElement, instance, '[data-bind-class]', 'bindClass', classBindingContextCache, (el, ctx) => {
+        this._processPortalBindingType(contentElement, instance, 'bind-class', classBindingContextCache, (el, ctx) => {
             ctx._isClassBinding = true;
             ctx._updateClassBindingElement(this._resolvePortalBindingValue(ctx));
         }, metaFlag ? 'class' : null);
 
         // Process data-bind-style elements (children + self)
-        this._processPortalBindingType(contentElement, instance, '[data-bind-style]', 'bindStyle', styleBindingContextCache, (el, ctx, path) => {
+        this._processPortalBindingType(contentElement, instance, 'bind-style', styleBindingContextCache, (el, ctx, path) => {
             ctx._isStyleBinding = true;
             this._processStyleBinding(el, null, path, 0, null);
         }, metaFlag ? 'style' : null);
@@ -486,18 +568,17 @@ export const PortalSystemMethods = {
      * Shared logic for data-bind-html, data-bind-class, data-bind-style.
      * @param {HTMLElement} contentElement - Portal content root
      * @param {Object} instance - Component instance
-     * @param {string} selector - CSS selector (e.g. '[data-bind-html]')
-     * @param {string} datasetKey - Dataset property name (e.g. 'bindHtml')
+     * @param {string} attrName - Attribute name without its prefix (e.g. 'bind-html'); data- and data-wf- both match
      * @param {WeakMap} contextCache - WeakMap to cache binding context per element
      * @param {Function} postProcess - Called with (element, bindingContext, path) after context creation
      * @private
      */
-    _processPortalBindingType(contentElement, instance, selector, datasetKey, contextCache, postProcess, metaType) {
-        const elements = contentElement.querySelectorAll(selector);
+    _processPortalBindingType(contentElement, instance, attrName, contextCache, postProcess, metaType) {
+        const elements = contentElement.querySelectorAll(this._attrSelector(attrName));
         // Process children, then the content element itself if it matches
-        const candidates = contentElement.dataset?.[datasetKey] ? [...elements, contentElement] : elements;
+        const candidates = this._hasAttr(contentElement, attrName) ? [...elements, contentElement] : elements;
         for (const el of candidates) {
-            const path = el.dataset[datasetKey];
+            const path = this._getAttr(el, attrName);
             if (!path || contextCache.has(el)) continue;
 
             const ctx = this._contextRecords.createPortalBindingRecord(path, instance, el);
@@ -670,7 +751,7 @@ export const PortalSystemMethods = {
      */
     _bindPortaledAction(actionEl, instance)
     {
-        const actionAttr = actionEl.dataset.action;
+        const actionAttr = this._getAttr(actionEl, 'action');   // either prefix
         if (!actionAttr) return;
 
         // Skip if already bound by main action system (has bound actions)
@@ -746,7 +827,7 @@ export const PortalSystemMethods = {
      */
     _bindPortaledModel(modelEl, instance)
     {
-        const modelPath = modelEl.dataset.model;
+        const modelPath = this._getAttr(modelEl, 'model');
         if (!modelPath) return;
 
         // Determine the appropriate event type
@@ -831,7 +912,8 @@ export const PortalSystemMethods = {
         }
 
         // Find portals with pending conditions
-        const pendingPortals = element.querySelectorAll('[data-portal][data-show], [data-portal][data-render]');
+        const pendingPortals = Array.from(element.querySelectorAll(this._attrSelector('portal')))
+            .filter(el => this._hasAttr(el, 'show') || this._hasAttr(el, 'render'));
         if (pendingPortals.length === 0) return;
 
         pendingPortals.forEach(portalElement => {
@@ -858,8 +940,8 @@ export const PortalSystemMethods = {
      */
     _evaluatePortalConditions(portalElement, instance, listItemContext) {
         const pm = portalMetaCache.get(portalElement);
-        const showCondition = pm?.show ?? portalElement.dataset.show;
-        const renderCondition = pm?.render ?? portalElement.dataset.render;
+        const showCondition = pm?.show ?? this._getAttr(portalElement, 'show');
+        const renderCondition = pm?.render ?? this._getAttr(portalElement, 'render');
 
         let visible = true;
         if (showCondition) {

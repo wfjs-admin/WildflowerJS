@@ -63,7 +63,7 @@ npm install wildflowerjs
 <script defer src="https://cdn.jsdelivr.net/npm/wildflowerjs@1/dist/wildflower.full.min.js"></script>
 ```
 
-Pin a specific version with `wildflowerjs@1.1.0`.
+Pin a specific version with `wildflowerjs@1.5.0`.
 
 
 ## Guiding Principles
@@ -94,10 +94,11 @@ Neither entry carries an issue flag, and all results were run on the benchmark m
 - **Zero Build Step**: Drop a `<script>` tag and start building. No CLI, no compilation, no transpilation.
 - **Verifiable Supply Chain**: Three SHA-512-pinned tarballs in the build path, no transitive deps, no `npm install`. See [PROVENANCE.md](./PROVENANCE.md).
 - **No Virtual DOM**: Direct DOM manipulation for performance and simplicity.
-- **Reactive State**: Automatic UI updates when state changes, with computed properties and dependency tracking.
+- **Reactive State**: Automatic UI updates when state changes, with computed properties and dependency tracking. A computed may return a promise: bindings keep showing the last settled value while the new one resolves.
 - **Component System**: Declarative components with lifecycle hooks, props, and cross-component communication.
 - **Store Management**: Global reactive stores for shared state across components.
-- **Data Queries**: Point an element at a named server source and the view stays current. Polling, conditional GET, refetch on focus and reconnect, Server-Sent Events, automatic retry with backoff, and optimistic writes with `patch()`.
+- **Data Queries**: Point an element at a named server source and the view stays current. Polling, conditional GET, refetch on focus and reconnect, Server-Sent Events, automatic retry with backoff, and `persist:` to paint the last confirmed rows before any request leaves the machine.
+- **Declarative Writes**: A query that declares where data comes from declares where it goes. `to:` is the write transport, `write()` applies the change immediately, and `confirmation:` decides what the server's answer means. A rejection rolls back only the fields that write still owns, so concurrent writes to the same row do not clobber each other.
 - **Entity Pools**: Pull-based rendering for high-frequency DOM updates at 60fps. Game-ready.
 - **List Rendering**: Efficient array rendering with keyed reconciliation.
 - **Event Handling**: Declarative event binding with modifiers and form handling.
@@ -290,6 +291,7 @@ Pools also support an optional `entity: { state, computed, methods }` block for 
 | Variant | Includes | Use Case |
 |---------|----------|----------|
 | `wildflower.mini.min.js` | Core + Stores (no data-pools, plugins, portals, transitions, modals) | Smallest footprint (CRUD, forms, dashboards) |
+| `wildflower.mini-pool.min.js` | Mini with data-pools in place of the list cluster (no `data-list`) | Games, simulations, per-frame visualization |
 | `wildflower.lite.min.js` | Core + Stores + data-pools (no plugins, portals, transitions, modals) | Minimal footprint with high-frequency entity rendering |
 | `wildflower.min.js` | Core framework | Most applications |
 | `wildflower.spa.min.js` | Core + Router | Single-page applications |

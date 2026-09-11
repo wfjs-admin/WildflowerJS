@@ -152,6 +152,41 @@ suite('data-expect shape-drift warn (WF-962)', () => {
         expect(all.some(w => w.includes('"name"')), 'valid tokens still checked').toBe(true)
     })
 
+    // ── Slot burn on client partials (survey batch 8, Lane B row 2) ─────
+    // The drift warn is once-per-query-per-field-per-kind, forever. An
+    // optimistic write applies a PARTIAL through the same choke point, and a
+    // partial legitimately omits every field it is not writing, so checking
+    // it spent the "missing" slot on a non-arrival and masked the real drift
+    // that arrived later from the server. A client intent is not data to
+    // validate; only genuine arrivals are.
+    devIt('an optimistic write partial does not burn the drift slot', async () => {
+        const q = uname('q'); const c = uname('c')
+        let payload = [{ id: 1, name: 'a', price: 10 }]
+        window.fetch = async () => jsonResponse(payload)
+        wildflower.query(q, {
+            from: '/api/x.json', key: 'id',
+            to: () => Promise.resolve(undefined)
+        })
+        mountList(q, c, 'id:number, name:string, price:number')
+        await settle()
+        expect(wf962().length, 'complete rows, no drift').toBe(0)
+
+        // A write carries only what it changes. `name` and `price` are absent
+        // by design, not missing from the source.
+        await wildflower.getQuery(q).write({ id: 1, name: 'b' }).catch(() => {})
+        await settle(40)
+        expect(wf962().length, 'a client partial is not an arrival to validate').toBe(0)
+
+        // Now the source really does drop a declared field.
+        payload = [{ id: 1, name: 'b' }]
+        await wildflower.getQuery(q).refresh()
+        await settle(40)
+
+        const hits = wf962()
+        expect(hits.length, 'the real drift still gets said').toBe(1)
+        expect(hits[0]).toContain('price')
+    })
+
     minIt('the attribute is inert in production: rows render, nothing warns', async () => {
         const q = uname('q'); const c = uname('c')
         window.fetch = async () => jsonResponse([{ id: 1, name: 'a' }])

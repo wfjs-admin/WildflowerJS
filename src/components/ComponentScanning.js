@@ -45,15 +45,24 @@ _setupDynamicComponentDetection()
                     for (let j = 0; j < addedNodes.length; j++) {
                         const node = addedNodes[j];
                         if (node.nodeType === 1) { // ELEMENT_NODE
-                            // OPTIMIZATION: Skip pool entities - managed by PoolRenderer
-                            if (node._poolEntity) continue;
-                            // Fast path: check attribute first (no DOM traversal)
-                            if (node.hasAttribute('data-component')) {
+                            // Skip framework-rendered rows and pool entities: the list
+                            // renderer and PoolRenderer initialize any nested components
+                            // in their own output (needsComponentInitSet /
+                            // _initializeNestedComponentsInItem), so re-scanning them here
+                            // finds nothing and costs a subtree querySelector per row.
+                            // Mirrors the removed-node loop below, which has always
+                            // skipped these. A component added INTO a row later is its own
+                            // added node and still gets scanned.
+                            if (node._listIndex !== undefined || node._poolEntity) continue;
+                            // Fast path: check attribute first (no DOM traversal).
+                            // Both prefixes: a data-wf-component root must trigger
+                            // the scan too, or it is never initialized.
+                            if (this._hasAttr(node, 'component')) {
                                 needsScan = true;
                                 break;
                             }
                             // Slow path: only querySelector if needed
-                            if (node.querySelector('[data-component]')) {
+                            if (node.querySelector(this._attrSelector('component'))) {
                                 needsScan = true;
                                 break;
                             }
@@ -232,7 +241,7 @@ _setupDynamicComponentDetection()
         // to close the race; see _evaluateCloakShowVerdict for rationale.
         if (initializedCount > 0) {
             requestAnimationFrame(() => {
-                searchRoot.querySelectorAll('[data-cloak]').forEach(el => {
+                searchRoot.querySelectorAll(this._attrSelector('cloak')).forEach(el => {
                     this._stripCloakWithVerdict(el);
                 });
             });
@@ -259,45 +268,41 @@ _setupDynamicComponentDetection()
      * @private
      */
     _isInsideFalseDataRender(element) {
-        let parent = element.parentElement;
-        while (parent && parent !== this.root) {
-            if (this._hasAttr(parent, 'render')) {
-                // Find the component that owns this data-render element
-                const componentElement = this._getComponentElement(parent);
+        // Collect the data-render ancestors, then evaluate them outermost
+        // first: an outer section that is false settles it, and the inner
+        // conditions (which may name a $query) are not evaluated at all.
+        const chain = [];
+        for (let parent = element.parentElement; parent && parent !== this.root; parent = parent.parentElement) {
+            if (this._hasAttr(parent, 'render')) chain.push(parent);
+        }
+        for (let i = chain.length - 1; i >= 0; i--) {
+            const parent = chain[i];
+            const conditionPath = this._getAttr(parent, 'render');
+            if (!conditionPath) continue;
+            const componentElement = this._getComponentElement(parent);
+            if (!componentElement) continue;
 
-                // If the parent component is already initialized, use its instance
-                if (componentElement && componentElement.dataset.componentId) {
-                    const instance = this.componentInstances.get(componentElement.dataset.componentId);
-                    if (instance) {
-                        const conditionPath = this._getAttr(parent, 'render');
-                        const conditionValue = this._evaluateCondition(conditionPath, instance);
-                        if (!conditionValue) {
-                            return true; // Inside a data-render with false condition
-                        }
-                    }
-                } else if (componentElement) {
-                    // Parent component not yet initialized - check the definition's initial state
-                    const componentName = componentElement.dataset.wfComponent || componentElement.dataset.component;
-                    const definition = this.componentDefinitions.get(componentName);
-                    if (definition && definition.state) {
-                        const conditionPath = this._getAttr(parent, 'render');
-                        // Handle negation
-                        let negate = false;
-                        let actualPath = conditionPath;
-                        if (conditionPath.startsWith('!')) {
-                            negate = true;
-                            actualPath = conditionPath.slice(1);
-                        }
-                        // Get initial value from definition's state
-                        const initialValue = this._getNestedValue(definition.state, actualPath);
-                        const conditionValue = negate ? !initialValue : !!initialValue;
-                        if (!conditionValue) {
-                            return true; // Inside a data-render with false initial condition
-                        }
-                    }
-                }
+            // The owning component is initialized: the same verdict its render
+            // effect reaches (_conditionVerdict).
+            if (componentElement.dataset.componentId) {
+                const instance = this.componentInstances.get(componentElement.dataset.componentId);
+                if (instance && !this._evaluateCondition(conditionPath, instance)) return true;
+                continue;
             }
-            parent = parent.parentElement;
+
+            // Not initialized yet: a simple state path can be read off the
+            // definition's initial state. An expression or a $entity path
+            // cannot be evaluated without an instance, so the component
+            // initializes now and the owner's own conditional pass settles the
+            // section when it runs.
+            const componentName = componentElement.dataset.wfComponent || componentElement.dataset.component;
+            const definition = this.componentDefinitions.get(componentName);
+            if (!definition || !definition.state) continue;
+            const parsed = this._parseConditionPath(conditionPath);
+            if (parsed.isExpression) continue;
+            const initialValue = this._getNestedValue(definition.state, parsed.path);
+            const conditionValue = parsed.negate ? !initialValue : !!initialValue;
+            if (!conditionValue) return true;
         }
         return false;
     },
@@ -445,7 +450,9 @@ _setupDynamicComponentDetection()
      * @private
      */
     _createSingleInstance(element, ctx) {
-        const componentName = element.dataset.component;
+        // Both prefixes: the selector that collected `element` accepts
+        // data-wf-component, so the name must be read the same way.
+        const componentName = this._getAttr(element, 'component');
         if (!this.componentDefinitions.has(componentName)) return;
 
         // Skip already-initialized components to prevent double init
@@ -582,6 +589,11 @@ _setupDynamicComponentDetection()
      * @private
      */
     _prepareSingleInstanceForInit(instance, ctx) {
+        // Computeds exist now: adopt children that initialized under this
+        // element before it had an instance (a late registration that landed
+        // while the scan was yielding). See _adoptPendingChildren.
+        this._adoptPendingChildren(instance);
+
         // Queue init() for deferred execution (will run in separate macrotask)
         if (typeof instance.context.init === 'function') {
             ctx.pendingInits.push(instance);
@@ -919,7 +931,7 @@ _setupDynamicComponentDetection()
         element.dataset.componentId = instanceId;
 
         // Find parent component
-        const { parentInstance, parentId } = this._findParentComponent(element, options.parentElement);
+        const { parentInstance, parentId, parentElement } = this._findParentComponent(element, options.parentElement);
 
         // Create state manager using helper
         const stateManager = this._createComponentStateManager(instanceId, componentName, element);
@@ -960,6 +972,13 @@ _setupDynamicComponentDetection()
 
         // Register in context system using helper
         this._registerComponentInContextSystem(instance, parentInstance, parentId, element, componentName);
+
+        // Declaration order: a component ancestor with no instance yet means the
+        // parent's definition registers later. Park the link on that element;
+        // _adoptPendingChildren drains it once the parent finishes initializing.
+        if (parentElement && !parentId) {
+            this._deferParentLink(parentElement, instance);
+        }
 
         // Apply services from providers (uses: [...]) - only if plugin system is loaded
         if (definition.uses && this._useServices) {

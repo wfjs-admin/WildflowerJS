@@ -334,3 +334,84 @@ describe('ReactiveGraph core — frozen (stable) row effects', () => {
     expect(node.sources.length).toBe(edgeCountAfterFirst); // edges frozen, no churn
   });
 });
+
+describe('ReactiveGraph core — immutable container writes store raw elements', () => {
+  // The React-era idioms build a NEW container out of elements read THROUGH the
+  // proxy, so every element is a facade. The set trap unwraps the container but
+  // must also unwrap what it holds, or the raw graph ends up with facades as
+  // elements; each later read then wraps them again (proxy over proxy), which
+  // misroutes updates and deepens every read. The oracle is proxy identity: one
+  // proxy per raw object, so a slot that was stored raw re-reads as the SAME
+  // proxy, and a slot that was stored wrapped re-reads as a different one.
+
+  it('reactiveTree: items = items.filter(...) keeps element identity', () => {
+    const s = reactiveTree({ items: [{ id: 1, name: 'a' }, { id: 2, name: 'b' }, { id: 3, name: 'c' }] });
+    const seen = [];
+    effect(() => { seen.push(s.items.map((x) => x.name).join(',')); });
+    const pc = s.items[2];
+    s.items = s.items.filter((x) => x.id !== 2);
+    flushSync();
+    expect(seen[seen.length - 1]).toBe('a,c');
+    expect(s.items[1]).toBe(pc);
+    // A second immutable write must not add a layer either.
+    s.items = [...s.items, { id: 4, name: 'd' }];
+    flushSync();
+    expect(s.items[1]).toBe(pc);
+    // A field write on the relocated element still reaches the reader.
+    s.items[1].name = 'C';
+    flushSync();
+    expect(seen[seen.length - 1]).toBe('a,C,d');
+  });
+
+  it('reactive(): items = items.filter(...) keeps element identity', () => {
+    const s = reactive({ items: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+    const pc = s.items[2];
+    s.items = s.items.filter((x) => x.id !== 2);
+    expect(s.items[1]).toBe(pc);
+    s.items = [...s.items];
+    expect(s.items[1]).toBe(pc);
+  });
+
+  it('reactiveTree: items.map(i => ({ ...i, done })) stores raw nested values', () => {
+    // Spreading a facade copies its own values, so a nested object arrives one
+    // level deeper than the element scan: a fresh plain element holding a facade.
+    const s = reactiveTree({ items: [{ id: 1, meta: { tag: 't1' }, done: false }] });
+    const seen = [];
+    effect(() => { seen.push(s.items.map((x) => x.meta.tag + (x.done ? '!' : '')).join(',')); });
+    const pm = s.items[0].meta;
+    s.items = s.items.map((i) => ({ ...i, done: true }));
+    flushSync();
+    expect(seen[seen.length - 1]).toBe('t1!');
+    expect(s.items[0].meta).toBe(pm);
+    s.items[0].meta.tag = 't2';
+    flushSync();
+    expect(seen[seen.length - 1]).toBe('t2!');
+  });
+
+  it('reactiveTree: a plain object assigned with facade values stores them raw', () => {
+    const s = reactiveTree({ current: { id: 1 }, all: [{ id: 1 }, { id: 2 }] });
+    const p2 = s.all[1];
+    s.current = { picked: s.all[1], at: 3 };
+    flushSync();
+    expect(s.current.picked).toBe(p2);
+  });
+
+  it('reactiveTree: two levels are unwrapped silently; a facade three levels deep draws WF-966', () => {
+    const warns = [];
+    const realWarn = console.warn;
+    console.warn = (...a) => { warns.push(a.join(' ')); };
+    try {
+      const s = reactiveTree({ inner: { name: 'x' }, d2: null, d3: null });
+      const pi = s.inner;
+      s.d2 = { b: { c: s.inner } };
+      flushSync();
+      expect(s.d2.b.c).toBe(pi);
+      expect(warns.filter((w) => w.includes('WF-966')).length).toBe(0);
+      s.d3 = { a: { b: { c: s.inner } } };
+      flushSync();
+      expect(warns.filter((w) => w.includes('WF-966')).length).toBe(1);
+    } finally {
+      console.warn = realWarn;
+    }
+  });
+});

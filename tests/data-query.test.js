@@ -52,6 +52,7 @@ suite('data-query engine probe', () => {
     afterEach(() => {
         window.fetch = realFetch
         console.warn = realWarn
+        delete wildflower._queryTeardownGraceMs
         if (container && container.parentNode) container.parentNode.removeChild(container)
         container = null
     })
@@ -189,6 +190,31 @@ suite('data-query engine probe', () => {
         expect(container.querySelector('.row').textContent).toBe('v2')
     })
 
+    // The prefetch pattern (docs): refresh() before any element binds
+    // warms the store, and a later mount paints from it immediately —
+    // no new fetch has to settle first.
+    it('prefetch pattern: refresh() before any element binds warms the query', async () => {
+        const q = uname('q'); const c = uname('c')
+        let hold = false
+        let release = null
+        window.fetch = () => {
+            if (!hold) return Promise.resolve(jsonResponse([{ id: 1, name: 'warmed' }]))
+            return new Promise(res => { release = () => res(jsonResponse([{ id: 1, name: 'later' }])) })
+        }
+        wildflower.query(q, { from: '/api/x.json', key: 'id' })
+
+        await wildflower.getQuery(q).refresh()   // prefetch: nothing bound yet
+        await settle(20)
+        expect(wildflower.getQuery(q).rows.length, 'store warmed pre-mount').toBe(1)
+
+        hold = true   // any fetch the mount itself fires is held open
+        mountList(q, c)
+        await settle(20)
+        expect(container.querySelector('.row').textContent,
+            'the mount paints from the warm store, not a fresh round trip').toBe('warmed')
+        if (release) { release(); await settle(20) }
+    })
+
     it('getQuery(...).rows auto-tracks inside a computed', async () => {
         const q = uname('q'); const c = uname('c')
         let payload = [{ id: 1, name: 'b' }, { id: 2, name: 'a' }]
@@ -246,8 +272,13 @@ suite('data-query engine probe', () => {
         expect(warnings.some(w => /during .*(its own )?evaluation/i.test(w) && w.includes('[WF'))).toBe(true)
     })
 
+    // The warning is deferred behind the teardown grace: declaring a query
+    // after its markup binds is a supported ordering, so warning at bind time
+    // would fire on correct code. A name that never registers still gets named
+    // once the grace lapses, which is what this asserts.
     it.skipIf(isMinifiedBuild())('unknown query name in markup warns and does not crash', async () => {
         const c = uname('c')
+        wildflower._queryTeardownGraceMs = 40
         container.innerHTML = `
             <div data-component="${c}">
                 <ul data-query="never-registered-xyz"><template><li data-bind="name"></li></template></ul>
@@ -255,8 +286,8 @@ suite('data-query engine probe', () => {
         `
         wildflower.component(c, { state: {} })
         wildflower.scan(container)
-        await settle()
-        expect(warnings.some(w => w.includes('never-registered-xyz') && w.includes('no such query'))).toBe(true)
+        await settle(160)
+        expect(warnings.some(w => w.includes('never-registered-xyz') && w.includes('WF-955'))).toBe(true)
     })
 
     it('initial rows render before first fetch resolves', async () => {
@@ -552,6 +583,23 @@ suite('data-query engine probe', () => {
         const q = uname('q')
         wildflower.query(q, { from: async () => [], refresh: 0.2 })
         expect(warnings.some(w => w.includes(q) && /sub-second|poll/i.test(w))).toBe(true)
+    })
+
+    // Review finding:retry is a
+    // plain count; every other shape coerced via `| 0` with no diagnostic —
+    // `retry: { max: 3 }` (the shape peer libraries use) silently became 0,
+    // retry OFF, and the misdeclaration only showed under a network failure.
+    it.skipIf(isMinifiedBuild())('a non-number retry shape warns WF-983 in dev', async () => {
+        const q = uname('q')
+        wildflower.query(q, { from: async () => [], retry: { max: 3 } })
+        expect(warnings.some(w => w.includes('WF-983') && w.includes(q) && w.includes('DISABLED')),
+            'the policy-object shape is named, with the coerced outcome').toBe(true)
+    })
+
+    it.skipIf(isMinifiedBuild())('calibration: a plain-number retry stays silent', async () => {
+        const q = uname('q')
+        wildflower.query(q, { from: async () => [], retry: 3 })
+        expect(warnings.some(w => w.includes('WF-983'))).toBe(false)
     })
 
     it('data-wf-query gets wf-prefixed transform attributes', async () => {
@@ -1037,7 +1085,10 @@ suite('data-query engine probe', () => {
         const after = fetches
         const controller = wildflower._queryControllers.get(q)
         expect(controller.active).toBe(false)
-        expect(controller.timerId).toBeNull()
+        // `timerId` is property-mangled in production builds, so the handle is
+        // only readable by name in dev. The behavioral proof — the interval
+        // really stopped — is the fetch count below, and that runs everywhere.
+        if (!isMinifiedBuild()) expect(controller.timerId).toBeNull()
         await settle(300)
         expect(fetches).toBe(after) // interval really stopped
         delete wildflower._queryTeardownGraceMs
@@ -1455,8 +1506,8 @@ suite('data-query engine probe', () => {
             <div data-component="${c}" data-ssr="true">
                 <ul data-query="${q}">
                     <template><li class="row" data-bind="name"></li></template>
-                    <li data-seed='{"id":1}' data-bind="name">served-a</li>
-                    <li data-seed='{"id":2}' data-bind="name">served-b</li>
+                    <li class="row" data-seed='{"id":1}' data-bind="name">served-a</li>
+                    <li class="row" data-seed='{"id":2}' data-bind="name">served-b</li>
                 </ul>
             </div>
         `

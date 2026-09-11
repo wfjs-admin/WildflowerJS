@@ -2,7 +2,7 @@
 // ES6 MODULE IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
-import { WF_ERRORS, objectUtils, wfError, definitionSignature, validateEntityDefinition, warnDefinitionCollisions } from '../core/wfUtils.js';
+import { WF_ERRORS, objectUtils, wfError, definitionSignature, validateEntityDefinition, warnDefinitionCollisions, PENDING_BINDING } from '../core/wfUtils.js';
 
 // Non-function definition keys the store factory actually consumes
 // (validateEntityDefinition allowlist — keep in sync with createStoreComponent).
@@ -164,6 +164,46 @@ export class StoreManager {
     }
 
     /**
+     * Re-evaluate a component's cached work and re-render its lists after an
+     * entity it referenced finally registered. Its computed caches were filled
+     * with the misses (external() returns null for an absent entity), and its
+     * mapArray lists captured an array function that resolved to nothing, so
+     * both have to be dropped rather than merely marked dirty.
+     *
+     * Shared by the deferred-subscribe path and the pending-binding path: the
+     * two arrive for different reasons and need identical recovery.
+     *
+     * @param {Object} instance - The component instance to wake
+     * @private
+     */
+    _wakeComponentForLateEntity(instance) {
+        if (!instance || !instance.stateManager) return;
+        // Invalidate ALL computed caches so they re-evaluate with the now-available store
+        if (instance.stateManager.computedCache) {
+            instance.stateManager.computedCache.clear();
+        }
+        if (instance.stateManager._lastEvalResult) {
+            instance.stateManager._lastEvalResult.clear();
+        }
+        // Re-render any list elements in this component that may depend on the store
+        if (instance.element && this.framework._renderList) {
+            const listEls = instance.element.querySelectorAll('[data-list],[data-wf-list]');
+            for (const listEl of listEls) {
+                if (listEl._mapArrayInitialized && listEl._disposeMapArray) {
+                    listEl._disposeMapArray();
+                    listEl._mapArrayInitialized = false;
+                    listEl._disposeMapArray = null;
+                    listEl.innerHTML = '';
+                }
+                const ctx = listEl._listContext;
+                if (ctx) {
+                    this.framework._renderList(listEl, null, ctx, instance);
+                }
+            }
+        }
+    }
+
+    /**
      * Resolve pending dependencies when a store is created.
      * Re-evaluates computed properties and triggers list re-renders.
      *
@@ -212,29 +252,15 @@ export class StoreManager {
                 if (subTarget && subTarget.id && this.framework._registerEntityDependent) {
                     this.framework._registerEntityDependent(subTarget.id, componentId);
                 }
-                // Invalidate ALL computed caches so they re-evaluate with the now-available store
-                if (instance.stateManager.computedCache) {
-                    instance.stateManager.computedCache.clear();
-                }
-                if (instance.stateManager._lastEvalResult) {
-                    instance.stateManager._lastEvalResult.clear();
-                }
-                // Re-render any list elements in this component that may depend on the store
-                if (instance.element && this.framework._renderList) {
-                    const listEls = instance.element.querySelectorAll('[data-list]');
-                    for (const listEl of listEls) {
-                        if (listEl._mapArrayInitialized && listEl._disposeMapArray) {
-                            listEl._disposeMapArray();
-                            listEl._mapArrayInitialized = false;
-                            listEl._disposeMapArray = null;
-                            listEl.innerHTML = '';
-                        }
-                        const ctx = listEl._listContext;
-                        if (ctx) {
-                            this.framework._renderList(listEl, null, ctx, instance);
-                        }
-                    }
-                }
+                this._wakeComponentForLateEntity(instance);
+            }
+
+            // A binding that referenced this entity before it existed. There is
+            // no computed to re-evaluate; the bindings themselves are what went
+            // stale, so the component gets the same wake a deferred subscribe
+            // gets. The render-effect re-run below covers the non-list bindings.
+            if (computedName === PENDING_BINDING) {
+                this._wakeComponentForLateEntity(instance);
             }
 
             // Re-evaluate the computed property to get fresh data

@@ -12,7 +12,8 @@
  *
  * ERROR SYSTEM:
  * ─────────────
- * - WF_ERRORS    : Structured error code definitions (WF-001 through WF-999)
+ * - WF_ERRORS    : Structured error code definitions, WF-001 through WF-999,
+ *                  allocated in per-subsystem blocks (see CODE ALLOCATION below)
  * - wfError()    : Error reporting with context and suggestions
  * - wfWarn()     : Runtime warnings (survives production builds)
  *
@@ -171,6 +172,45 @@ export const wfYield = (() => {
     return () => new Promise(resolve => setTimeout(resolve, 0));
 })();
 
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * CODE ALLOCATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Codes are grouped by subsystem, one hundred per block, and allocated in
+ * order within a block. 143 of the 999 are in use, so the range is nowhere
+ * near full — but a BLOCK can fill while the range is mostly empty, which is
+ * what happened to queries, and the shape is not visible without counting.
+ * Hence this map. Update it when a block is claimed or exhausted.
+ *
+ *   block  owner                       used            free
+ *   ─────  ──────────────────────────  ──────────────  ─────────────────────
+ *   000s   core, initialization        001-003         004-099
+ *   100s   components                  101-108         109-199
+ *   200s   state, computed, watch      201-235         236-299
+ *   300s   context                     301-304         305-399
+ *   400s   templates, lists            401-415         416-499
+ *   500s   bindings, forms             501-512         513-599
+ *   600s   actions, events             601-606         607-699
+ *   700s   routing                     701-712         713-799
+ *   800s   SSR                         801-802         803-899
+ *   900s   stores    901-910           queries 940,950-999  911-939 (shared), 941-949
+ *
+ * The 900s hold two owners and are the one block to think about before
+ * allocating. Stores grew up from 901 and queries were given 950-999, which
+ * filled. Queries then claimed 940-949 and fill it UPWARD from 940; the next
+ * exhausted block is claimed the same way, backward in tens (930-939, then
+ * 920-929). Stores continue upward from 911. The two therefore approach each
+ * other across 911-939, and whichever needs the space first should take it —
+ * but the one that does should say so here, because after that the other one
+ * needs a home somewhere else and there is no way to tell from the numbers.
+ *
+ * A retired code is never reused: its number stays commented in place below
+ * and keeps its entry on the error-codes page, so a reader who meets the code
+ * in an old console log or an old post can still find out what it was.
+ * Every code that can fire needs an entry on that page — it is the surface
+ * the printed docs URL points at.
+ */
 export const WF_ERRORS = {
     // Core/initialization (001-099)
     ROOT_NOT_FOUND: { code: 'WF-001', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Root element not found' }) },
@@ -216,6 +256,7 @@ export const WF_ERRORS = {
     RULE_CONFIG: { code: 'WF-228', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule declaration invalid; rule disabled' }) },
     RULE_EVAL_ERROR: { code: 'WF-229', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule check threw; rule skipped for this pass' }) },
     RULE_VERDICT_INVALID: { code: 'WF-234', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule check returned something that is not a verdict; rule skipped' }) },
+    ITEM_COMPUTED_ASYNC: { code: 'WF-235', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Item-level list computed returned a Promise; async computeds are component/store/plugin-level only' }) },
 
     // Context system (300-399)
     CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
@@ -256,6 +297,7 @@ export const WF_ERRORS = {
     PROPS_PARSE_FAILED: { code: 'WF-510', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to parse the data-props attribute as JSON' }) },
     // WF-511 briefly held the query external-write diagnostic pre-release;
     // renumbered to WF-950 (query block, store century) before shipping.
+    MODEL_STORE_SHADOW: { code: 'WF-512', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A data-model root names both a component state key and a store; component state wins' }) },
 
     // Action/event errors (600-699)
     ACTION_HANDLER_ERROR: { code: 'WF-601', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in action handler' }) },
@@ -295,8 +337,12 @@ export const WF_ERRORS = {
     STORE_NEVER_REGISTERED: { code: 'WF-909', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A subscribed or watched store never registered' }) },
     STORE_WAIT_TIMEOUT: { code: 'WF-910', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Timed out waiting for a subscribed store to become ready' }) },
 
-    // Query diagnostics (950-969): queries are stores with a source, so
-    // their codes live in the store century, in their own block.
+    // Query diagnostics: queries are stores with a source, so their codes
+    // live in the store century, in their own block. 950-999 filled, so the
+    // block was extended backward to 940-949, which fills upward from here.
+    // (966 is not a query code; FACADE_IN_RAW sits inside the run.)
+    QUERY_CONFIRM_NOT_INHERITED: { code: 'WF-940', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A query-level `confirmation` reaches update and create only, so this named operation discarded its response body and refetched the whole collection instead' }) },
+
     QUERY_STORE_EXTERNAL_WRITE: { code: 'WF-950', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'External write to a query-owned store' }) },
     QUERY_DUPLICATE: { code: 'WF-951', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query name already registered; second registration ignored' }) },
     QUERY_NAME_COLLISION: { code: 'WF-952', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query name collides with an existing store; registration ignored' }) },
@@ -312,6 +358,48 @@ export const WF_ERRORS = {
     QUERY_REFRESH_SHAPE: { code: 'WF-961', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'refresh() received unexpected options; request parameters belong inside params' }) },
     QUERY_EXPECT_DRIFT: { code: 'WF-962', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Incoming rows drifted from the data-expect declaration' }) },
     QUERY_ORPHAN: { code: 'WF-963', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-query element has no component ancestor, so nothing will ever process it' }) },
+    QUERY_TO_INVALID: { code: 'WF-964', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() needs a `to` function declared on the query' }) },
+    QUERY_WRITE_KEYLESS_RESULT: { code: 'WF-965', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() resolved with an object lacking the query key; treated as resolve-with-nothing (the query invalidates)' }) },
+    FACADE_IN_RAW: { code: 'WF-966', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A container written to reactive state holds facade-wrapped elements; unwrap with wildflower.toRaw before writing' }) },
+    QUERY_RUNG_UNKNOWN: { code: 'WF-967', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Unrecognized refresh rung token; token ignored' }) },
+    QUERY_PERSIST_INVALID: { code: 'WF-968', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query `persist` must be true or a storage-key string; persistence disabled' }) },
+    QUERY_WRITE_KEYLESS: { code: 'WF-969', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() was called without the query key field; a keyless item has no row to target' }) },
+    QUERY_PARAMS_THREW: { code: 'WF-970', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The query `params` function threw; the request proceeds with no declared params' }) },
+    QUERY_TO_SHAPE: { code: 'WF-971', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A `to` or `create` declaration is not a URL string, an operation entry, or a function' }) },
+    QUERY_URL_TOKEN_UNRESOLVED: { code: 'WF-972', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A :token in the request URL had no value on the item or in params; no request was sent' }) },
+    QUERY_URL_TOKEN_UNDECLARED: { code: 'WF-973', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A :token in a declared URL names nothing the query can supply' }) },
+    QUERY_OP_UNKNOWN: { code: 'WF-974', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() or create() named an operation this query does not declare' }) },
+    QUERY_DELETE_SHAPE: { code: 'WF-975', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The delete operation and the declared `deleted` field disagree' }) },
+    QUERY_OP_NO_FIELDS: { code: 'WF-976', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The written item merges no fields onto its row, so nothing can roll back' }) },
+    QUERY_BODY_MISSING: { code: 'WF-977', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'An update or create carries fields but declares no `body`, so the request is sent empty' }) },
+    QUERY_OPTION_IGNORED: { code: 'WF-978', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A declarative option cannot be honored beside a function `from`' }) },
+    QUERY_PARAMS_MIXED: { code: 'WF-979', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'An engine refetch dropped values the last one-shot refresh({ params }) had applied' }) },
+    QUERY_SELECT_SHAPE: { code: 'WF-980', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The read response did not arrive as an array of rows' }) },
+    QUERY_HEADERS_INVALID: { code: 'WF-981', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A `headers` declaration is not an object or a function, or it threw' }) },
+    QUERY_CREATE_ON_RECORD: { code: 'WF-982', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'create() was called on a record-shaped query, which holds one record and has no second to create' }) },
+    QUERY_RETRY_SHAPE: { code: 'WF-983', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query `retry` must be a number; a non-number coerces silently, usually to 0 (retry disabled)' }) },
+    QUERY_STREAM_HEADERS: { code: 'WF-984', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Declared headers cannot apply to the sse stream; EventSource carries no headers' }) },
+    QUERY_INITIAL_SHAPE: { code: 'WF-985', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query `initial` must be an array of rows; a non-array seed is ignored' }) },
+    QUERY_REDIRECT_CROSS_ORIGIN: { code: 'WF-986', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A request with declared headers was redirected to another origin; the platform strips only Authorization on the hop' }) },
+    QUERY_WRITE_UNDEFINED_FIELD: { code: 'WF-987', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() received an undefined-valued field; undefined is not a value (null clears, absent leaves alone), so the field is treated as absent' }) },
+    QUERY_SAVE_AFTER_CLEAR: { code: 'WF-988', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A persist save landed inside the clearPersisted() window and was suppressed; a real logout navigates, reloads, or tears the query down' }) },
+    QUERY_SSE_JSON_ENDPOINT: { code: 'WF-989', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The sse stream on the read URL keeps being refused without ever delivering a message; the endpoint likely answers JSON, not text/event-stream' }) },
+    QUERY_WRITE_UNHANDLED: { code: 'WF-990', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A write() rejection reached no handler; rollback and syncError already applied, but the rejection is part of the contract' }) },
+    QUERY_WRITE_PENDING: { code: 'WF-991', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A write has been pending far longer than a request should take; its claims and the paused refresh machinery hold until it settles' }) },
+    QUERY_PERSIST_SHAPE: { code: 'WF-992', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A persisted row carries a value JSON cannot round-trip (Date, Map, or Set); it restores different after a reload' }) },
+    QUERY_HEADERS_ORIGIN_MISS: { code: 'WF-993', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A request origin matched no config({ headers }) key, but a declared key differs only in scheme or port; origins compare exactly, so those headers never ship' }) },
+    QUERY_PERSIST_SAVE_FAILED: { code: 'WF-994', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A persist save failed and was dropped along with the stored snapshot; nothing persists for this query until a save succeeds' }) },
+    QUERY_WRITE_EXTRA_ARG: { code: 'WF-995', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write(item, ...) received a second argument, which this form does not take; it was ignored' }) },
+    QUERY_WRITE_NO_ITEM: { code: 'WF-996', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() was called with no item, so the operation carries no fields and nothing can roll back' }) },
+    QUERY_RECORD_FIELD_MISSING: { code: 'WF-997', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A binding inside a record-shape query subtree names something the row and the component both lack, so it renders empty' }) },
+    QUERY_CONFIRMATION_THREW: { code: 'WF-998', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A confirmation: callback threw, so the write rejected and rolled back even though the server answered ok; confirmation receives the parsed response body, not the Response' }) },
+    QUERY_WRITE_BODY_UNPARSED: { code: 'WF-999', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A write succeeded but its response body is not JSON, so there was nothing to apply and the query refetched; an empty body is normal and says nothing here' }) },
+    // 950-999 is full. Queries claimed 940-949 and fill it UPWARD from the
+    // top of this block, so the next query code is WF-941 (940 is taken, and
+    // is declared up there in numeric order, not down here). See CODE
+    // ALLOCATION at the top of this
+    // file before claiming another block: 911-939 is shared headroom that
+    // stores also grow into.
 
     // CSP-safe expression evaluator (non-numeric codes: separate category
     // from the 1xx-9xx ranges because they describe parser / security
@@ -337,6 +425,44 @@ export const WF_ERRORS = {
  * same cell.
  */
 export const QUERY_ENGINE_WRITE = { depth: 0 };
+
+/**
+ * Synthetic computed name for a pending-entity dependency that has no computed
+ * behind it. An external() miss inside a computed registers under that
+ * computed's name and the drain re-evaluates it; a miss from a plain binding
+ * (data-list, data-bind, class/attr expressions) has no such name, and this
+ * stands in so the same drain can wake it. Shared rather than written as a
+ * literal at each site: a marker that must match across modules and fails
+ * silently when it does not is exactly the kind of string to name once.
+ * Sibling of the older '_subscribe_' marker in the same registry.
+ */
+export const PENDING_BINDING = '_binding_';
+
+/**
+ * Depth marker for "a computed is currently evaluating".
+ *
+ * `_wrapMethod` queues a method call and returns undefined while a component
+ * is not init-ready, so an action fired before init() replays afterwards
+ * rather than being lost. Everything the framework evaluates to produce the
+ * FIRST paint runs before that flag is set, so a computed that delegates to a
+ * method received `undefined`, computed a wrong result, and cached it, while
+ * the queued call replayed for real afterwards and looked innocent.
+ *
+ * A computed evaluation is a synchronous read that needs its value now and
+ * cannot be meaningfully replayed later, which is the same reason the wrapper
+ * already exempts re-entrant calls ("already inside a known execution
+ * frame"). This cell is how the two ends of that decision see each other, and
+ * a shared mutable object rather than a boolean export so every module reads
+ * the same cell. Depth, not a flag, because computeds nest.
+ */
+// depth: how many computed evaluations are on the stack (any entity).
+// owners: the component instance evaluating at each level (null for stores
+// and plugins). The pre-init action queue is bypassed only for a method
+// call landing on the instance whose OWN computed is evaluating (review
+// R16): the global depth alone lifted every component's queue while any
+// computed anywhere evaluated, so a computed on A reaching a method on
+// not-yet-initialized B ran it early instead of queueing it for replay.
+export const COMPUTED_EVAL = { depth: 0, owners: [] };
 
 /**
  * Build the canonical doc URL for an error code.

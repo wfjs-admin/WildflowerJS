@@ -1,6 +1,6 @@
 {
   "name": "wildflowerjs",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Lightweight reactive JavaScript framework with no build step and no virtual DOM",
   "type": "module",
   "main": "dist/wildflower.min.js",
@@ -21,6 +21,7 @@
       "default": "./dist/wildflower.min.js"
     },
     "./nano": "./dist/wildflower.nano.min.js",
+    "./mini-pool": "./dist/wildflower.mini-pool.min.js",
     "./mini": "./dist/wildflower.mini.min.js",
     "./lite": "./dist/wildflower.lite.min.js",
     "./spa": "./dist/wildflower.spa.min.js",

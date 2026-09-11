@@ -19,7 +19,7 @@ export const TemplateSystemMethods = {
      * Find template element in a container (HTML5 template only)
      * @private
      */
-    _findTemplate(container, instance = null) {
+    _findTemplate(container, instance = null, options = null) {
         // Check for data-use-template first (Configurable Component Templates)
         const useTemplate = container.querySelector(this._attrSelector('use-template'));
         if (useTemplate && instance) {
@@ -104,14 +104,18 @@ export const TemplateSystemMethods = {
 
         // Standard template discovery (existing behavior)
         const found = container.querySelector('template');
-        // A4 (DX diagnostics sweep, dev only): a 'template'-named element with
-        // no content fragment is the HTML parser's foreign-content leftover
-        // (e.g. <template> inside <svg> parses as an inert SVG element, NOT an
-        // HTMLTemplateElement). Return null so the no-template diagnosis names
-        // the cause, instead of downstream code building rows from the inert
-        // element or choking on .content. Production keeps today's behavior.
-        if (__DEV__ && found && found.content === undefined) {
-            return null;
+        // A 'template'-named element with no content fragment is the HTML
+        // parser's foreign-content leftover: <template> inside <svg> parses as
+        // an inert SVG element, NOT an HTMLTemplateElement. Its children are
+        // still parsed, as real SVG elements, so a caller that can render them
+        // (pools; _extractTemplateContent builds the fragment from those
+        // children) opts in with { acceptForeign: true }. Lists do not: their
+        // row pipeline assumes HTML, so in dev return null and let the
+        // no-template diagnosis name the <svg> cause instead of downstream code
+        // choking on .content. Production keeps the pre-existing behavior.
+        if (found && found.content === undefined) {
+            if (options && options.acceptForeign && found.childElementCount > 0) return found;
+            if (__DEV__) return null;
         }
         return found;
     },
@@ -120,7 +124,23 @@ export const TemplateSystemMethods = {
      * @private
      */
     _extractTemplateContent(template) {
-        const content = template.content ? template.content.cloneNode(true) : template.cloneNode(true);
+        let content;
+        if (template.content) {
+            content = template.content.cloneNode(true);
+        } else if (template.localName === 'template') {
+            // Foreign-content template (<template> inside <svg>): a 'template'
+            // element with no fragment. Its children are real elements in the
+            // right namespace, so clone them into a fragment and the rest of
+            // the pipeline sees the usual shape (fragment → firstElementChild
+            // is the entity root).
+            content = document.createDocumentFragment();
+            const kids = template.childNodes;
+            for (let i = 0; i < kids.length; i++) content.appendChild(kids[i].cloneNode(true));
+        } else {
+            // An ordinary element used as a template (named templates declared
+            // on a <div>, inline slot fallbacks): the element itself is the root.
+            content = template.cloneNode(true);
+        }
         // PERF: Strip whitespace-only text nodes to reduce DOM size
         // For 10k rows, this eliminates ~100k+ whitespace nodes and speeds up reflow
         this._stripWhitespaceNodes(content);
@@ -1088,7 +1108,7 @@ export const TemplateSystemMethods = {
 
                 // PERF: Pre-compute binding type at compile time (not per-item)
                 const isExpression = this.isExpression(bindPath);
-                const isListContextVar = this._listContextVars.has(bindPath);
+                const isListContextVar = !!this._listContextVars && this._listContextVars.has(bindPath);
                 const isPropsPath = bindPath.startsWith('props:');
                 const isComputed = bindPath.startsWith('computed:');
 
@@ -1165,7 +1185,10 @@ export const TemplateSystemMethods = {
             // Extract data-show metadata (support both prefixes)
             let showPath = this._getAttr(el, 'show');
             if (showPath) {
-                const negate = showPath.startsWith('!');
+                // Negate-flag only for a single simple term ("!done"); a
+                // compound expression keeps its leading ! — stripping it would
+                // negate the whole expression (De Morgan flip).
+                const negate = showPath.startsWith('!') && /^[\w.$:]+$/.test(showPath.slice(1));
                 let actualPath = negate ? showPath.slice(1) : showPath;
 
                 // Normalize $store.path shorthand to external() calls at compile time
@@ -1271,8 +1294,8 @@ export const TemplateSystemMethods = {
                     const uniqueVars = this._extractExpressionVars(bindClassExpr);
                     classBinding.expressionVars = uniqueVars;
                     classBinding.expressionPaths = this._extractExpressionPaths(bindClassExpr);
-                    classBinding.usesListContext = uniqueVars.some(v => this._listContextVars.has(v));
-                    classBinding.needsComponentState = uniqueVars.some(v => !this._listContextVars.has(v));
+                    classBinding.usesListContext = uniqueVars.some(v => !!this._listContextVars && this._listContextVars.has(v));
+                    classBinding.needsComponentState = uniqueVars.some(v => !this._listContextVars || !this._listContextVars.has(v));
                     // Pre-compile if it's a pure item expression (no component state needed, no list context)
                     if (!classBinding.usesListContext && classBinding.needsComponentState === false) {
                         classBinding.compiledFn = this._getCompiledExpression(bindClassExpr, uniqueVars, 'classBinding');
@@ -1306,7 +1329,7 @@ export const TemplateSystemMethods = {
                     const uniqueVars = this._extractExpressionVars(bindStyleExpr);
                     styleBinding.expressionVars = uniqueVars;
                     styleBinding.expressionPaths = this._extractExpressionPaths(bindStyleExpr);
-                    styleBinding.usesListContext = uniqueVars.some(v => this._listContextVars.has(v));
+                    styleBinding.usesListContext = uniqueVars.some(v => !!this._listContextVars && this._listContextVars.has(v));
                     // Pre-compile if no list context variables (those need special handling at runtime)
                     if (uniqueVars.length > 0 && !styleBinding.usesListContext) {
                         styleBinding.compiledFn = this._getCompiledExpression(bindStyleExpr, uniqueVars, 'styleBinding');
@@ -1340,7 +1363,7 @@ export const TemplateSystemMethods = {
                     const uniqueVars = this._extractExpressionVars(bindAttrExpr);
                     attrBinding.expressionVars = uniqueVars;
                     attrBinding.expressionPaths = this._extractExpressionPaths(bindAttrExpr);
-                    attrBinding.usesListContext = uniqueVars.some(v => this._listContextVars.has(v));
+                    attrBinding.usesListContext = uniqueVars.some(v => !!this._listContextVars && this._listContextVars.has(v));
                     // Pre-compile if no list context variables (those need special handling at runtime)
                     if (uniqueVars.length > 0 && !attrBinding.usesListContext) {
                         attrBinding.compiledFn = this._getCompiledExpression(bindAttrExpr, uniqueVars, 'attrBinding');
@@ -1803,6 +1826,57 @@ export const TemplateSystemMethods = {
         return metadata;
     },
     /**
+     * Build elements array from compiled DOM paths
+     * PERF: Uses pre-computed elementPaths array for single-loop resolution
+     * instead of iterating through 7 separate binding type arrays
+     *
+     * Lives here (not in the list-only ListItemBinding.js) because it's pure
+     * DOM-path resolution over compiledMetadata.elementPaths — no list
+     * concepts involved — and PoolRenderer.js calls it directly via
+     * this._framework, so it must be present whenever _compileTemplate is,
+     * regardless of whether the list feature is built in.
+     * @private
+     */
+    _buildElementsArrayFromMetadata(itemEl, compiledMetadata) {
+        const paths = compiledMetadata.elementPaths;
+
+        // FAST PATH: Use pre-computed elementPaths (7x fewer loop iterations)
+        // Instead of looping through bindings, htmlBindings, models, shows, actions,
+        // classBindings, styleBindings separately with undefined checks,
+        // we just resolve each unique element once
+        if (paths && paths.length > 0) {
+            const allElementsArray = new Array(paths.length);
+            // PERF OPTIMIZATION 2.1: Inline element path resolution to eliminate function call overhead
+            // For 1000 items × 5 bindings = 5000 function calls saved
+            for (let i = 0; i < paths.length; i++) {
+                const path = paths[i];
+                const plen = path ? path.length : 0;
+                if (plen === 0) {
+                    allElementsArray[i] = itemEl;
+                    continue;
+                }
+                // Resolve each child index by element node-pointers
+                // (firstElementChild + nextElementSibling) rather than fetching the live
+                // HTMLCollection (current.children) and indexing it per hop. elementPaths
+                // are element-child indices, and *ElementSibling traverse element-only
+                // nodes, so this is semantically identical to children[idx] (text/comment
+                // nodes excluded the same way) while avoiding the collection wrapper +
+                // index walk on each step (~58% faster per row at create10k).
+                let current = itemEl;
+                for (let p = 0; p < plen; p++) {
+                    let next = current.firstElementChild;
+                    for (let k = path[p]; k > 0 && next; k--) next = next.nextElementSibling;
+                    if (!next) { current = null; break; }
+                    current = next;
+                }
+                allElementsArray[i] = current;
+            }
+            return allElementsArray;
+        }
+
+        return [];
+    },
+    /**
      * Quote bare hyphenated object keys so attr expressions are valid JS:
      * { data-item-id: id } → { 'data-item-id': id }
      * Shared by the attr evaluator builders here and the list attr-binding
@@ -2200,6 +2274,12 @@ export const TemplateSystemMethods = {
 
             const listVal = this._getAttr(el, 'list');
             if (listVal) sig += ':l=' + listVal;
+
+            // The compiled snapshot registers pool containers by this path,
+            // so two instances that differ only in the pool they name must
+            // not share a snapshot (the second would bind the first's pool).
+            const poolVal = this._getAttr(el, 'pool');
+            if (poolVal) sig += ':p=' + poolVal;
 
             parts.push(sig);
 

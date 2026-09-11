@@ -566,6 +566,12 @@ export const SSRListMethods = {
                 this._ensureItemContexts(itemEl);
             }
 
+            // Components inside this server-rendered row were created before
+            // the row carried its item (instances exist before lists mount), so
+            // a data-prop-x="." on them resolved to nothing and was never
+            // revisited. The row has its metadata now: re-resolve.
+            this._refreshSSRRowComponentProps(itemEl, itemProxy, listPath);
+
             // Store element reference
             const itemKey = itemProxy && itemProxy[keyProp] !== undefined ? itemProxy[keyProp] : i;
             itemElements.set(itemKey, itemEl);
@@ -580,10 +586,37 @@ export const SSRListMethods = {
         element._mapArrayItemElements = itemElements;
         // NOTE: Do NOT set _mapArrayInitialized; SSR hydration doesn't create mapArray effects
 
+        // Keep the key -> adopted-element map for the mapArray takeover: when
+        // the first structural change hands this list to mapArray, its mapFn
+        // reuses these server-rendered elements for matching keys instead of
+        // stamping replacements, so adopted DOM identity survives the first
+        // re-render (focus, selection, transitions, third-party state intact).
+        element._ssrAdoptedByKey = itemElements;
+
         // Set up event delegation on the container element
         this._ensureListEventDelegation(element, instance, listPath);
 
         return true; // SSR handled
+    },
+
+    /**
+     * Re-resolve props on the components inside one adopted row, now that the
+     * row carries _listIndex/_itemData. Runs the parent-state-change follow-up
+     * (_refreshChildProps): props-dependent computeds are invalidated, the
+     * child's render effect re-runs, and onPropsChange fires.
+     * @private
+     */
+    _refreshSSRRowComponentProps(itemEl, itemProxy, listPath) {
+        const nested = itemEl.querySelectorAll('[data-component-id]');
+        if (nested.length === 0 && !itemEl.dataset.componentId) return;
+
+        const propsChangeInfo = { parentPath: listPath, newValue: itemProxy, oldValue: undefined };
+        const refresh = (el) => {
+            const inst = this.componentInstances.get(el.dataset.componentId);
+            if (inst && inst._propPaths) this._refreshChildProps(inst, propsChangeInfo);
+        };
+        if (itemEl.dataset.componentId) refresh(itemEl);
+        nested.forEach(refresh);
     },
 
     /**
@@ -754,7 +787,7 @@ export const SSRListMethods = {
                             // If element's closest component is not itemEl itself, it's inside a nested component
                             if (elComponent && elComponent !== itemEl) {
                                 // Smart boundary detection: only skip if component owns the binding property
-                                const bindingProp = el.dataset.bind || el.dataset.bindHtml;
+                                const bindingProp = this._getAttr(el, 'bind') || this._getAttr(el, 'bind-html');
                                 if (bindingProp) {
                                     // Check if it's a simple property (not an expression)
                                     const isSimpleProp = /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(bindingProp);
@@ -791,7 +824,19 @@ export const SSRListMethods = {
         // Process all elements
         for (let i = 0; i < allElements.length; i++) {
             const el = allElements[i];
-            const dataset = el.dataset;
+            // Prefix-aware view of the seven binding attributes this loop reads.
+            // `el.dataset.bind` sees the bare attribute only, so on a data-wf-*
+            // page every branch below fell through and the row rendered empty
+            // even though the selector above had matched the element.
+            const dataset = {
+                bindClass: this._getAttr(el, 'bind-class'),
+                bindStyle: this._getAttr(el, 'bind-style'),
+                bindAttr: this._getAttr(el, 'bind-attr'),
+                bind: this._getAttr(el, 'bind'),
+                bindHtml: this._getAttr(el, 'bind-html'),
+                model: this._getAttr(el, 'model'),
+                show: this._getAttr(el, 'show')
+            };
             const tagName = el.tagName;
             const isInput = tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT';
 

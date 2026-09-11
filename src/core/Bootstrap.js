@@ -88,7 +88,7 @@ function _createDevToolsHook(wf) {
         // detects capabilities off this, NOT the framework version. Start at 1.
         // dev: true on development builds; false on minified production builds
         // (the extension uses it to show which introspection is available).
-        version: '1.4.1', schemaVersion: 1, dev: __DEV__, framework: wf,
+        version: '1.5.0', schemaVersion: 1, dev: __DEV__, framework: wf,
         getComponents() {
             const r = [];
             wf.componentInstances.forEach((i, id) => {
@@ -146,15 +146,39 @@ function _createDevToolsHook(wf) {
         // Registered queries with the source descriptor (envelope
         // provenance ruling): lastSource says where the last ingested rows
         // came from ('fetch'|'stream'|'ssr'|'patch'). Dev-only surface; the
-        // descriptor never appears on the public query store.
+        // descriptor never appears on the public query store. The extension's
+        // Queries tab reads everything from this one poll: sync flags off the
+        // backing store, declaration facts off the config, write-machinery
+        // pressure off the controller registries.
         hook.getQueries = function () {
             const r = [];
             const qc = wf._queryControllers;
             if (!qc) return r;
             qc.forEach((c, name) => {
-                let rows = 0;
-                try { const st = wf.getStore(name); if (st && Array.isArray(st.rows)) rows = st.rows.length; } catch {}
-                r.push({ name, active: !!c.active, accumulated: !!c.accumulated, lastSource: c.lastSource || null, observers: c.elements ? c.elements.size : 0, rows, retry: c.retryMax > 0 ? { max: c.retryMax, attempt: c.retryAttempt, pending: c.retryTimerId !== null || !!c._retryOnline } : null });
+                let rows = 0, flags = null;
+                try {
+                    const st = wf.getStore(name);
+                    if (st) {
+                        if (Array.isArray(st.rows)) rows = st.rows.length;
+                        flags = { isLoading: !!st.isLoading, isStale: !!st.isStale, error: st.error || null, syncError: st.syncError || null, lastSync: st.lastSync || null };
+                    }
+                } catch {}
+                const rg = c.rungs || {};
+                r.push({
+                    name, active: !!c.active, accumulated: !!c.accumulated,
+                    lastSource: c.lastSource || null,
+                    observers: c.elements ? c.elements.size : 0, rows, flags,
+                    record: !!c.hasRecord, key: c.key || null,
+                    deletedField: c.deletedField || null,
+                    // Any declared shape counts: to: is legally a
+                    // URL string, an operation map, or a function — the
+                    // function test reported "no write transport" for the two
+                    // headline declarative forms.
+                    hasTo: c.config?.to != null,
+                    rungs: { poll: rg.pollSecs || rg.etagSecs || 0, fresh: rg.freshSecs || 0, focus: !!rg.focus, reconnect: !!rg.reconnect, sse: !!rg.sse },
+                    writes: { pending: c.pendingWrites || 0, fieldClaims: c.fieldClaims ? c.fieldClaims.size : 0, rowClaims: c.rowClaims ? c.rowClaims.size : 0 },
+                    retry: c.retryMax > 0 ? { max: c.retryMax, attempt: c.retryAttempt, pending: c.retryTimerId !== null || !!c._retryOnline } : null
+                });
             });
             return r;
         };

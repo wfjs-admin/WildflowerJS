@@ -94,7 +94,13 @@ export const PropsSystemMethods = {
         if (instance.stateManager) {
             const sm = instance.stateManager;
             sm.getComputedPropertyNames().forEach(propName => {
-                sm._invalidateCachedComputed?.(propName);
+                // `true` = an input VALUE is known to have changed (both
+                // callers of this method are change-gated). For an async
+                // computed with a request in flight this flags a RELAUNCH
+                // instead of a forced hold — props have no graph edge, so
+                // this is their only wake channel, and absorbing it lost
+                // the change for the whole flight.
+                sm._invalidateCachedComputed?.(propName, true);
                 sm.scheduleComputedEvaluation(propName);
             });
         }
@@ -157,7 +163,7 @@ export const PropsSystemMethods = {
         // Check for data-props attribute (alternative to individual data-prop-* attributes)
         // data-props="{ message: greeting, color: accentColor }"
         //   → values are state path references (resolved from parent, same as data-prop-*)
-        const dataPropsAttr = element.getAttribute('data-props');
+        const dataPropsAttr = this._getAttr(element, 'props');   // data-props or data-wf-props
         if (dataPropsAttr)
         {
             const trimmed = dataPropsAttr.trim();
@@ -219,17 +225,21 @@ export const PropsSystemMethods = {
             }
         }
 
-        // Then, check for individual data-prop-* attributes (these override data-props values)
+        // Then, check for individual data-prop-* attributes (these override data-props values).
+        // Both prefixes are read; in exclusive mode only data-wf-prop-*. Neither
+        // prefix matches data-props / data-wf-props (the 's' is not a '-').
         const attributes = element.attributes;
+        const propPrefixes = this.options.useWfPrefixOnly ? ['data-wf-prop-'] : ['data-wf-prop-', 'data-prop-'];
 
         for (let i = 0; i < attributes.length; i++)
         {
             const attr = attributes[i];
-            if (attr.name.startsWith('data-prop-'))
+            const propPrefix = propPrefixes.find(p => attr.name.startsWith(p));
+            if (propPrefix)
             {
                 // Convert data-prop-user-name to userName (camelCase)
                 const propName = attr.name
-                    .slice(10) // Remove 'data-prop-'
+                    .slice(propPrefix.length)
                     .replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
 
                 props[propName] = attr.value;
@@ -551,8 +561,11 @@ export const PropsSystemMethods = {
                     }
                 }
 
-                // Only store path for reactive updates if we didn't use default
-                if (!usedDefault)
+                // Only store path for reactive updates if we didn't use default.
+                // With no parent instance the path was never resolved at all
+                // (the parent's definition registers later), so keep it for
+                // _adoptPendingChildren to resolve once the parent exists.
+                if (!usedDefault || !parentInstance)
                 {
                     if (!instance._propPaths)
                     {

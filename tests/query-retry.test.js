@@ -218,4 +218,49 @@ suite('query auto-retry with backoff', () => {
         expect(entry.retry.attempt).toBeGreaterThan(0)
         expect(entry.retry.pending).toBe(true)
     })
+
+    // Survey probe #5a (Lane F #2, the axios validateStatus scar; ruled
+    // 2026-08-29): the ladder exists for TRANSIENT failures. A 4xx is
+    // the server answering deterministically — re-asking on the doubling
+    // curve just delays the honest terminal state — so it lands
+    // immediately. Three 4xx codes are transient by meaning and stay
+    // retryable: 401 (a refreshed credential rides the retry — the
+    // pinned ladder-with-current-credential design), 408 (request
+    // timeout), and 429 (too many requests).
+    it('a permanent 4xx never enters the ladder; the failure lands immediately', async () => {
+        const q = uname('q'); const c = uname('c')
+        let calls = 0
+        window.fetch = async () => { calls++; return new Response(null, { status: 404 }) }
+        wildflower.query(q, { from: '/api/x.json', key: 'id', retry: 3 })
+        mountList(q, c)
+        await settle(400)
+
+        expect(calls, 'no retry burned on a deterministic answer').toBe(1)
+        const h = wildflower.getQuery(q)
+        expect(h.error, 'the terminal state lands at once').toBe('HTTP 404')
+    })
+
+    it('429 is transient by meaning: it climbs the full ladder', async () => {
+        const q = uname('q'); const c = uname('c')
+        let calls = 0
+        window.fetch = async () => { calls++; return new Response(null, { status: 429 }) }
+        wildflower.query(q, { from: '/api/x.json', key: 'id', retry: 2 })
+        mountList(q, c)
+        await settle(500)
+
+        expect(calls, 'initial attempt + two retries').toBe(3)
+        expect(wildflower.getQuery(q).error).toBe('HTTP 429')
+    })
+
+    it('a 5xx still climbs the ladder (the status gate is 4xx-only)', async () => {
+        const q = uname('q'); const c = uname('c')
+        let calls = 0
+        window.fetch = async () => { calls++; return new Response(null, { status: 503 }) }
+        wildflower.query(q, { from: '/api/x.json', key: 'id', retry: 2 })
+        mountList(q, c)
+        await settle(500)
+
+        expect(calls, 'initial attempt + two retries').toBe(3)
+        expect(wildflower.getQuery(q).error).toBe('HTTP 503')
+    })
 })

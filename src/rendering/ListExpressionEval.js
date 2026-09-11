@@ -12,12 +12,32 @@
 import { getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
 import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
 import { applyAttrObj, applyStyleObj } from '../core/BindingWriters.js';
-import { wfError, WF_ERRORS } from '../core/wfUtils.js';
+import { wfError, WF_ERRORS, COMPUTED_EVAL } from '../core/wfUtils.js';
 
 // WF-214 dedupe: one warning per (component name, computed name) per page life.
 // Dev-only storage; the emitting block below is __DEV__-gated, so production
 // builds strip the reads and this Set holds nothing.
 const _wf214Warned = new Set();
+
+// WF-235 dedupe: same scheme as WF-214.
+const _wf235Warned = new Set();
+
+// WF-235 (dev-only): an item-level computed (fn.length > 0) returned a
+// thenable. Async computeds live in the entity facade (component/store/plugin
+// scope) — one coordinated request per entity. Item-level computeds run through
+// this separate per-row machinery, where a returned promise would mean one
+// uncoordinated request per row and the raw Promise object binding as text, so
+// they are excluded by design.
+function _warnItemComputedAsync(instance, computedName) {
+    const key = ((instance && instance.name) || '?') + ':' + computedName;
+    if (_wf235Warned.has(key)) return;
+    _wf235Warned.add(key);
+    wfError(WF_ERRORS.ITEM_COMPUTED_ASYNC, {
+        warn: true,
+        context: `item-level computed "${computedName}" on component "${instance && instance.name}" returned a Promise`,
+        suggestion: `Item-level computeds must be synchronous (a promise per row would issue one request per row). Fetch the collection in a component-level computed, derive the row array from it in a second computed, and bind the list to the derived array.`
+    });
+}
 
 // WF-214 (dev-only): a zero-arg computed evaluated for a list-row binding runs
 // at component scope, so `this.<prop>` reads of ITEM fields silently resolve
@@ -495,6 +515,20 @@ export const ListExpressionMethods = {
                             instance.state && prop in instance.state) {
                             return instance.state[prop];
                         }
+                        // 4. Component METHODS. Without this an item-level
+                        //    computed that factors a predicate into a method
+                        //    threw "this.X is not a function", the row binding
+                        //    silently rendered empty, and only a dev-build
+                        //    console line said why. Resolved off instance.context
+                        //    so the wrapped form is returned, keeping the `this`
+                        //    binding and error routing every other caller gets.
+                        //    Looked up on the definition first so an arbitrary
+                        //    name never probes the context proxy.
+                        if (typeof prop === 'string' && !prop.startsWith('_') &&
+                            instance.definition && typeof instance.definition[prop] === 'function' &&
+                            instance.context) {
+                            return instance.context[prop];
+                        }
                         return undefined;
                     },
                     has(target, prop) {
@@ -502,6 +536,8 @@ export const ListExpressionMethods = {
                         if (typeof prop === 'string') {
                             if (instance.stateManager?.computed?.[prop]) return true;
                             if (!prop.startsWith('_') && instance.state && prop in instance.state) return true;
+                            if (!prop.startsWith('_') && instance.definition &&
+                                typeof instance.definition[prop] === 'function') return true;
                         }
                         return false;
                     }
@@ -520,7 +556,24 @@ export const ListExpressionMethods = {
                 // Record state reads only across the user computed body (not the
                 // framework's listLen/info setup above), keeping the union precise.
                 if (_recSm) _recSm._recordItemReads = true;
-                return originalFn.call(componentContext, item, itemIndex, info);
+                // A method called from inside the computed body must run NOW
+                // and return its value, rather than being queued as a pre-init
+                // action and answering undefined. Owner-scoped:
+                // the bypass is owed only to this component's own methods.
+                // See COMPUTED_EVAL in wfUtils.
+                COMPUTED_EVAL.depth++;
+                COMPUTED_EVAL.owners.push((instance && instance.id) || null);
+                let result;
+                try {
+                    result = originalFn.call(componentContext, item, itemIndex, info);
+                } finally {
+                    COMPUTED_EVAL.depth--;
+                    COMPUTED_EVAL.owners.pop();
+                }
+                if (__DEV__ && result !== null && typeof result === 'object' && typeof result.then === 'function') {
+                    _warnItemComputedAsync(instance, computedName);
+                }
+                return result;
             } catch (e) {
                 if (__DEV__) console.warn(`[WF] Error evaluating computed "${computedName}" in list context:`, e.message);
                 return null;

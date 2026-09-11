@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework, hasFeature } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, hasFeature, isMinifiedBuild } from './helpers/load-framework.js'
 
 const suite = hasFeature('query') ? describe : describe.skip
 
@@ -113,18 +113,26 @@ suite('data-query teardown retention', () => {
         mountList(q, c)
         await settle(150)
 
+        // The resource handles (_listeners, timerId, lifecycleTimerId, es) are
+        // property-mangled in production builds, so they are readable by name
+        // only in dev. The handles that stay unmangled — active, abort,
+        // elements — assert in both arms, and teardown either releases every
+        // resource or none, since _queryTeardown has no partial path.
+        const dev = !isMinifiedBuild()
         const controller = wildflower._queryControllers.get(q)
-        expect(controller._listeners.length).toBeGreaterThan(0)
+        if (dev) expect(controller._listeners.length).toBeGreaterThan(0)
 
         container.innerHTML = ''
         await settle(600) // grace + at least two would-be ticks
 
         expect(controller.active).toBe(false)
-        expect(controller.timerId).toBeNull()
-        expect(controller.lifecycleTimerId).toBeNull()
-        expect(controller.es).toBeNull()
+        if (dev) {
+            expect(controller.timerId).toBeNull()
+            expect(controller.lifecycleTimerId).toBeNull()
+            expect(controller.es).toBeNull()
+            expect(controller._listeners.length).toBe(0)
+        }
         expect(controller.abort).toBeNull()
-        expect(controller._listeners.length).toBe(0)
         expect(controller.elements.size).toBe(0)
     })
 

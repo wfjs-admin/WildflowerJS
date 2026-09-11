@@ -71,7 +71,16 @@ export const ErrorBoundariesMethods = {
                 throw new Error(`${message}: ${error.message}`);
             case 'log':
             default:
-                if (__DEV__) console.error(`[WildflowerJS] ${message}:`, error);
+                // Every build, on purpose. This is the APPLICATION's exception,
+                // caught here only so one bad handler cannot take the page down.
+                // Stripping it in production turned a typo in an action into a
+                // dead control and an empty console, with nothing to tell a
+                // broken handler from one that ran and changed nothing. The
+                // framework's own diagnostics (the WF-nnn codes) stay
+                // development-only; an author's error does not.
+                // `errorHandling: 'silent'` is still there for anyone who
+                // wants the quiet behaviour back.
+                console.error(`[WildflowerJS] ${message}:`, error);
                 // Display error in component if available
                 if (instance?.element && this.debug)
                 {

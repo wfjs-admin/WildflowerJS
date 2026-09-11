@@ -59,12 +59,17 @@ export const ExpressionEvaluatorMethods = {
         if (standaloneMatch) {
             const storeName = standaloneMatch[1];
             const path = standaloneMatch[2];
+            // A $name.path reference is a query observer edge if `name` names
+            // a registered query (no-op for stores/components/plugins). See
+            // QuerySystem.js's _queryTouchByShorthand for why this lives here.
+            if (this._queryTouchByShorthand) this._queryTouchByShorthand(storeName);
             return `external('${storeName}', '${path}')`;
         }
 
         // Replace inline store shorthands within complex expressions
         // e.g., "$expr.count > 3" → "external('expr', 'count') > 3"
         return expression.replace(STORE_SHORTHAND_INLINE_REGEX, (match, storeName, path) => {
+            if (this._queryTouchByShorthand) this._queryTouchByShorthand(storeName);
             return `external('${storeName}', '${path}')`;
         });
     },
