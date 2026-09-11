@@ -47,7 +47,13 @@ npm install wildflowerjs
 ### CDN Links
 
 ```html
-<!-- Mini (smallest: CRUD apps, forms, dashboards, no data-pools) -->
+<!-- Nano (smallest: interactive widgets and single-file artifacts, no data-list) -->
+<script defer src="https://cdn.jsdelivr.net/npm/wildflowerjs@1/dist/wildflower.nano.min.js"></script>
+
+<!-- Mini-pool (nano with data-pools: games, simulations, per-frame visualization) -->
+<script defer src="https://cdn.jsdelivr.net/npm/wildflowerjs@1/dist/wildflower.mini-pool.min.js"></script>
+
+<!-- Mini (CRUD apps, forms, dashboards, no data-pools) -->
 <script defer src="https://cdn.jsdelivr.net/npm/wildflowerjs@1/dist/wildflower.mini.min.js"></script>
 
 <!-- Lite (smaller: no plugins, portals, transitions, or modals) -->
@@ -290,8 +296,9 @@ Pools also support an optional `entity: { state, computed, methods }` block for 
 
 | Variant | Includes | Use Case |
 |---------|----------|----------|
-| `wildflower.mini.min.js` | Core + Stores (no data-pools, plugins, portals, transitions, modals) | Smallest footprint (CRUD, forms, dashboards) |
-| `wildflower.mini-pool.min.js` | Mini with data-pools in place of the list cluster (no `data-list`) | Games, simulations, per-frame visualization |
+| `wildflower.nano.min.js` | Core + Stores, no `data-list` render cluster | Smallest footprint (interactive widgets, single-file artifacts) |
+| `wildflower.mini-pool.min.js` | Nano with `data-pool` in place of the list cluster (no `data-list`) | Games, simulations, per-frame visualization |
+| `wildflower.mini.min.js` | Core + Stores (no data-pools, plugins, portals, transitions, modals) | CRUD apps, forms, dashboards |
 | `wildflower.lite.min.js` | Core + Stores + data-pools (no plugins, portals, transitions, modals) | Minimal footprint with high-frequency entity rendering |
 | `wildflower.min.js` | Core framework | Most applications |
 | `wildflower.spa.min.js` | Core + Router | Single-page applications |
