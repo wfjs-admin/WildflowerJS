@@ -77,8 +77,36 @@ jobs:
           fi
 
       - name: Verify published attestation
+        # npm accepts a publish, signs the provenance, and THEN validates
+        # asynchronously: its own output says "may take a few minutes to become
+        # available", and the registry serves 404 for the version until that
+        # finishes. At v1.5.0 it took about ten minutes. A fixed 15s sleep plus
+        # one unguarded fetch therefore failed a release whose publish had
+        # succeeded, and an empty body crashed JSON.parse with "Unexpected end
+        # of JSON input", which reads like a broken artifact rather than a race.
+        # Poll instead, and treat "not there yet" as not-yet rather than failure.
         run: |
           version="${GITHUB_REF_NAME#v}"
-          sleep 15
-          curl -sf "https://registry.npmjs.org/-/npm/v1/attestations/wildflowerjs@${version}" \
-            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d).attestations.map(x=>x.predicateType);console.log('attestations:',a.join(', '));process.exit(a.length?0:1)})"
+          url="https://registry.npmjs.org/-/npm/v1/attestations/wildflowerjs@${version}"
+          for attempt in $(seq 1 20); do
+            body="$(curl -s --max-time 20 "$url" || true)"
+            types="$(printf '%s' "$body" | node -e "
+              let d='';
+              process.stdin.on('data', c => d += c).on('end', () => {
+                try {
+                  const a = JSON.parse(d).attestations;
+                  if (Array.isArray(a) && a.length) return console.log(a.map(x => x.predicateType).join(', '));
+                } catch (e) { /* empty or not-yet-JSON: fall through */ }
+                process.exit(1);
+              });" 2>/dev/null || true)"
+            if [ -n "$types" ]; then
+              echo "attestations: $types (after ${attempt} attempt(s))"
+              exit 0
+            fi
+            echo "attempt ${attempt}/20: attestation not published yet, waiting 30s"
+            sleep 30
+          done
+          echo "::error::No attestation after 10 minutes. The publish step above may still have SUCCEEDED —"
+          echo "::error::check 'npm view wildflowerjs@${version}' and 'npm audit signatures' on a fresh install"
+          echo "::error::before assuming otherwise. Do NOT re-run this whole job: npm refuses to republish a version."
+          exit 1
