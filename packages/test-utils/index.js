@@ -449,27 +449,6 @@ export function hasConsoleWarnings() {
 }
 
 /**
- * Check if we're testing the Meadow alternative reactive core.
- *
- * On the spike/unified-graph-core branch Meadow IS the reactive core for every
- * build (the core swap is the branch's whole purpose), and `dist` now holds
- * Meadow — the `dist`/`dist-meadow` split is collapsed (see build-rollup.cjs).
- * So this is unconditionally true here: the path-based heuristic it used before
- * (matching `/meadow/i` against `__WILDFLOWER_DIST_DIR__`) no longer applies.
- *
- * Used by `skipIf(isMeadowBuild())` to skip tests that assert RSM-internal
- * structures Meadow legitimately does not have (pattern-trie, version/epoch
- * staleness machinery, computed-tier promotion ladder, external-dependency
- * bookkeeping). Those skips are retired in B1 once RSM is deleted; until then
- * this keeps gating them.
- *
- * @returns {boolean} Whether the current build is the Meadow core
- */
-export function isMeadowBuild() {
-  return true
-}
-
-/**
  * Load a single script and return a promise
  * @private
  */

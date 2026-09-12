@@ -352,7 +352,7 @@ export const BindingResolverMethods = {
             }
 
             case 'simple': {
-                // Computed takes precedence over state (the project guide: "Computed properties take precedence").
+                // Computed takes precedence over state (documented rule: computed properties win when names collide).
                 const sm = componentInstance?.stateManager;
                 let value;
                 if (sm?.computed?.[desc.path]) {

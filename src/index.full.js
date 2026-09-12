@@ -110,3 +110,4 @@ wildflower.SSRProtectionContext = SSRProtectionContext;
 wildflower.SSRPhase = SSRPhase;
 
 export { WildflowerJS, wildflower, RouteManager, SSRManager, SSRProtectionContext, SSRPhase };
+export default wildflower;

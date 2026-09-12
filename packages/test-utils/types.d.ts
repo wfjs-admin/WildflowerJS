@@ -3,7 +3,10 @@
  */
 
 /** Distribution modes for loading the framework */
-export type DistMode = 'source' | 'core' | 'lite' | 'spa' | 'full';
+export type DistMode =
+  | 'source'
+  | 'nano' | 'mini-pool' | 'mini' | 'lite' | 'core' | 'spa' | 'full'
+  | 'nano-dev' | 'mini-pool-dev' | 'mini-dev' | 'lite-dev' | 'core-dev' | 'spa-dev' | 'full-dev';
 
 /** WildflowerJS framework instance */
 export interface WildflowerInstance {

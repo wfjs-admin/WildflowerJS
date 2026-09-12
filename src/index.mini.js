@@ -122,3 +122,4 @@ Object.assign(WildflowerJS.prototype,
 const wildflower = createInstance(WildflowerJS);
 
 export { WildflowerJS, wildflower };
+export default wildflower;

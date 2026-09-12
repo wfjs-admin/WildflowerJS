@@ -119,10 +119,11 @@ describeIfPlugins('Plugin Registration', () => {
       expect(() => wildflower.plugin(null)).toThrow()
     })
 
-    it('should throw if object plugin has no install method', () => {
-      const plugin = { name: 'broken', version: '1.0.0' }
+    it('registers an object plugin that has no install method (optional since 1.5.1)', () => {
+      const plugin = { name: 'no-install', version: '1.0.0' }
 
-      expect(() => wildflower.plugin(plugin)).toThrow(/install/)
+      expect(() => wildflower.plugin(plugin)).not.toThrow()
+      expect(wildflower.hasPlugin('no-install')).toBe(true)
     })
 
     it.skipIf(isMinifiedBuild())('should catch and report plugin errors without crashing', () => {

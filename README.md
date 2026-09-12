@@ -71,6 +71,21 @@ npm install wildflowerjs
 
 Pin a specific version with `wildflowerjs@1.5.0`.
 
+### ES modules
+
+Every tier also ships as an ES module (`.esm.min.js`, plus an `.esm.dev.js` twin with the development diagnostics). The default export is the framework instance and the same `wildflower` global is registered, so a page behaves the same whichever file it loads.
+
+```js
+import wildflower from 'wildflowerjs';         // core tier, via the package's `import` condition
+import wildflower from 'wildflowerjs/full';    // or nano, mini-pool, mini, lite, spa
+```
+
+```html
+<script type="module">
+  import wildflower from 'https://cdn.jsdelivr.net/npm/wildflowerjs@1/dist/wildflower.esm.min.js';
+</script>
+```
+
 
 ## Guiding Principles
 

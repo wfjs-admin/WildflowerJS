@@ -37,7 +37,7 @@ export default defineConfig({
 
 | Variable | Values | Description |
 |----------|--------|-------------|
-| `WILDFLOWER_DIST` | `source`, `core`, `lite`, `spa`, `full` | Distribution mode to test against |
+| `WILDFLOWER_DIST` | `source`, `nano`, `mini-pool`, `mini`, `lite`, `core`, `spa`, `full` (append `-dev` for the development build, e.g. `full-dev`) | Distribution mode to test against |
 
 ### Troubleshooting
 
@@ -164,7 +164,7 @@ await loadFramework({ scripts: ['/my/custom/build.js'] })
 ```
 
 **Options:**
-- `mode`: `'source' | 'core' | 'lite' | 'spa' | 'full'`
+- `mode`: `'source' | 'nano' | 'mini-pool' | 'mini' | 'lite' | 'core' | 'spa' | 'full'` (or any of these with a `-dev` suffix)
 - `scripts`: `string[]` - Custom script paths (overrides mode)
 
 #### `resetFramework()`
@@ -326,11 +326,14 @@ The test utilities support testing different framework builds:
 
 | Mode | Description |
 |------|-------------|
-| `source` | Individual source files (default) |
-| `core` | Minified core build |
-| `lite` | Lightweight build (fewer features) |
-| `spa` | SPA build with router |
-| `full` | Full build with all features |
+| `source` | Individual source files |
+| `nano` | Smallest tier: components, stores, forms, no lists or pools |
+| `mini-pool` | Nano plus entity pools |
+| `mini` | Nano plus `data-list` |
+| `lite` | Lists and pools |
+| `core` | Lite plus plugins, portals, transitions |
+| `spa` | Core plus router |
+| `full` | Everything, including SSR and data queries (`full-dev` is the default) |
 
 ```javascript
 // Set via environment variable

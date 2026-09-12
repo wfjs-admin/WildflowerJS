@@ -2,8 +2,12 @@
  * WildflowerJS TypeScript Definitions
  * A lightweight reactive framework with no build step required
  *
- * @version 1.0.0
+ * @version 1.5.1
  * @license MIT
+ *
+ * The bundles are IIFEs that assign `window.wildflower`; import this file for
+ * types only. Surface as of 1.5.1: components, stores, plugins, pools,
+ * routing (spa/full), data queries (full).
  */
 
 // =============================================================================
@@ -31,6 +35,22 @@ export interface WildflowerOptions {
 
   /** Enable automatic performance optimizations (default: true) */
   autoOptimize?: boolean;
+
+  /** Milliseconds to wait for subscribed stores before init() runs (default: 5000) */
+  subscribeTimeout?: number;
+
+  /** Always evaluate binding expressions with the CSP-safe parser, never `new Function` */
+  forceCSPMode?: boolean;
+
+  /** Sanitizer applied to data-bind-html content before insertion (default: none) */
+  htmlSanitizer?: ((html: string) => string) | null;
+
+  /**
+   * Default request headers for data queries, keyed by origin
+   * ('https://api.example.com') or 'self' for the document's own origin.
+   * A query's own `headers:` declaration wins over these.
+   */
+  headers?: Record<string, Record<string, string> | (() => Record<string, string>)>;
 }
 
 // =============================================================================
@@ -81,8 +101,42 @@ export interface ComponentDefinition<TState extends ComponentState = ComponentSt
    * Entity pools for high-frequency reactive rendering.
    * Each pool renders plain-object data via template binding without reactive proxy overhead.
    * Access at runtime via `this.pools.poolName` inside component methods.
+   * The array form declares pool names only.
    */
-  pools?: Record<string, PoolConfig>;
+  pools?: Record<string, PoolConfig> | string[];
+
+  /** Watch handlers keyed by state path; append `:immediate` to run once on init */
+  watch?: Record<string, (this: ComponentContext<TState>, newValue: any, oldValue: any) => void>;
+
+  /** Stores to inject on `this.stores`; init() waits for them (see subscribeTimeout) */
+  subscribe?: string[] | Record<string, string[] | boolean>;
+
+  /** Per-component override of the store wait, in milliseconds */
+  subscribeTimeout?: number;
+
+  /** Cross-field form rules; the key is the user-facing message */
+  rules?: Record<string, string | RuleConfig>;
+
+  /** Services from plugins, injected on `this` */
+  uses?: string[];
+
+  /** Lifecycle: called before each DOM update pass */
+  beforeUpdate?: (this: ComponentContext<TState>) => void;
+
+  /** Lifecycle: receives errors thrown by this component's methods and lifecycle hooks */
+  onError?: (this: ComponentContext<TState>, error: Error, info?: any) => void;
+
+  /** Called every animation frame, before pool flush. dt in ms (clamped to 250), now from performance.now() */
+  tick?: (this: ComponentContext<TState>, dt: number, now: number) => void;
+
+  /** Called when a subscribed store changes */
+  onStoreUpdate?: (this: ComponentContext<TState>, storeName: string, path: string, newValue: any, oldValue: any) => void;
+
+  /** Called when props passed from the parent change */
+  onPropsChange?: (this: ComponentContext<TState>, info: { changed: string[]; props: Record<string, any>; previous: Record<string, any> }) => void;
+
+  /** Called after a route change (spa and full builds) */
+  onRouteChange?: (this: ComponentContext<TState>, route: Route) => void;
 
   /** Custom methods - available on this.context */
   [key: string]: any;
@@ -94,30 +148,78 @@ export interface ComponentDefinition<TState extends ComponentState = ComponentSt
  * via declarative template binding, with optional culling, FPS throttling,
  * and DOM recycling.
  */
-export interface PoolConfig {
+export interface PoolConfig<T extends Record<string, any> = Record<string, any>> {
   /** Initial entities to populate the pool */
-  items?: Array<Record<string, any>>;
+  items?: T[];
 
   /** Shared props object (parent-injected data accessible from pool item templates via `props.`) */
   props?: Record<string, any>;
 
-  /** Called when an entity is added to the pool */
-  onAdd?: (item: Record<string, any>) => void;
+  /** Called when an entity is added: a component method name, or a function */
+  onAdd?: string | ((item: T) => void);
 
-  /** Called when an entity is removed from the pool */
-  onRemove?: (item: Record<string, any>) => void;
+  /** Called before each removal: a component method name, or a function */
+  onRemove?: string | ((item: T) => void);
 
-  /** Called when the pool is cleared */
-  onClear?: () => void;
+  /** Called once on clear(), skipping onRemove */
+  onClear?: string | (() => void);
+
+  /** Shape shared by every entity in the pool: state defaults, per-entity computeds, methods */
+  entity?: PoolEntityShape<T>;
 }
 
 /**
- * Runtime pool handle — returned by `this.pool(name)` or accessed via `this.pools.name`.
+ * Shared shape for every entity in a pool. Methods and computeds run with
+ * `this` bound to the entity. Spawn-provided values win over `state` defaults.
+ */
+export interface PoolEntityShape<T extends Record<string, any> = Record<string, any>> {
+  state?: Partial<T>;
+  computed?: Record<string, (this: T & Record<string, any>) => any>;
+  [method: string]: any;
+}
+
+/**
+ * Cross-field form rule, declared under a component's `rules` field.
+ * The rule's key is the user-facing message.
+ */
+export interface RuleConfig {
+  /** Expression string, or a predicate, that must hold */
+  check: string | (() => boolean);
+
+  /** Expression string; the rule applies only while it is truthy */
+  when?: string;
+
+  message?: string;
+
+  /** Fields the message is reported against */
+  fields?: string[];
+}
+
+/**
+ * Runtime pool handle — returned by `this.getPool(name)` or accessed via `this.pools.name`.
+ * Entities are plain objects: mutate them and let the frame loop flush, or call markDirty().
  * @template T - Shape of entities stored in this pool
  */
 export interface PoolHandle<T extends Record<string, any> = Record<string, any>> {
   /** Add one entity or many (bulk add via array is a single DOM op) */
   add(item: T | T[]): T | T[];
+
+  /** Alias of add() */
+  push(item: T | T[]): T | T[];
+
+  /** Entity count; reactive when read inside a computed (`items.length` is not) */
+  readonly length: number;
+
+  /** Iterates the entities in storage order */
+  [Symbol.iterator](): Iterator<T>;
+
+  filter(fn: (item: T) => boolean): T[];
+  map<R>(fn: (item: T) => R): R[];
+  find(fn: (item: T) => boolean): T | undefined;
+  forEach(fn: (item: T) => void): void;
+  some(fn: (item: T) => boolean): boolean;
+  every(fn: (item: T) => boolean): boolean;
+  reduce<R>(fn: (acc: R, item: T) => R, initial: R): R;
 
   /** Remove an entity by its key value */
   remove(key: string | number): void;
@@ -174,6 +276,38 @@ export interface PropConfig {
 }
 
 /**
+ * jQuery-like wrapper returned by `this.$el()`, scoped to the component element.
+ * Event handlers registered through it are removed when the component is destroyed.
+ */
+export interface DollarEl {
+  /** First matched element, or null */
+  readonly el: HTMLElement | null;
+  readonly length: number;
+  get(index: number): HTMLElement | undefined;
+  each(fn: (el: HTMLElement, index: number) => void): DollarEl;
+  addClass(names: string): DollarEl;
+  removeClass(names: string): DollarEl;
+  toggleClass(name: string): DollarEl;
+  css(prop: string, value: string): DollarEl;
+  css(props: Record<string, string>): DollarEl;
+  attr(name: string, value: string): DollarEl;
+  text(value: string): DollarEl;
+  /** Sets innerHTML and scans the result for components */
+  html(value: string): DollarEl;
+  /** Sets the value and dispatches `input`, so `data-model` sees it */
+  val(value: string): DollarEl;
+  show(): DollarEl;
+  hide(): DollarEl;
+  on(event: string, handler: (event: Event) => void): DollarEl;
+  off(event: string, handler?: (event: Event) => void): DollarEl;
+  trigger(event: string): DollarEl;
+  find(selector: string): DollarEl;
+  parent(): DollarEl;
+  closest(selector: string): DollarEl;
+  children(): DollarEl;
+}
+
+/**
  * Component context - the 'this' context inside component methods
  * @template TState - The type of the component's state
  */
@@ -196,6 +330,9 @@ export interface ComponentContext<TState extends ComponentState = ComponentState
   /** Child component instances */
   children: ComponentInstance[];
 
+  /** Read-only props from data-prop-* / data-props */
+  readonly props: Record<string, any>;
+
   /**
    * Pool handles for any pools declared in the component definition's `pools` field.
    * Access as `this.pools.poolName` inside component methods.
@@ -203,17 +340,26 @@ export interface ComponentContext<TState extends ComponentState = ComponentState
   pools: Record<string, PoolHandle>;
 
   /**
-   * Get a pool handle by name. Equivalent to `this.pools[name]`.
-   * @param name - The pool name as declared in the component's `pools` field
+   * Get a pool handle by name, including markup-only pools (a `data-pool`
+   * element with no entry in the `pools` field). Renamed from `pool()` in 1.3.0.
    */
-  pool(name: string): PoolHandle | undefined;
+  getPool<T extends Record<string, any> = Record<string, any>>(name: string): PoolHandle<T> | null;
+
+  /** Stores declared in `subscribe`, keyed by name, available once init() runs */
+  stores: Record<string, StoreContext & Record<string, any>>;
+
+  /** A store by name. State fields, computeds, and methods sit directly on the handle */
+  getStore<TStore extends Record<string, any> = Record<string, any>>(
+    name?: string
+  ): (StoreContext<TStore> & TStore & Record<string, any>) | undefined;
 
   /**
-   * Get value from another component or store
-   * @param componentNameOrId - Name or ID of the target component/store
-   * @param path - Property path to retrieve (e.g., 'count', 'computed:total')
+   * Read, or with a value write, another entity's state by name or id
+   * @param entityNameOrId - Component, store, or plugin name, or a component id
+   * @param path - Property path (e.g., 'count', 'computed:total')
+   * @param value - When given, the value to write
    */
-  external(componentNameOrId: string, path: string): any;
+  external(entityNameOrId: string, path: string, value?: any): any;
 
   /**
    * Emit an event to parent components
@@ -231,28 +377,57 @@ export interface ComponentContext<TState extends ComponentState = ComponentState
    */
   store(storeName: string, path?: string, value?: any): any;
 
-  /**
-   * Open a modal dialog from a template
-   * @param templateId - ID of the template element
-   * @param data - Data to pass to the modal
-   * @returns Promise resolving to modal result
-   */
-  openModal<T = any>(templateId: string, data?: Record<string, any>): Promise<T>;
+  /** Partial state update: a path and value, or an object of paths */
+  update(pathOrUpdates: string | Partial<TState>, value?: any): void;
 
-  /**
-   * Close the current modal (call from within modal component)
-   * @param result - Result to return to the opener
-   */
-  closeModal(result?: any): void;
+  /** Subscribe to state changes on a path ('*' for all). Returns an unsubscribe function */
+  subscribe(
+    path: string,
+    callback: (newValue: any, oldValue: any, path: string) => void,
+    options?: { immediate?: boolean; deep?: boolean }
+  ): () => void;
 
-  /** Update component state (partial update) */
-  setState(updates: Partial<TState>): void;
+  /** True once init() has completed */
+  isReady(): boolean;
 
-  /** Get value from nested path */
-  get(path: string): any;
+  /** Resolves once init() has completed */
+  waitForReady(): Promise<void>;
 
-  /** Set value at nested path */
-  set(path: string, value: any): void;
+  /** jQuery-like wrapper scoped to the component element */
+  $el(selector?: string | Element): DollarEl;
+
+  /** querySelector scoped to the component element */
+  find(selector: string): Element | null;
+
+  /** querySelectorAll scoped to the component element */
+  findAll(selector: string): NodeListOf<Element>;
+
+  /** closest() from the component element */
+  closest(selector: string): Element | null;
+
+  /** The list row (or pool entity) whose element an event came from, or null */
+  getItemFromEvent(event: Event): any;
+
+  /** Re-bind data-action handlers after markup inside the component was replaced */
+  rebindActions(): void;
+
+  /** Persist state to localStorage under the component's `data-storage-key` */
+  saveToStorage(): void;
+
+  /** Restore state from localStorage */
+  loadFromStorage(): void;
+
+  /** Clear the component's error-boundary state so it renders normally again */
+  resetError(): void;
+
+  /** The list row this component was rendered inside, if any */
+  readonly listItem: any;
+
+  /** Set by data-validate-on forms */
+  formValid: boolean;
+
+  /** Field validation messages, set by data-validate-on forms */
+  validationErrors: Record<string, string>;
 }
 
 /**
@@ -532,6 +707,22 @@ export interface StoreConfig<TState extends Record<string, any> = Record<string,
   /** Lifecycle: called when store is initialized */
   init?: (this: StoreContext<TState>) => void;
 
+  /** Other stores this store reads through `this.stores` */
+  subscribe?: string[] | Record<string, string[] | boolean>;
+
+  /** localStorage key. With autoSave, state is written on every change and restored on load */
+  storageKey?: string;
+  autoSave?: boolean;
+
+  /** Lifecycle: called before the store is destroyed */
+  beforeDestroy?: (this: StoreContext<TState>) => void;
+
+  /** Lifecycle: called when the store is destroyed */
+  destroy?: (this: StoreContext<TState>) => void;
+
+  /** Called every animation frame. dt in ms (clamped to 250), now from performance.now() */
+  tick?: (this: StoreContext<TState>, dt: number, now: number) => void;
+
   /** Store methods (actions) - defined at top level, not in separate 'actions' block */
   [key: string]: any;
 }
@@ -605,8 +796,8 @@ export type PluginInstallFn = (framework: WildflowerJS, options?: any) => void;
  * Plugin object with install method
  */
 export interface PluginObject {
-  /** Install function called when plugin is registered */
-  install: PluginInstallFn;
+  /** Install function called when plugin is registered. Optional since 1.5.1: a plugin that is only state, computed, and methods needs none */
+  install?: PluginInstallFn;
 
   /** Plugin name (for identification) */
   name?: string;
@@ -628,12 +819,162 @@ export interface PluginObject {
 
   /** Watch handlers */
   watch?: Record<string, Function>;
+
+  /** Top-level functions become plugin methods, callable as `wildflower.$name.method()` */
+  [key: string]: any;
 }
 
 /**
  * Plugin type - can be install function or plugin object
  */
 export type Plugin = PluginInstallFn | PluginObject;
+
+// =============================================================================
+// DATA QUERIES (full build)
+// =============================================================================
+
+/**
+ * A refresh rung. A number polls every N seconds; 'etag:N' re-checks
+ * conditionally at most every N seconds; 'fresh:N' skips event-driven
+ * refetches while the last sync is younger than N seconds.
+ */
+export type RefreshRung =
+  | number | 'focus' | 'reconnect' | 'sse' | 'once'
+  | `etag:${number}` | `fresh:${number}`;
+
+/**
+ * One entry in a query's `to` map, or its `create` entry
+ */
+export interface WriteOperation<T = any> {
+  /** `:token` placeholders are filled from the item and from params */
+  url: string;
+
+  /** Defaults: PATCH for update, DELETE for delete, POST for create and any named operation */
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | (string & {});
+
+  /** Builds the request body from the item. Nothing is sent without it */
+  body?: (item: Partial<T> & Record<string, any>) => any;
+
+  /**
+   * Decides what the ok response meant. Receives the parsed body and the
+   * item that was written. Return a record to reconcile it, return `item`
+   * to keep what was written with no refetch, throw to reject and roll
+   * back. Absent, the query refetches instead.
+   */
+  confirmation?: (responseBody: any, item: Partial<T> & Record<string, any>) => Partial<T> | null | undefined | void;
+}
+
+/**
+ * Declaration passed to `wildflower.query(name, config)`
+ */
+export interface QueryConfig<T = any> {
+  /** Read source: a URL with `:token` placeholders, or a function returning the rows (or a promise of them) */
+  from: string | ((params: Record<string, any>) => any);
+
+  /** Row identity field (default: 'id') */
+  key?: string;
+
+  /** Fills URL tokens; anything left over joins the read query string */
+  params?: Record<string, any> | (() => Record<string, any>);
+
+  /** Sent with reads and writes, never with the 'sse' stream. A function runs once per attempt */
+  headers?: Record<string, string> | (() => Record<string, string>);
+
+  /** Shapes the response, e.g. unwraps an envelope */
+  select?: (data: any) => any;
+
+  /** Rows shown before the first fetch resolves */
+  initial?: T[];
+
+  refresh?: RefreshRung | RefreshRung[];
+
+  /** Event-stream URL for the 'sse' rung (defaults to `from`) */
+  stream?: string;
+
+  /** Retries after a failed read, with backoff (default: 0) */
+  retry?: number;
+
+  /** true, or a storage key: the last confirmed rows survive a reload */
+  persist?: boolean | string;
+
+  /** Tombstone field: a truthy value on a written item removes the row and sends the delete */
+  deleted?: string;
+
+  /** Write destination: a URL string, a map of named operations, or a function doing the request */
+  to?: string
+    | Record<string, string | WriteOperation<T>>
+    | ((item: Partial<T> & Record<string, any>) => any);
+
+  /** Query-level body builder for update and create */
+  body?: (item: Partial<T> & Record<string, any>) => any;
+
+  /** Query-level record extractor for update and create. Receives `(body, item)` */
+  confirmation?: (responseBody: any, item: Partial<T> & Record<string, any>) => Partial<T> | null | undefined | void;
+
+  /** The operation that creates a row. The URL is the collection; a rejection removes the row */
+  create?: string | WriteOperation<T>;
+}
+
+export interface RefreshOptions {
+  params?: Record<string, any>;
+
+  /** Add a page instead of replacing */
+  append?: boolean;
+
+  /** Drop current rows before the request */
+  clear?: boolean;
+}
+
+/**
+ * A query as returned by `getQuery()`, or bound as `$name` in markup
+ */
+export interface QueryHandle<T = any> {
+  readonly rows: T[];
+  readonly count: number;
+
+  /** A fetch is in flight with no usable data yet */
+  readonly isLoading: boolean;
+
+  /** Data on screen the server has not yet confirmed */
+  readonly isStale: boolean;
+
+  /** The initial load failed */
+  readonly error: any;
+
+  /** A later refresh failed; existing rows were kept */
+  readonly syncError: any;
+
+  readonly lastSync: number | Date | null;
+
+  /** Writes dispatched but not yet settled */
+  readonly pendingWrites: number;
+
+  refresh(options?: RefreshOptions): Promise<void>;
+
+  /** Conditional refetch */
+  invalidate(): Promise<void>;
+
+  /** Apply local data with no transport */
+  patch(data: Partial<T> | Partial<T>[]): void;
+
+  /** Save the key plus the changed fields. Delete when the `deleted` field is truthy, update otherwise */
+  write(item: Partial<T> & Record<string, any>): Promise<T | void>;
+
+  /** Run a named operation from the `to` map */
+  write(operation: string, item: Partial<T> & Record<string, any>): Promise<T | void>;
+
+  /** Add a row through the `create` entry. The temporary key is minted for you */
+  create(item: Partial<T> & Record<string, any>): Promise<T | void>;
+}
+
+/**
+ * How `data-model` reads and writes a web component: its value property and change event
+ */
+export interface AdapterConfig {
+  prop: string;
+  event: string;
+  [key: string]: any;
+}
 
 // =============================================================================
 // DIRECTIVE SYSTEM
@@ -895,6 +1236,9 @@ export default class WildflowerJS {
   /** Debug mode flag */
   readonly debug: boolean;
 
+  /** Framework version string, stamped from the package version at build time */
+  readonly version: string;
+
   /** Component definitions registry */
   readonly componentDefinitions: Map<string, ComponentDefinition>;
 
@@ -922,7 +1266,7 @@ export default class WildflowerJS {
    */
   component<TState extends ComponentState = ComponentState>(
     name: string,
-    definition: ComponentDefinition<TState>
+    definition: ComponentDefinition<TState> & ThisType<ComponentContext<TState> & TState & Record<string, any>>
   ): this;
 
   /**
@@ -939,9 +1283,16 @@ export default class WildflowerJS {
   getComponents(name: string): Array<Record<string, any> & { element: HTMLElement; id: string; name: string }>;
 
   /**
-   * Get all registered component instances
+   * Get all instances of a component type
+   * @param name - Component name
    */
-  getAllComponentInstances(): ComponentInstance[];
+  getComponentsByType(name: string): ComponentInstance[];
+
+  /**
+   * Get a component instance by its id
+   * @param componentId - Component ID
+   */
+  getComponentInstance(componentId: string): ComponentInstance | undefined;
 
   /**
    * Check if a component instance exists
@@ -950,45 +1301,32 @@ export default class WildflowerJS {
   hasComponentInstance(componentId: string): boolean;
 
   /**
-   * Get a component definition by name
-   * @param componentName - Component name
-   */
-  getComponentDefinition(componentName: string): ComponentDefinition | undefined;
-
-  /**
-   * Check if a component definition exists
-   * @param componentName - Component name
-   */
-  hasComponentDefinition(componentName: string): boolean;
-
-  /**
-   * Get all registered component names
-   */
-  getRegisteredComponentNames(): string[];
-
-  /**
-   * Destroy a specific component
+   * Destroy a specific component. Remove its element from the DOM as well,
+   * or the next scan re-creates it.
    * @param componentId - Component ID to destroy
    */
   destroyComponent(componentId: string): void;
 
   /**
-   * Clear component definitions within a scope
-   * @param scope - DOM element scope (null for global)
-   * @param preserve - Component names to preserve
-   * @returns Array of cleared component names
+   * Free a component or store name so it can be registered again
+   * @param name - Component or store name
    */
-  clearComponentDefinitions(scope?: HTMLElement | null, preserve?: string[]): string[];
+  unregister(name: string): void;
 
   // =========================================================================
-  // ROUTING METHODS
+  // ROUTING METHODS (spa and full builds)
   // =========================================================================
 
   /**
-   * Create and configure a router
+   * Create and configure a router. With a `routes` array the router
+   * initializes itself; without one, register routes with onRoute() and
+   * call init() yourself.
    * @param options - Router configuration
    */
-  router(options?: RouteManagerOptions): RouteManager;
+  createRouter(options?: RouteManagerOptions): RouteManager;
+
+  /** The RouteManager class, for `new wildflower.RouteManager(options)` */
+  readonly RouteManager: new (options?: RouteManagerOptions) => RouteManager;
 
   // =========================================================================
   // STORE METHODS
@@ -1001,16 +1339,46 @@ export default class WildflowerJS {
    */
   store<TState extends Record<string, any> = Record<string, any>>(
     name: string,
-    config: StoreConfig<TState>
-  ): StoreContext<TState>;
+    config: StoreConfig<TState> & ThisType<StoreContext<TState> & TState & Record<string, any>>
+  ): StoreContext<TState> & TState & Record<string, any>;
 
   /**
-   * Get an existing store by name
+   * Get an existing store by name. State fields, computeds, and methods sit
+   * directly on the handle (`store.count`), alongside the StoreContext API.
    * @param name - Store name
    */
   getStore<TState extends Record<string, any> = Record<string, any>>(
     name: string
-  ): StoreContext<TState> | undefined;
+  ): (StoreContext<TState> & TState & Record<string, any>) | undefined;
+
+  // =========================================================================
+  // DATA QUERY METHODS (full build)
+  // =========================================================================
+
+  /**
+   * Declare a query: where rows come from, how fresh they stay, and where
+   * changes go. Markup binds it with `data-query="name"` and reads state as `$name`.
+   * @param name - Query name (a noun: the data it delivers)
+   * @param config - Query declaration
+   */
+  query<T = any>(name: string, config: QueryConfig<T>): QueryHandle<T>;
+
+  /**
+   * Get a declared query's handle
+   * @param name - Query name
+   */
+  getQuery<T = any>(name: string): QueryHandle<T> | undefined;
+
+  /**
+   * Mark several queries out of date and refetch them. Resolves once every
+   * triggered refetch has settled; inactive queries are skipped.
+   */
+  invalidateQueries(...names: string[]): Promise<void>;
+
+  /**
+   * Remove persisted query rows from localStorage. No names clears every query's.
+   */
+  clearPersisted(...names: string[]): void;
 
   // =========================================================================
   // PLUGIN METHODS
@@ -1123,23 +1491,11 @@ export default class WildflowerJS {
    */
   cancelBatch(): void;
 
-  // =========================================================================
-  // MODAL METHODS
-  // =========================================================================
-
   /**
-   * Open a modal from a template
-   * @param templateId - ID of the template element
-   * @param data - Data to pass to the modal
-   * @returns Promise resolving to modal result
+   * Run a function as one batch: DOM updates are deferred until it returns
+   * @param fn - Function performing the state changes
    */
-  openModal<T = any>(templateId: string, data?: Record<string, any>): Promise<T>;
-
-  /**
-   * Close a modal
-   * @param modalOrId - Modal element or template ID
-   */
-  closeModal(modalOrId: HTMLElement | string): void;
+  batch(fn: () => void): void;
 
   // =========================================================================
   // ERROR HANDLING
@@ -1179,26 +1535,51 @@ export default class WildflowerJS {
   isExpression(str: string): boolean;
 
   /**
-   * Get context statistics for debugging
-   */
-  getContextStats(): {
-    total: number;
-    byType: Record<ContextType, number>;
-  };
-
-  /**
    * Manually rescan for item templates in a component
    * @param elementOrId - Component element or ID
    */
   rescanItemTemplates(elementOrId: HTMLElement | string): void;
 
   /**
-   * Update a specific item in a list
-   * @param context - List context
-   * @param itemIndex - Index of item to update
-   * @param updates - Updates to apply
+   * Change options after initialization (debug, errorHandling, forceCSPMode,
+   * htmlSanitizer, per-origin query headers, ...)
+   * @param options - Options to merge into the current configuration
    */
-  updateListItem(context: any, itemIndex: number, updates: Record<string, any>): void;
+  config(options: Partial<WildflowerOptions>): this;
+
+  /**
+   * Deep plain-object snapshot of reactive state, for structured clone
+   * (IndexedDB, postMessage, JSON)
+   * @param value - Reactive value
+   */
+  toRaw<T>(value: T): T;
+
+  /**
+   * Install (or with null, remove) the sanitizer applied to data-bind-html content
+   * @param fn - Sanitizer function
+   */
+  setHtmlSanitizer(fn: ((html: string) => string) | null): this;
+
+  /**
+   * Tell data-model how a web component exposes its value
+   * @param tagName - Custom element tag name (e.g. 'sl-input')
+   * @param config - Its value property and change event
+   */
+  registerAdapter(tagName: string, config: AdapterConfig): this;
+
+  /**
+   * Get the adapter registered for a tag name
+   * @param tagName - Custom element tag name
+   * @param element - Optional element, for adapters that inspect the instance
+   */
+  getAdapter(tagName: string, element?: Element): AdapterConfig | undefined;
+
+  /**
+   * Inspect the running application, or all instances of one component type.
+   * Logs a structured summary and returns the data.
+   * @param componentName - Optional component name
+   */
+  inspect(componentName?: string): any;
 
   /**
    * Clean up orphaned components and contexts
@@ -1236,11 +1617,6 @@ export default class WildflowerJS {
    * @param exclusive - When true, only process data-wf-* attributes
    */
   setWfPrefixMode(exclusive: boolean): void;
-
-  /**
-   * Reset event delegation state
-   */
-  resetEventDelegation(): void;
 
   /**
    * Add a hook to run before content updates (e.g., for syntax highlighting)
@@ -1303,39 +1679,7 @@ declare global {
 // =============================================================================
 // MODULE EXPORTS
 // =============================================================================
-
-export {
-  WildflowerJS,
-  WildflowerOptions,
-  ComponentDefinition,
-  ComponentInstance,
-  ComponentContext,
-  ComponentState,
-  PropConfig,
-  PoolConfig,
-  PoolHandle,
-  RouteManager,
-  RouteManagerOptions,
-  RouteConfig,
-  Route,
-  RouteContext,
-  RouteGuard,
-  AfterHook,
-  StoreConfig,
-  StoreContext,
-  StoreManager,
-  Plugin,
-  PluginObject,
-  PluginInstallFn,
-  DirectiveHandlers,
-  DirectiveContext,
-  HookName,
-  HookHandler,
-  EventDelegationOptions,
-  DelegatedEventHandler,
-  ContextRegistry,
-  ContextType,
-  ReactiveStateManager,
-  ReactiveStateOptions,
-  SSRManager
-};
+//
+// Every type above is exported inline where it is declared. A trailing
+// `export { ... }` block that re-exported them made every strict consumer
+// (skipLibCheck off) fail with TS2484 on each name; it was removed after 1.5.0.

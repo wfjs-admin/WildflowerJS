@@ -1,7 +1,7 @@
 /**
  * RowCompiler: per-template row-build specialization for data-list.
  *
- * One emitter set, multiple assembly modes (see the design notes).
+ * One emitter set, multiple assembly modes.
  * Each emitter is derived once per template from the compiled metadata and emits
  * a closure that produces the row's DOM effect. The composed path (this file's
  * v1 scope) runs those closures in a JS loop; later phases add a `new Function`

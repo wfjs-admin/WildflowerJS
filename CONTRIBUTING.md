@@ -54,11 +54,12 @@ npm run test:retry
 2. Make changes in `src/`, then `npm run build`
 3. Add or update tests in `tests/` covering your changes
 4. Run tests: `npm test`
-5. Submit a PR referencing the related issue
+5. Optionally lint: `npm run lint`. The rules are in `eslint.config.js`; eslint itself is not a dev dependency of this package (the dev tree is kept deliberately small, see `PROVENANCE.md`), so have eslint 9 installed globally or add it locally with `npm install --no-save eslint`. Integration runs the same config on every change.
+6. Submit a PR referencing the related issue
 
 ## How PRs Are Reviewed
 
-Pull requests are reviewed with the help of AI-assisted code analysis against the full internal test suite (~3,400 tests across 8 build variants). This means:
+Pull requests are reviewed with the help of AI-assisted code analysis against the full test suite: 5,300 tests, run in real Chromium against every build lane (seven tiers, each as raw, development, and minified builds; 21 lanes in all). This means:
 
 - **Reviews may take a few days.** Your PR is evaluated against the complete codebase for correctness, performance impact, and pattern consistency, not just a quick skim.
 - **Integration goes through an internal pipeline.** Accepted changes are merged into the development tree, tested, and published through our build process. Your PR will be closed with a reference to the integrating commit rather than merged directly on GitHub.

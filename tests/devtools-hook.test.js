@@ -29,6 +29,8 @@ describe('DevTools hook v1.2 surface', () => {
         const h = hook()
         expect(h, 'global hook should exist in every build').toBeTruthy()
         expect(h.version).toBe('1.5.0')
+        // wildflower.version is the same build-time string (from package.json).
+        expect(wildflower.version).toBe(h.version)
         expect(h.schemaVersion).toBe(1)
         expect(typeof h.dev).toBe('boolean')
         // dev builds are the non-minified ones; min builds strip the dev surface.

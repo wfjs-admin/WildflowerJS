@@ -8,7 +8,7 @@ The honest summary: we close the post-publish tampering vector, remove the posti
 
 There are two pipelines. They have different trust profiles.
 
-**Framework build pipeline** (`npm run build` → produces `www/js/dist/wildflower.*.js`):
+**Framework build pipeline** (`npm run build` → produces `dist/wildflower.*.js`):
 - Three SHA-512-pinned tarballs total: `rollup` 3.30.0, `terser` 5.46.2, `acorn` 8.16.0.
 - Fetched directly from `https://registry.npmjs.org/` by `scripts/fetch-rollup.cjs` and `scripts/fetch-terser.cjs`. No `npm install`. No package manager involved.
 - Each fetch script has the SHA-512 baked in as a constant. Mismatch is a hard failure.
@@ -94,11 +94,11 @@ Compare against the `INTEGRITY` constants in `scripts/fetch-rollup.cjs` and the 
 Verify a clean build from a fresh clone:
 
 ```bash
-git clone https://github.com/<org>/wildflowerjs.git wf-verify && cd wf-verify
+git clone https://github.com/wfjs-admin/WildflowerJS.git wf-verify && cd wf-verify
 node scripts/fetch-rollup.cjs   # SHA-512 verified
 node scripts/fetch-terser.cjs   # SHA-512 verified, sourcemap stub patched in
-node scripts/build-rollup.cjs   # produces www/js/dist/*
-shasum -a 256 www/js/dist/wildflower.full.min.js
+node scripts/build-rollup.cjs   # produces dist/*
+shasum -a 256 dist/wildflower.full.min.js
 ```
 
 The same input commit produces the same bytes. If our published CDN artifact has a different hash than your locally rebuilt one, something is wrong on our side and we want to hear about it.

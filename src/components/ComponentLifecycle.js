@@ -604,6 +604,39 @@ export const ComponentLifecycleMethods = {
      * Call the init lifecycle hook
      * @private
      */
+    /**
+     * Register the component's tick(dt) hook with the shared frame loop.
+     *
+     * Called from BOTH init paths: _initWithStoreWait (dynamic mounts, and
+     * page-load components that define init()) and the page-load no-init
+     * branch in ComponentScanning. Until 1.5.1 registration lived only inside
+     * _initWithStoreWait, so a page-load component with tick() and no init()
+     * never ticked (the docs' particle example has that shape). Idempotent.
+     *
+     * The frame loop lives in the pool module — in tiers without pools (e.g.
+     * mini), a bare call crashed component init with an unhandled TypeError
+     * (latent until the DX sweep's tests defined tick() on those tiers).
+     * Guard + dev-warn.
+     *
+     * @param {Object} instance - Component instance
+     * @private
+     */
+    _registerTickHook(instance) {
+        if (instance._tickFn) return;
+        if (typeof instance.definition.tick !== 'function') return;
+        if (this._startPoolLoop) {
+            instance._tickFn = instance.definition.tick.bind(instance.context);
+            if (!this._tickableInstances) this._tickableInstances = [];
+            this._tickableInstances.push(instance);
+            this._startPoolLoop();
+        } else if (__DEV__) {
+            wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
+                warn: true,
+                context: `Component '${instance.name}': tick() is defined, but this build does not include the frame loop (pool module excluded from this tier); tick will never run`
+            });
+        }
+    },
+
     _callInitHook(instance, componentName) {
         if (typeof instance.context.init !== 'function') return;
 
@@ -751,23 +784,9 @@ export const ComponentLifecycleMethods = {
             }
         }
 
-        // Register tick lifecycle hook if defined. The frame loop lives in the
-        // pool module — in tiers without pools (e.g. mini), a bare call here
-        // crashed component init with an unhandled TypeError (latent until the
-        // DX sweep's tests defined tick() on those tiers). Guard + dev-warn.
-        if (typeof instance.definition.tick === 'function') {
-            if (this._startPoolLoop) {
-                instance._tickFn = instance.definition.tick.bind(instance.context);
-                if (!this._tickableInstances) this._tickableInstances = [];
-                this._tickableInstances.push(instance);
-                this._startPoolLoop();
-            } else if (__DEV__) {
-                wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
-                    warn: true,
-                    context: `Component '${instance.name}': tick() is defined, but this build does not include the frame loop (pool module excluded from this tier); tick will never run`
-                });
-            }
-        }
+        // Register tick lifecycle hook if defined (shared with the page-load
+        // no-init branch in ComponentScanning, which never reaches this method).
+        this._registerTickHook(instance);
 
         // Process portals created dynamically in init()
         if (this._processPortals) {

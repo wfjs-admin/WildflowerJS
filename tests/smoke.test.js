@@ -40,7 +40,7 @@ describe('WildflowerJS Browser Mode Smoke Test', () => {
   })
 
   it('should have access to real browser APIs', () => {
-    // Verify we're in a real browser, not jsdom
+    // Verify we're in a real browser, not a simulated DOM
     expect(window).toBeDefined()
     expect(document).toBeDefined()
     expect(document.body).toBeDefined()
@@ -68,7 +68,7 @@ describe('WildflowerJS Browser Mode Smoke Test', () => {
     div.id = 'async-test'
     testContainer.appendChild(div)
 
-    // Use requestAnimationFrame (this fails in jsdom sometimes)
+    // Use requestAnimationFrame (simulated DOM environments sometimes lack it)
     await new Promise(resolve => {
       requestAnimationFrame(() => {
         div.textContent = 'Updated via RAF'

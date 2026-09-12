@@ -35,13 +35,15 @@ export const PluginSystemMethods = {
         if (typeof plugin === 'function') {
             this._installPlugin(plugin, null, options);
         } else if (plugin && typeof plugin === 'object') {
-            if (typeof plugin.install !== 'function') {
-                throw new Error('Object plugin must have an install() method');
-            }
+            // install() is optional (since 1.5.1): a plugin that is only state,
+            // computed, and methods has the same shape as a component or store
+            // and needs no installation step. Absent, a no-op stands in so the
+            // rest of the registration (name, state, $accessor) runs unchanged.
+            const install = typeof plugin.install === 'function' ? plugin.install : function () {};
             // Don't bind here - let _installPlugin handle context for inject
-            this._installPlugin(plugin.install, plugin, options);
+            this._installPlugin(install, plugin, options);
         } else {
-            throw new Error('Plugin must be a function or object with install method');
+            throw new Error('Plugin must be a function or an object');
         }
 
         return this;

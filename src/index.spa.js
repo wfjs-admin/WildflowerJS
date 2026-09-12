@@ -101,3 +101,4 @@ wildflower.RouteManager = RouteManager;
 wildflower.createRouter = RouteManager.create;
 
 export { WildflowerJS, wildflower, RouteManager };
+export default wildflower;

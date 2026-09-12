@@ -42,11 +42,13 @@ body:
     attributes:
       label: Package variant
       options:
-        - Core (wildflower.min.js)
+        - Nano (wildflower.nano.min.js)
+        - Mini-pool (wildflower.mini-pool.min.js)
+        - Mini (wildflower.mini.min.js)
         - Lite (wildflower.lite.min.js)
+        - Core (wildflower.min.js)
         - SPA (wildflower.spa.min.js)
         - Full (wildflower.full.min.js)
-        - ESM (wildflower.esm.js)
     validations:
       required: true
 

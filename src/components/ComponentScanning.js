@@ -603,6 +603,11 @@ _setupDynamicComponentDetection()
             // immediately rather than being queued indefinitely by
             // _wrapMethod's action-before-init guard.
             instance._initReady = true;
+            // This branch never reaches _initWithStoreWait, where tick()
+            // registration lives for init-bearing components, so register
+            // here too. Without this, a page-load component with tick() and
+            // no init() never ticked (dynamic mounts were unaffected).
+            this._registerTickHook(instance);
         }
 
         // Dispatch component init event for optional module integration (e.g., RouteManager)

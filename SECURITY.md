@@ -34,6 +34,6 @@ We take all reports seriously regardless of severity.
 
 WildflowerJS ships as a single pre-built JavaScript file. Users who follow the documented integration path (one `<script>` tag pointing at the CDN-hosted bundle) never run `npm install` to use the framework, so the npm postinstall / build-time supply-chain attack class (Shai-Hulud, event-stream, ua-parser-js, node-ipc, etc.) does not apply to framework consumers.
 
-Maintainers building the framework from source use a vendored, SHA-512-pinned toolchain (rollup + terser, fetched once via direct tarball download with integrity verification, no `npm install` during the build, no postinstall scripts). The build trust footprint is 8 frozen tarballs pinned in `scripts/fetch-rollup.cjs` and `scripts/fetch-terser.cjs`. Version bumps require explicit hash updates and changelog review.
+Maintainers building the framework from source use a vendored, SHA-512-pinned toolchain (rollup + terser, fetched once via direct tarball download with integrity verification, no `npm install` during the build, no postinstall scripts). The build trust footprint is three frozen tarballs (rollup, terser, acorn) pinned by SHA-512 in `scripts/fetch-rollup.cjs` and `scripts/fetch-terser.cjs`; see `PROVENANCE.md`. Version bumps require explicit hash updates and changelog review.
 
 If you spot a way to introduce attacker-controlled code into a published WildflowerJS bundle through the build path, treat it as in-scope and report via the email above.

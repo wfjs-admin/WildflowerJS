@@ -157,8 +157,7 @@ export const HAS_MOVE_BEFORE = typeof Element !== 'undefined' && typeof Element.
  * priority starves under main-thread contention — the 2026-07-15 headroom
  * probe measured 240-component page-load init at 418 ms via rIC vs 90 ms via
  * postTask under animation-grade contention, identical when idle, with
- * worst-case input wait bounded by the caller's chunk budget (P3 in
- * the design notes).
+ * worst-case input wait bounded by the caller's chunk budget.
  */
 export const wfYield = (() => {
     const sch = typeof scheduler !== 'undefined' ? scheduler : null;

@@ -2,8 +2,7 @@
  * QuerySystem: the data-query primitive ("SSR for post-load").
  *
  * A query is a named declaration binding markup to an external data source,
- * kept current per a declared freshness policy. Design + decisions:
- * the design notes. Ships only in tiers with SSR
+ * kept current per a declared freshness policy. Ships only in tiers with SSR
  * (__FEATURE_QUERY__), constant-folded out elsewhere.
  *
  * Architecture (deliberate delegation, the probe thesis):
@@ -2330,7 +2329,7 @@ export const QuerySystemMethods = {
         controller.es = es;
         controller.streamUrl = streamUrl;
         if (__DEV__ && !controller._warnedStreamHeaders) {
-            // Platform constraint, named once (review finding / triage):
+            // Platform constraint, named once:
             // EventSource carries no headers — its constructor accepts only
             // withCredentials — so a query's declared headers authenticate
             // reads and writes while the stream connects anonymously, and a
@@ -2374,7 +2373,7 @@ export const QuerySystemMethods = {
                 const s = store();
                 if (!s) return;
                 // select: turns a read response into rows on EVERY read
-                // delivery, stream included (review finding / triage). Before
+                // delivery, stream included. Before
                 // this call the fetch path was the only caller, so a shared
                 // envelope ingested raw on every push — the list replaced by
                 // one row whose fields were the envelope's — and WF-980,
@@ -2639,7 +2638,7 @@ export const QuerySystemMethods = {
         // failed, not whatever the app's state says at retry time.
         const declared = this._queryResolveParams(controller);
         if (__DEV__) {
-            // Reversion watch (review finding. replacing the request-time check).
+            // Reversion watch (replacing the request-time check).
             // An imperative refresh({ params }) wins for exactly one fetch
             // before the declaration reasserts. Correct under the stated
             // precedence, and it reads as a value spontaneously reverting:

@@ -534,14 +534,19 @@ export class SSRManager {
      * Called after framework initialization is complete
      */
     activateAllComponents() {
-        this._log('Activating all SSR components for full functionality...');
-
         let activatedCount = 0;
 
         // Snapshot protected elements before activation; activateComponent() removes
         // each element from this.protectedElements as part of its cleanup, so by the
         // time the post-activation steps run, the live set would be empty.
         const elementsToActivate = Array.from(this.protectedElements);
+
+        // Nothing to activate on a page without data-ssr components: return
+        // quietly. (Before 1.5.1 every dev page load logged two activation
+        // lines here even when the page had no SSR markup at all.)
+        if (elementsToActivate.length === 0) return 0;
+
+        this._log('Activating all SSR components for full functionality...');
 
         // Activate all currently protected components
         elementsToActivate.forEach(element => {

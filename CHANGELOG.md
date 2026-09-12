@@ -2,17 +2,31 @@
 
 All notable changes to WildflowerJS will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
+
+## [1.5.1] - UNRELEASED (queued; set the date at release)
+
+### Added
+- [`wildflower.version`](https://www.wildflowerjs.com/changelog.html#wildflower-version): the framework version string, stamped from the package version at build time, in every tier and build.
+- [ES-module bundles for every tier](https://www.wildflowerjs.com/changelog.html#esm-bundles): `wildflower.<tier>.esm.min.js` (and an `.esm.dev.js` twin) beside each script-tag file; default export is the instance, the `wildflower` global is still registered, and the package's `import` condition resolves it (`import wildflower from 'wildflowerjs/full'`).
+- [Object plugins no longer need an `install()` method](https://www.wildflowerjs.com/changelog.html#plugin-install-optional): a plugin that is only state, computed, and methods registers like a component or store; `install(wf, options)`, when present, runs as before.
+- [Opt-in typings for the script-tag global](https://www.wildflowerjs.com/changelog.html#global-typings): `types/wildflower.global.d.ts` infers `this` inside a definition from the literal you pass, for plain JavaScript projects; the module typings remain the `types` entry.
+
+### Fixed
+- [The published typings compile under `strict` and cover the 1.5 surface](https://www.wildflowerjs.com/changelog.html#published-typings): a trailing export block gave strict consumers thirty-two errors from the file itself, and its content had stopped at 1.2.0 (it still declared the removed `pool()` and had no query layer). Clean now, with the 1.5 API declared and phantom declarations removed.
+- [Unsanitized `data-bind-html` warns in production too](https://www.wildflowerjs.com/changelog.html#html-sanitizer-production-warning): the one-time "no sanitizer installed" warning was development-only; it now fires in every build.
+- [`tick()` runs for a page-load component that has no `init()`](https://www.wildflowerjs.com/changelog.html#tick-without-init): the batched page-load path registered the frame hook only for components that defined `init()`, so a component with `tick()` alone never ticked; dynamically mounted components were unaffected.
+- [Minified builds keep the license banner](https://www.wildflowerjs.com/changelog.html#min-license-banner): the MIT notice and version now open every `.min.js`, as they always did the unminified builds.
+- [Development builds stay quiet about SSR on pages without it](https://www.wildflowerjs.com/changelog.html#ssr-activation-log): the two activation lines no longer print when a page has no `data-ssr` markup.
 
 ## [1.5.0] - 2026-09-11
 
 ### Added
 - [`confirmation` receives the item that was written](https://www.wildflowerjs.com/docs/data-query-writes#what-comes-back): an `ok` response can mean the row came back, the write was refused, or the write was accepted with nothing to report, and only the body can tell them apart. The callback now takes `(body, item)`, so returning a record reconciles it, throwing rejects and rolls back, and returning the item keeps what was written without a refetch. Existing one-argument callbacks are unaffected.
-- [The `mini-pool` tier](https://www.wildflowerjs.com/changelog.html#mini-pool-tier): mini with entity pools in place of the list cluster, at 52&nbsp;KB brotli, for games, simulations, and per-frame visualization that render through `data-pool` and never use `data-list`. Available as `wildflower.mini-pool.min.js` and the package export `wildflowerjs/mini-pool`.
+- [The `mini-pool` tier](https://www.wildflowerjs.com/changelog.html#mini-pool-tier): mini with entity pools in place of the list cluster, at 55&nbsp;KB brotli, for games, simulations, and per-frame visualization that render through `data-pool` and never use `data-list`. Available as `wildflower.mini-pool.min.js` and the package export `wildflowerjs/mini-pool`.
 - [Declarative writes: `to:` and `write()`](https://www.wildflowerjs.com/changelog.html#declarative-writes): a query that declares where data comes from can now declare where it goes, with `to:` as the write transport and `write(item)` as the call. The item applies to its row immediately, the server's answer reconciles it, and a rejection rolls back field by field.
 - [Declarative transport: `to:` as a URL, named operations, and `create:`](https://www.wildflowerjs.com/changelog.html#declarative-transport): `to:` accepts a URL string or a map of named operations, `create:` is its own key for the operation that creates a row's identity, and `select:`, `body:`, and `confirmation:` carry the payload shapes. The function form of `to:` is unchanged.
 - [URL templates: `:token` segments in `from:` and `to:`](https://www.wildflowerjs.com/changelog.html#query-url-templates): a query URL may carry `:token` path segments, resolved from `params` on a read and from the item's own fields on a write. A read with an unresolved token waits and loads when the value arrives; a write with one rejects (WF-972).

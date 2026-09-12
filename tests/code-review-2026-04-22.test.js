@@ -158,59 +158,10 @@ describe.skipIf(isMinifiedBuild())('Code Review 2026-04-22 — Group 1 (phase 1)
     it.skip('placeholder to keep ordering', () => {})
   })
 
-  // ─────────────────────────────────────────────────────────────────
-  // C1 — _reusableEffectSet mid-iteration clear corrupts outer loop
-  //       ReactiveStateManager.js:3211-3244
-  //
-  // Exploit requires the slow path (exact + pattern effects on same
-  // path). A sync effect inside that batch writes another pattern-
-  // matched path, which re-enters `_notifyEffectDependents` and
-  // `.clear()`s the shared Set, dropping any remaining effects from
-  // the outer iteration.
-  //
-  // We engineer both paths via the internal
-  // `_registerEffectPatternDependency` and verify that all expected
-  // effects fire after the sync write. The snapshot fix (Array.from
-  // before iterating) makes the outer loop immune to mid-iteration
-  // `.clear()` on the reusable Set.
-  // ─────────────────────────────────────────────────────────────────
-  describe.skip('C1 — sync-effect reentry smoke test (hangs; needs investigation)', () => {
-    // Full slow-path reproduction requires internal pattern-effect
-    // registration. This is a SMOKE test: confirm a sync effect that
-    // writes to another reactive path during its run does not crash or
-    // prevent the async effect on the same path from firing. The snapshot
-    // fix at ReactiveStateManager.js:3224 is the regression-safety code
-    // path here. The full test suite is the true safety net for C1 — the
-    // snapshot change is a 1-line structural fix with no behavior delta
-    // in any non-reentrant case.
-    it('sync effect that writes another path does not drop sibling async effect', async () => {
-      const store = wildflower.storeManager.createStoreComponent('c1-store', {
-        state: { a: 0, b: 0 }
-      })
-
-      let asyncRuns = 0
-
-      // Async effect on 'a' — this is the one the bug would drop
-      store.stateManager.createEffect(() => {
-        const _ = store.state.a
-        asyncRuns++
-      })
-
-      // Sync effect on 'a' that writes 'b' when a changes — would
-      // trigger the mid-iteration clear in the slow path pre-fix.
-      store.stateManager.createEffect(() => {
-        const a = store.state.a
-        if (a > 0) store.state.b = a * 2
-      }, { sync: true })
-
-      const baseline = asyncRuns
-      store.state.a = 1
-      await whenSettled()
-
-      expect(asyncRuns).toBeGreaterThan(baseline)
-      expect(store.state.b).toBe(2)
-    })
-  })
+  // C1 (a sync-effect reentry smoke test against the pre-1.2.0 reactive core)
+  // was deleted 2026-09-11: the ReactiveStateManager code it guarded no longer
+  // exists, and the single dependency graph has no sync-effect mode. Reentry
+  // coverage for the graph lives in the reactive-graph tests.
 
   describe('C2 — Pool remove() preserves entity identity (resumed)', () => {
     const itPools = hasFeature('pools') ? it : it.skip

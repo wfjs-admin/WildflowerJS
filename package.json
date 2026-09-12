@@ -18,23 +18,27 @@
   ],
   "exports": {
     ".": {
+      "import": "./dist/wildflower.esm.min.js",
       "default": "./dist/wildflower.min.js"
     },
-    "./nano": "./dist/wildflower.nano.min.js",
-    "./mini-pool": "./dist/wildflower.mini-pool.min.js",
-    "./mini": "./dist/wildflower.mini.min.js",
-    "./lite": "./dist/wildflower.lite.min.js",
-    "./spa": "./dist/wildflower.spa.min.js",
-    "./full": "./dist/wildflower.full.min.js",
+    "./nano": { "import": "./dist/wildflower.nano.esm.min.js", "default": "./dist/wildflower.nano.min.js" },
+    "./mini-pool": { "import": "./dist/wildflower.mini-pool.esm.min.js", "default": "./dist/wildflower.mini-pool.min.js" },
+    "./mini": { "import": "./dist/wildflower.mini.esm.min.js", "default": "./dist/wildflower.mini.min.js" },
+    "./lite": { "import": "./dist/wildflower.lite.esm.min.js", "default": "./dist/wildflower.lite.min.js" },
+    "./spa": { "import": "./dist/wildflower.spa.esm.min.js", "default": "./dist/wildflower.spa.min.js" },
+    "./full": { "import": "./dist/wildflower.full.esm.min.js", "default": "./dist/wildflower.full.min.js" },
     "./adapters/*": "./adapters/*"
   },
+  "module": "dist/wildflower.esm.min.js",
   "types": "types/wildflowerJS.d.ts",
   "scripts": {
     "build": "node scripts/fetch-rollup.cjs && node scripts/fetch-terser.cjs && node scripts/build-rollup.cjs",
     "test": "vitest run --config tests/vitest.browser.config.js",
+    "test:nano": "vitest run --config tests/vitest.nano.config.js",
     "test:retry": "node scripts/test-with-retry.cjs",
     "test:watch": "vitest --config tests/vitest.browser.config.js",
-    "test:setup": "npx playwright install chromium"
+    "test:setup": "npx playwright install chromium",
+    "lint": "eslint src/"
   },
   "keywords": [
     "framework",

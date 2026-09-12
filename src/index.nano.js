@@ -1,14 +1,15 @@
 /**
- * WildflowerJS: Nano Package Entry Point (SPIKE — size measurement only)
+ * WildflowerJS: Nano Package Entry Point
  *
- * Below mini: core reactive UI + components, NO data-list, NO pools.
- * The interactive-widget / single-file-artifact tier — state, computed,
- * data-bind/show/model, events, forms. No list rendering pipeline.
+ * The smallest shipped tier (since 1.3.0). Below mini: core reactive UI +
+ * components + stores, NO data-list, NO pools. The interactive-widget /
+ * single-file-artifact tier: state, computed, data-bind/show/render/model,
+ * events, forms, error boundaries, CSP-safe expressions.
  *
- * This is a measurement spike to quantify the brotli delta of gating the
- * list-render cluster (ListRenderer + ListItemBinding + ListExpressionEval +
- * ListNestedManager + RowCompiler). Runtime correctness of list-less apps is
- * NOT the goal here — the goal is the tree-shaken size number.
+ * Excludes the list-render cluster (ListRenderer + ListItemBinding +
+ * ListExpressionEval + ListNestedManager + RowCompiler), pools, plugins,
+ * portals, transitions, routing, SSR and data queries. __FEATURE_LISTS__ is
+ * false for this entry so list call-sites constant-fold out.
  *
  * @module WildflowerJS/Nano
  */
@@ -91,3 +92,4 @@ Object.assign(WildflowerJS.prototype,
 const wildflower = createInstance(WildflowerJS);
 
 export { WildflowerJS, wildflower };
+export default wildflower;

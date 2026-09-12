@@ -88,7 +88,7 @@ function _createDevToolsHook(wf) {
         // detects capabilities off this, NOT the framework version. Start at 1.
         // dev: true on development builds; false on minified production builds
         // (the extension uses it to show which introspection is available).
-        version: '1.5.0', schemaVersion: 1, dev: __DEV__, framework: wf,
+        version: __VERSION__, schemaVersion: 1, dev: __DEV__, framework: wf,
         getComponents() {
             const r = [];
             wf.componentInstances.forEach((i, id) => {

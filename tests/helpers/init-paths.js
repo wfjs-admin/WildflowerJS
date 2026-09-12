@@ -22,7 +22,7 @@
  * load uses the async _scanForComponentsAsync, but both share the per-instance
  * unit-of-work functions where divergences live, so this is a faithful proxy for
  * the "a setup step is missing on one path" bug class. Async-sequencing-only bugs
- * need the Layer 2 real-page fixtures (tests/pageload/).
+ * need real-page fixtures, which this suite does not include.
  *
  * Each entry scans the document root (like a real page load), so tests must place
  * their component in the document and clean it up afterward.

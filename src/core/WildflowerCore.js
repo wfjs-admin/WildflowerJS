@@ -71,6 +71,10 @@ export class WildflowerJS
         // Debug mode
         this.debug = this.options.debug;
 
+        // Framework version, stamped from package.json at build time (__VERSION__
+        // is a build-time define, like __DEV__). Read it as wildflower.version.
+        this.version = typeof __VERSION__ !== 'undefined' ? __VERSION__ : '0.0.0';
+
         // Strict props mode (throw on validation failure even in production)
         this.strictProps = this.options.strictProps;
 
@@ -423,8 +427,10 @@ export class WildflowerJS
         if (this._htmlSanitizer) {
             return this._htmlSanitizer(htmlValue);
         }
-        // Dev-mode one-time warning
-        if (!this._htmlSanitizerWarned && typeof __DEV__ !== 'undefined' && __DEV__) {
+        // One-time warning in EVERY build (console.warn survives minification).
+        // Until 1.5.1 this was dev-only, so a production page rendered raw
+        // HTML with no sign of it; the warning is the only hint a deployer gets.
+        if (!this._htmlSanitizerWarned) {
             this._htmlSanitizerWarned = true;
             console.warn(
                 '[WF] data-bind-html is rendering unsanitized HTML. ' +

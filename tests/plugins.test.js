@@ -95,8 +95,9 @@ describeIfPlugins('Plugin System', () => {
       expect(wildflower.hasPlugin('test-plugin')).toBe(true)
     })
 
-    it('throws for object plugin without install()', () => {
-      expect(() => wildflower.plugin({ name: 'bad' })).toThrow('install()')
+    it('accepts an object plugin without install() (optional since 1.5.1)', () => {
+      expect(() => wildflower.plugin({ name: 'no-install' })).not.toThrow()
+      expect(wildflower.hasPlugin('no-install')).toBe(true)
     })
 
     it('throws for non-function/non-object plugin', () => {

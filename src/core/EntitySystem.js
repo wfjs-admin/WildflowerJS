@@ -1563,8 +1563,7 @@ export const EntitySystemMethods = {
      * proxy-internal markers used to identify array-mutation operations
      * (push, splice). They feed into the top-level expansion below but
      * don't belong as standalone changed paths in downstream consumers.
-     *
-         * @private
+     * @private
      */
     _applyBatchChangesFromProxy(snapshot) {
         if (!snapshot || snapshot.size === 0) return;

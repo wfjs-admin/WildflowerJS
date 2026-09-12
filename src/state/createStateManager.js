@@ -6,7 +6,7 @@
  * core (state/reactive-graph/).
  *
  * setStateManagerImpl() allows a process-wide runtime override, used by the
- * reactive-graph node/jsdom integration tests to inject the handle explicitly.
+ * reactive graph's own integration tests to inject the handle explicitly.
  */
 
 import { EntityHandle } from './reactive-graph/entity-handle.js';

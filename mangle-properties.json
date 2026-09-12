@@ -737,6 +737,7 @@
     "_tickableInstances",
     "_tickFn",
     "_startPoolLoop",
+    "_registerTickHook",
     "_boundPoolLoopTick",
     "_isPassive",
     "_templateContent",

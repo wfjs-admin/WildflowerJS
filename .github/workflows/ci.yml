@@ -9,6 +9,19 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    # One lane per shipped tier (production .min.js) plus the full development
+    # build, so every published bundle runs the suite, not just full-dev. The
+    # list-free tiers (nano, mini-pool) use their own config, which excludes
+    # every data-list test file.
+    strategy:
+      fail-fast: false
+      matrix:
+        dist: [full-dev, full, spa, core, lite, mini]
+        script: [test]
+        include:
+          - { dist: mini-pool, script: 'test:nano' }
+          - { dist: nano, script: 'test:nano' }
+    name: test (${{ matrix.dist }})
 
     steps:
       - uses: actions/checkout@v5
@@ -34,8 +47,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Run tests
-        run: npm test
+      - name: Run tests (${{ matrix.dist }})
+        run: npx cross-env WILDFLOWER_DIST=${{ matrix.dist }} npm run ${{ matrix.script }}
 
   bundle-size:
     runs-on: ubuntu-latest
