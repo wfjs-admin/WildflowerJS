@@ -76,7 +76,8 @@ describe('DevTools hook v1.2 surface', () => {
     })
 
     // The Queries tab reads everything from one getQueries() poll; this pins
-    // the enriched payload contract: sync flags, rung summary, shape, and write machinery.
+    // the enriched payload contract: sync flags, rung summary, shape, and
+    // write machinery.
     it('getQueries reports flags, rungs, shape, and write-machinery pressure', async () => {
         const h = hook()
         if (!h.dev || !hasFeature('query')) return

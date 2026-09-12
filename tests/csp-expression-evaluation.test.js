@@ -611,7 +611,7 @@ describe('CSP Evaluator Factory Functions', () => {
 });
 
 describe('Expression Patterns (from Appendix B)', () => {
-    // These are the expression patterns documented CSP-safe expression patterns
+    // These are the documented CSP-safe expression patterns
 
     describe('Simple paths', () => {
         it('should evaluate count', () => {
