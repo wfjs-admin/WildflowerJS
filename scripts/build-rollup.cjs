@@ -9,11 +9,12 @@
  * flags before rollup sees the source. Dropping plugins keeps the trust footprint
  * minimal: rollup tarball + terser tarball + their few SHA-pinned transitive deps.
  *
- * Mirrors the layout of scripts/build-esbuild.cjs: 5 entry points (core, mini,
- * lite, spa, full) x 3 modes (raw, dev-minified, prod-minified) = 15 variants.
+ * 7 entry points (nano, mini-pool, mini, lite, core, spa, full) x 3 modes
+ * (raw, dev-minified, prod-minified) = 21 IIFE variants, plus an ES-module
+ * twin of each dev and min file (.esm.dev.js / .esm.min.js) = 35 files.
  *
  * Usage:
- *   node scripts/build-rollup.cjs                # build all 15
+ *   node scripts/build-rollup.cjs                # build all 35
  *   node scripts/build-rollup.cjs lite.min       # filter (substring match on output filename)
  */
 const fs = require('fs');
@@ -76,7 +77,9 @@ const VERSION = pkg.version || '1.0.0';
 // -----------------------------------------------------------------------------
 // Banner / footer (mirrors rollup.config.js)
 // -----------------------------------------------------------------------------
-const banner = `/**
+// `/*!` (not `/**`) so terser's `comments: /^!/` keeps the license notice in
+// the minified builds too: CDN users only ever see the .min.js file.
+const banner = `/*!
  * WildflowerJS v${VERSION}
  * Lightweight reactive framework - no build step, no virtual DOM
  * https://github.com/wfjs-admin/WildflowerJS
@@ -139,7 +142,9 @@ const FEATURES_LITE = {
 const FEATURES_NANO = { ...FEATURES_LITE, __FEATURE_LISTS__: 'false' };
 
 function defines(features, dev) {
-    return { __DEV__: String(!!dev), ...features };
+    // __VERSION__ is the single source of the version string inside the bundle
+    // (wildflower.version and the DevTools hook); it comes from package.json.
+    return { __DEV__: String(!!dev), __VERSION__: JSON.stringify(VERSION), ...features };
 }
 
 // -----------------------------------------------------------------------------
@@ -184,6 +189,15 @@ const configs = [
     { entry: 'index.full.js', file: 'wildflower.full.dev.js',  features: FEATURES_FULL, dev: true,  minify: true,  mangleProps: false, footer: 'full' },
     { entry: 'index.full.js', file: 'wildflower.full.min.js',  features: FEATURES_FULL, dev: false, minify: true,  mangleProps: true,  footer: 'full' },
 ];
+
+// ES module twins: every tier's .dev.js and .min.js also ships as
+// .esm.dev.js / .esm.min.js (format 'es', default export = the instance,
+// named exports as in the entry file). Same defines, same terser settings.
+// The instance still registers window.wildflower (createInstance does that),
+// so a page behaves the same whichever file it loads.
+for (const c of configs.filter(c => /\.(dev|min)\.js$/.test(c.file))) {
+    configs.push({ ...c, file: c.file.replace(/\.(dev|min)\.js$/, '.esm.$1.js'), format: 'es' });
+}
 
 // Optional maintainer-local variant extensions (repo-internal tooling; the
 // extension file is not part of the published package). Absent file = no-op.
@@ -309,12 +323,9 @@ async function buildOne(cfg) {
                 warn(warning);
             },
         });
-        const { output } = await bundle.generate({
-            format: 'iife',
-            name: 'WildflowerBundle',
-            banner: banner,
-            footer: footers[cfg.footer],
-        });
+        const { output } = await bundle.generate(cfg.format === 'es'
+            ? { format: 'es', banner: banner }
+            : { format: 'iife', name: 'WildflowerBundle', banner: banner, footer: footers[cfg.footer] });
         await bundle.close();
         bundled = output[0].code;
     } catch (e) {
@@ -327,6 +338,7 @@ async function buildOne(cfg) {
     let finalCode = bundled;
     if (cfg.minify) {
         const opts = makeTerserOpts(cfg.mangleProps);
+        if (cfg.format === 'es') opts.module = true; // keep import/export, module-safe compress
         try {
             const result = await terser.minify(bundled, opts);
             if (result.error) {

@@ -4,7 +4,7 @@
  * @module
  */
 
-import { actionBoundElements, handlingSubmitSet, keyModifiersCache, boundActionsCache } from '../core/DomMetadata.js';
+import { actionBoundElements, handlingSubmitSet, keyModifiersCache, boundActionsCache, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
 import { pathResolver } from '../core/wfUtils.js';
 
 // Modifier names usable in data-event-key-* attributes (bare or in combos).
@@ -871,7 +871,7 @@ const _eventCore = {
 
         // Check for compiled metadata and cached elements
         const metadata = listItem._compiledMetadata;
-        const elements = listItem._cachedElementsArray || listItem._bindingElements;
+        const elements = this._rowElements(listItem);
 
         if (!metadata?.actions || !elements) return null;
 
@@ -1157,7 +1157,78 @@ export const ListEventDelegationMethods = {
      */
     _dispatchDelegatedListEvent(event, listElement, instance, listContext, path, resolveDispatchType)
     {
-        // Must honor exclusive mode. A literal both-prefix selector matches a
+        // Common case: the target sits inside one of this list's rows. One
+        // walk resolves the row, the action element and any nested component
+        // root; the cascade below then runs with everything in hand.
+        const r = this._resolveListActionTarget(event.target, listElement);
+        if (r !== null) {
+            const row = r.row;
+            let actionEl = r.attrEl || r.recordEl;
+            let metaAction = null;
+            if (actionEl === null) {
+                // Stripped template: match the chain against the row's compiled
+                // metadata actions, nearest element first.
+                const md = row._compiledMetadata;
+                const els = this._rowElements(row);
+                if (md && md.actions && els) {
+                    const chain = r.chain, actions = md.actions;
+                    for (let i = 0; i < chain.length && actionEl === null; i++) {
+                        for (let a = 0; a < actions.length; a++) {
+                            if (els[actions[a].index] === chain[i]) { actionEl = chain[i]; metaAction = actions[a]; break; }
+                        }
+                    }
+                }
+                if (actionEl === null) return;
+            }
+
+            const dispatchEventType = resolveDispatchType(actionEl, event);
+            if (!dispatchEventType) return;
+
+            // Metadata match on an element with no record yet: build that one
+            // record; rows that need the whole-row path (data-event-outside)
+            // get it from _ensureActionRecord's refusal.
+            if (metaAction !== null && actionEl._actionContext === undefined
+                && !this._ensureActionRecord(row, actionEl, metaAction, listElement._listContext)) {
+                this._ensureItemContexts(row);
+            }
+
+            // Route to a nested component's instance when the action element
+            // lives inside one (component roots at or above the action
+            // element only; one crossed below it belongs to the target's own
+            // subtree, exactly as closest() from the action element saw it).
+            let targetInstance = instance;
+            if (r.sawComponent) {
+                let c = actionEl;
+                while (c && c !== listElement) {
+                    if (c.hasAttribute('data-component-id')) {
+                        if (c !== instance.element) {
+                            const nestedInstance = this.componentInstances.get(c.dataset.componentId);
+                            if (nestedInstance) targetInstance = nestedInstance;
+                        }
+                        break;
+                    }
+                    c = c.parentElement;
+                }
+            }
+
+            const currentListContext = listElement._listContext;
+            if (currentListContext) {
+                const handled = this._handleDelegatedActionWithListItem(
+                    actionEl, row, currentListContext, listElement,
+                    event, targetInstance, dispatchEventType
+                );
+                if (handled) return;
+            }
+            if (this._handleDelegatedActionFromContext(actionEl, event, dispatchEventType)) return;
+            this._handleDelegatedActionFallback(actionEl, event, targetInstance, listContext, path, dispatchEventType);
+            return;
+        }
+
+        // The target is not inside a row of this list (a nested list's row,
+        // whose own listener handles it, or a non-row child of the container):
+        // the original resolution, kept for those shapes.
+        //
+        // It must honor exclusive mode. A literal both-prefix selector matches a
         // BARE data-action even when the author asked the framework to ignore
         // bare attributes, which is the whole purpose of the mode: it exists so
         // WildflowerJS can sit beside a library that owns data-action. The
@@ -1204,12 +1275,11 @@ export const ListEventDelegationMethods = {
         if (closestList && closestList._listContext) {
             const currentListContext = closestList._listContext;
             const listItem = this._findListItemForAction(actionEl, closestList);
-            const allDataIndexElements = this._collectDataIndexHierarchy(actionEl);
 
             if (listItem) {
                 const handled = this._handleDelegatedActionWithListItem(
                     actionEl, listItem, currentListContext, closestList,
-                    allDataIndexElements, event, targetInstance, dispatchEventType
+                    event, targetInstance, dispatchEventType
                 );
                 if (handled) return;
             }
@@ -1220,6 +1290,91 @@ export const ListEventDelegationMethods = {
 
         // Finally the context-based fallback.
         this._handleDelegatedActionFallback(actionEl, event, targetInstance, listContext, path, dispatchEventType);
+    },
+    /**
+     * One upward walk from an event target to this list's container. Finds
+     * the row (the ancestor carrying _listIndex whose parent is the
+     * container), the nearest element on the way carrying the action
+     * attribute and the nearest carrying an action record (the caller keeps
+     * the closest/registry/metadata order: attribute, then record, then the
+     * row's compiled metadata against the returned chain), and whether a
+     * nested component root was crossed. Returns null when the target is not
+     * inside a row of this list: the walk reached the container without a
+     * row, or crossed a nested list's row or container (that list's own
+     * listener handles the event).
+     * @private
+     */
+    _resolveListActionTarget(target, listElement)
+    {
+        const chain = [];
+        let el = target, row = null, attrEl = null, recordEl = null, sawComponent = false;
+        while (el && el !== listElement) {
+            const isRow = el._listIndex !== undefined;
+            if (isRow) {
+                if (el.parentElement !== listElement) return null;   // a nested list's row
+            } else if (el._listContext) {
+                return null;                                          // a nested list's container
+            }
+            if (attrEl === null && this._hasAttr(el, 'action')) attrEl = el;
+            if (recordEl === null && el._actionContext) recordEl = el;
+            if (!sawComponent && el.hasAttribute('data-component-id')) sawComponent = true;
+            chain.push(el);
+            if (isRow) { row = el; break; }
+            el = el.parentElement;
+        }
+        if (row === null) return null;
+        return { row, chain, attrEl, recordEl, sawComponent };
+    },
+    /**
+     * Create the action record for ONE action element of a compiled row on
+     * its first interaction, instead of every record the row will ever need
+     * (_ensureItemContextsFromMetadata builds them all). Same record, same
+     * eventHandlers merge for an element declaring several actions. Returns
+     * false when this element must take the whole-row or attribute path: an
+     * action inside a nested list or nested component (those are skipped by
+     * the whole-row builder too and resolve through the attribute path
+     * against the routed instance), or a row with a data-event-outside
+     * action, whose document-level registration must exist before any
+     * outside click and is made on the row's first interaction.
+     * @private
+     */
+    _ensureActionRecord(row, actionEl, metaAction, listContext)
+    {
+        if (metaAction.isInNestedList || metaAction.isInNestedComponent || metaAction.hasEventOutside) return false;
+        const md = row._compiledMetadata;
+        if (md._hasEventOutside === undefined) {
+            let has = false;
+            const actions = md.actions;
+            for (let i = 0; i < actions.length; i++) { if (actions[i].hasEventOutside) { has = true; break; } }
+            md._hasEventOutside = has;
+        }
+        if (md._hasEventOutside) return false;
+        const componentInstance = listContext && listContext.componentInstance;
+        if (!componentInstance || !this._contextRecords || !this._contextSystemInitialized) return false;
+
+        const defs = metaAction._parsedDefs || (metaAction._parsedDefs = this._parseActions(metaAction.actionName));
+        const itemIndex = row._listIndex;
+        for (let d = 0; d < defs.length; d++) {
+            const { methodName, eventType, args: actionArgs } = defs[d];
+            if (!methodName || typeof componentInstance.context[methodName] !== 'function') continue;
+            const existing = actionEl._actionContext;
+            if (existing) {
+                if (!existing.data.eventHandlers) {
+                    existing.data.eventHandlers = new Map();
+                    existing.data.eventHandlers.set(existing.data.event, {
+                        methodName: existing.path,
+                        args: existing.data.actionArgs || []
+                    });
+                }
+                existing.data.eventHandlers.set(eventType, { methodName, args: actionArgs || [] });
+                continue;
+            }
+            const record = this._contextRecords.createActionContext(
+                methodName, componentInstance, actionEl, methodName, eventType, listContext, itemIndex
+            );
+            if (record && actionArgs && actionArgs.length > 0) record.data.actionArgs = actionArgs;
+        }
+        return actionEl._actionContext !== undefined;
     },
     /**
      * Per-family matcher for focus/blur delegation: does this action element
@@ -1247,7 +1402,7 @@ export const ListEventDelegationMethods = {
         // Fallback: check compiled metadata for event type
         const listItem = this._findListItemAncestor(actionEl);
         if (listItem?._compiledMetadata?.actions) {
-            const elements = listItem._cachedElementsArray || listItem._bindingElements;
+            const elements = this._rowElements(listItem);
             if (elements) {
                 for (const action of listItem._compiledMetadata.actions) {
                     if (elements[action.index] === actionEl) {
@@ -1363,31 +1518,59 @@ export const ListEventDelegationMethods = {
         const SYNTHESIZED_FROM = { mouseenter: 'mouseover', mouseleave: 'mouseout' };
         let eventTypes;
 
-        const template = listElement.querySelector('template');
-        if (template?.content) {
-            const actionEls = template.content.querySelectorAll('[data-action],[data-wf-action]');
-            if (actionEls.length === 0) return; // No actions in template, skip entirely
+        // By the time delegation is set up, mount has already extracted the
+        // container's <template>, removed it (left in children it breaks child
+        // indexing) and parked the element in the DomMetadata stored-template
+        // caches; a querySelector here finds nothing. Read it from the cache.
+        // A data-use-template marker resolves through _resolvedTemplateCache to
+        // the template it points at. Only a list with no template anywhere
+        // (server-rendered rows) falls back to registering every event type.
+        let templates = null;
+        const live = listElement.querySelector('template');
+        if (live) {
+            templates = [live];
+        } else {
+            const stored = storedTemplateCache.get(listElement);
+            if (stored) {
+                templates = [stored];
+            } else {
+                const storedAll = storedTemplatesCache.get(listElement);
+                if (storedAll && storedAll.length > 0) templates = storedAll;
+            }
+        }
+        if (templates && templates.length === 1 && this._hasAttr(templates[0], 'use-template')) {
+            const resolved = this._resolvedTemplateCache && this._resolvedTemplateCache.get(listElement);
+            templates = (resolved && resolved.template) ? [resolved.template] : null;
+        }
 
+        if (templates) {
             const needed = new Set();
-            for (const el of actionEls) {
-                const attr = el.getAttribute('data-action') || el.getAttribute('data-wf-action');
-                if (!attr) continue;
-                for (const part of attr.split(/\s+/)) {
-                    const ci = part.indexOf(':');
-                    if (ci > 0) {
-                        const type = part.substring(0, ci);
-                        if (ALL_GENERIC_EVENTS.indexOf(type) !== -1) needed.add(type);
-                        // Synthesized enter/leave: register the underlying
-                        // bubbling event so per-row mouseenter/mouseleave
-                        // handlers reach the same delegation path.
-                        if (SYNTHESIZED_FROM[type]) needed.add(SYNTHESIZED_FROM[type]);
+            let actionCount = 0;
+            for (const tpl of templates) {
+                const root = tpl.content || tpl;
+                const actionEls = root.querySelectorAll('[data-action],[data-wf-action]');
+                actionCount += actionEls.length;
+                for (const el of actionEls) {
+                    const attr = el.getAttribute('data-action') || el.getAttribute('data-wf-action');
+                    if (!attr) continue;
+                    for (const part of attr.split(/\s+/)) {
+                        const ci = part.indexOf(':');
+                        if (ci > 0) {
+                            const type = part.substring(0, ci);
+                            if (ALL_GENERIC_EVENTS.indexOf(type) !== -1) needed.add(type);
+                            // Synthesized enter/leave: register the underlying
+                            // bubbling event so per-row mouseenter/mouseleave
+                            // handlers reach the same delegation path.
+                            if (SYNTHESIZED_FROM[type]) needed.add(SYNTHESIZED_FROM[type]);
+                        }
                     }
                 }
             }
+            if (actionCount === 0) return; // No actions in template, skip entirely
             if (needed.size === 0) return; // Only click/submit/focus actions, skip
             eventTypes = needed;
         } else {
-            // No template available (SSR or consumed); fall back to all
+            // No template available (server-rendered rows); fall back to all
             eventTypes = ALL_GENERIC_EVENTS;
         }
 
@@ -1449,100 +1632,37 @@ export const ListEventDelegationMethods = {
         return null;
     },
     /**
-     * Collect all list item elements in the hierarchy from action element up
-     * Used for nested list parent detection
-     * @param {HTMLElement} actionEl - The action element that was clicked
-     * @returns {Array} Array of objects with listIndex and parentList
-     * @private
-     */
-    _collectDataIndexHierarchy(actionEl)
-    {
-        const allDataIndexElements = [];
-        let element = actionEl;
-
-        while (element && element !== document.body)
-        {
-            if (element._listIndex !== undefined)
-            {
-                allDataIndexElements.push({
-                    listIndex: element._listIndex,
-                    parentList: element.closest('[data-list]')?.dataset?.list
-                });
-            }
-            element = element.parentElement;
-        }
-
-        return allDataIndexElements;
-    },
-    /**
-     * Ensure action context has parent info for nested lists
-     * @param {Object} context - The action context
-     * @param {HTMLElement} closestList - The closest list element
-     * @param {number} index - The current item index
-     * @param {Array} allListItemElements - Hierarchy of list item elements
-     * @private
-     */
-    _ensureContextParentInfo(context, closestList, index, allListItemElements)
-    {
-        if (context._parentInfo) return;
-
-        let parentListPath = this._getAttr(closestList, 'list');
-        let parentIndex = index;
-
-        // Check if this list is nested by looking for a parent list element (support both prefixes)
-        const parentListElement = closestList.parentElement?.closest('[data-list],[data-wf-list]');
-
-        if (parentListElement && allListItemElements.length > 1)
-        {
-            // We're in a nested list - find the parent list item
-            const parentListElementPath = this._getAttr(parentListElement, 'list');
-            const parentListItem = allListItemElements.find(elem =>
-                elem.parentList === parentListElementPath
-            );
-
-            if (parentListItem)
-            {
-                parentListPath = parentListElementPath;
-                parentIndex = parentListItem.listIndex;
-            }
-        }
-
-        context._parentInfo = {
-            parentListPath: parentListPath,
-            parentIndex: parentIndex
-        };
-        context._parentIndex = parentIndex;
-        context._fullPath = `${parentListPath}[${parentIndex}].${context.path}`;
-    },
-    /**
      * Handle delegated action when list context exists and list item is found
      * @param {HTMLElement} actionEl - The action element
      * @param {HTMLElement} listItem - The list item element
      * @param {Object} listContext - The list context
      * @param {HTMLElement} closestList - The closest list element
-     * @param {Array} allListItemElements - Hierarchy of list item elements
      * @param {Event} event - The click event
      * @param {Object} instance - The component instance
      * @returns {boolean} True if action was handled, false otherwise
      * @private
      */
-    _handleDelegatedActionWithListItem(actionEl, listItem, listContext, closestList, allListItemElements, event, instance, actionEventType = null)
+    _handleDelegatedActionWithListItem(actionEl, listItem, listContext, closestList, event, instance, actionEventType = null)
     {
-        this._ensureItemContexts(listItem);
-
         const index = listItem._listIndex;
         if (isNaN(index)) return false;
 
-        // Check if element already has an action record
-        const existingContext = actionEl._actionContext;
+        // An element that already carries its record needs no row-wide
+        // context creation (records are built per element on first touch);
+        // one without goes through the whole-row builder first.
+        let existingContext = actionEl._actionContext;
+        if (!existingContext) {
+            this._ensureItemContexts(listItem);
+            existingContext = actionEl._actionContext;
+        }
 
         if (existingContext)
         {
-            this._ensureContextParentInfo(existingContext, closestList, index, allListItemElements);
-
-            // Always update _parentIndex from the list item's _listIndex.
-            // Without this, nested lists where _parentInfo points to the parent list
-            // would cause the index to always be 0.
+            // Keep _parentIndex current from the row's _listIndex (rows renumber
+            // on remove/move); getFullPath and the form/portal paths read it.
+            // The former per-dispatch parent-list walk (_collectDataIndexHierarchy
+            // + _ensureContextParentInfo) wrote _parentInfo/_fullPath that nothing
+            // read and a _parentIndex this line overwrote.
             existingContext._parentIndex = index;
 
             // Update parent to point to the correct list context.
@@ -1568,7 +1688,7 @@ export const ListEventDelegationMethods = {
         // with no data-bind-style / data-bind-attr / etc.) would silently
         // fail to dispatch. See list-row-action-attribute-preserved.test.js.
         if (!actionAttr) {
-            const elements = listItem._bindingElements || listItem._cachedElementsArray;
+            const elements = this._rowElements(listItem);
             const meta = listItem._compiledMetadata;
             if (elements && meta?.actions) {
                 const elIndex = elements.indexOf(actionEl);

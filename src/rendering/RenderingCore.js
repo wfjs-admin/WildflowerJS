@@ -452,38 +452,12 @@ export const RenderingCoreMethods = {
         // here was dead: the flag is a boolean, and cancelAnimationFrame coerces
         // it to handle 1, risking cancellation of an unrelated frame).
 
-        if (this._batchChangedPaths && this._batchChangedPaths.size > 0)
-        {
-            this._batchChangedPaths.forEach(path => this._pendingStateChanges.add(path));
-        }
-
-        if (!this._batchChangedComponents)
-        {
-            this._batchChangedComponents = new Set();
-        }
-
-        // At this point, if no pending changes exist, add any updated paths
-        // If we have pending state changes but no changed components tracked,
-        // find all potentially affected components
-
-        if (this._pendingStateChanges.size > 0 && this._batchChangedComponents.size === 0)
-        {
-
-            this.componentInstances.forEach((instance, id) =>
-            {
-                // Check if any of the pending changes might affect this component
-                if (this._componentMightBeAffected(instance, this._pendingStateChanges))
-                {
-                    this._batchChangedComponents.add(id);
-                }
-            });
-
-        }
-
-        // Clear pending state changes AFTER using them to prevent unbounded growth
-        // New changes that arrive during render will be added to a fresh set
-        // and processed in the next render cycle
-        this._pendingStateChanges.clear();
+        // No per-change component sweep here. The former
+        // _componentMightBeAffected walk (every component's state keys through
+        // the facade's ownKeys/has traps, on every state change) only fed
+        // _batchChangedComponents, which _render merged into a set nothing
+        // consumed once effects took over DOM updates. Batch mode still fills
+        // _batchChangedComponents itself (applyBatch) for _applyBatchToLists.
 
         // Schedule a new render. EXPERIMENT: microtask instead of rAF so the
         // commit isn't gated behind a fireAnimationFrame (j-f-b penalty). Under
@@ -565,29 +539,11 @@ export const RenderingCoreMethods = {
         }
 
 
-        const componentsToProcess = new Set();
-
-        // Add all pending component updates to the processing set
-        if (this._componentsToUpdate)
-        {
-            this._componentsToUpdate.forEach(id => componentsToProcess.add(id));
-        }
-
-        // Add any batch components to the processing set
-        if (this._batchChangedComponents)
-        {
-            this._batchChangedComponents.forEach(id => componentsToProcess.add(id));
-        }
-
-        // Add any dependent components to the processing set
-        if (this._pendingDependentUpdates)
-        {
-            this._pendingDependentUpdates.forEach(id => componentsToProcess.add(id));
-        }
-
-
-        // Make _componentsToUpdate accessible for benchmark instrumentation
-        this._componentsToUpdate = componentsToProcess;
+        // The component queues (_componentsToUpdate, _batchChangedComponents,
+        // _pendingDependentUpdates) are no longer merged into a processing set
+        // here: bindings, lists and conditionals are effect-driven, so the
+        // merged set had no consumer. _componentsToUpdate is reset below and
+        // _pendingDependentUpdates is drained for computed re-evaluation.
 
         if (!this._renderCounter) this._renderCounter = 0;
         ++this._renderCounter;

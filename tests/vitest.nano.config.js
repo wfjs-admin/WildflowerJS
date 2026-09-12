@@ -60,7 +60,9 @@ const EXTRA_EXCLUDE = new Set([
 // Walk tests/ (excluding archive) and collect files that reference data-list,
 // classifying each as { rel, pure } where pure === every it()/test() block in the
 // file references data-list (so excluding it loses no non-list coverage).
-function collectListFiles(dir, rel = 'test-new') {
+// The relative prefix is the test directory's own name (test-new here, tests in
+// the public package), so the excludes always match the include glob below.
+function collectListFiles(dir, rel = path.basename(dir)) {
   const out = []
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (entry.name === 'archive') continue

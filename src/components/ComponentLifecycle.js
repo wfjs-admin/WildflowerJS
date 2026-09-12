@@ -9,7 +9,6 @@ import { RAW_TARGET } from '../state/ContextProxy.js';
 import { objectUtils, pathResolver, wfError, WF_ERRORS, COMPUTED_EVAL } from '../core/wfUtils.js';
 
 // Named constants (replaces magic numbers)
-const LARGE_ARRAY_THRESHOLD = 500;     // Arrays above this size use synchronous render
 const READY_POLL_INTERVAL_MS = 10;     // Polling interval for waitForReady()
 const READY_TIMEOUT_MS = 10000;        // Wall-clock timeout for waitForReady() (NOT poll count)
 const STALE_DEPENDENCY_MS = 30000;     // Deferred dependencies older than this are dropped (cross-component/store dep resolution)
@@ -2321,21 +2320,14 @@ export const ComponentLifecycleMethods = {
             this._updatePortalVisibility(instance);
         }
 
-        // OPTIMIZATION: For large array operations, render synchronously to avoid RAF delay
-        const isLargeArrayUpdate = Array.isArray(newValue) && newValue.length > LARGE_ARRAY_THRESHOLD;
-
-        if (isLargeArrayUpdate) {
-            // Synchronous render for large arrays to minimize perceived latency
-            this._render();
-            // Call onUpdate after synchronous render
-            this._callOnUpdateHook(instance, instance._lastChangeInfo);
-            instance._lastChangeInfo = null; // consumed, release oldValue
-        } else {
-            // Standard async render for small updates
-            this._scheduleRender();
-            // Schedule onUpdate to be called after async render completes
-            this._scheduleOnUpdateHook(instance);
-        }
+        // One path for every size. The former large-array branch ran
+        // _render() synchronously "to avoid the rAF delay": the render is a
+        // microtask now and _render is bookkeeping (effects mutate the DOM),
+        // and _handleListStateChange had already scheduled that same render
+        // for the list path, so a large replacement rendered twice and paid
+        // it inside the click.
+        this._scheduleRender();
+        this._scheduleOnUpdateHook(instance);
 
         return true;
     },

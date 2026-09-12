@@ -101,6 +101,19 @@ const proxyCache = new WeakMap(); // one proxy per raw object (identity)
 // slot + transition). The raw object's shape is now never touched; reads are a
 // WeakMap.get in getNode/notifyNode/the traps.
 const nodeTable = new WeakMap();
+// Arrays keep their node maps (and, further down, their tree proxies) in
+// side-tables of their own. V8 backs a WeakMap with an ephemeron hash table
+// that keeps its capacity through a GC; the GC only marks dead keys deleted,
+// and the first INSERT after that pays an O(capacity) rehash to compact them.
+// The object tables gain one entry per rendered list item (sink stamp nodes,
+// tree proxies), so after a list clears they hold thousands of dead keys, and
+// the clear's own inserts (the new empty array's `length` node and tree proxy)
+// were paying a ~50µs rehash of each big table (measured 2026-09-02, a forced
+// GC right before the clear, which is exactly what the krausest runner does).
+// Arrays are few, so their tables stay tiny and that insert costs ~1µs. Every
+// lookup pays one Array.isArray; the item-path tables are otherwise unchanged.
+const arrayNodeTable = new WeakMap();
+function nodeTableFor(target) { return Array.isArray(target) ? arrayNodeTable : nodeTable; }
 
 // ---------------------------------------------------------------------------
 // Node: monomorphic, eagerly shaped for stable V8 hidden classes
@@ -297,9 +310,17 @@ function wakeObservers(node) {
 // Mark the node for (target, key) dirty if it exists. Returns whether it did.
 // Shared by both set traps (object set + array length pulse).
 function notifyNode(target, key) {
-  const map = nodeTable.get(target);
+  const map = nodeTableFor(target).get(target);
   const node = map && map.get(key);
-  if (!node) return false;
+  if (!node) {
+    // No node for this leaf: a uniform-stamp list may still own the object
+    // (one owner record per row item instead of a node per stamped prop, see
+    // setListOwner). The owner sink applies the row's targeted DOM update;
+    // with no node there are no observers to wake.
+    const owner = listOwners.get(target);
+    if (owner !== undefined && owner.keys.indexOf(key) !== -1) { owner.sink(target, key); return true; }
+    return false;
+  }
   // Direct text writer: a pure-single-text list field (one bound text node, read
   // by no other binding) writes its node here and skips waking the per-item
   // effect entirely (the direct-writer fast path).
@@ -357,6 +378,13 @@ function notifyNode(target, key) {
   // bookkeeping is made throw-safe.
   try {
     if (ls !== null) ls(target, key);
+    else {
+      // A node without a sink of its own (a direct-writer upgrade, or a
+      // computed/watcher read that materialized the leaf) on an item a
+      // uniform-stamp list owns: the owner sink still applies the row write.
+      const owner = listOwners.get(target);
+      if (owner !== undefined && owner.keys.indexOf(key) !== -1) owner.sink(target, key);
+    }
   } finally {
     const obs = node.observers;
     for (let i = 0; i < obs.length; i++) mark(obs[i], DIRTY);
@@ -623,10 +651,11 @@ function discardScheduled() {
 // ---------------------------------------------------------------------------
 
 function getNode(target, key) {
-  let map = nodeTable.get(target);
+  const table = nodeTableFor(target);
+  let map = table.get(target);
   if (!map) {
     map = new Map();
-    nodeTable.set(target, map);
+    table.set(target, map);
   }
   let node = map.get(key);
   if (!node) {
@@ -658,6 +687,14 @@ function linkLeaf(objOrProxy, key) {
 function setDirectWriter(objOrProxy, key, writerFn, el) {
   if (objOrProxy === null || typeof objOrProxy !== 'object') return;
   const raw = objOrProxy[RAW] || objOrProxy;
+  if (writerFn === null) {
+    // Clearing never materializes a node (a row whose leaf was never
+    // upgraded has nothing to clear).
+    const map = nodeTableFor(raw).get(raw);
+    const node = map && map.get(key);
+    if (node) { node.directWriter = null; node.dwEl = null; }
+    return;
+  }
   const node = getNode(raw, key);
   node.directWriter = writerFn;
   // Shared-writer path stores the target element here; closure writers pass no
@@ -675,7 +712,32 @@ function setDirectWriter(objOrProxy, key, writerFn, el) {
 function setListSink(objOrProxy, key, sinkFn) {
   if (objOrProxy === null || typeof objOrProxy !== 'object') return;
   const raw = objOrProxy[RAW] || objOrProxy;
+  if (sinkFn === null) {
+    // Clearing never materializes a node.
+    const map = nodeTableFor(raw).get(raw);
+    const node = map && map.get(key);
+    if (node) node.listSink = null;
+    return;
+  }
   getNode(raw, key).listSink = sinkFn;
+}
+
+// Uniform-stamp lists (every reactive dep of the row template is a flat item
+// prop, see the list renderer's fast-touch classifier) register ONE owner
+// record per row item, `{ keys: string[], sink(raw, key) }`, instead of a
+// node map plus a node per stamped prop. notifyNode consults it for a write
+// to a leaf that has no node, or a node with no listSink of its own (a
+// direct-writer upgrade, a materialized computed read), and calls the sink for
+// the owned keys. Per row this is one WeakMap insert in place of a Map and
+// two or more ~20-field Node allocations, which is most of a bulk create's
+// framework-side allocation. Pass `null` to release (remove, same-key replace).
+const listOwners = new WeakMap();
+
+function setListOwner(objOrProxy, owner) {
+  if (objOrProxy === null || typeof objOrProxy !== 'object') return;
+  const raw = objOrProxy[RAW] || objOrProxy;
+  if (owner === null) listOwners.delete(raw);
+  else listOwners.set(raw, owner);
 }
 
 // Mark a raw array as operation-recording: subsequent bare index writes through
@@ -765,7 +827,7 @@ function toRaw(x) {
 const handlers = {
   get(target, key) {
     if (key === RAW) return target;
-    if (key === NODES) return nodeTable.get(target);
+    if (key === NODES) return nodeTableFor(target).get(target);
     const value = target[key];
     // Functions (array methods, etc.) pass through untracked in the core.
     if (typeof value === 'function') return value;
@@ -827,7 +889,7 @@ const handlers = {
   deleteProperty(target, key) {
     if (!(key in target)) return true;
     delete target[key];
-    const map = nodeTable.get(target);
+    const map = nodeTableFor(target).get(target);
     const node = map && map.get(key);
     if (node) wakeObservers(node);
     // Removed key: wake iteration readers (mirrors the set-trap add pulse).
@@ -846,7 +908,7 @@ function reactive(obj) {
   // read (state.rows[i]) returns — identity stability — and its set trap
   // carries the entity's onStateChange dispatch. List items are tree-wrapped
   // during create (clone setter walk), so this is a cache hit for them.
-  const tree = treeProxies.get(obj);
+  const tree = treeProxiesFor(obj).get(obj);
   if (tree) return tree.proxy;
   const existing = proxyCache.get(obj);
   if (existing) return existing;
@@ -865,6 +927,12 @@ function reactive(obj) {
 // ---------------------------------------------------------------------------
 
 const treeProxies = new WeakMap(); // rawTarget -> { proxy, prefix }
+// Arrays live in their own table for the same reason as arrayNodeTable above:
+// every rendered list item is tree-wrapped, so this table carries thousands of
+// dead keys after a clear, and the cleared list's replacement array would pay
+// the post-GC rehash on its way into the cache.
+const arrayTreeProxies = new WeakMap();
+function treeProxiesFor(obj) { return Array.isArray(obj) ? arrayTreeProxies : treeProxies; }
 
 // Sentinel a computedResolver returns to mean "this key is not a computed";
 // the get trap then falls through to normal state resolution.
@@ -1038,7 +1106,7 @@ function devCountRead(target, key) {
 
 function wrapTree(obj, prefix, notify, computedResolver) {
   if (obj === null || typeof obj !== 'object') return obj;
-  const cached = treeProxies.get(obj);
+  const cached = treeProxiesFor(obj).get(obj);
   if (cached) return cached.proxy;
 
   const handler = {
@@ -1075,7 +1143,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
             // exist. Post-untracked-structural-reads these are rare (the structural
             // effect no longer creates them), so this walk is cheap; a spuriously
             // pulsed unchanged index re-evaluates to the same value and stops.
-            const nmap = nodeTable.get(target);
+            const nmap = arrayNodeTable.get(target);
             if (nmap !== undefined) {
               for (const k of nmap.keys()) {
                 if (typeof k === 'string') { const ix = +k; if (ix >= 0 && (ix | 0) === ix) notifyNode(target, k); }
@@ -1120,7 +1188,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
         // allocation + GC on every repeated nested read, which dominates steady-state
         // per-frame workloads (e.g. animating thousands of list rows). Behavior is
         // identical: a cached proxy keeps the prefix from its first access either way.
-        const cached = treeProxies.get(value);
+        const cached = treeProxiesFor(value).get(value);
         if (cached) return cached.proxy;
         return wrapTree(value, prefix + key + '.', notify, computedResolver);
       }
@@ -1200,7 +1268,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
       if (!(key in target)) return true;
       const old = target[key];
       delete target[key];
-      const map = nodeTable.get(target);
+      const map = nodeTableFor(target).get(target);
       const node = map && map.get(key);
       if (node) wakeObservers(node);
       // Removed key: wake iteration readers (mirrors the set-trap add pulse).
@@ -1213,7 +1281,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
   };
 
   const proxy = new Proxy(obj, handler);
-  treeProxies.set(obj, { proxy, prefix });
+  treeProxiesFor(obj).set(obj, { proxy, prefix });
   return proxy;
 }
 
@@ -1317,6 +1385,7 @@ export {
   linkLeaf,
   setDirectWriter,
   setListSink,
+  setListOwner,
   runInListFrame,
   enableArrayOps,
   consumeArrayOps,

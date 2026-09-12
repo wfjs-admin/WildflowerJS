@@ -977,9 +977,6 @@ export const EntitySystemMethods = {
             // via _bindWithCompiledMetadata in effect re-runs. No EntitySystem
             // intervention needed for list-item bindings.
         }
-
-        // Track pending state changes
-        this._pendingStateChanges.add(path);
     },
     /**
      * Bind methods from a definition to a context object.
@@ -1696,60 +1693,6 @@ export const EntitySystemMethods = {
 
         return this;
     },
-    /**
-     * Check if a component might be affected by pending state changes
-     * @param {Object} instance - Component instance
-     * @param {Set<string>} pendingChanges - Set of changed paths
-     * @returns {boolean} - Whether the component might be affected
-     * @private
-     */
-    _componentMightBeAffected(instance, pendingChanges)
-    {
-
-        // NB: `stateManager.computedDependencies` is never populated (the reactive
-        // graph wakes affected computeds directly), so the former computed-dependency
-        // branch here was dead. A direct path-vs-state check is the whole method.
-        let result = Array.from(pendingChanges).some(changePath =>
-        {
-            // If the component has this path directly in its state
-            if (instance.state && this._hasNestedProperty(instance.state, changePath))
-            {
-                return true;
-            }
-
-            // If this is a parent path of any state property
-            return Object.keys(instance.state || {}).some(key =>
-                key === changePath || key.startsWith(changePath + '.'));
-        });
-
-        
-        // Handle initial render case: only force render if the component hasn't rendered yet
-        if (!result && pendingChanges.size > 0 && instance._hasRendered === false) {
-            result = true;
-        }
-        
-        
-        return result;
-    },
-    // Helper to check if an object has a nested property path
-    _hasNestedProperty(obj, path)
-    {
-        const parts = path.split('.');
-        let current = obj;
-
-        for (let i = 0; i < parts.length; i++)
-        {
-            if (current === null || current === undefined ||
-                typeof current !== 'object' || !(parts[i] in current))
-            {
-                return false;
-            }
-            current = current[parts[i]];
-        }
-
-        return true;
-    },
-
     /**
      * Return a deep plain-JS copy of a reactive value.
      *

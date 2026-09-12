@@ -39,6 +39,36 @@ _setupDynamicComponentDetection()
                 const mutation = mutations[i];
                 if (mutation.type !== 'childList') continue;
 
+                // Framework-owned bulk removal (data-list full clear, pool clear):
+                // the renderer stamps the container with the child count it is
+                // about to replaceChildren() away, having verified by count that
+                // every child was one of its own rows/entities. Those are torn
+                // down by the renderer itself, so this record has nothing to
+                // find; without the stamp the removed-node loop below touched all
+                // N wrappers just to skip each one as a row. The stamp is consumed
+                // only by the record whose removedNodes count matches it, so any
+                // other childList record on the same container (a foreign node, a
+                // partial removal) is still walked.
+                const target = mutation.target;
+                if (target._wfOwnedRemoval !== undefined
+                    && mutation.addedNodes.length === 0
+                    && mutation.removedNodes.length === target._wfOwnedRemoval) {
+                    target._wfOwnedRemoval = undefined;
+                    continue;
+                }
+                // Same idea for a framework-owned bulk INSERT (data-list bulk
+                // create/append, pool push): the renderer stamps the number of
+                // rows it inserted in one fragment. Those rows initialize their
+                // own nested components (the added-node loop below would only
+                // touch each wrapper to skip it), so the matching record needs
+                // no walk either.
+                if (target._wfOwnedAddition !== undefined
+                    && mutation.removedNodes.length === 0
+                    && mutation.addedNodes.length === target._wfOwnedAddition) {
+                    target._wfOwnedAddition = undefined;
+                    continue;
+                }
+
                 // Check for new components (only if we haven't already found one)
                 if (!needsScan) {
                     const addedNodes = mutation.addedNodes;

@@ -15,6 +15,7 @@ import {
   reactiveTree, computed as mComputed, effect as mEffect,
   refresh as mRefresh, setDirectWriter as mSetDirectWriter,
   setListSink as mSetListSink,
+  setListOwner as mSetListOwner,
   runInListFrame as mRunInListFrame,
   toRaw as mToRaw, runEffect as mRunEffect,
   reactive as mReactive,
@@ -955,6 +956,13 @@ class EntityHandle {
 
   clearListSink(itemProxy, key) {
     mSetListSink(itemProxy, key, null);
+  }
+
+  // Uniform-stamp registration: one owner record `{ keys, sink }` per row
+  // item in place of a node per stamped prop (see core setListOwner). Pass
+  // null to release the item (remove, same-key replace).
+  setListOwner(itemProxy, owner) {
+    mSetListOwner(itemProxy, owner);
   }
 
   // Run `fn` under a list tracking frame (hybrid one-sink, computed/external

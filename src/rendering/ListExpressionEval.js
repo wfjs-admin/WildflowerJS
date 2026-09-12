@@ -737,13 +737,15 @@ export const ListExpressionMethods = {
             const itemEl = items[index];
             const item = itemEl._itemData || {};
 
-            // OPTIMIZATION: Use cached binding elements instead of querySelectorAll
-            // This eliminates 3 querySelectorAll calls per item (30,000 for 10,000 items)
-            const cachedElements = itemEl._cachedElementsArray || itemEl._bindingElements;
-
             // Use compiled metadata for class bindings since the source
-            // attributes may have been stripped during compile.
+            // attributes may have been stripped during compile. Such rows
+            // carry (or build on first need) their binding-element array;
+            // attribute rows keep whatever array they have and fall back to
+            // querySelectorAll below.
             const itemMetadata = itemEl._compiledMetadata;
+            const cachedElements = itemMetadata
+                ? this._rowElements(itemEl)
+                : (itemEl._cachedElementsArray || itemEl._bindingElements);
             if (itemMetadata && itemMetadata.classBindings && cachedElements) {
                 // FAST PATH: Use pre-compiled metadata
                 for (let i = 0; i < itemMetadata.classBindings.length; i++) {

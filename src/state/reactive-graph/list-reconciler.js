@@ -125,11 +125,15 @@ export function reconcile(arrayFn, mapFn, options = {}) {
         // onBulkRemove (one cleanup pass + replaceChildren) instead of N per-item
         // onRemove calls (each tears down contexts/nested components + el.remove).
         if (n === 0 && oldLen > 0 && options.onBulkRemove) {
-          for (let i = 0; i < prev.length; i++) {
-            _disposeRow(prev[i]);
+          // One pass over the old rows: dispose the per-row effect where one
+          // exists (bulk-created rows carry none) and collect the element for
+          // the batched DOM teardown.
+          const oldEls = new Array(oldLen);
+          for (let i = 0; i < oldLen; i++) {
+            const e = prev[i];
+            if (e.disposeEffect) _disposeRow(e);
+            oldEls[i] = e.element;
           }
-          const oldEls = new Array(prev.length);
-          for (let i = 0; i < prev.length; i++) oldEls[i] = prev[i].element;
           options.onBulkRemove(oldEls, prev);
           if (options.onComplete) options.onComplete(arr, oldLen, 0);
           return; // cleared; skip the per-item reconcile
@@ -153,7 +157,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
             for (let i = 0; i < n; i++) {
               const r = bulkResults[i];
               next[i] = r
-                ? { key: r.key, element: r.element, itemProxy: r.itemProxy, disposeEffect: r.disposeEffect }
+                ? r /* adopted as-is: onBulkCreate builds { key, element, itemProxy, disposeEffect } in this field order */
                 : { key: keys[i], element: undefined, itemProxy: items[i], disposeEffect: null };
             }
             // onDeferredEffects writes each created disposeEffect back into the
@@ -188,7 +192,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
                 const r = bulkResults[j];
                 const idx = oldLen + j;
                 next[idx] = r
-                  ? { key: r.key, element: r.element, itemProxy: r.itemProxy, disposeEffect: r.disposeEffect }
+                  ? r /* adopted as-is: onBulkCreate builds { key, element, itemProxy, disposeEffect } in this field order */
                   : { key: keys[idx], element: undefined, itemProxy: items[idx], disposeEffect: null };
               }
               if (options.onDeferredEffects) options.onDeferredEffects(bulkResults, next, undefined);
@@ -224,7 +228,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
               for (let i = 0; i < n; i++) {
                 const r = bulkResults[i];
                 next[i] = r
-                  ? { key: r.key, element: r.element, itemProxy: r.itemProxy, disposeEffect: r.disposeEffect }
+                  ? r /* adopted as-is: onBulkCreate builds { key, element, itemProxy, disposeEffect } in this field order */
                   : { key: keys[i], element: undefined, itemProxy: items[i], disposeEffect: null };
               }
               if (options.onDeferredEffects) options.onDeferredEffects(bulkResults, next, undefined);

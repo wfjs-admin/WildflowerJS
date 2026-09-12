@@ -69,7 +69,7 @@ npm install wildflowerjs
 <script defer src="https://cdn.jsdelivr.net/npm/wildflowerjs@1/dist/wildflower.full.min.js"></script>
 ```
 
-Pin a specific version with `wildflowerjs@1.5.0`.
+Pin a specific version with `wildflowerjs@1.5.1`.
 
 ### ES modules
 

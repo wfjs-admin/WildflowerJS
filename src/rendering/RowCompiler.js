@@ -61,19 +61,29 @@ function buildTextEmitters(md) {
         // iterate this inline. The closure form added a `.apply()` call per binding
         // per row, measurably heavier on create10k than the inline write the pool
         // path and the old fast-path loop use.
-        emitters.push({ kind: 'text', elementIndex: b.index, reads: [prop] });
+        // `path` is the target's compiled element path (child hops from the
+        // row root) for the create-time write that runs without the row's
+        // binding-element array (applyRowTextByPath).
+        emitters.push({ kind: 'text', elementIndex: b.index, reads: [prop],
+            path: md.elementPaths ? md.elementPaths[b.index] : null });
     }
 
     let rootProp = null;
     if (md.rootBindings && md.rootBindings.hasBind) {
         rootProp = md.rootBindings.bindPath || null;
         if (rootProp) {
-            emitters.push({ kind: 'rootText', elementIndex: 0, reads: [rootProp] });
+            emitters.push({ kind: 'rootText', elementIndex: 0, reads: [rootProp], path: null });
         }
     }
 
     if (emitters.length === 0) return null;
-    return { emitters, rootProp };
+    // byPath: every child target has a compiled path, so the create path may
+    // write by path and skip the elements array.
+    let byPath = true;
+    for (let i = 0; i < emitters.length; i++) {
+        if (emitters[i].kind !== 'rootText' && !Array.isArray(emitters[i].path)) { byPath = false; break; }
+    }
+    return { emitters, rootProp, byPath };
 }
 
 /**
@@ -89,6 +99,31 @@ export function applyRowText(spec, els, item, row) {
         // Create-time: direct assign (the cloned row's target text is empty).
         if (e.kind === 'rootText') row.textContent = __wf_str(item[prop]);
         else { const el = els[e.elementIndex]; if (el) el.textContent = __wf_str(item[prop]); }
+    }
+}
+
+/**
+ * Create-time text write without the row's binding-element array: each
+ * emitter's target is reached by its compiled element path (element-child
+ * hops from the row root, the same hops _buildElementsArrayFromMetadata
+ * takes), so a bulk-created row of a plain text template pays no array
+ * allocation and no walk over the paths it never reads. Output is identical
+ * to applyRowText over the array.
+ */
+export function applyRowTextByPath(spec, row, item) {
+    const emitters = spec.emitters;
+    for (let j = 0; j < emitters.length; j++) {
+        const e = emitters[j];
+        if (e.kind === 'rootText') { row.textContent = __wf_str(item[e.reads[0]]); continue; }
+        const path = e.path;
+        let el = row;
+        for (let p = 0; p < path.length; p++) {
+            let next = el.firstElementChild;
+            for (let k = path[p]; k > 0 && next; k--) next = next.nextElementSibling;
+            if (!next) { el = null; break; }
+            el = next;
+        }
+        if (el) el.textContent = __wf_str(item[e.reads[0]]);
     }
 }
 
@@ -134,17 +169,16 @@ export function getPureTextSpec(pureTextMap) {
  * calls `sink(rawItem, changedKey)` for any leaf stamped via setListSink. Detached
  * rows (removed/replaced) are skipped via isConnected.
  */
-export function createListSinkDispatcher(spec, applyRow, stampProps) {
+export function createListSinkDispatcher(spec, applyRow, stampProps, rowElements) {
     const rows = new Map(); // rawItem -> rowEl
     const dispatcher = { rows, spec, stampProps: stampProps || null };
     // Default applier (pure-text templates): write only the changed text binding.
     // Class-bearing templates pass an applyRow that also re-applies class via the
-    // existing _applyClassBindingsToRow under untrack. Element array resolution
-    // mirrors the renderer's convention: bulk-created rows carry the
-    // metadata-ordered array on _bindingElements, per-row-bound rows on
-    // _cachedElementsArray; read whichever exists.
+    // existing _applyClassBindingsToRow under untrack. The renderer hands in its
+    // _rowElements accessor (the array is built on a row's first need); without
+    // one, read whichever array the row carries.
     const apply = applyRow || ((rowEl, rawItem, key) => {
-        applyRowTextUpdate(spec, rowEl._cachedElementsArray || rowEl._bindingElements, rawItem, rowEl, key);
+        applyRowTextUpdate(spec, rowElements ? rowElements(rowEl) : (rowEl._cachedElementsArray || rowEl._bindingElements), rawItem, rowEl, key);
     });
     dispatcher.sink = (rawItem, key) => {
         const rowEl = rows.get(rawItem);

@@ -32,6 +32,52 @@ const _reusableBindCtx = {
  */
 export const ListItemBindingMethods = {
     /**
+     * The row's binding-element array, built on first need. A bulk-created
+     * row of a plain text template carries none until something reads it
+     * (a sink write, action dispatch, an applier, context creation): the
+     * eager build was the largest framework-only cost of bulk create and most
+     * rows are never touched afterwards. Order of preference: the rebind
+     * cache (_cachedElementsArray, rebuilt after a data-render structure
+     * change), the create-time array (_bindingElements), else build one from
+     * the row's compiled metadata and stash it as _bindingElements. Null for
+     * a row without compiled metadata (attribute-based rows never carried
+     * one). Both expandos are nulled together on a structure change, so the
+     * rebuild always reads the current DOM. Lives here (list-only) rather
+     * than beside _buildElementsArrayFromMetadata so the list-free tiers do
+     * not carry it.
+     * @private
+     */
+    _rowElements(rowEl) {
+        const cached = rowEl._cachedElementsArray || rowEl._bindingElements;
+        if (cached) return cached;
+        const md = rowEl._compiledMetadata;
+        if (!md) return null;
+        return (rowEl._bindingElements = this._buildElementsArrayFromMetadata(rowEl, md));
+    },
+    /**
+     * One binding element of a row by compiled index, without building the
+     * whole array when the row carries none: the cached array if present,
+     * else the element reached by that index's compiled path. For a caller
+     * that needs a single target (a direct-writer stamp at registration).
+     * Null when the index has no path or the path does not resolve.
+     * @private
+     */
+    _rowElementAt(rowEl, index) {
+        const els = rowEl._cachedElementsArray || rowEl._bindingElements;
+        if (els) return els[index] || null;
+        const md = rowEl._compiledMetadata;
+        const path = md && md.elementPaths ? md.elementPaths[index] : null;
+        if (!path) return null;
+        let current = rowEl;
+        for (let p = 0; p < path.length; p++) {
+            let next = current.firstElementChild;
+            for (let k = path[p]; k > 0 && next; k--) next = next.nextElementSibling;
+            if (!next) return null;
+            current = next;
+        }
+        return current;
+    },
+    /**
      * Bind using compiled metadata (fast path)
      * @private
      */
@@ -501,7 +547,8 @@ export const ListItemBindingMethods = {
         // Get stored metadata (_listIndex is the canonical row index, kept current
         // by onMove; _bindItemIndex was a redundant mirror, now retired).
         const itemIndex = itemEl._listIndex;
-        const allElements = itemEl._bindingElements;
+        // Built on first need for bulk-created rows of plain text templates.
+        const allElements = this._rowElements(itemEl);
 
         // Get the list context
         const listContext = itemEl._listContext;
@@ -718,8 +765,11 @@ export const ListItemBindingMethods = {
                     continue;
                 }
 
-                // Parse actions (handle multiple actions like "click:save blur:validate")
-                const actionDefs = this._parseActions(action.actionName);
+                // Parse actions (handle multiple actions like "click:save blur:validate").
+                // The action string is fixed per compiled template, so the parse is
+                // cached on the metadata action: this runs on a row's first
+                // interaction (a click on a fresh row), and callers only read the defs.
+                const actionDefs = action._parsedDefs || (action._parsedDefs = this._parseActions(action.actionName));
 
                 for (const { methodName, eventType, args: actionArgs } of actionDefs) {
                     if (!methodName || typeof componentInstance.context[methodName] !== 'function') {

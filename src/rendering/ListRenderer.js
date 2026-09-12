@@ -82,7 +82,7 @@ import { applyAttrObj, applyStyleProp, applyStyleObj, applyClass } from '../core
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { __wf_str, __wf_txt, HAS_MOVE_BEFORE, wfYield } from '../core/wfUtils.js';
 import { getRowCompileMode, getTextEmitters, applyRowText, shadowCompareRow,
-    createListSinkDispatcher, applyRowTextUpdate, getPureTextSpec } from './RowCompiler.js';
+    createListSinkDispatcher, applyRowTextUpdate, applyRowTextByPath, getPureTextSpec } from './RowCompiler.js';
 
 // Shared text directWriter. The target element lives on the graph node
 // (node.dwEl, set at stamp time) and the field name is node.key, so this single
@@ -615,9 +615,11 @@ export const ListRendererMethods = {
         for (const item of items) {
             allElements.add(item);
 
-            // PERF: Check for cached binding elements first (set by _createDeferredContextsForInnerHTML)
-            if (item._bindingElements && item._bindingElements.length > 0) {
-                for (const el of item._bindingElements) {
+            // Rows with compiled metadata carry (or build on first need) their
+            // binding-element array; only attribute-based rows take the full walk.
+            const bound = this._rowElements(item);
+            if (bound && bound.length > 0) {
+                for (const el of bound) {
                     allElements.add(el);
                 }
             } else {
@@ -1369,7 +1371,7 @@ export const ListRendererMethods = {
             // or null when the leaf can't be handled (unresolvable/custom/multi
             // target) and the caller must fall through to the full-row apply.
             const applyPureLeaf = (rowEl, rowProxy, key, entry) => {
-                const els = rowEl._cachedElementsArray || rowEl._bindingElements;
+                const els = self._rowElements(rowEl);
                 if (entry.kind === 'text') {
                     const el = els && els[entry.elIdx];
                     if (!el || el._isCustomEl === true) return null;
@@ -1447,6 +1449,7 @@ export const ListRendererMethods = {
                 listEffect: null,
                 frame: null,
                 sink: null,
+                owner: null, // { keys, sink } record for the uniform (fast-touch) registration
                 stampLeaf: () => { /* runtime stamps only (frame.stamp) */ },
                 // Both slots live on the same node (dual-stamp): the pure-leaf
                 // fast path may have upgraded a stamped leaf to a suppressing
@@ -1455,6 +1458,10 @@ export const ListRendererMethods = {
                 clearRowStamps: (raw) => {
                     const u = dispatcher.uniformStamps;
                     if (u) {
+                        if (sm.setListOwner) sm.setListOwner(raw, null);
+                        // Direct-writer upgrades (and any pre-owner per-prop sink)
+                        // live on nodes; both clears are no-ops for a leaf that
+                        // never materialized one.
                         for (let i = 0; i < u.length; i++) { sm.clearDirectWriter(raw, u[i]); sm.setListSink(raw, u[i], null); }
                     }
                     const set = rawStamps.get(raw);
@@ -1477,7 +1484,15 @@ export const ListRendererMethods = {
                     if (!isPolymorphic && compiledMetadata && compiledMetadata._reactiveGraphFastTouch) {
                         const u = compiledMetadata._reactiveGraphFastTouch;
                         const raw = sm.toRaw(rowProxy);
-                        for (let i = 0; i < u.length; i++) sm.setListSink(raw, u[i], dispatcher.sink);
+                        if (sm.setListOwner) {
+                            // One owner record per item (no node map, no node per
+                            // prop): the graph routes writes to owned keys through
+                            // the sink itself (see core setListOwner).
+                            sm.setListOwner(raw, dispatcher.owner
+                                || (dispatcher.owner = { keys: u, sink: dispatcher.sink }));
+                        } else {
+                            for (let i = 0; i < u.length; i++) sm.setListSink(raw, u[i], dispatcher.sink);
+                        }
                         dispatcher.uniformStamps = u;
                         return;
                     }
@@ -1581,8 +1596,13 @@ export const ListRendererMethods = {
             // surface by READING through the proxy — a raw item (list create
             // path stores raw) would register nothing and the row would go
             // stale. Wrap on demand: cache-hit when the proxy exists,
-            // identity-stable either way.
-            if (sm.reactive) itemProxy = sm.reactive(itemProxy);
+            // identity-stable either way. The uniform (fast-touch) registration
+            // in registerWalk stamps the RAW item and never reads through a
+            // proxy, so only the walk-based registration (polymorphic or
+            // non-fast-touch templates) needs one; for a uniform template this
+            // used to mint a proxy per row that registerWalk unwrapped at once.
+            const walkNeedsProxy = isPolymorphic || !compiledMetadata || !compiledMetadata._reactiveGraphFastTouch;
+            if (walkNeedsProxy && sm.reactive) itemProxy = sm.reactive(itemProxy);
             const d = ensureComputedDispatcher(itemProxy);
             if (!d) return false;
             const raw = sm.toRaw(itemProxy);
@@ -1834,10 +1854,10 @@ export const ListRendererMethods = {
                             });
                             if (structureChanged) return;
                         }
-                        applyRowTextUpdate(spec, rowEl._cachedElementsArray || rowEl._bindingElements, rawItem, rowEl, key);
+                        applyRowTextUpdate(spec, self._rowElements(rowEl), rawItem, rowEl, key);
                         if (hasSmh && (applyAll || smhReads.has(key))) {
                             sm.untrack(() => {
-                                const els = rowEl._cachedElementsArray || rowEl._bindingElements;
+                                const els = self._rowElements(rowEl);
                                 if (!els) return;
                                 const rowProxy = rowEl._itemData || rawItem;
                                 _armCtx.componentState = instance?.state || {};
@@ -1893,7 +1913,7 @@ export const ListRendererMethods = {
                     registerComputedRow(itemEl, itemProxy);
                     return;
                 }
-                dispatcher = createListSinkDispatcher(spec, applyRow, Array.from(leafKinds.keys()));
+                dispatcher = createListSinkDispatcher(spec, applyRow, Array.from(leafKinds.keys()), (r) => self._rowElements(r));
                 dispatcher.leafKinds = leafKinds;
                 dispatcher.ownedProps = new Set(leafKinds.keys());
                 let _safe = compiledMetadata._reactiveGraphStyleSafe;
@@ -1949,12 +1969,14 @@ export const ListRendererMethods = {
                     if (!entry) return;
                     sm.setListSink(proxy, prop, dispatcher.sink);
                     if (_safe && entry.kind !== 'deco') {
-                        const _els = rowEl._cachedElementsArray || rowEl._bindingElements;
                         if (entry.kind === 'text') {
-                            const tEl = _els && _els[entry.elIdx];
+                            // One target by compiled path: a bulk-created row
+                            // of a plain text template carries no element
+                            // array yet, and the writer needs only this node.
+                            const tEl = self._rowElementAt(rowEl, entry.elIdx);
                             if (tEl && tEl._isCustomEl !== true) { self._stampDirectText(sm, proxy, prop, tEl); return; }
                         } else {
-                            const el = resolveSingleTarget(rowEl, _els, entry.targets);
+                            const el = resolveSingleTarget(rowEl, self._rowElements(rowEl), entry.targets);
                             if (el && el._isCustomEl !== true) {
                                 if (entry.kind === 'style') { self._stampDirectStyle(sm, proxy, prop, el, entry.cssProp); return; }
                                 self._stampDirectAttr(sm, proxy, prop, el, entry.attrName); return;
@@ -2337,6 +2359,10 @@ export const ListRendererMethods = {
                     // proxy (sink walks, action mutations) wrap on demand via the
                     // cached sm.reactive().
                     const rawNewArray = sm.toRaw(newArray) || newArray;
+                    // _applyListItemIntegrations checks the same four things per
+                    // row; decide once so a plain template skips the call.
+                    const needsIntegrations = hasConditionals || hasChildLists || hasPortals
+                        || !!(self._processCustomDirectives && self._customDirectives && self._customDirectives.size > 0);
                     for (let i = rowStartIndex; i < rows.length; i++) {
                         const row = rows[i];
                         const itemProxy = rawNewArray[i];
@@ -2354,11 +2380,9 @@ export const ListRendererMethods = {
                             row.dataset.wfUsedTemplate = usedTemplateName;
                         }
 
-                        // Build and cache elements array for sparse updates.
-                        // The clone+setter create path already built and stashed
-                        // this array (to run text setters), so reuse it instead of
-                        // walking the element paths a second time.
-                        row._bindingElements = row._bindingElements || self._buildElementsArrayFromMetadata(row, compiledMetadata);
+                        // The clone+setter path stashed row._bindingElements when
+                        // this template's create loop reads it; a plain text
+                        // template leaves it to _rowElements (built on first need).
                         row._compiledMetadata = compiledMetadata;
 
                         // Apply class bindings (skip call entirely when no evaluators)
@@ -2394,7 +2418,7 @@ export const ListRendererMethods = {
                         }
 
                         // Apply style bindings
-                        const elements = row._bindingElements || row._cachedElementsArray;
+                        const elements = (hasStyleBindings || hasAttrBindings) ? self._rowElements(row) : null;
                         if (hasStyleBindings) {
                             if (rootStyleExpr) {
                                 self._processStyleBinding(row, itemProxy, rootStyleExpr, i, enrichedContext);
@@ -2441,7 +2465,7 @@ export const ListRendererMethods = {
                         // idempotent so repeat row mounts (template re-renders,
                         // key reuse) are safe.
                         if (outsideClickActions) {
-                            const rowElements = row._bindingElements;
+                            const rowElements = self._rowElements(row);
                             for (let oi = 0; oi < outsideClickActions.length; oi++) {
                                 const entry = outsideClickActions[oi];
                                 const actionEl = rowElements[entry.index];
@@ -2464,17 +2488,24 @@ export const ListRendererMethods = {
                         // This was the main performance bottleneck (O(n) context creation during initial render)
 
                         // Process conditionals, nested lists, directives, and portals
-                        self._applyListItemIntegrations(row, instance, listPath, i, itemProxy, element, context,
-                            hasConditionals, hasChildLists, hasPortals);
+                        // (one call per row only when the template or the app has any).
+                        if (needsIntegrations) {
+                            self._applyListItemIntegrations(row, instance, listPath, i, itemProxy, element, context,
+                                hasConditionals, hasChildLists, hasPortals);
+                        }
 
                         // Store element reference
                         itemElements.set(itemKey, row);
 
-                        // PERF: Index assignment (no array resizing) + minimal object
+                        // PERF: Index assignment (no array resizing) + minimal object.
+                        // Field order matches the reconciler's row entries
+                        // ({ key, element, itemProxy, disposeEffect }) so it adopts
+                        // these objects as-is instead of copying each into a
+                        // fresh entry (1000 allocations per bulk create).
                         results[resultIdx++] = {
+                            key: itemKey,
                             element: row,
                             itemProxy: itemProxy,
-                            key: itemKey,
                             disposeEffect: null
                         };
                     }
@@ -2645,11 +2676,30 @@ export const ListRendererMethods = {
                         // tracked row into ANOTHER list before the state update
                         // emptied this one. Left alone, that node survives next
                         // to the destination list's own render of the same item
-                        // as a visible duplicate. Normal clears pay one
-                        // parentNode comparison per row and mutate nothing.
-                        for (let i = 0; i < elements.length; i++) {
-                            const el = elements[i];
-                            if (el && el.parentNode && el.parentNode !== element) el.remove();
+                        // as a visible duplicate. One child count gates the walk:
+                        // when the container holds exactly as many element
+                        // children as tracked rows, a row living elsewhere would
+                        // have left a gap that only a foreign child could fill
+                        // (an equal number moved out and in is the one shape this
+                        // cannot see), so the normal clear skips the N parentNode
+                        // reads and mutates nothing. A mismatch walks every row.
+                        const allRowsInPlace = element.childElementCount === elements.length;
+                        if (!allRowsInPlace) {
+                            for (let i = 0; i < elements.length; i++) {
+                                const el = elements[i];
+                                if (el && el.parentNode && el.parentNode !== element) el.remove();
+                            }
+                        }
+                        // Stamp the container for the component-scanning
+                        // MutationObserver (see _setupDynamicComponentDetection):
+                        // when every child is one of these rows, the childList
+                        // record replaceChildren() emits has nothing for it to
+                        // find, and its callback skips the N-node walk.
+                        if (allRowsInPlace) {
+                            // The record reports every removed child node (a
+                            // stray text node included), so stamp the childNodes
+                            // count the observer will see, not the row count.
+                            element._wfOwnedRemoval = element.childNodes.length;
                         }
                         // Full clear: single DOM operation
                         // Template was removed from DOM during setup, so just clear everything
@@ -2736,7 +2786,40 @@ export const ListRendererMethods = {
                     // path. Per-row effects no longer exist; sink stamps live on
                     // the graph's global node table, so store-item writes reach
                     // them without any _effectDependents registration.
-                    for (let i = 0; i < deferredItems.length; i++) {
+                    let i = 0;
+                    for (; i < deferredItems.length; i++) {
+                        const data = deferredItems[i];
+                        if (!data || !data.element || !data.itemProxy) continue;
+                        if (!data.element.parentNode) continue;
+                        registerRowLeafSinks(data.element, data.itemProxy);
+                        data.element._wfDisposeEffect = null;
+                        i++;
+                        break;
+                    }
+                    // Uniform fast-touch template on the computed dispatcher: once
+                    // the first row has built the dispatcher and its owner record,
+                    // every further row's registration is exactly two inserts
+                    // (rows map, owner record). Do them here instead of routing
+                    // each row through registerRowLeafSinks -> registerComputedRow
+                    // -> registerWalk -> setListOwner; this path runs once per
+                    // page load, cold, and the four calls per row were a fifth of
+                    // the create script. Bulk-created rows were inserted by this
+                    // same effect run, so the parentNode guard is not needed.
+                    const d = element._wfListSinkDispatcher;
+                    if (d && d.computedRows && d.owner && !isPolymorphic
+                        && compiledMetadata && compiledMetadata._reactiveGraphFastTouch && sm.setListOwner) {
+                        const rows = d.rows, owner = d.owner;
+                        for (; i < deferredItems.length; i++) {
+                            const data = deferredItems[i];
+                            if (!data || !data.element || !data.itemProxy) continue;
+                            const raw = sm.toRaw(data.itemProxy);
+                            rows.set(raw, data.element);
+                            sm.setListOwner(raw, owner);
+                            data.element._wfDisposeEffect = null;
+                        }
+                        return;
+                    }
+                    for (; i < deferredItems.length; i++) {
                         const data = deferredItems[i];
                         if (!data || !data.element || !data.itemProxy) continue;
                         if (!data.element.parentNode) continue;
@@ -2789,7 +2872,7 @@ export const ListRendererMethods = {
                         }
                         // Text refresh; class (if any) is re-applied by the existing
                         // onItemUpdate apply sequence below.
-                        applyRowTextUpdate(spec, itemEl._cachedElementsArray || itemEl._bindingElements, newRaw, itemEl, null);
+                        applyRowTextUpdate(spec, self._rowElements(itemEl), newRaw, itemEl, null);
                     }
 
                     // No registry contexts to reindex here: per-item data-show/data-bind
@@ -3266,7 +3349,13 @@ export const ListRendererMethods = {
         // reads are not dependency-tracking (the per-item effect wires reactivity
         // separately from the proxy), so the raw values are identical. Mirrors the
         // raw-target reads already used by the class-copy path and the remove fast path.
-        const rawData = stateManager?._proxyTargets?.get(data) || data;
+        // The ReactiveGraph facade unwraps through toRaw (the RSM-era
+        // _proxyTargets lookup is undefined there, which silently left this
+        // reading the proxy: 1000 tree-proxy allocations + cache inserts per
+        // create for items nothing at create time needs wrapped).
+        const rawData = (stateManager && typeof stateManager.toRaw === 'function')
+            ? (stateManager.toRaw(data) || data)
+            : (stateManager?._proxyTargets?.get(data) || data);
 
         // Compiled (composed-emitter) text path: for the flat item-prop shape
         // (the !needsProxy fast path), run a per-template emitter set instead of
@@ -3280,6 +3369,14 @@ export const ListRendererMethods = {
         const _textSpec = (_compileMode !== 'generic' && !needsProxy && !compiledMetadata._rowCompileDisabled)
             ? getTextEmitters(compiledMetadata) : null;
         let _shadowChecked = compiledMetadata._rowCompileShadowChecked === true;
+        // Plain text templates write by element path and leave the row's
+        // binding-element array to be built on first need (_rowElements): the
+        // eager array (an allocation plus a walk over every compiled path, per
+        // row) was the largest framework-only cost of bulk create, and most
+        // rows are never touched afterwards. Templates whose create loop reads
+        // the array keep the eager build (_createNeedsRowElements).
+        const _lazyEls = _textSpec !== null && _textSpec.byPath === true
+            && !this._createNeedsRowElements(compiledMetadata);
 
         const fragment = document.createDocumentFragment();
         for (let i = startIndex; i < endIndex; i++) {
@@ -3287,6 +3384,17 @@ export const ListRendererMethods = {
             if (!item) continue;
 
             const row = proto.cloneNode(true);
+            if (_lazyEls) {
+                applyRowTextByPath(_textSpec, row, item);
+                if (__DEV__ && !_shadowChecked) {
+                    _shadowChecked = true;
+                    compiledMetadata._rowCompileShadowChecked = true;
+                    shadowCompareRow(compiledMetadata, row, item, proto,
+                        (r) => this._buildElementsArrayFromMetadata(r, compiledMetadata));
+                }
+                fragment.appendChild(row);
+                continue;
+            }
             const els = this._buildElementsArrayFromMetadata(row, compiledMetadata);
 
             if (needsProxy) {
@@ -3335,15 +3443,54 @@ export const ListRendererMethods = {
             fragment.appendChild(row);
         }
 
-        if (startIndex === 0) {
-            // FULL CREATION: clear then insert (the container is normally already
-            // empty at full create), mirroring the old element.innerHTML = ...
+        // Stamp the container for the component-scanning MutationObserver (see
+        // _setupDynamicComponentDetection) when the insert below yields a
+        // pure-add record (append, or a full create into an empty container):
+        // rows initialize their own nested components, so the observer can
+        // skip walking the N added nodes. A full create over existing children
+        // yields a mixed record, which the observer walks as before.
+        const added = fragment.childNodes.length;
+        if (added > 0 && (startIndex !== 0 || element.childNodes.length === 0)) {
+            element._wfOwnedAddition = added;
+        }
+        if (startIndex === 0 && element.firstChild) {
+            // FULL CREATION over existing children: clear then insert,
+            // mirroring the old element.innerHTML = ...
             element.replaceChildren(fragment);
         } else {
-            // APPEND MODE: insert new rows at end without disturbing existing ones.
+            // Append, or a full creation into an already-empty container (the
+            // normal case): one insert. replaceChildren on an empty container
+            // costs about 0.1 ms more per 1000 rows than appendChild for the
+            // same resulting DOM.
             element.appendChild(fragment);
         }
         return true;
+    },
+
+    /**
+     * Whether the bulk create loop itself reads a row's binding-element array:
+     * style or attr bindings (root or child), a non-root class evaluator, or a
+     * data-event-outside action. A plain text template (text bindings, a root
+     * class, ordinary child actions) does not, and its rows leave the array to
+     * _rowElements. Cached on the metadata.
+     * @private
+     */
+    _createNeedsRowElements(md) {
+        let v = md._createNeedsElements;
+        if (v !== undefined) return v;
+        v = false;
+        const rb = md.rootBindings;
+        if ((md.styleBindings && md.styleBindings.length) || (md.attrBindings && md.attrBindings.length)
+            || (rb && (rb.hasBindStyle || rb.hasBindAttr))) {
+            v = true;
+        } else {
+            const ce = md.classEvaluators;
+            if (ce) for (let i = 0; i < ce.length; i++) { if (!ce[i].isRoot) { v = true; break; } }
+            const acts = md.actions;
+            if (!v && acts) for (let i = 0; i < acts.length; i++) { if (acts[i].hasEventOutside) { v = true; break; } }
+        }
+        md._createNeedsElements = v;
+        return v;
     },
 
     /**
@@ -3462,7 +3609,9 @@ export const ListRendererMethods = {
      * @param {Object} componentState - Component state object
      */
     _applyClassBindingsToRow(row, item, index, dataLen, classEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
-        const elements = row._bindingElements || row._cachedElementsArray;
+        // The row's binding-element array, fetched on the first non-root
+        // evaluator (a root-only template never builds one here).
+        let elements;
         let mergedCtx = prebuiltMergedCtx || null;
         // Lazy ctx for compiled (_usesMergedContext) evaluators, which consume the
         // context GET-only. Kept separate from the eager `mergedCtx` so it never
@@ -3540,13 +3689,16 @@ export const ListRendererMethods = {
 
             if (evaluator.isRoot) {
                 targetEl = row;
-            } else if (elements && evaluator.index !== undefined) {
-                targetEl = elements[evaluator.index];
-            } else if (evaluator.elementPath && evaluator.elementPath.length > 0) {
-                targetEl = row;
-                for (const idx of evaluator.elementPath) {
-                    if (!targetEl || !targetEl.children) break;
-                    targetEl = targetEl.children[idx];
+            } else {
+                if (elements === undefined) elements = this._rowElements(row);
+                if (elements && evaluator.index !== undefined) {
+                    targetEl = elements[evaluator.index];
+                } else if (evaluator.elementPath && evaluator.elementPath.length > 0) {
+                    targetEl = row;
+                    for (const idx of evaluator.elementPath) {
+                        if (!targetEl || !targetEl.children) break;
+                        targetEl = targetEl.children[idx];
+                    }
                 }
             }
 
@@ -3744,7 +3896,7 @@ export const ListRendererMethods = {
      * Bypasses evaluateExpression → _processObjectBinding → _applyObjectBinding chain.
      */
     _applyStyleBindingsToRow(row, item, index, dataLen, styleEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
-        const elements = row._bindingElements || row._cachedElementsArray;
+        let elements; // the row's binding-element array, fetched on the first non-root evaluator
         // PERF: Reusable lazy proxy; avoids spreading item + componentState per evaluator.
         // Destructuring `const {x, y} = ctx` only calls GET for needed properties (no ownKeys).
         // V8 proxy spread ({...proxy}) triggers ownKeys + ALL property GETs; extremely slow.
@@ -3783,7 +3935,7 @@ export const ListRendererMethods = {
         for (const evaluator of styleEvaluators) {
             let targetEl;
             if (evaluator.isRoot) { targetEl = row; }
-            else if (elements && evaluator.index !== undefined) { targetEl = elements[evaluator.index]; }
+            else if ((elements === undefined ? (elements = this._rowElements(row)) : elements) && evaluator.index !== undefined) { targetEl = elements[evaluator.index]; }
             else if (evaluator.elementPath?.length > 0) {
                 targetEl = row;
                 for (const idx of evaluator.elementPath) {
@@ -3874,7 +4026,7 @@ export const ListRendererMethods = {
      * Fast-path attr binding using pre-compiled evaluators.
      */
     _applyAttrBindingsToRow(row, item, index, dataLen, attrEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
-        const elements = row._bindingElements || row._cachedElementsArray;
+        let elements; // the row's binding-element array, fetched on the first non-root evaluator
         // PERF: Same lazy proxy pattern as _applyStyleBindingsToRow
         let lazyCtx = prebuiltMergedCtx || null;
         if (!lazyCtx) {
@@ -3908,7 +4060,7 @@ export const ListRendererMethods = {
         for (const evaluator of attrEvaluators) {
             let targetEl;
             if (evaluator.isRoot) { targetEl = row; }
-            else if (elements && evaluator.index !== undefined) { targetEl = elements[evaluator.index]; }
+            else if ((elements === undefined ? (elements = this._rowElements(row)) : elements) && evaluator.index !== undefined) { targetEl = elements[evaluator.index]; }
             else if (evaluator.elementPath?.length > 0) {
                 targetEl = row;
                 for (const idx of evaluator.elementPath) {

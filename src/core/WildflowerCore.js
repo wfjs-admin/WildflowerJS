@@ -215,7 +215,6 @@ export class WildflowerJS
         this._componentsToUpdate = new Set();
         this._contextsToUpdate = new Set();
         this._externalDependencies = new Map();
-        this._pendingStateChanges = new Set();
         this._notifyingPaths = new Set();
         this._initialRenderQueue = new Set();
         this._instanceIdCounter = 0;

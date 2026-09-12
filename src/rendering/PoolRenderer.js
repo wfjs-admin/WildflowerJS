@@ -113,6 +113,13 @@ class PoolHandle {
         this._container = container;
         this._keyProp = keyProp;
         this._templateContent = templateContent;
+        // Row prototype: the template's root element. Rows clone it directly
+        // (a parentless clone) rather than the whole template content: that
+        // clone also copied the surrounding whitespace text nodes and left the
+        // row inside a throwaway fragment, so the bulk fragment.appendChild
+        // paid a removal from that parent on every row (~6x the cost of
+        // appending a parentless node at bulk create).
+        this._rowProto = templateContent.firstElementChild || null;
         this._compiledMetadata = compiledMetadata;
         this._framework = framework;
 
@@ -285,18 +292,32 @@ class PoolHandle {
         /** @type {number} Maximum recycled nodes to retain */
         this._maxFreeListSize = 100;
 
-        // Snapshot template's original class/cssText for recycling restoration.
+        // Snapshot the template's original class/cssText for recycling
+        // restoration: the root plus the BOUND elements, in cached-elements-
+        // array order. The pool writes class/style (bindings, show, culling)
+        // to the root and to elements of that array and nowhere else, so
+        // restoring exactly those is the complete restore; snapshotting every
+        // descendant made each recycle re-touch the whole subtree.
+        //
         // Read the class ATTRIBUTE, not .className: on SVG entities .className
         // is an SVGAnimatedString object, not a string.
-        const snapEl = templateContent.cloneNode(true).firstElementChild;
+        const snapEl = this._rowProto;
         this._templateSnapshot = null;
         if (snapEl) {
-            const snap = [{ className: snapEl.getAttribute('class') || '', cssText: snapEl.style.cssText }];
-            const snapChildren = snapEl.querySelectorAll('*');
-            for (let i = 0; i < snapChildren.length; i++) {
-                snap.push({ className: snapChildren[i].getAttribute('class') || '', cssText: snapChildren[i].style.cssText });
+            const boundEls = compiledMetadata
+                ? framework._buildElementsArrayFromMetadata(snapEl, compiledMetadata)
+                : [];
+            const els = new Array(boundEls.length);
+            for (let i = 0; i < boundEls.length; i++) {
+                const b = boundEls[i];
+                els[i] = (b && b !== snapEl)
+                    ? { className: b.getAttribute('class') || '', cssText: b.style.cssText }
+                    : null;
             }
-            this._templateSnapshot = snap;
+            this._templateSnapshot = {
+                root: { className: snapEl.getAttribute('class') || '', cssText: snapEl.style.cssText },
+                els
+            };
         }
     }
 
@@ -371,9 +392,8 @@ class PoolHandle {
             // Restore to template-original state: strip dynamic classes/styles/attrs
             this._restoreRecycledElement(el, elementsArray);
         } else {
-            // Clone template and get root element
-            const clone = this._templateContent.cloneNode(true);
-            el = clone.firstElementChild;
+            // Clone the row prototype (parentless clone; see constructor)
+            el = this._rowProto.cloneNode(true);
 
             // Mark as pool entity so MutationObserver skips it
             el._poolEntity = true;
@@ -459,8 +479,7 @@ class PoolHandle {
                 el._poolItem = obj;
                 this._restoreRecycledElement(el, elementsArray);
             } else {
-                const clone = this._templateContent.cloneNode(true);
-                el = clone.firstElementChild;
+                el = this._rowProto.cloneNode(true);
                 el._poolEntity = true;
                 el._poolItem = obj;
                 elementsArray = null;
@@ -489,7 +508,11 @@ class PoolHandle {
             if (this._onAdd) this._onAdd(obj);
         }
 
-        // Single DOM operation for all items
+        // Single DOM operation for all items. Stamp the container first so the
+        // component-scanning MutationObserver (see
+        // _setupDynamicComponentDetection) skips walking the N added entities.
+        const added = fragment.childNodes.length;
+        if (added > 0) this._container._wfOwnedAddition = added;
         this._container.appendChild(fragment);
 
         if (!this._isPassive) {
@@ -585,20 +608,31 @@ class PoolHandle {
             }
         }
 
-        // Populate free list from existing entities before clearing
+        // Detach everything in ONE DOM operation, then recycle. Stamping the
+        // container first tells the component-scanning MutationObserver (see
+        // _setupDynamicComponentDetection) that the childList record it is about
+        // to receive holds only this pool's entities (by count: a foreign child
+        // breaks the equality), so its callback skips the N-node walk. The
+        // recycled entries are already detached by replaceChildren(), so the
+        // loop no longer pays a per-element remove() and its own record each.
+        const container = this._container;
+        const arr = this._entitiesArray;
+        if (arr.length > 0 && container.childElementCount === arr.length) {
+            // The record reports every removed child node, whitespace text
+            // included, so stamp the childNodes count the observer will see.
+            container._wfOwnedRemoval = container.childNodes.length;
+        }
+        container.replaceChildren();
+        // Populate free list from the detached entities
         const space = this._maxFreeListSize - this._freeList.length;
         if (space > 0) {
-            const arr = this._entitiesArray;
             const count = Math.min(space, arr.length);
             for (let i = 0; i < count; i++) {
                 const entry = arr[i];
-                entry.el.remove();
                 this._resetElementCaches(entry.el, entry.elementsArray);
                 this._freeList.push({ el: entry.el, elementsArray: entry.elementsArray });
             }
         }
-        // Clear remaining DOM (entries not recycled)
-        this._container.replaceChildren();
         this.items.length = 0;
         this._entities.clear();
         this._entitiesArray.length = 0;
@@ -901,26 +935,31 @@ class PoolHandle {
      */
     _restoreRecycledElement(el, elementsArray) {
         const snap = this._templateSnapshot;
-        if (snap) {
-            // Restore root element: use removeAttribute for empty values to avoid
-            // adding class="" or style="" attributes that weren't on the original template.
-            // Bootstrap and other CSS frameworks may style elements differently when
-            // the attribute is present-but-empty vs absent.
-            // setAttribute rather than .className: assigning .className throws
-            // on SVG entities (read-only SVGAnimatedString).
-            if (snap[0].className) { el.setAttribute('class', snap[0].className); }
-            else { el.removeAttribute('class'); }
-            if (snap[0].cssText) { el.style.cssText = snap[0].cssText; }
-            else { el.removeAttribute('style'); }
-            // Restore child elements (querySelectorAll order matches snapshot order)
-            const children = el.querySelectorAll('*');
-            for (let i = 0; i < children.length && i + 1 < snap.length; i++) {
-                const s = snap[i + 1];
-                if (s.className) { children[i].setAttribute('class', s.className); }
-                else { children[i].removeAttribute('class'); }
-                if (s.cssText) { children[i].style.cssText = s.cssText; }
-                else { children[i].removeAttribute('style'); }
-            }
+        if (!snap) return;
+        // Restore root element: use removeAttribute for empty values to avoid
+        // adding class="" or style="" attributes that weren't on the original template.
+        // Bootstrap and other CSS frameworks may style elements differently when
+        // the attribute is present-but-empty vs absent.
+        // setAttribute rather than .className: assigning .className throws
+        // on SVG entities (read-only SVGAnimatedString).
+        const r = snap.root;
+        if (r.className) { el.setAttribute('class', r.className); }
+        else { el.removeAttribute('class'); }
+        if (r.cssText) { el.style.cssText = r.cssText; }
+        else { el.removeAttribute('style'); }
+        // Restore the bound elements (the only descendants the pool writes
+        // class/style to); the snapshot is in the same cached-array order.
+        const els = snap.els;
+        if (!elementsArray || !els) return;
+        const n = elementsArray.length < els.length ? elementsArray.length : els.length;
+        for (let i = 0; i < n; i++) {
+            const t = elementsArray[i];
+            const s = els[i];
+            if (!t || !s) continue;
+            if (s.className) { t.setAttribute('class', s.className); }
+            else { t.removeAttribute('class'); }
+            if (s.cssText) { t.style.cssText = s.cssText; }
+            else { t.removeAttribute('style'); }
         }
     }
 
@@ -1318,6 +1357,7 @@ class PoolHandle {
         this._freeList = null;
         this._container = null;
         this._templateContent = null;
+        this._rowProto = null;
         this._compiledMetadata = null;
         this._framework = null;
     }

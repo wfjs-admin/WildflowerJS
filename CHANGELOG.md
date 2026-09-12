@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
-## [1.5.1] - UNRELEASED (queued; set the date at release)
+## [1.5.1] - 2026-09-12
 
 ### Added
 - [`wildflower.version`](https://www.wildflowerjs.com/changelog.html#wildflower-version): the framework version string, stamped from the package version at build time, in every tier and build.
@@ -21,6 +21,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - [`tick()` runs for a page-load component that has no `init()`](https://www.wildflowerjs.com/changelog.html#tick-without-init): the batched page-load path registered the frame hook only for components that defined `init()`, so a component with `tick()` alone never ticked; dynamically mounted components were unaffected.
 - [Minified builds keep the license banner](https://www.wildflowerjs.com/changelog.html#min-license-banner): the MIT notice and version now open every `.min.js`, as they always did the unminified builds.
 - [Development builds stay quiet about SSR on pages without it](https://www.wildflowerjs.com/changelog.html#ssr-activation-log): the two activation lines no longer print when a page has no `data-ssr` markup.
+
+### Performance
+- [Faster list create, replace and clear](https://www.wildflowerjs.com/changelog.html#list-create-clear-path): bulk create registers rows in one pass and builds a row's element array only when something reads it, a delegated list action resolves its target in a single walk, and the clear path drops a per-change component sweep. Against the 1.5.0 bundle on the js-framework-benchmark rig, create, replace and clear run 4 to 9% faster end to end, and the standard entry's script time falls by about a fifth.
 
 ## [1.5.0] - 2026-09-11
 
