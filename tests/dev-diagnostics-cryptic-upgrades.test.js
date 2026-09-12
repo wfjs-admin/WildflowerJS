@@ -41,7 +41,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode cryptic-failure upgrades (A9)', () 
         testContainer = null
     })
 
-    // A9a (createStore stub) was DROPPED2026-07-12: the rename to
+    // A9a (createStore stub) was DROPPED 2026-07-12: the rename to
     // store() predates the public launch by three months, so no human or
     // model ever saw createStore as WildflowerJS API — a diagnostic for it
     // defends against an audience that cannot exist. The remaining tests pin

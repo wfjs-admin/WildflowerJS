@@ -585,7 +585,7 @@ suite('data-query engine probe', () => {
         expect(warnings.some(w => w.includes(q) && /sub-second|poll/i.test(w))).toBe(true)
     })
 
-    // Review finding:retry is a
+    // Review finding: retry is a
     // plain count; every other shape coerced via `| 0` with no diagnostic —
     // `retry: { max: 3 }` (the shape peer libraries use) silently became 0,
     // retry OFF, and the misdeclaration only showed under a network failure.

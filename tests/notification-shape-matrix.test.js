@@ -23,8 +23,6 @@
  * Findings encoded:
  *   F-1: pattern subs DROPPED during splice (silent gap; user-visible only
  *        if user registers a pattern without pairing `.length`).
- *
- * Audit doc: the design notes
  */
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest'
 import { loadFramework, resetFramework } from './helpers/load-framework.js'

@@ -11,8 +11,6 @@
  * - DOM nodes are MOVED, not recreated (verified via reference equality)
  * - Element state (focus, selection, scroll) is preserved
  * - _listIndex and _itemData are correctly updated on moved nodes
- *
- * @see the design notes
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest';

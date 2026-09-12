@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding:an async
+ * Review finding: an async
  * computed must never let a settled result beat a NEWER input.
  *
  * Three reproduced shapes, all fixed together:

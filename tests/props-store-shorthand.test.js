@@ -10,7 +10,8 @@
  * History: this was previously a silent gap — `$` is a
  * legal JS identifier start, so "$probe.val" was looked up as a parent state key,
  * missed, and yielded undefined exactly like a typo. A WF-506 diagnostic shipped
- * briefly and was replaced by support the same day. The probes also established that the passthrough-computed
+ * briefly and was replaced by support the same day. The probes also
+ * established that the passthrough-computed
  * workaround could serve a STALE value (computed never read under an observer
  * tracks nothing and never invalidates), so the direct form is not just shorter —
  * it is more correct.

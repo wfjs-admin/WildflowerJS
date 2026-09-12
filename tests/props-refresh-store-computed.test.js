@@ -2,7 +2,8 @@
  * Props refresh on store-driven computed change — the "unwatched computed"
  * seal (sweep half).
  *
- * The stale-workaround finding (probed 2026-07-16/17): store -> parent computed -> child prop went stale, and
+ * The stale-workaround finding (probed 2026-07-16/17): store -> parent
+ * computed -> child prop went stale, and
  * the computed was INNOCENT. After a store write, the parent's computed reads
  * fresh and the parent's own bound computed repaints; only the child's
  * _propsData snapshot stayed stale. Cause: a store change sweeps the

@@ -1928,7 +1928,8 @@ suite('data-query writes — write(): one option, one method', () => {
     // create claim outlives it — and the replace branch keeps a row a pending
     // create owns even when the arrival correctly omits it.
     //
-    // Documented as STILL OPEN (2026-08-16); the model fuzzer excludes it by restricting deletes to unclaimed rows.
+    // Documented as STILL OPEN (2026-08-16); the model fuzzer excludes it by
+    // restricting deletes to unclaimed rows.
     it('a confirmed delete is not undone by a later write on the same row', async () => {
         const q = uname('q'); const c = uname('c')
         let serverHasRow1 = true
@@ -2218,7 +2219,7 @@ suite('data-query writes — write(): one option, one method', () => {
         expect(String(caught)).toMatch(/operation hint/)
     })
 
-    // 54 — review finding. the refactor-typo shape: an undeclared operation
+    // 54 — review finding, the refactor-typo shape: an undeclared operation
     // name rejects with the declared list in the message, applies nothing
     // optimistically, and sends nothing.
     it('an undeclared operation name rejects, catchably, touching nothing', async () => {

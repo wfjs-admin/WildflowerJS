@@ -62,7 +62,6 @@ describe('Cross-store async whole-array reassignment + subscribed computed', () 
   // Fixed 2026-05-15 by registering subscribe-block
   // components as entity-dependents of their stores in subscribePath, so
   // path-relevant store mutations correctly dirty dependent computeds.
-  // See the design notes.
   it('cross-store computed re-evaluates after async whole-array reassign', async () => {
     testContainer.innerHTML = `
       <div data-component="cross-store-reader">

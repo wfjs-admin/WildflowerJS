@@ -7,7 +7,6 @@
  *
  * The integration-showcase-wf demo exhibits this bug; the templates.html demo
  * does not. This test pairs the two patterns to isolate the trigger.
- *
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'

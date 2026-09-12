@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding:WF-979 fires at
+ * Review finding: WF-979 fires at
  * REVERSION time, not request time.
  *
  * The hazard it names: refresh({ params }) wins for exactly one fetch, and

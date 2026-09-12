@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding:data-model's
+ * Review finding: data-model's
  * two directions resolve a bare root by ONE rule — component-first, store
  * as fallback, decided by root ownership.
  *

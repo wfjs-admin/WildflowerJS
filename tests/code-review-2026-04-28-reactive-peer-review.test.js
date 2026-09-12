@@ -6,7 +6,7 @@
  * behavior tests. Concerns 3 (fast-path duplication) and 7 (batch JSON-diff) are
  * maintainability/perf concerns addressed elsewhere.
  *
- * Test-first:written to FAIL pre-fix, PASS post-fix.
+ * Test-first: written to FAIL pre-fix, PASS post-fix.
  *
  * Coverage:
  *   Concern 1 — STATIC computeds with externalized conditional helpers

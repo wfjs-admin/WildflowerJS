@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding:stream URLs
+ * Review finding: stream URLs
  * resolve :tokens exactly as reads do, and the stream FOLLOWS THE READS.
  *
  * Before the fix, the sse rung handed the literal URL to EventSource —

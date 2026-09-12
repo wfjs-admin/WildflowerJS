@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding:a component
+ * Review finding: a component
  * nested inside ANOTHER component's list row must keep its own bindings
  * across a meta rescan.
  *

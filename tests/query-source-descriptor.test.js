@@ -1,5 +1,5 @@
 /**
- * source descriptor at the ingestion choke point (envelope provenance
+ * Source descriptor at the ingestion choke point (envelope provenance
  * ruling, 2026-07-26).
  *
  * Every _queryIngest call declares source: 'fetch' | 'stream' | 'ssr' |

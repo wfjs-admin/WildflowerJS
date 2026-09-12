@@ -1910,7 +1910,7 @@ describe('data-bind-style', () => {
   // value to every element bound to that name — including elements inside a
   // data-list whose per-row item field should take precedence.
   //
-  // Surfaced 2026-05-17 via PM-demo team page: a project
+  // Surfaced 2026-05-17 via the PM-demo team page: a project
   // chip's background color reactively followed the parent team's color
   // after editing the team, despite the project's per-row iconStyle field
   // being unchanged. Reloading the page rebuilt the bindings against row

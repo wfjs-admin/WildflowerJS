@@ -58,7 +58,7 @@ describe('Nested list — parent re-emit preserves row identity', () => {
   })
 
   // SKIPPED: red against current main; documents the bug shape, not a
-  // currently-enforced contract. See the design notes.
+  // currently-enforced contract.
   it.skip('row DOM elements survive a parent-group recomputation', async () => {
     testContainer.innerHTML = `
       <div data-component="parent-reemit-rows">

@@ -5,7 +5,7 @@
  * These tests do NOT touch scheduler / rAF / pools / sync effects — they
  * only call pure methods or inspect prototypes. Safe to run.
  *
- * Test-first:written to FAIL pre-fix, PASS post-fix.
+ * Test-first: written to FAIL pre-fix, PASS post-fix.
  *
  * Subsequent groups (C1/C2/C3/H4/H10/H14) will land in separate files
  * after their APIs are verified against existing tests.

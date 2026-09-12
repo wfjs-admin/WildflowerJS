@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding:the five NETWORK-driven
+ * Review finding (warn-once dedupe): the five NETWORK-driven
  * diagnostics describe a STANDING condition — the endpoint's shape, a
  * broken params/headers function, a non-JSON stream — and used to re-warn
  * on the refresh cadence, flooding the console and burying every one-shot

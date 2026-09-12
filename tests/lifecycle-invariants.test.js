@@ -10,9 +10,6 @@
  * If an invariant test fails, the framework has a latent ordering race in
  * the corresponding code path — even if the visible bug only surfaces
  * under specific timing.
- *
- * Companion doc: the design notes.
- *
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'

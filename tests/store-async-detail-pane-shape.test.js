@@ -58,7 +58,7 @@ describe('Detail-pane shape: body bindings re-evaluate after async store assign'
   })
 
   // SKIPPED: red against current main; documents the bug shape, not a
-  // currently-enforced contract. See the design notes.
+  // currently-enforced contract.
   it.skip('all body data-bindings populate after async store hydration', async () => {
     testContainer.innerHTML = `
       <div data-component="detail-pane">
