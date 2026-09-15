@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.5.2] - 2026-09-15
+
+### Fixed
+- [A `data-render` turning on no longer clears a pool's bindings](https://www.wildflowerjs.com/changelog.html#pool-render-bindings): when a `data-render` condition started false and later became true, rows in a `data-pool` elsewhere in the same component lost their `data-bind-attr` values, while the pool entities kept the correct data.
+- [`undefined` and `null` query values are left out of the URL](https://www.wildflowerjs.com/changelog.html#router-query-undefined): `navigate(path, { query: { q: undefined } })` wrote the literal string `undefined`, so the key came back as a real value on the next page load.
+
+
 ## [1.5.1] - 2026-09-12
 
 ### Added

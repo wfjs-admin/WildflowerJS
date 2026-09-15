@@ -2215,6 +2215,20 @@ export const RenderingCoreMethods = {
             // component owns are row-owned from its point of view.
             if (listAncestor && listAncestor !== el
                 && listAncestor.closest('[data-component], [data-wf-component]') === element) return false;
+            // Pool interiors are row-owned in the same way. At init the pool is
+            // empty, so this rescan is the only pass that ever sees rendered
+            // rows. Collecting one makes the component effect evaluate the row's
+            // expression in COMPONENT scope, where the entity's fields are
+            // undefined, and that write clears the attribute the pool had just
+            // set. A data-render flipping false -> true stripped every pool
+            // row's bound src this way. The container itself stays collectible,
+            // since data-show or data-bind-class on a data-pool element is a
+            // component binding. Ownership scoping mirrors the list guard above,
+            // so a component living inside another component's pool row keeps
+            // its own meta.
+            const poolAncestor = el.closest(this._attrSelector('pool'));
+            if (poolAncestor && poolAncestor !== el
+                && poolAncestor.closest('[data-component], [data-wf-component]') === element) return false;
             // Use data-component (not data-component-id) to detect component boundaries.
             // Nested components may not have data-component-id yet during init batches.
             const closestComp = el.closest('[data-component], [data-wf-component]');

@@ -819,12 +819,16 @@ export class RouteManager {
             }
         });
 
-        // Add query string
-        if (Object.keys(query).length > 0) {
-            const queryString = Object.entries(query)
-                .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
-                .join('&');
-            path += '?' + queryString;
+        // Add query string. undefined and null drop out: `{ search: term ||
+        // undefined }` is the ordinary way to say "leave this key off", and
+        // stringifying it wrote a literal "undefined" into the URL that read
+        // back as a real filter value. An empty string stays, since `?q=` says
+        // something different from no `q` at all.
+        const queryPairs = Object.entries(query)
+            .filter(([, value]) => value !== undefined && value !== null)
+            .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+        if (queryPairs.length > 0) {
+            path += '?' + queryPairs.join('&');
         }
 
         // Add hash fragment
@@ -1870,17 +1874,25 @@ class URLParser {
     buildUrl(location) {
         let url = this.base !== '/' ? this.base + location.pathname : location.pathname;
 
-        // Add query string
-        if (location.query && Object.keys(location.query).length > 0) {
-            const queryString = Object.entries(location.query)
+        // Add query string. Same rule as the path builder above: undefined and
+        // null drop out, an empty string stays. Inside an array the same holds
+        // per element, so one bad entry does not poison the whole key.
+        if (location.query) {
+            const queryPairs = Object.entries(location.query)
+                .filter(([, value]) => value !== undefined && value !== null)
                 .map(([key, value]) => {
                     if (Array.isArray(value)) {
-                        return value.map(v => `${encodeURIComponent(key)}=${encodeURIComponent(v)}`).join('&');
+                        return value
+                            .filter(v => v !== undefined && v !== null)
+                            .map(v => `${encodeURIComponent(key)}=${encodeURIComponent(v)}`)
+                            .join('&');
                     }
                     return `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
                 })
-                .join('&');
-            url += '?' + queryString;
+                .filter(pair => pair !== '');
+            if (queryPairs.length > 0) {
+                url += '?' + queryPairs.join('&');
+            }
         }
 
         // Add hash fragment
