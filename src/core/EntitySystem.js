@@ -5,7 +5,7 @@
  */
 
 import { RAW_TARGET } from '../state/ContextProxy.js';
-import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING } from '../core/wfUtils.js';
+import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING, setOwn } from '../core/wfUtils.js';
 import { beginBatchScope, endBatchScope, discardScheduled } from '../state/reactive-graph/core.js';
 
 /**
@@ -57,7 +57,7 @@ function _toRawWalk(value, seen) {
     for (const key in value) {
         if (Object.prototype.hasOwnProperty.call(value, key)) {
             const v = value[key];
-            if (typeof v !== 'function') out[key] = _toRawWalk(v, seen);
+            if (typeof v !== 'function') setOwn(out, key, _toRawWalk(v, seen));
         }
     }
     return out;

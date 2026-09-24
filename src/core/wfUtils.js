@@ -210,6 +210,15 @@ export const wfYield = (() => {
  * Every code that can fire needs an entry on that page — it is the surface
  * the printed docs URL points at.
  */
+// The two codes the reactive graph's facade (entity-handle.js) raises, hoisted
+// out of the table so a headless bundle of the graph (the thread extension's
+// worker half) imports these two definitions and not the whole registry: the
+// table is one object literal, so any import of it ships every code. The
+// entries below point at these same objects; the ledger check reads codes
+// textually and sees them either way.
+export const WF_ERR_CIRCULAR_DEPENDENCY = { code: 'WF-202', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Circular dependency detected' }) };
+export const WF_ERR_HOT_LOOP_FACADE_READS = { code: 'WF-216', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A state property is read thousands of times per frame through the reactive facade (sustained hot loop)' }) };
+
 export const WF_ERRORS = {
     // Core/initialization (001-099)
     ROOT_NOT_FOUND: { code: 'WF-001', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Root element not found' }) },
@@ -225,10 +234,11 @@ export const WF_ERRORS = {
     DESTROY_RESURRECT: { code: 'WF-106', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'destroy() called with the component element still in the document' }) },
     PROVIDER_MISSING: { code: 'WF-107', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A declared provider was never provided' }) },
     REGISTRATION_OVERWRITTEN: { code: 'WF-108', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A directive or plugin registration was overwritten' }) },
+    PLUGIN_EXPOSES_NOTHING: { code: 'WF-109', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A named plugin declares no state, computed, methods, or top-level functions' }) },
 
     // State/reactivity (200-299)
     COMPUTED_EVAL_ERROR: { code: 'WF-201', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating computed property' }) },
-    CIRCULAR_DEPENDENCY: { code: 'WF-202', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Circular dependency detected' }) },
+    CIRCULAR_DEPENDENCY: WF_ERR_CIRCULAR_DEPENDENCY,
     STATE_SET_ERROR: { code: 'WF-203', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error setting state value' }) },
     STATE_DELETE_ERROR: { code: 'WF-204', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error deleting state value' }) },
     STATE_LOAD_ERROR: { code: 'WF-205', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading state from storage' }) },
@@ -246,7 +256,7 @@ export const WF_ERRORS = {
     INDEXED_PATH_OBSERVER: { code: 'WF-213', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Watch/subscribe path targets a list item by numeric index; index paths reflect the item\'s position when first observed and go stale after splice/reorder' }) },
     ITEM_COMPUTED_THIS_MISS: { code: 'WF-214', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Zero-arg computed referenced in a list row reads a property via `this` that is undefined on the component but present on the list item; item-level computeds receive the item as their first argument' }) },
     DUPLICATE_REGISTRATION_CONFLICT: { code: 'WF-215', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component or store is being re-registered under a name that already exists with a DIFFERENT definition; the new definition is ignored and the original is kept. Unregister the existing one first (wildflower.unregister(name)) or use a distinct name' }) },
-    HOT_LOOP_FACADE_READS: { code: 'WF-216', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A state property is read thousands of times per frame through the reactive facade (sustained hot loop)' }) },
+    HOT_LOOP_FACADE_READS: WF_ERR_HOT_LOOP_FACADE_READS,
     COMPUTED_WRITE_IN_EVAL: { code: 'WF-217', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed wrote to reactive state during its own evaluation' }) },
     NAME_COLLISION: { code: 'WF-218', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'The same name is defined in more than one definition bucket' }) },
     DEFINITION_KEY_IGNORED: { code: 'WF-219', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Definition key is not part of the contract and was ignored' }) },
@@ -297,6 +307,9 @@ export const WF_ERRORS = {
     // WF-511 briefly held the query external-write diagnostic pre-release;
     // renumbered to WF-950 (query block, store century) before shipping.
     MODEL_STORE_SHADOW: { code: 'WF-512', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A data-model root names both a component state key and a store; component state wins' }) },
+    BINDING_ORPHAN: { code: 'WF-513', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A binding attribute has no component ancestor, so it never initializes' }) },
+    MODIFIER_FALSY_VALUE: { code: 'WF-514', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A presence-only modifier carries a falsy-looking value; presence alone turns it on' }) },
+    LATE_INIT_CHUNKED: { code: 'WF-515', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component registered after the page-load scan matched more elements than fit its synchronous budget; the rest are initializing in chunks' }) },
 
     // Action/event errors (600-699)
     ACTION_HANDLER_ERROR: { code: 'WF-601', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in action handler' }) },
@@ -341,6 +354,7 @@ export const WF_ERRORS = {
     // block was extended backward to 940-949, which fills upward from here.
     // (966 is not a query code; FACADE_IN_RAW sits inside the run.)
     QUERY_CONFIRM_NOT_INHERITED: { code: 'WF-940', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A query-level `confirmation` reaches update and create only, so this named operation discarded its response body and refetched the whole collection instead' }) },
+    QUERY_ATTR_ON_TEMPLATE: { code: 'WF-941', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-query is on the <template> element itself; its content is inert light DOM, so nothing was bound' }) },
 
     QUERY_STORE_EXTERNAL_WRITE: { code: 'WF-950', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'External write to a query-owned store' }) },
     QUERY_DUPLICATE: { code: 'WF-951', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query name already registered; second registration ignored' }) },
@@ -781,6 +795,8 @@ export class PathResolver {
 
         for (let i = 0; i < lastIndex; i++) {
             const part = parts[i];
+            // `__proto__.x` would walk into Object.prototype and write there.
+            if (part === '__proto__') return false;
             if (current[part] === undefined || current[part] === null) {
                 const nextPart = parts[i + 1];
                 current[part] = /^\d+$/.test(nextPart) ? [] : {};
@@ -835,6 +851,37 @@ export const pathResolver = new PathResolver();
 // ============================================================================
 
 /**
+ * Object.assign for data, minus an own `__proto__` key. JSON.parse makes that
+ * key an ordinary property, and assigning it replaces the target's prototype,
+ * so `row.isAdmin` would read (and render) the payload's value. Merges skip
+ * it, as jQuery.extend and Solid's store do.
+ */
+export function mergeData(target) {
+    for (let i = 1; i < arguments.length; i++) {
+        const src = arguments[i];
+        if (src == null) continue;
+        if (!Object.prototype.hasOwnProperty.call(src, '__proto__')) {
+            Object.assign(target, src);
+            continue;
+        }
+        for (const k of Reflect.ownKeys(src)) {
+            if (k !== '__proto__' && Object.prototype.propertyIsEnumerable.call(src, k)) target[k] = src[k];
+        }
+    }
+    return target;
+}
+
+/**
+ * `target[key] = value` for a copy, keeping a `__proto__` key as the own data
+ * key it was (as spread and structuredClone do) instead of calling the
+ * prototype setter.
+ */
+export function setOwn(target, key, value) {
+    if (key === '__proto__') Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+    else target[key] = value;
+}
+
+/**
  * ObjectUtils - Unified deep clone and equality comparison for WildflowerJS
  *
  * Consolidates _deepClone and _isEqual patterns used across
@@ -874,7 +921,7 @@ export const objectUtils = {
         // Recursively clone properties
         for (const key in obj) {
             if (Object.prototype.hasOwnProperty.call(obj, key)) {
-                clone[key] = this.deepClone(obj[key], seen);
+                setOwn(clone, key, this.deepClone(obj[key], seen));
             }
         }
 
@@ -953,16 +1000,8 @@ export const objectUtils = {
 
 
 
-// ============================================================================
-// BROWSER GLOBALS (for script tag usage)
-// ============================================================================
-
-// Assign to window for backward compatibility with script tag usage
-if (typeof window !== 'undefined') {
-    window.WF_ERRORS = WF_ERRORS;
-    window.wfError = wfError;
-    window.wfWarn = wfWarn;
-    window.PathResolver = PathResolver;
-    window.pathResolver = pathResolver;
-    window.objectUtils = objectUtils;
-}
+// The window globals for script-tag usage (window.WF_ERRORS, wfError, wfWarn,
+// PathResolver, pathResolver, objectUtils) are assigned in ./wfGlobals.js,
+// imported by WildflowerCore.js, so that a module-load side effect here does
+// not pin the whole registry into bundles that import one export from this
+// file (the reactive graph built headless).

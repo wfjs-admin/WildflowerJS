@@ -19,7 +19,7 @@
  *   hard/transient error split.
  */
 
-import { QUERY_ENGINE_WRITE, WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { QUERY_ENGINE_WRITE, WF_ERRORS, wfError, mergeData } from '../core/wfUtils.js';
 import { toRaw as rgToRaw } from '../state/reactive-graph/core.js';
 
 const QUERY_STATE = () => ({
@@ -247,6 +247,23 @@ function findNonRoundTrippable(value, path, depth, seen) {
     return null;
 }
 
+// Dev-only trip wire for the raw-carry invariant the comments at each rows
+// commit site name: every row written to store.rows must already be raw
+// (never a reactive-graph facade). rgToRaw() cannot fail to unwrap — it
+// loops until raw by construction — so a violation here means some future
+// code path added a row to the committed array without routing it through
+// rgToRaw first, not that rgToRaw itself misbehaved.
+function assertRowsAreRaw(rows, where) {
+    if (!__DEV__) return;
+    for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        if (r !== null && typeof r === 'object' && rgToRaw(r) !== r) {
+            console.assert(false, `[WF] raw-carry invariant violated in ${where}: row ${i} is still a reactive-graph facade`);
+            break;
+        }
+    }
+}
+
 // Result-cache bounds, each overridable through wildflower.config(). The
 // defaults live here rather than in the core options bag because queries ship
 // in the full tier only, and a nano page should not carry query keys it can
@@ -326,12 +343,13 @@ function writeHttpError(resp) {
     });
 }
 
-// Shallow copy without one field. Used where the framework must hand an
-// application function an item minus bookkeeping it added itself.
+// Shallow copy without one field (or `__proto__`, as mergeData). Used where
+// the framework must hand an application function an item minus bookkeeping
+// it added itself.
 function omitKey(item, key) {
     const out = {};
     for (const f of Object.keys(item || {})) {
-        if (f !== key) out[f] = item[f];
+        if (f !== key && f !== '__proto__') out[f] = item[f];
     }
     return out;
 }
@@ -513,10 +531,21 @@ function parseRungs(refresh, name) {
 
 // Prune-then-add: controller.elements holds strong references; sweeping
 // disconnected nodes at each new observation keeps the set bounded even for
-// rungless queries whose lifecycle check never fires.
+// rungless queries whose lifecycle check never fires. Below the watermark
+// this sweeps on every single add (the common case: a handful of views per
+// query), which is cheap and keeps pruning immediate. Past the watermark a
+// query with many simultaneous bound elements ("many views") would otherwise
+// pay an O(size) sweep on every add, making a burst of N observations O(n^2);
+// past that point a sweep only re-runs once the set has grown enough since
+// the last one to be worth the walk, which amortizes to O(1) per add.
+const OBSERVE_SWEEP_WATERMARK = 32;
 function observeElement(controller, el) {
-    for (const e of controller.elements) {
-        if (!e.isConnected) controller.elements.delete(e);
+    const size = controller.elements.size;
+    if (size < OBSERVE_SWEEP_WATERMARK || size >= (controller._obsSweepAt || OBSERVE_SWEEP_WATERMARK)) {
+        for (const e of controller.elements) {
+            if (!e.isConnected) controller.elements.delete(e);
+        }
+        controller._obsSweepAt = Math.max(OBSERVE_SWEEP_WATERMARK, controller.elements.size * 2);
     }
     controller.elements.add(el);
 }
@@ -1096,6 +1125,25 @@ export const QuerySystemMethods = {
         for (const el of els) {
             const name = el.getAttribute('data-query') || el.getAttribute('data-wf-query');
             if (!name) continue;
+            // The attribute belongs on the CONTAINER, with <template> as its
+            // child — the mirror of WF-401 ("no <template> found"), which
+            // fires when a template is missing but not when the attribute
+            // sits directly on a <template> tag itself. That tag's own
+            // light-DOM children are always empty (real content lives in
+            // .content), so the hasTemplateEarly check below can't tell
+            // this apart from a legitimately empty record-shape query
+            // without an explicit tag check.
+            if (el.tagName === 'TEMPLATE') {
+                if (__DEV__ && !el._wfQueryOnTemplateWarned) {
+                    el._wfQueryOnTemplateWarned = true;
+                    wfError(WF_ERRORS.QUERY_ATTR_ON_TEMPLATE, {
+                        warn: true,
+                        context: `data-query="${name}" is on the <template> element itself; nothing was bound`,
+                        suggestion: `Move data-query="${name}" to the parent element and keep <template> as its child: <div data-query="${name}"><template>...</template></div>`
+                    });
+                }
+                continue;
+            }
             // Under a data-render section that starts hidden: the conditional
             // pass runs after this transform, so without the check the element
             // would be observed and the query fetched for a section removed a
@@ -1324,6 +1372,8 @@ export const QuerySystemMethods = {
         const CONTAINERS = '[data-list],[data-wf-list],[data-query],[data-wf-query]';
         const setPath = (obj, path, value) => {
             const parts = path.split('.');
+            // `__proto__.x` would walk into Object.prototype and write there.
+            if (parts.includes('__proto__')) return;
             let cur = obj;
             for (let i = 0; i < parts.length - 1; i++) {
                 if (cur[parts[i]] == null || typeof cur[parts[i]] !== 'object') cur[parts[i]] = {};
@@ -1367,7 +1417,7 @@ export const QuerySystemMethods = {
                     : text);
             }
             const seed = readSeed(root);
-            if (seed) Object.assign(into, seed);
+            if (seed) mergeData(into, seed);
             return into;
         };
 
@@ -1553,7 +1603,7 @@ export const QuerySystemMethods = {
             if (!claimedFields) return rec;
             const fields = claimedFields.get(String(rowK));
             if (!fields) return rec;
-            const out = Object.assign({}, rec);
+            const out = mergeData({}, rec);
             for (const f of fields) {
                 if (cur != null && f in cur) out[f] = cur[f];
                 else delete out[f];
@@ -1573,14 +1623,25 @@ export const QuerySystemMethods = {
         // the two `reconcile` call sites; a non-reconcile call (append's
         // shared code path) skips straight to reconcileRow, unchanged.
         const isPlainObject = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
-        const mergePatchRow = (resolved, cur) => {
-            const out = isPlainObject(cur) ? Object.assign({}, cur) : {};
+        // Depth-capped and cycle-safe, same shape as findNonRoundTrippable
+        // above: a confirmation is application data (a function `to:` or a
+        // `confirmation` callback's return value), and JSON.parse can never
+        // produce a cycle but a hand-built object can. Past the cap or on a
+        // cycle, the field lands as-is (still honoring the
+        // null-deletes-the-field rule) instead of recursing further. `seen`
+        // holds only the current path, so a sub-object reused in two fields
+        // is not mistaken for a cycle and merges at both.
+        const mergePatchRow = (resolved, cur, depth = 0, seen = new Set()) => {
+            const out = isPlainObject(cur) ? mergeData({}, cur) : {};
+            const capped = depth >= 5 || seen.has(resolved);
+            if (!capped) seen.add(resolved);
             for (const f in resolved) {
-                if (!Object.prototype.hasOwnProperty.call(resolved, f)) continue;
+                if (f === '__proto__' || !Object.prototype.hasOwnProperty.call(resolved, f)) continue;
                 const v = resolved[f];
                 if (v === null) delete out[f];
-                else out[f] = isPlainObject(v) ? mergePatchRow(v, out[f]) : v;
+                else out[f] = (!capped && isPlainObject(v)) ? mergePatchRow(v, out[f], depth + 1, seen) : v;
             }
+            if (!capped) seen.delete(resolved);
             return out;
         };
         const resolveConfirmation = (resolved, cur, rowK) =>
@@ -1645,7 +1706,7 @@ export const QuerySystemMethods = {
                 // partial merges into rows[0]; anything else (reconcile,
                 // multi-row payloads, empty store) is a wholesale replace.
                 if (fieldMerge && live.length === 1 && current.length > 0) {
-                    nextRows = [Object.assign({}, rgToRaw(current[0]), live[0])].concat(current.slice(1).map(rgToRaw));
+                    nextRows = [mergeData({}, rgToRaw(current[0]), live[0])].concat(current.slice(1).map(rgToRaw));
                 } else if (reconcile && live.length === 1 && current.length > 0) {
                     nextRows = [resolveConfirmation(live[0], rgToRaw(current[0]), undefined)];
                 } else {
@@ -1660,7 +1721,7 @@ export const QuerySystemMethods = {
                     const k = keyOf(r);
                     if (dead.has(k)) continue;
                     nextRows.push(fresh.has(k)
-                        ? (fieldMerge ? Object.assign({}, r, fresh.get(k)) : resolveConfirmation(fresh.get(k), r, k))
+                        ? (fieldMerge ? mergeData({}, r, fresh.get(k)) : resolveConfirmation(fresh.get(k), r, k))
                         : r); // keyed dedup: update in place
                 }
                 const seen = new Set(nextRows.map(keyOf));
@@ -1797,6 +1858,7 @@ export const QuerySystemMethods = {
                     store.lastSync = Date.now();
                 }
             }
+            if (__DEV__) assertRowsAreRaw(nextRows, '_queryIngest');
             store.rows = nextRows;
         });
 
@@ -3144,7 +3206,7 @@ export const QuerySystemMethods = {
         if (opName === 'delete' && item != null) {
             if (controller.deletedField) {
                 if (!item[controller.deletedField]) {
-                    item = Object.assign({}, item, { [controller.deletedField]: true });
+                    item = mergeData({}, item, { [controller.deletedField]: true });
                 }
             } else if (__DEV__) {
                 // One mistake, one warning (review A3): the same call would
@@ -3195,7 +3257,7 @@ export const QuerySystemMethods = {
         let mintedKey = false;
         if (opName === 'create' && !boundAsRecord
             && (item == null || item[key] == null)) {
-            item = Object.assign({}, item, {
+            item = mergeData({}, item, {
                 [key]: 'tmp-' + controller.name + '-' + (++controller.tmpSeq)
             });
             mintedKey = true;
@@ -3287,7 +3349,19 @@ export const QuerySystemMethods = {
         const prevByField = new Map();
         for (const f of Object.keys(item || {})) {
             if (f === key) continue; // the key identifies the row; it is not written data
+            if (f === '__proto__') continue; // never merged (see mergeData), so never claimed
             prevByField.set(ck(f), rowExisted ? currentRow[f] : undefined);
+            // Claim monotonicity: writeId comes from a per-controller
+            // ++counter, so a later write always issues a strictly larger
+            // one — "later claims overwrite earlier" (the tie-break this
+            // rule enables) depends on that holding. A violation here would
+            // mean an older write's claim can incorrectly clobber a newer
+            // one's, silently misattributing whose optimistic value wins.
+            if (__DEV__) {
+                const existingClaim = claims.get(ck(f));
+                console.assert(existingClaim === undefined || existingClaim < writeId,
+                    `[WF] claim monotonicity violated for query "${controller.name}": field "${f}" claim regressed from writeId ${existingClaim} to ${writeId}`);
+            }
             claims.set(ck(f), writeId); // later claims overwrite earlier — that IS the tie-break
         }
         if (__DEV__ && prevByField.size === 0 && !isDelete && !warnedDeleteShape && !warnedNoItem) {
@@ -3313,7 +3387,7 @@ export const QuerySystemMethods = {
             // rides the same registry — including the arrival refresh, so
             // a restore after an out-of-band change carries fresh values.
             for (const f of Object.keys(rgToRaw(currentRow))) {
-                if (f === key) continue;
+                if (f === key || f === '__proto__') continue;
                 if (!prevByField.has(ck(f))) prevByField.set(ck(f), currentRow[f]);
             }
             controller.rowClaims.set(String(k), { w: writeId, kind: 'delete' });
@@ -3406,6 +3480,14 @@ export const QuerySystemMethods = {
             return succ > 0 ? controller.inflightWrites.get(succ) : null;
         };
 
+        // Flags before rows: the pendingWrites mirror above must already be
+        // visible before the optimistic ingest paints the row, so a binding
+        // reading both in the same repaint never sees a stale count beside
+        // a fresh row. Structurally guaranteed by source order today (the
+        // engineWrite above runs before this call); this trips if a future
+        // refactor moves the ingest ahead of the mirror.
+        if (__DEV__) console.assert(store.pendingWrites === controller.pendingWrites,
+            `[WF] flags-before-rows invariant violated for query "${controller.name}": store.pendingWrites (${store.pendingWrites}) lags controller.pendingWrites (${controller.pendingWrites}) before the optimistic ingest`);
         this._queryIngest(controller, item, { patch: true, source: 'write' });
 
         const releaseClaims = () => {
@@ -4070,6 +4152,10 @@ export const QuerySystemMethods = {
      * the list is always missing one.
      */
     _queryWarnRedirect(controller, requestUrl, resp, declaredCount) {
+        // Both call sites are already __DEV__-guarded, so this changes no
+        // behaviour — it lets a production build fold the body away instead
+        // of shipping it unreachable. See _queryOrphanSweep.
+        if (!__DEV__) return;
         if (declaredCount === 0 || !resp || !resp.redirected) return;
         const from = urlOrigin(requestUrl);
         const to = urlOrigin(resp.url || '');
@@ -4368,9 +4454,9 @@ export const QuerySystemMethods = {
             if (r != null && r[key] === oldK) {
                 changed = true;
                 if (hasNew) continue; // twin exists under the real key: drop the tmp row
-                next.push(Object.assign({}, r, { [key]: newK }));
+                next.push(mergeData({}, r, { [key]: newK }));
             } else if (hasNew && r != null && r[key] === newK && carryFields && carryFields.size > 0) {
-                const merged = Object.assign({}, r);
+                const merged = mergeData({}, r);
                 for (const f of carryFields) {
                     if (f in tmpRow) merged[f] = tmpRow[f];
                 }
@@ -4380,7 +4466,10 @@ export const QuerySystemMethods = {
                 next.push(r);
             }
         }
-        if (changed) engineWrite(() => { store.rows = next; });
+        if (changed) engineWrite(() => {
+            if (__DEV__) assertRowsAreRaw(next, '_queryRenameRowKey');
+            store.rows = next;
+        });
     },
 
     /** Remove one row by key (create rollback). A rows-only write: no
@@ -4396,7 +4485,10 @@ export const QuerySystemMethods = {
         // graph are never facade proxies.
         const next = rows.filter((r) => !(r != null && r[key] === k)).map(rgToRaw);
         if (next.length !== rows.length) {
-            engineWrite(() => { store.rows = next; });
+            engineWrite(() => {
+                if (__DEV__) assertRowsAreRaw(next, '_queryRemoveRow');
+                store.rows = next;
+            });
         }
     },
 };

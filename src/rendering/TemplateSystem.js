@@ -6,7 +6,7 @@
 
 // Import CSP-safe evaluation functions
 import { getCSPSafeMergedContextEvaluator, getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
-import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
+import { _EXPR_FOOTGUN_RE } from '../core/ExpressionEvaluator.js';
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { slotDataCache } from '../core/DomMetadata.js';
 import { applyShow, applyText } from '../core/BindingWriters.js';
@@ -1426,6 +1426,9 @@ export const TemplateSystemMethods = {
             _bumpDep(_rb.bindStyleExpr, true);
             _bumpDep(_rb.bindAttrExpr, true);
         }
+        // Every top-level name any binding reads: the pool's props context is
+        // shaped from this (PoolRenderer's _ctxBuffer).
+        metadata._readVars = Array.from(_refCount.keys());
         let _singleTextProp = null;
         for (const b of metadata.bindings) {
             if (b.isSimplePath && !b.isInput && _refCount.get(b.path) === 1) {
@@ -1908,7 +1911,7 @@ export const TemplateSystemMethods = {
             if (this._useCSPSafeEvaluation) {
                 evalFn = getCSPSafeMergedContextEvaluator(expr, allVars, this._astCache, cacheTag);
                 if (evalFn) evalFn._usesMergedContext = true;
-            } else if (!_UNSAFE_EXPR_RE.test(expr)) {
+            } else if (!_EXPR_FOOTGUN_RE.test(expr)) {
                 let exprForReturn = expr;
                 if (wrapObjectLiteral) {
                     const trimmed = expr.trim();

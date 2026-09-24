@@ -1240,6 +1240,7 @@ export class StoreManager {
      * @private
      */
     _dispatchStoreReadyEvent(storeName) {
+        if (typeof document === 'undefined') return; // headless host: no document to notify
         const event = new CustomEvent('wildflower:store-ready', {
             bubbles: true,
             detail: {storeName}
@@ -1290,7 +1291,7 @@ export class StoreManager {
 
             const cleanup = () => {
                 if (timeoutId) clearTimeout(timeoutId);
-                document.removeEventListener('wildflower:store-ready', onStoreReady);
+                if (typeof document !== 'undefined') document.removeEventListener('wildflower:store-ready', onStoreReady);
             };
 
             const onStoreReady = (event) => {
@@ -1302,7 +1303,7 @@ export class StoreManager {
             };
 
             // Listen for store ready event
-            document.addEventListener('wildflower:store-ready', onStoreReady);
+            if (typeof document !== 'undefined') document.addEventListener('wildflower:store-ready', onStoreReady);
 
             // Set timeout (unless timeout is 0, which means wait indefinitely)
             if (timeout > 0) {
@@ -1345,7 +1346,7 @@ export class StoreManager {
                 // subscribeTimeout — and rather than hanging forever when the
                 // timeout is 0 (wait indefinitely), which would otherwise leak
                 // this interval and leave init uncalled for good.
-                if (!current && document.readyState === 'complete') {
+                if (!current && (typeof document === 'undefined' || document.readyState === 'complete')) {
                     resolved = true;
                     cleanup();
                     clearInterval(pollInterval);

@@ -237,8 +237,14 @@ function cleanupSources(node) { trimSourcesFrom(node, 0); }
 // computed's VALUE read under the frame links the computed to the observer.
 let listFrame = null;
 
+// __FEATURE_LISTS__ (a build-time define, like __DEV__) gates every list-only
+// path in this file: the tracking frame, direct writers, list sinks, list
+// owners and the array-op log. Their only callers are ListRenderer,
+// RowCompiler and the list reconciler, which builds without lists do not
+// ship (nano, mini-pool, the thread extension's headless graph); with the
+// define false the bodies fold out of those builds.
 function trackRead(target, key) {
-  if (listFrame !== null && activeObserver === listFrame.observer && listFrame.owns(target)) {
+  if (__FEATURE_LISTS__ && listFrame !== null && activeObserver === listFrame.observer && listFrame.owns(target)) {
     listFrame.stamp(target, key);
     return;
   }
@@ -255,6 +261,7 @@ function trackRead(target, key) {
 // frozen run this temporarily lifts suppressTracking with the cursor already
 // at the append position.
 function runInListFrame(node, frame, fn) {
+  if (!__FEATURE_LISTS__) return fn();
   const prevObserver = activeObserver;
   const prevSuppress = suppressTracking;
   const prevFrame = listFrame;
@@ -317,9 +324,15 @@ function notifyNode(target, key) {
     // (one owner record per row item instead of a node per stamped prop, see
     // setListOwner). The owner sink applies the row's targeted DOM update;
     // with no node there are no observers to wake.
-    const owner = listOwners.get(target);
-    if (owner !== undefined && owner.keys.indexOf(key) !== -1) { owner.sink(target, key); return true; }
+    if (__FEATURE_LISTS__) {
+      const owner = listOwners.get(target);
+      if (owner !== undefined && owner.keys.indexOf(key) !== -1) { owner.sink(target, key); return true; }
+    }
     return false;
+  }
+  if (!__FEATURE_LISTS__) {
+    wakeObservers(node);
+    return true;
   }
   // Direct text writer: a pure-single-text list field (one bound text node, read
   // by no other binding) writes its node here and skips waking the per-item
@@ -685,6 +698,7 @@ function linkLeaf(objOrProxy, key) {
 // retire the per-item effect wake for pure-single-text fields. `objOrProxy` may
 // be a tree proxy (unwrapped via RAW) or a raw object. Pass `null` to clear.
 function setDirectWriter(objOrProxy, key, writerFn, el) {
+  if (!__FEATURE_LISTS__) return;
   if (objOrProxy === null || typeof objOrProxy !== 'object') return;
   const raw = objOrProxy[RAW] || objOrProxy;
   if (writerFn === null) {
@@ -710,6 +724,7 @@ function setDirectWriter(objOrProxy, key, writerFn, el) {
 // the leaf correct. Pass `null` to clear (remove/clear/replace). `objOrProxy`
 // may be a tree proxy (unwrapped via RAW) or a raw object.
 function setListSink(objOrProxy, key, sinkFn) {
+  if (!__FEATURE_LISTS__) return;
   if (objOrProxy === null || typeof objOrProxy !== 'object') return;
   const raw = objOrProxy[RAW] || objOrProxy;
   if (sinkFn === null) {
@@ -734,6 +749,7 @@ function setListSink(objOrProxy, key, sinkFn) {
 const listOwners = new WeakMap();
 
 function setListOwner(objOrProxy, owner) {
+  if (!__FEATURE_LISTS__) return;
   if (objOrProxy === null || typeof objOrProxy !== 'object') return;
   const raw = objOrProxy[RAW] || objOrProxy;
   if (owner === null) listOwners.delete(raw);
@@ -750,6 +766,7 @@ function setListOwner(objOrProxy, owner) {
 const EMPTY_OPS = [];
 
 function enableArrayOps(rawArray) {
+  if (!__FEATURE_LISTS__) return;
   if (rawArray === null || typeof rawArray !== 'object') return;
   if (rawArray[ARR_OPS]) return;
   Object.defineProperty(rawArray, ARR_OPS, { value: { writes: [], mutators: [] }, enumerable: false, configurable: true, writable: true });
@@ -759,6 +776,7 @@ function enableArrayOps(rawArray) {
 // read) for unmanaged arrays. `writes` is flat ([index, nv, ov, ...]) to avoid
 // a per-write object allocation in the hot mutation path.
 function recordArrayWrite(target, index, nv, ov) {
+  if (!__FEATURE_LISTS__) return;
   const log = target[ARR_OPS];
   if (log !== undefined) log.writes.push(index, nv, ov);
 }
@@ -768,6 +786,7 @@ function recordArrayWrite(target, index, nv, ov) {
 // normalizes to splice semantics (kind 0); reverse/sort/copyWithin/fill record
 // nothing, so the fastPath declines and the full reconcile runs.
 function recordArrayMutator(target, start, deleteCount, addCount) {
+  if (!__FEATURE_LISTS__) return;
   const log = target[ARR_OPS];
   if (log !== undefined) log.mutators.push(0, start, deleteCount, addCount);
 }
@@ -776,6 +795,7 @@ function recordArrayMutator(target, start, deleteCount, addCount) {
 // Gated by the caller to ARR_OPS-managed arrays. `oldLen` is the length BEFORE
 // the native call ran.
 function recordMutatorFor(target, key, args, oldLen) {
+  if (!__FEATURE_LISTS__) return;
   let start, dc, add;
   if (key === 'splice') {
     let s = args.length > 0 ? (args[0] | 0) : 0;
@@ -798,6 +818,7 @@ function recordMutatorFor(target, key, args, oldLen) {
 // and the full reconcile runs. Clearing on every drain keeps a declined fast
 // path from leaking stale ops into the next cycle.
 function consumeArrayOps(rawArray) {
+  if (!__FEATURE_LISTS__) return null;
   const log = rawArray && rawArray[ARR_OPS];
   if (!log) return null;
   const hasW = log.writes.length > 0;
@@ -1104,8 +1125,24 @@ function devCountRead(target, key) {
     }
 }
 
+// Whether the reactive tree proxies a value: arrays, plain objects and
+// ordinary class instances (type tag [object Object]). Anything reporting its
+// own tag (Date, Map, Set, URL, EventTarget, typed arrays, DOM nodes) keeps
+// state in internal slots a proxy can't reach, so it is held by reference and
+// is reactive by identity: reassign to notify. Same rule as @vue/reactivity.
+// A class defining its own Symbol.toStringTag is held by reference too.
+// Plain objects and arrays answer before the tag string is built.
+const OBJECT_TAG = '[object Object]';
+function isTreeModelled(v) {
+  if (Array.isArray(v)) return true;
+  const proto = Object.getPrototypeOf(v);
+  if (proto === Object.prototype || proto === null) return true;
+  return Object.prototype.toString.call(v) === OBJECT_TAG;
+}
+
 function wrapTree(obj, prefix, notify, computedResolver) {
   if (obj === null || typeof obj !== 'object') return obj;
+  if (!isTreeModelled(obj)) return obj;
   const cached = treeProxiesFor(obj).get(obj);
   if (cached) return cached.proxy;
 
@@ -1155,7 +1192,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
             notify(prefix + 'length', target.length, oldLen);
             // Record a normalized splice descriptor so the structural fastPath can
             // classify a targeted op (remove-one, append-k). Managed arrays only.
-            if (target[ARR_OPS] !== undefined) recordMutatorFor(target, key, args, oldLen);
+            if (__FEATURE_LISTS__ && target[ARR_OPS] !== undefined) recordMutatorFor(target, key, args, oldLen);
             return result;
           };
         }
@@ -1179,7 +1216,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
       } else if (__DEV__ && !suppressTracking && typeof key === 'string') {
         devCountRead(target, key); // WF-216: sustained hot-loop read detection
       }
-      if (value !== null && typeof value === 'object') {
+      if (value !== null && typeof value === 'object' && isTreeModelled(value)) {
         if (typeof key === 'symbol') return value; // Symbol-keyed internals are not path-observable
         // On a cache HIT, return the existing child proxy WITHOUT building the
         // `prefix + key + '.'` path string; wrapTree would only use that string to
@@ -1237,7 +1274,7 @@ function wrapTree(obj, prefix, notify, computedResolver) {
       // Record bare index writes on a managed array (outside any structural
       // mutator) so the structural effect's fastPath can classify a targeted
       // op. Integer non-negative keys only; 'length' and method writes excluded.
-      if (wasArray && typeof key === 'string') {
+      if (__FEATURE_LISTS__ && wasArray && typeof key === 'string') {
         const idx = +key;
         if (idx >= 0 && (idx | 0) === idx) {
           recordArrayWrite(target, idx, value, old);
@@ -1390,6 +1427,7 @@ export {
   enableArrayOps,
   consumeArrayOps,
   toRaw,
+  isTreeModelled,
   runEffect,
   batch,
   untrack,

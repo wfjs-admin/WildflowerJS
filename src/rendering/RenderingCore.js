@@ -5,7 +5,7 @@
  */
 
 import { listBoundElements, ssrAdoptedElements } from '../core/DomMetadata.js';
-import { WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { WF_ERRORS, wfError, mergeData } from '../core/wfUtils.js';
 import { recording as __tlOn, timelineNoteFrame as __tlFrame } from '../state/TimelineRecorder.js';
 import { applyShow, applyAttrObj, applyStyleObj, applyText, applyModel, applyClass } from '../core/BindingWriters.js';
 
@@ -2609,7 +2609,7 @@ export const RenderingCoreMethods = {
             const rowStore = this.getStore(element._wfRecordQuery);
             const rows = rowStore && rowStore.rows;
             if (rows && rows.length > 0 && rows[0] && typeof rows[0] === 'object') {
-                scopeState = Object.assign({}, scopeState, rows[0]);
+                scopeState = mergeData({}, scopeState, rows[0]);
                 if (__DEV__ && !element._wfRecordChecked) {
                     element._wfRecordChecked = true;
                     this._warnRecordFieldMisses(element, path, scopeState);

@@ -10,7 +10,7 @@
  */
 
 import { getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
-import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
+import { _EXPR_FOOTGUN_RE } from '../core/ExpressionEvaluator.js';
 import { applyAttrObj, applyStyleObj } from '../core/BindingWriters.js';
 import { wfError, WF_ERRORS, COMPUTED_EVAL } from '../core/wfUtils.js';
 
@@ -1027,7 +1027,7 @@ export const ListExpressionMethods = {
                         this._expressionEvaluator.set(cacheKey, evaluator);
                         return;
                     }
-                } else if (!_UNSAFE_EXPR_RE.test(expression)) {
+                } else if (!_EXPR_FOOTGUN_RE.test(expression)) {
                     // Auto-wrap object-literal expressions in parens to defeat JS ASI
                     // ambiguity (`return {x: y}` parses as `return; {x: y}` → undefined).
                     const trimmed = expression.trim();

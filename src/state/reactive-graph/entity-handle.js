@@ -18,6 +18,7 @@ import {
   setListOwner as mSetListOwner,
   runInListFrame as mRunInListFrame,
   toRaw as mToRaw, runEffect as mRunEffect,
+  isTreeModelled,
   reactive as mReactive,
   untrack as mUntrack,
   setFlushObserver as mSetFlushObserver,
@@ -25,7 +26,9 @@ import {
   COMPUTED_MISS,
   F_REENTERED,
 } from './core.js';
-import { wfError, WF_ERRORS, COMPUTED_EVAL } from '../../core/wfUtils.js';
+// The two codes by name, not the WF_ERRORS table: a headless bundle of this
+// facade (the thread extension's worker half) must not carry every code.
+import { wfError, WF_ERR_CIRCULAR_DEPENDENCY, WF_ERR_HOT_LOOP_FACADE_READS, COMPUTED_EVAL } from '../../core/wfUtils.js';
 import { recording as __tlOn, timelineNoteFlush as __tlFlush } from '../TimelineRecorder.js';
 import { reconcile } from './list-reconciler.js';
 
@@ -39,7 +42,7 @@ if (__DEV__) {
   // WF-216 (sealing row 6): the core detects sustained hot-loop facade reads
   // but is clean-room, so the structured warning is emitted from here.
   mSetDevHotReadReporter((key, perFrame) => {
-    wfError(WF_ERRORS.HOT_LOOP_FACADE_READS, {
+    wfError(WF_ERR_HOT_LOOP_FACADE_READS, {
       warn: true,
       context: `state '${key}' is being read ~${perFrame} times per frame through the reactive facade, sustained across frames`,
       suggestion: `A facade read costs ~100x a plain property read (proxy physics; every fine-grained framework pays it). In per-frame loops, hoist the value to a local before the loop (const ${key} = this.state.${key}) and read the local; for per-entity hot data, use pool entities (plain objects, zero proxy cost).`
@@ -77,6 +80,27 @@ function getPath(root, path) {
   return cur;
 }
 
+// Per-entity copy of a built-in, keeping its type and prototype (so a
+// subclass survives). Map and Set contents stay shared: keys and membership
+// are by identity. Uncopyable values (Node, Promise, WeakMap, URL, ...) are
+// returned as-is.
+function cloneBuiltin(v) {
+  let out;
+  switch (Object.prototype.toString.call(v)) {
+    case '[object Date]': out = new Date(v.getTime()); break;
+    case '[object RegExp]': out = new RegExp(v.source, v.flags); out.lastIndex = v.lastIndex; break;
+    case '[object Map]': out = new Map(v); break;
+    case '[object Set]': out = new Set(v); break;
+    case '[object ArrayBuffer]': return v.slice(0);
+    default:
+      // Typed arrays; DataView has no slice() and stays shared.
+      return ArrayBuffer.isView(v) && typeof v.slice === 'function' ? v.slice() : v;
+  }
+  const proto = Object.getPrototypeOf(v);
+  if (Object.getPrototypeOf(out) !== proto) Object.setPrototypeOf(out, proto);
+  return out;
+}
+
 class EntityHandle {
   constructor(options = {}) {
     this.onStateChange = options.onStateChange || (() => {});
@@ -89,8 +113,12 @@ class EntityHandle {
     this.storageKey = options.storageKey || null;
     this.autoSave = options.autoSave || false;
 
-    this.computed = {};            // name -> bound fn (enumerable map; contract)
-    this._getters = {};            // name -> ReactiveGraph computed getter
+    // Both tables are prototype-free: a state or item field named
+    // `constructor`, `toString` or `__proto__` must not find Object.prototype's
+    // member in either and be read as a computed. Callers look them up by name
+    // (`computed[name]`, `name in computed`) across the renderers.
+    this.computed = Object.create(null); // name -> bound fn (enumerable map; contract)
+    this._getters = Object.create(null); // name -> ReactiveGraph computed getter
     this._effects = new Set();
     // Set by destroy() when the owning component is torn down. Guards the
     // deferred computed-notifier install (a queueMicrotask) against firing after
@@ -156,7 +184,10 @@ class EntityHandle {
       this._getters[key] ? this.evaluateComputed(key) : COMPUTED_MISS;
     this._state = reactiveTree(this._raw, (path, nv, ov) => {
       this.onStateChange(path, nv, ov);
-      if (this.autoSave && this.storageKey) this._saveToStorage();
+      // __HEADLESS__ (build define, true only for a bundle of the graph with no
+      // framework around it) folds the facade's framework-only surface:
+      // persistence, the component/props paths, the computed-eval owner stack.
+      if (!__HEADLESS__ && this.autoSave && this.storageKey) this._saveToStorage();
       // Bump the state-version counter. ListRenderer's buildComponentState()
       // caches the merged per-item component-state snapshot keyed on
       // sm._globalEpoch and only rebuilds when it changes. Without the bump it
@@ -190,13 +221,14 @@ class EntityHandle {
         if (fullInstance) this._wf._checkTypeMatch(fullInstance, path, nv);
       }
     }, computedResolver);
-    if (this.storageKey) this._loadFromStorage();
+    if (!__HEADLESS__ && this.storageKey) this._loadFromStorage();
     return this._state;
   }
 
   // Hydrate state from localStorage over the initial state. Called in
   // createState so stored values are present before init() runs.
   _loadFromStorage() {
+    if (__HEADLESS__) return;
     if (!this.storageKey || typeof localStorage === 'undefined') return;
     try {
       const stored = localStorage.getItem(this.storageKey);
@@ -207,25 +239,43 @@ class EntityHandle {
   // Serialize the raw state tree (plain values: the set traps unwrap proxies
   // on write, so _raw never holds a proxy) to localStorage.
   _saveToStorage() {
+    if (__HEADLESS__) return;
     if (!this.storageKey || typeof localStorage === 'undefined') return;
     try {
       localStorage.setItem(this.storageKey, JSON.stringify(this._raw));
     } catch (_) { /* quota or unserializable value: drop the save */ }
   }
 
-  // Cycle-safe deep clone (matches the framework's objectUtils.deepClone). DOM nodes
-  // pass by reference; a `seen` map records each clone BEFORE recursing so a
-  // self- or back-reference resolves to the in-progress clone instead of
-  // recursing forever (self-referential state, parent-pointing list items, etc.).
+  // Cycle-safe deep copy of declared state. A component's `state` literal is
+  // evaluated once, so each instance needs its own copy or mutations leak
+  // between instances. Tree-modelled values are rebuilt field by field (a
+  // class instance on its own prototype); built-ins go through cloneBuiltin.
+  // #private fields can't be copied from outside, so such a class's methods
+  // throw on the copy (1.5.2 flattened it to {}). `seen` is set before
+  // recursing so back-references resolve to the in-progress copy.
   _clone(v, seen) {
     if (v === null || typeof v !== 'object') return v;
-    if (typeof Node !== 'undefined' && v instanceof Node) return v;
     if (!seen) seen = new WeakMap();
     if (seen.has(v)) return seen.get(v);
-    const out = Array.isArray(v) ? [] : {};
+    if (!isTreeModelled(v)) {
+      const copy = cloneBuiltin(v);
+      seen.set(v, copy);
+      return copy;
+    }
+    let out;
+    if (Array.isArray(v)) out = [];
+    else {
+      const proto = Object.getPrototypeOf(v);
+      out = proto === Object.prototype ? {} : Object.create(proto);
+    }
     seen.set(v, out);
     for (const k in v) {
-      if (Object.prototype.hasOwnProperty.call(v, k)) out[k] = this._clone(v[k], seen);
+      if (!Object.prototype.hasOwnProperty.call(v, k)) continue;
+      const c = this._clone(v[k], seen);
+      // `out[k] = c` would call the __proto__ setter: the key would vanish
+      // and its contents become inherited. Define it as the own key it was.
+      if (k === '__proto__') Object.defineProperty(out, k, { value: c, enumerable: true, writable: true, configurable: true });
+      else out[k] = c;
     }
     return out;
   }
@@ -248,7 +298,7 @@ class EntityHandle {
       const v = this._readComputedRooted(sub);
       return v === NO_VALUE ? this.evaluateComputed(sub) : v;
     }
-    if (path.startsWith('props.')) {
+    if (!__HEADLESS__ && path.startsWith('props.')) {
       const id = this.component && this.component.id;
       if (id && this._wf) {
         const inst = this._wf.componentInstances.get(id);
@@ -286,9 +336,13 @@ class EntityHandle {
     const normalized = path.replace(/\[(\d+)]/g, '.$1');
     const parts = normalized.split('.');
     const last = parts.pop();
+    // `__proto__` is never a writable path segment: mid-path it walks into
+    // Object.prototype, and last it replaces the target's prototype (as
+    // update(JSON.parse(...)) would, one key per call).
+    if (last === '__proto__') return false;
     let cur = this._state;
     for (const part of parts) {
-      if (part === '') return false;
+      if (part === '' || part === '__proto__') return false;
       if (cur[part] === undefined || cur[part] === null) cur[part] = {};
       cur = cur[part];
       if (typeof cur !== 'object' || cur === null) return false;
@@ -354,7 +408,7 @@ class EntityHandle {
           this._circularDependencies.add(name);
           if (!this._warnedCircular.has(name)) {
             this._warnedCircular.add(name);
-            wfError(WF_ERRORS.CIRCULAR_DEPENDENCY, {
+            wfError(WF_ERR_CIRCULAR_DEPENDENCY, {
               context: [...this._evalStack, name].join(' → '),
               suggestion: 'Refactor computed properties to break the circular chain'
             });
@@ -696,7 +750,7 @@ class EntityHandle {
   // sees it); a rejection happens after the body returned, so the facade is
   // the only place that can report it.
   _reportAsyncComputedError(name, err) {
-    const wf = this._wf;
+    const wf = __HEADLESS__ ? null : this._wf;
     const id = this.component && this.component.id;
     const instance = wf && id ? wf.componentInstances.get(id) : null;
     if (instance && typeof wf._handleError === 'function') {
@@ -730,16 +784,21 @@ class EntityHandle {
     // Owner-scoped: the bypass is owed only to THIS entity's
     // instance — a cross-instance call still queues. See COMPUTED_EVAL in
     // wfUtils.
-    COMPUTED_EVAL.depth++;
-    // By id, not object: the handle's `component` is a light descriptor,
-    // while _wrapMethod compares against the full registry instance.
-    COMPUTED_EVAL.owners.push((this.component && this.component.id) || null);
     let v;
-    try {
+    if (__HEADLESS__) {
+      // No component methods to bypass the pre-init queue for: plain read.
       v = getter();
-    } finally {
-      COMPUTED_EVAL.depth--;
-      COMPUTED_EVAL.owners.pop();
+    } else {
+      COMPUTED_EVAL.depth++;
+      // By id, not object: the handle's `component` is a light descriptor,
+      // while _wrapMethod compares against the full registry instance.
+      COMPUTED_EVAL.owners.push((this.component && this.component.id) || null);
+      try {
+        v = getter();
+      } finally {
+        COMPUTED_EVAL.depth--;
+        COMPUTED_EVAL.owners.pop();
+      }
     }
     if (v === COMPUTED_ERROR) {
       // Cycle-poison propagation: when a computed evaluation consumes a
@@ -874,7 +933,7 @@ class EntityHandle {
       get disposed() { return (node.flags & 4) !== 0; },
     };
     this._effects.add(effect);
-    if (effect.scope) {
+    if (!__HEADLESS__ && effect.scope) {
       if (!effect.scope._effects) effect.scope._effects = new Set();
       effect.scope._effects.add(effect);
     }
@@ -941,7 +1000,11 @@ class EntityHandle {
   // DOM write and return false when its element is detached (so notifyNode clears
   // the stale writer and falls back to the effect wake). Same DIRECT_HANDLED
   // suppression contract as the typed stampers.
+  // The list-only facade methods below fold to no-ops when __FEATURE_LISTS__
+  // is false (nano, mini-pool, the headless graph): their sole caller is
+  // ListRenderer / RowCompiler, which those builds do not ship.
   stampDirectWriter(itemProxy, key, fn, el) {
+    if (!__FEATURE_LISTS__) return;
     mSetDirectWriter(itemProxy, key, fn, el);
   }
 
@@ -951,10 +1014,12 @@ class EntityHandle {
   // computed/watcher reading the same leaf stays correct. Pass null to clear
   // (same-key replace, remove, clear).
   setListSink(itemProxy, key, sinkFn) {
+    if (!__FEATURE_LISTS__) return;
     mSetListSink(itemProxy, key, sinkFn);
   }
 
   clearListSink(itemProxy, key) {
+    if (!__FEATURE_LISTS__) return;
     mSetListSink(itemProxy, key, null);
   }
 
@@ -962,6 +1027,7 @@ class EntityHandle {
   // item in place of a node per stamped prop (see core setListOwner). Pass
   // null to release the item (remove, same-key replace).
   setListOwner(itemProxy, owner) {
+    if (!__FEATURE_LISTS__) return;
     mSetListOwner(itemProxy, owner);
   }
 
@@ -973,6 +1039,7 @@ class EntityHandle {
   // observer). Frame shape: { observer, owns(raw), stamp(raw, key) }; set
   // frame.observer to runInListFrame's node (this method wires it).
   runInListFrame(effectHandle, frame, fn) {
+    if (!__FEATURE_LISTS__) return fn();
     const node = effectHandle && effectHandle._effect && effectHandle._effect._node;
     if (!node) return fn();
     frame.observer = node;
@@ -982,6 +1049,7 @@ class EntityHandle {
   // Clear a directWriter stamped via stampDirectWriter (same-key replace: the
   // old item's leaf must stop writing the reused row). Mirrors clearListSink.
   clearDirectWriter(itemProxy, key) {
+    if (!__FEATURE_LISTS__) return;
     mSetDirectWriter(itemProxy, key, null);
   }
 

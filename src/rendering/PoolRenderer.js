@@ -8,7 +8,7 @@
  * @module
  */
 
-import { WF_ERRORS, wfError, __wf_txt, validateEntityDefinition, HAS_MOVE_BEFORE } from '../core/wfUtils.js';
+import { WF_ERRORS, wfError, __wf_txt, validateEntityDefinition, HAS_MOVE_BEFORE, mergeData } from '../core/wfUtils.js';
 import { reactive as rgReactive, isTracking as rgIsTracking } from '../state/reactive-graph/core.js';
 
 // Non-function keys the pool entity block actually consumes
@@ -150,8 +150,29 @@ class PoolHandle {
         this.props = options.props || {};
         /** @type {boolean} Cached flag: true if props has any keys */
         this._hasProps = this.props && Object.keys(this.props).length > 0;
-        /** @type {Object|null} Reusable context buffer for props merging (avoids per-entity allocation) */
-        this._ctxBuffer = this._hasProps ? { props: this.props } : null;
+        // Reusable binding context for a pool with props (avoids per-entity
+        // allocation): `props` plus one slot per name the template reads, every
+        // slot refilled from the entity on each apply. Copying the whole entity
+        // in instead (Object.assign) left fields from the previous entity in
+        // place for one that lacks them, and an own `__proto__` key from JSON
+        // replaced the buffer's prototype for every entity after it.
+        /** @type {Object|null} */
+        this._ctxBuffer = null;
+        /** @type {string[]|null} Entity fields copied into _ctxBuffer */
+        this._ctxNames = null;
+        if (this._hasProps) {
+            const names = [];
+            const buf = { props: this.props };
+            const vars = (compiledMetadata && compiledMetadata._readVars) || [];
+            for (let i = 0; i < vars.length; i++) {
+                const n = vars[i];
+                if (n === 'props' || n === '__proto__') continue;
+                names.push(n);
+                buf[n] = undefined;
+            }
+            this._ctxBuffer = buf;
+            this._ctxNames = names;
+        }
 
         /** @type {string|null} Property name for z-index sort (null = no sort) */
         this._sortProp = options.sortProp || null;
@@ -217,9 +238,9 @@ class PoolHandle {
                 names.push(key);
                 descriptors[key] = {
                     configurable: true,
-                    // Enumerable so that Object.assign() into the ctx-buffer
-                    // (used when a pool has props, see _applyBindings) invokes
-                    // the getter and carries its value into the binding context.
+                    // Enumerable, so it reads like a field: in `for...in`,
+                    // Object.keys and spread. The props context reads it by
+                    // name only when a binding uses it (see _applyBindings).
                     enumerable: true,
                     // Intentionally uncached: recompute on every access. See
                     // pool-entity-methods.test.js ("no cache" contract)
@@ -654,7 +675,7 @@ class PoolHandle {
     update(key, props) {
         const entry = this._entities.get(key);
         if (!entry) return null;
-        if (props) Object.assign(entry.item, props);
+        if (props) mergeData(entry.item, props);
         if (this._isPassive) {
             // Passive pools: apply bindings synchronously since rAF flush is skipped
             this._applyBindings(entry.el, entry.item);
@@ -999,9 +1020,14 @@ class PoolHandle {
         const meta = this._compiledMetadata;
         if (!meta) return;
 
-        // If pool has props, merge into a reusable context buffer
-        // Props are accessed via `props.` prefix in expressions
-        const ctx = this._hasProps ? Object.assign(this._ctxBuffer, item) : item;
+        // If pool has props, refill the reusable context buffer (see the
+        // constructor). Props are accessed via `props.` prefix in expressions.
+        let ctx = item;
+        if (this._hasProps) {
+            ctx = this._ctxBuffer;
+            const names = this._ctxNames;
+            for (let i = 0; i < names.length; i++) ctx[names[i]] = item[names[i]];
+        }
 
         const elements = el._cachedElementsArray;
 

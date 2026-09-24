@@ -88,29 +88,39 @@ const banner = `/*!
  * Released under the MIT License
  */`;
 
+// Globals for script-tag usage. `window` on a page; `self` in a Web Worker,
+// where the same file loads headless (no document: no scan, no listeners) and
+// `self.wildflower` is the instance the thread extension's worker half uses.
+const globalTarget = `(typeof window !== 'undefined' ? window : (typeof self !== 'undefined' ? self : null))`;
 const footers = {
     core: `
-// Expose globals for script tag usage
-if (typeof window !== 'undefined') {
-    window.WildflowerJS = WildflowerBundle.WildflowerJS;
-    window.wildflower = WildflowerBundle.wildflower;
-}`,
+// Expose globals for script tag usage (window on a page, self in a worker)
+(function (g) { if (!g) return;
+    g.WildflowerJS = WildflowerBundle.WildflowerJS;
+    g.wildflower = WildflowerBundle.wildflower;
+})(${globalTarget});`,
     spa: `
-// Expose globals for script tag usage
-if (typeof window !== 'undefined') {
-    window.WildflowerJS = WildflowerBundle.WildflowerJS;
-    window.wildflower = WildflowerBundle.wildflower;
-    window.RouteManager = WildflowerBundle.RouteManager;
-}`,
+// Expose globals for script tag usage (window on a page, self in a worker)
+(function (g) { if (!g) return;
+    g.WildflowerJS = WildflowerBundle.WildflowerJS;
+    g.wildflower = WildflowerBundle.wildflower;
+    g.RouteManager = WildflowerBundle.RouteManager;
+})(${globalTarget});`,
     full: `
-// Expose globals for script tag usage
-if (typeof window !== 'undefined') {
-    window.WildflowerJS = WildflowerBundle.WildflowerJS;
-    window.wildflower = WildflowerBundle.wildflower;
-    window.RouteManager = WildflowerBundle.RouteManager;
-    window.SSRManager = WildflowerBundle.SSRManager;
-    window.SSRProtectionContext = WildflowerBundle.SSRProtectionContext;
-    window.SSRPhase = WildflowerBundle.SSRPhase;
+// Expose globals for script tag usage (window on a page, self in a worker)
+(function (g) { if (!g) return;
+    g.WildflowerJS = WildflowerBundle.WildflowerJS;
+    g.wildflower = WildflowerBundle.wildflower;
+    g.RouteManager = WildflowerBundle.RouteManager;
+    g.SSRManager = WildflowerBundle.SSRManager;
+    g.SSRProtectionContext = WildflowerBundle.SSRProtectionContext;
+    g.SSRPhase = WildflowerBundle.SSRPhase;
+})(${globalTarget});`,
+    // Probe artifact (thread extension, Probe 7): the headless reactive graph
+    // loaded into a Web Worker, where `self` is the global and `window` is absent.
+    graph: `
+if (typeof self !== 'undefined') {
+    self.WildflowerGraph = WildflowerBundle;
 }`,
 };
 
@@ -141,10 +151,14 @@ const FEATURES_LITE = {
 // nano-shipped modules (crash-safe) and drops the cluster spread.
 const FEATURES_NANO = { ...FEATURES_LITE, __FEATURE_LISTS__: 'false' };
 
-function defines(features, dev) {
+function defines(features, dev, headless) {
     // __VERSION__ is the single source of the version string inside the bundle
     // (wildflower.version and the DevTools hook); it comes from package.json.
-    return { __DEV__: String(!!dev), __VERSION__: JSON.stringify(VERSION), ...features };
+    // __HEADLESS__ is true only for bundles of the reactive graph with no
+    // framework around it (the thread extension's worker half): it folds the
+    // facade's framework-only surface (persistence, component/props paths,
+    // the computed-eval owner stack) out of those bundles. Every tier is false.
+    return { __DEV__: String(!!dev), __HEADLESS__: String(!!headless), __VERSION__: JSON.stringify(VERSION), ...features };
 }
 
 // -----------------------------------------------------------------------------
@@ -188,14 +202,57 @@ const configs = [
     { entry: 'index.full.js', file: 'wildflower.full.js',      features: FEATURES_FULL, dev: true,  minify: false, mangleProps: false, footer: 'full' },
     { entry: 'index.full.js', file: 'wildflower.full.dev.js',  features: FEATURES_FULL, dev: true,  minify: true,  mangleProps: false, footer: 'full' },
     { entry: 'index.full.js', file: 'wildflower.full.min.js',  features: FEATURES_FULL, dev: false, minify: true,  mangleProps: true,  footer: 'full' },
+
+    // PROBE (thread extension, Probe 7): the reactive graph + EntityHandle
+    // alone, for loading into a Web Worker. Not a shipped tier: not in the
+    // 21-lane matrix, not in the sizes check; the .raw/.mangled suffixes keep
+    // it out of the ESM-twin loop below and out of the .min.js size listing.
+    { entry: 'index.reactive-graph-probe.js', file: 'wildflower.reactive-graph-probe.raw.js',     features: FEATURES_NANO, dev: true,  minify: false, mangleProps: false, footer: 'graph' },
+    { entry: 'index.reactive-graph-probe.js', file: 'wildflower.reactive-graph-probe.mangled.js', features: FEATURES_NANO, dev: false, minify: true,  mangleProps: true,  footer: 'graph' },
+
+    // THREAD EXTENSION (packages/threads): the isomorphic file. Public API
+    // only on both sides (the worker loads a tier file headless and uses
+    // wildflower.store / subscribe / batch), so there is nothing to mangle;
+    // built here for the defines and the pinned terser. Own entry and output
+    // paths; not a tier: not in the 21-lane matrix, not in the sizes check,
+    // no ESM twin (see the loop below). Filter: `node scripts/build-rollup.cjs threads`.
+    ...threadsConfigs(),
 ];
+
+function threadsConfigs() {
+    const dir = path.join(ROOT, 'packages', 'threads');
+    const entryPath = path.join(dir, 'src', 'index.js');
+    if (!fs.existsSync(entryPath)) return [];
+    const tpkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    const tbanner = `/*!
+ * ${tpkg.name} v${tpkg.version}
+ * ${tpkg.description}
+ *
+ * Copyright (c) ${new Date().getFullYear()} WildflowerJS Contributors
+ * Released under the MIT License
+ */`;
+    const base = { entryPath, features: FEATURES_NANO, banner: tbanner };
+    // The framework file: the same runtime plus the WildflowerJS layer
+    // (src/wf.js), which registers the mirror as a store through public API.
+    // Each output is also written to www/js/extensions/ (gitignored), the
+    // path the site's demos and docs load it from; sync-www publishes that
+    // directory, unlike js/dist.
+    const wfEntry = path.join(dir, 'src', 'wf.js');
+    const site = (file) => path.join(ROOT, 'www', 'js', 'extensions', file);
+    return [
+        { ...base, file: 'threads.js',        outPath: path.join(dir, 'dist', 'threads.js'),        alsoWrite: site('threads.js'),        dev: true,  minify: false, mangleProps: false },
+        { ...base, file: 'threads.min.js',    outPath: path.join(dir, 'dist', 'threads.min.js'),    alsoWrite: site('threads.min.js'),    dev: false, minify: true,  mangleProps: false },
+        { ...base, file: 'threads.wf.js',     outPath: path.join(dir, 'dist', 'threads.wf.js'),     alsoWrite: site('threads.wf.js'),     dev: true,  minify: false, mangleProps: false, entryPath: wfEntry },
+        { ...base, file: 'threads.wf.min.js', outPath: path.join(dir, 'dist', 'threads.wf.min.js'), alsoWrite: site('threads.wf.min.js'), dev: false, minify: true,  mangleProps: false, entryPath: wfEntry },
+    ];
+}
 
 // ES module twins: every tier's .dev.js and .min.js also ships as
 // .esm.dev.js / .esm.min.js (format 'es', default export = the instance,
 // named exports as in the entry file). Same defines, same terser settings.
 // The instance still registers window.wildflower (createInstance does that),
 // so a page behaves the same whichever file it loads.
-for (const c of configs.filter(c => /\.(dev|min)\.js$/.test(c.file))) {
+for (const c of configs.filter(c => /\.(dev|min)\.js$/.test(c.file) && !c.outPath)) {
     configs.push({ ...c, file: c.file.replace(/\.(dev|min)\.js$/, '.esm.$1.js'), format: 'es' });
 }
 
@@ -304,9 +361,11 @@ function fmtBytes(n) {
 }
 
 async function buildOne(cfg) {
-    const entry = path.join(SRC, cfg.entry);
-    const out = path.join(DIST, cfg.file);
-    const defs = defines(cfg.features, cfg.dev);
+    const entry = cfg.entryPath || path.join(SRC, cfg.entry);
+    const out = cfg.outPath || path.join(DIST, cfg.file);
+    if (cfg.outPath) fs.mkdirSync(path.dirname(out), { recursive: true });
+    const bannerText = cfg.banner || banner;
+    const defs = defines(cfg.features, cfg.dev, cfg.headless);
 
     process.stdout.write(`${cfg.file.padEnd(28)} ... `);
 
@@ -324,8 +383,8 @@ async function buildOne(cfg) {
             },
         });
         const { output } = await bundle.generate(cfg.format === 'es'
-            ? { format: 'es', banner: banner }
-            : { format: 'iife', name: 'WildflowerBundle', banner: banner, footer: footers[cfg.footer] });
+            ? { format: 'es', banner: bannerText }
+            : { format: 'iife', name: 'WildflowerBundle', banner: bannerText, footer: footers[cfg.footer] });
         await bundle.close();
         bundled = output[0].code;
     } catch (e) {
@@ -356,6 +415,10 @@ async function buildOne(cfg) {
 
     // Step 3: write output and compute compressed sizes.
     fs.writeFileSync(out, finalCode);
+    if (cfg.alsoWrite) {
+        fs.mkdirSync(path.dirname(cfg.alsoWrite), { recursive: true });
+        fs.writeFileSync(cfg.alsoWrite, finalCode);
+    }
     const buf = Buffer.from(finalCode);
     const gz = zlib.gzipSync(buf, { level: 9 });
     const br = zlib.brotliCompressSync(buf, {

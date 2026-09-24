@@ -9,6 +9,9 @@
 
 // Import core dependencies
 import { StoreManager } from '../state/StoreManager.js';
+// Script-tag globals (window.WF_ERRORS, wfError, ...): a side-effect import
+// here, so every tier keeps them and headless bundles of the graph do not.
+import './wfGlobals.js';
 
 const WILDFLOWER_DEBUG = false;
 
@@ -25,10 +28,18 @@ export class WildflowerJS
      */
     constructor(root, options = {})
     {
-        // Store reference to the root element
+        // Store reference to the root element.
+        //
+        // Headless: `root === null` with no `document` in scope (a Web Worker,
+        // a DOM-less test host) creates an instance that never scans, never
+        // installs document listeners and never auto-initialises. Stores,
+        // computeds, methods and subscriptions work exactly as on a page; that
+        // is what the thread extension's worker half runs on. A null root WITH
+        // a document is still the error it always was.
+        this._headless = root === null && typeof document === 'undefined';
         this.root = typeof root === 'string' ? document.querySelector(root) : root;
 
-        if (!this.root)
+        if (!this.root && !this._headless)
         {
             throw new Error(`Root element not found: ${root}`);
         }
@@ -172,18 +183,58 @@ export class WildflowerJS
         // Entity dependents tracking is always needed (for stores and components)
         this._entityDependents = new Map(); // Unified entity->dependents tracking (components, stores, plugins)
 
-        // Initialize when DOM is ready
-        // IMPORTANT: Use requestAnimationFrame to ensure ALL synchronous scripts
-        // (including those that create stores/components) complete before scanning.
-        // This mirrors how WfBuilder.load() works: stores first, then components,
-        // then DOM, then scan.
+        // Initialize when DOM is ready.
+        //
+        // Init is deferred one step so that every script still running in the
+        // current turn (stores, components, a script's own onload handler, the
+        // other DOMContentLoaded listeners) has registered before the scan.
+        // Both a frame callback and a zero-delay timer give that guarantee; the
+        // difference is what happens when no frame comes. Browsers suspend
+        // requestAnimationFrame for a tab that is not visible, so a page opened
+        // in a background tab (cmd-click, "open in new tab", session restore)
+        // used to sit fully parsed and uninitialized until it was first brought
+        // forward: measured 15.6 s from DOMContentLoaded on the home page, and
+        // exactly as long as the tab stayed hidden. The timer is throttled in a
+        // hidden tab too, but a zero-delay one still fired within 3 ms in the
+        // same measurement, so the two are raced and the first to fire wins.
+        // _initialize() has its own re-entry guard; the flag here just keeps the
+        // loser from doing a redundant call.
+        // whenIdle() must cover the deferred page-load scan from construction,
+        // or a script awaiting it before init resolves early. Released by
+        // _completeInitialization(), or by a throw from _initialize().
+        if (!this._headless)
+        {
+            this._trackIdle(new Promise(resolve => { this._initIdleRelease = resolve; }));
+        }
+
         const initAfterScripts = () => {
-            requestAnimationFrame(() => {
-                this._initialize();
-            });
+            let started = false;
+            const go = () => {
+                if (started) return;
+                started = true;
+                try
+                {
+                    this._initialize();
+                }
+                catch (error)
+                {
+                    if (this._initIdleRelease)
+                    {
+                        const release = this._initIdleRelease;
+                        this._initIdleRelease = null;
+                        release();
+                    }
+                    throw error;
+                }
+            };
+            requestAnimationFrame(go);
+            setTimeout(go, 0);
         };
 
-        if (document.readyState === 'loading')
+        if (this._headless)
+        {
+            // Nothing to scan and no DOM to watch; entities register on demand.
+        } else if (document.readyState === 'loading')
         {
             document.addEventListener('DOMContentLoaded', initAfterScripts);
         } else
@@ -191,7 +242,7 @@ export class WildflowerJS
             initAfterScripts();
         }
 
-        this._setupDynamicComponentDetection();
+        if (!this._headless) this._setupDynamicComponentDetection();
 
 
         this._expressionEvaluator = new Map(); // Stores pre-bound evaluators

@@ -5,25 +5,19 @@
  * The core is ReactiveGraph: the EntityHandle facade over the reactive-graph
  * core (state/reactive-graph/).
  *
- * setStateManagerImpl() allows a process-wide runtime override, used by the
- * reactive graph's own integration tests to inject the handle explicitly.
+ * This was a switch once. During the 2026-06 spike two cores existed, the
+ * legacy ReactiveStateManager and the handle, and `setStateManagerImpl(cls)`
+ * chose between them for an integration test. The legacy core is gone, the
+ * handle is the only implementation, and that test was deleted on 2026-09-20,
+ * so the override went with it rather than stay as a seam with nothing on the
+ * other side.
  */
 
 import { EntityHandle } from './reactive-graph/entity-handle.js';
 
-let _impl = EntityHandle;
-
-/**
- * Override the reactive core implementation process-wide. Pass a class with the
- * state-manager surface, or null to restore the default (EntityHandle).
- */
-function setStateManagerImpl(cls) {
-  _impl = cls || EntityHandle;
-}
-
-/** Construct the active reactive core for one entity. */
+/** Construct the reactive core for one entity. */
 function createStateManager(options) {
-  return new _impl(options);
+  return new EntityHandle(options);
 }
 
-export { createStateManager, setStateManagerImpl };
+export { createStateManager };

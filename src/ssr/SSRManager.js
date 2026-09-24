@@ -167,7 +167,7 @@ export const SSRPhase = {
  */
 
 import { ssrAdoptedElements, ssrAllowActionsElements, boundActionsCache } from '../core/DomMetadata.js';
-import { pathResolver } from '../core/wfUtils.js';
+import { pathResolver, mergeData } from '../core/wfUtils.js';
 
 export class SSRManager {
     constructor(wildflower) {
@@ -694,7 +694,7 @@ export class SSRManager {
         // render (the DOM parse can only recover displayed values). Machine
         // truth wins overlaps with parsed display text.
         const rootSeed = this._readSeedAttribute(element);
-        if (rootSeed) Object.assign(state, rootSeed);
+        if (rootSeed) mergeData(state, rootSeed);
 
         return state;
     }
@@ -779,7 +779,7 @@ export class SSRManager {
 
             // data-seed on the item root: unrendered item fields (ids, flags).
             const itemSeed = this._readSeedAttribute(itemEl);
-            if (itemSeed) Object.assign(itemState, itemSeed);
+            if (itemSeed) mergeData(itemState, itemSeed);
 
             listItems.push(itemState);
         });

@@ -21,11 +21,25 @@ const STORE_SHORTHAND_INLINE_REGEX = /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.
 // with no dotted member chains; avoids per-call allocation in the compile path.
 const _EMPTY_PATHS = Object.freeze([]);
 
-// Block indirect eval/Function access that bypasses variable shadowing in new Function()
-// Catches: eval(), Function(), import(), ['constructor'], ['__proto__'], __defineGetter/Setter__,
-// and global object access (globalThis, window, self, frames) that could reach eval/fetch/etc.
+// NOT a security boundary — trivially bypassable by design, verified against
+// the real payloads: `''.constructor.constructor('return this')()`, `top`,
+// `parent.location`, and `fetch(...)` all compile and run past this regex,
+// since only bracket-form `['constructor']` and a handful of bare global
+// names are denylisted, and the expression compiles into `new Function`,
+// which has no sandbox of its own. Markup being code is the standard posture
+// for template frameworks (Vue: never compile untrusted templates; Angular
+// removed its own expression sandbox in 1.6, stating it was never a
+// boundary) — the actual boundary here is `data-csp-safe`, a genuinely
+// closed-grammar interpreter that this regex has nothing to do with.
+// What this regex actually is: a footgun catcher. It catches the obvious
+// mistake of writing `eval(...)`, `Function(...)`, `document`, `window`, or
+// similar directly in a bound expression, and rejects it with a silent
+// compile failure (the binding renders empty) rather than running it. That
+// silence is itself a known gap (2026-09-09 review; a legitimate expression
+// that merely mentions `document` fails with no message) — tracked
+// separately, not fixed by this rename.
 // Exported for use by TemplateSystem, ListExpressionEval, ListRenderer
-export const _UNSAFE_EXPR_RE = /\beval\s*\(|\bFunction\s*\(|\bimport\s*\(|\[\s*['"]constructor['"]\s*\]|\[\s*['"]__proto__['"]\s*\]|__defineGetter__|__defineSetter__|\bglobalThis\b|\bwindow\b|\bself\b|\bframes\b|\bdocument\b/;
+export const _EXPR_FOOTGUN_RE = /\beval\s*\(|\bFunction\s*\(|\bimport\s*\(|\[\s*['"]constructor['"]\s*\]|\[\s*['"]__proto__['"]\s*\]|__defineGetter__|__defineSetter__|\bglobalThis\b|\bwindow\b|\bself\b|\bframes\b|\bdocument\b/;
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -157,7 +171,7 @@ export const ExpressionEvaluatorMethods = {
 
         // Block expressions that could reach eval or construct functions
         // via indirect patterns that bypass variable shadowing
-        if (_UNSAFE_EXPR_RE.test(expression)) {
+        if (_EXPR_FOOTGUN_RE.test(expression)) {
             this._expressionEvaluator.set(cacheKey, null);
             return null;
         }

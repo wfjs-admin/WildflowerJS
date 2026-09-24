@@ -70,7 +70,7 @@
 
 // Import CSP-safe evaluation functions
 import { getCSPSafeMergedContextEvaluator } from '../core/CSPExpressionEvaluator.js';
-import { _UNSAFE_EXPR_RE } from '../core/ExpressionEvaluator.js';
+import { _EXPR_FOOTGUN_RE } from '../core/ExpressionEvaluator.js';
 import { ListNestedMethods } from './ListNestedManager.js';
 import { ListItemBindingMethods } from './ListItemBinding.js';
 import { ListExpressionMethods } from './ListExpressionEval.js';
@@ -3774,7 +3774,7 @@ export const ListRendererMethods = {
                             const keys = Object.keys(mergedCtx);
                             const cacheKey = `class-fallback::${evaluator.expression}::${keys.join(',')}`;
                             let fn = this._expressionEvaluator && this._expressionEvaluator.get(cacheKey);
-                            if (!fn && !_UNSAFE_EXPR_RE.test(evaluator.expression)) {
+                            if (!fn && !_EXPR_FOOTGUN_RE.test(evaluator.expression)) {
                                 fn = new Function(...keys, `"use strict"; return ${evaluator.expression}`);
                                 if (this._expressionEvaluator) this._expressionEvaluator.set(cacheKey, fn);
                             }

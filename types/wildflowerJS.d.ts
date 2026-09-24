@@ -2,7 +2,7 @@
  * WildflowerJS TypeScript Definitions
  * A lightweight reactive framework with no build step required
  *
- * @version 1.5.1
+ * @version 1.5.3
  * @license MIT
  *
  * The bundles are IIFEs that assign `window.wildflower`; import this file for
@@ -1604,6 +1604,13 @@ export default class WildflowerJS {
    *                If omitted, scans the entire document.
    */
   scan(scope?: HTMLElement | string): void;
+  /**
+   * Resolves once no deferred initialization is pending: the page-load scan,
+   * and the chunked remainder of a component registered after it. Resolves
+   * immediately when nothing is pending. The same moment fires a
+   * `wildflower:idle` event on document.
+   */
+  whenIdle(): Promise<void>;
 
   /**
    * Returns a Promise that resolves when all pending reactive updates,

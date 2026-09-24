@@ -67,6 +67,7 @@ export const FrameworkInitMethods = {
         // This allows the browser to handle input/rendering between component batches
         if (this.options.autoInit)
         {
+            // whenIdle() covers this scan via the constructor's pending count.
             this._scanForComponentsAsync().then(() => {
                 this._completeInitialization();
             }).catch(error => {
@@ -150,6 +151,67 @@ export const FrameworkInitMethods = {
             detail: {instance: this}
         });
         document.dispatchEvent(readyEvent);
+
+        // Release the constructor's pending count: idle fires after ready.
+        if (this._initIdleRelease)
+        {
+            const release = this._initIdleRelease;
+            this._initIdleRelease = null;
+            release();
+        }
+    },
+    /**
+     * Resolves once no deferred initialization work is pending: the page-load
+     * scan and the chunked remainder of any late registration (a component
+     * registered after the scan that matched more elements than its
+     * synchronous budget covered). Resolves immediately when nothing is
+     * pending. The same moment is announced as a `wildflower:idle` event on
+     * document, for code that listens rather than awaits.
+     *
+     * Small pages never need it: a late registration of up to
+     * LATE_INIT_SYNC_FLOOR elements is complete when component() returns.
+     *
+     * @returns {Promise<void>}
+     */
+    whenIdle()
+    {
+        if (!this._idlePending)
+        {
+            return Promise.resolve();
+        }
+        return new Promise(resolve => {
+            (this._idleResolvers || (this._idleResolvers = [])).push(resolve);
+        });
+    },
+    /**
+     * Count a piece of deferred work toward whenIdle(). When the count
+     * returns to zero every waiter is resolved and `wildflower:idle` fires.
+     * A rejected promise is logged and still counted as finished, so a
+     * failure inside one chunk cannot leave whenIdle() hanging.
+     * @param {Promise} promise
+     * @returns {Promise}
+     * @private
+     */
+    _trackIdle(promise)
+    {
+        this._idlePending = (this._idlePending || 0) + 1;
+        const done = () => {
+            this._idlePending--;
+            if (this._idlePending === 0)
+            {
+                const resolvers = this._idleResolvers || [];
+                this._idleResolvers = [];
+                resolvers.forEach(resolve => resolve());
+                document.dispatchEvent(new CustomEvent('wildflower:idle', {
+                    bubbles: true,
+                    detail: { instance: this }
+                }));
+            }
+        };
+        return promise.then(done, error => {
+            this._log('error', 'Deferred initialization failed:', error);
+            done();
+        });
     },
     _ensureContextSystem()
     {

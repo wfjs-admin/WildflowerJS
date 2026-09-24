@@ -490,8 +490,10 @@ function parseExpression(expr) {
 
         const identifier = expr.slice(start, index);
 
-        // Check for literal keywords
-        if (identifier in literals) {
+        // Check for literal keywords. Own keys only: `in` also finds
+        // Object.prototype's members, which made `constructor` or `toString`
+        // a literal holding the inherited function instead of a state read.
+        if (Object.prototype.hasOwnProperty.call(literals, identifier)) {
             return {
                 type: 'Literal',
                 value: literals[identifier],

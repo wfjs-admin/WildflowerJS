@@ -13,7 +13,28 @@ import { pathResolver, validateEntityDefinition, warnDefinitionCollisions, wfErr
 // Non-function definition keys the plugin factory actually consumes
 // (validateEntityDefinition allowlist — note plugins DO have a 'methods'
 // block, unlike components/stores).
-const PLUGIN_CONTRACT_KEYS = ['name', 'version', 'install', 'setup', 'uses', 'methods', 'state', 'computed', 'watch'];
+const PLUGIN_CONTRACT_KEYS = ['name', 'version', 'install', 'uses', 'methods', 'state', 'computed', 'watch'];
+
+// Metadata keys that are plugin machinery, never candidate top-level methods.
+// Used to detect a plugin whose functions were declared bare (same shape as
+// components/stores) rather than nested under `methods:`.
+const PLUGIN_NON_METHOD_KEYS = new Set(['name', 'version', 'install', 'setup', 'uses', 'state', 'computed', 'watch', 'tick']);
+
+/**
+ * True if the metadata has at least one function-valued key that isn't
+ * plugin machinery (name/version/install/setup/uses/state/computed/watch/tick).
+ * Catches the methods-at-top-level shape so it gets the same $name accessor
+ * a `methods:` block or `state:` block would.
+ * @private
+ */
+function hasTopLevelPluginMethods(metadata) {
+    for (const key in metadata) {
+        if (!PLUGIN_NON_METHOD_KEYS.has(key) && typeof metadata[key] === 'function') {
+            return true;
+        }
+    }
+    return false;
+}
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -84,8 +105,26 @@ export const PluginSystemMethods = {
                 this._pluginsByName.set(metadata.name, pluginInfo);
 
                 // Handle reactive plugin state
-                if (metadata.state || metadata.methods || metadata.computed) {
+                // setup is not a plugin hook: nothing calls it, and the
+                // validator skips functions, so name it here.
+                if (__DEV__ && typeof metadata.setup === 'function') {
+                    wfError(WF_ERRORS.DEFINITION_KEY_IGNORED, {
+                        warn: true,
+                        context: `Plugin '${metadata.name}': setup() is not a plugin lifecycle hook and is never called`,
+                        suggestion: 'Move its body into install(wf, options), which runs once when the plugin registers.'
+                    });
+                }
+
+                if (metadata.state || metadata.methods || metadata.computed || typeof metadata.tick === 'function' || hasTopLevelPluginMethods(metadata)) {
                     this._setupPluginState(metadata.name, metadata);
+                } else if (__DEV__ && typeof metadata.install !== 'function') {
+                    // install() has already run above, so an install-only plugin
+                    // (registers a directive, wires services) is legitimate.
+                    wfError(WF_ERRORS.PLUGIN_EXPOSES_NOTHING, {
+                        warn: true,
+                        context: `Plugin "${metadata.name}" declares no state, computed, methods, or top-level functions`,
+                        suggestion: `wildflower.$${metadata.name} will be undefined. Add a state/computed/methods block, or declare functions at the top level of the plugin definition.`
+                    });
                 }
             }
         } catch (error) {
@@ -99,7 +138,10 @@ export const PluginSystemMethods = {
     _setupPluginState(name, metadata)
     {
         const framework = this;
-        const initialState = metadata.state ? { ...metadata.state } : null;
+        // tick registers only on the reactive path, so a tick with no state
+        // takes it with empty state rather than the lightweight path.
+        const initialState = metadata.state ? { ...metadata.state }
+            : (typeof metadata.tick === 'function' ? {} : null);
 
         // If plugin has state, use ReactiveStateManager for full reactivity
         if (initialState) {
@@ -118,7 +160,16 @@ export const PluginSystemMethods = {
      */
     _createPluginAccessor(name) {
         const framework = this;
-        Object.defineProperty(this, `$${name}`, {
+        const key = `$${name}`;
+        // Tracked explicitly (not inferred from Object.keys at destroy time):
+        // a property's terser-mangled short name is not pinned for every
+        // field, so a name like _deferredReactiveUpdates can legitimately
+        // land on a `$`-prefixed short name in some builds, and a
+        // startsWith('$') scan would delete it as if it were a plugin
+        // accessor. See destroy()'s cleanup, which reads this set instead.
+        if (!this._pluginAccessorKeys) this._pluginAccessorKeys = new Set();
+        this._pluginAccessorKeys.add(key);
+        Object.defineProperty(this, key, {
             get() {
                 const ctx = framework._pluginStates.get(name);
                 if (framework._computedTrackingContext && ctx) {

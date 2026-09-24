@@ -104,7 +104,7 @@ describe('Security: expression evaluation global access', () => {
 
     // H6 regression guards — verify the extraction-and-shadow mechanism
     // continues to shadow these browser globals to undefined. These are
-    // the globals the `_UNSAFE_EXPR_RE` blocklist does NOT explicitly cover
+    // the globals the `_EXPR_FOOTGUN_RE` blocklist does NOT explicitly cover
     // (the CSP evaluator's BLOCKED_GLOBALS does). They are safe because
     // unreserved identifiers get extracted by `_extractExpressionVars` and
     // injected as parameters to the compiled function, shadowing any globals.

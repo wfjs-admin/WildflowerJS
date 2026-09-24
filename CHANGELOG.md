@@ -7,6 +7,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.5.3] - 2026-09-23
+
+### Added
+- [A warning when `data-query` is on the `<template>` element itself (WF-941)](https://www.wildflowerjs.com/changelog.html#query-template-attribute): the attribute belongs on the container, with `<template>` as its child; on the template tag directly, nothing bound and nothing said why.
+- [A warning for `data-bind`, `data-show`, `data-model`, or `data-action` with no component ancestor (WF-513)](https://www.wildflowerjs.com/changelog.html#binding-orphan): bindings only process inside a component, and one outside never initialized without saying why.
+- [A warning when a presence-only modifier carries a falsy value (WF-514)](https://www.wildflowerjs.com/changelog.html#modifier-falsy-value): `data-model-lazy="false"` and similar read as present, turning the modifier on instead of off.
+- [`wildflower.whenIdle()` and the `wildflower:idle` event](https://www.wildflowerjs.com/changelog.html#when-idle): a promise, and a document event, for the moment no deferred initialization is pending, covering the page-load scan and any chunked late registration.
+- [A warning when a late registration crosses into chunked initialization (WF-515)](https://www.wildflowerjs.com/changelog.html#late-init-warning): fires once per registration, with the number of elements left for the chunks and how to wait for them.
+- [Threads, an extension that runs a store on a Web Worker](https://www.wildflowerjs.com/docs/threads/): declare state, computed properties, and methods once with `thread(name, {...})`; the worker runs them as a store and the page binds to a mirror. A separate script, loaded after the framework.
+
+### Fixed
+- [A query with many simultaneously bound views no longer slows down as they grow](https://www.wildflowerjs.com/changelog.html#query-observe-sweep): each new view re-swept every existing one to prune disconnected nodes, so binding N views cost O(n²).
+- [`write()`'s confirming reconcile no longer risks a stack overflow](https://www.wildflowerjs.com/changelog.html#query-write-confirmation-recursion): a self-referential or very deeply nested confirmation object crashed instead of applying.
+- [`wildflower.destroy()` now fully tears down the framework](https://www.wildflowerjs.com/changelog.html#destroy-incomplete-teardown): it left the dynamic-component-detection observer running and every registered query's timers, streams, and in-flight requests alive.
+- [`wildflower.destroy()` could delete unrelated internal state in a minified build](https://www.wildflowerjs.com/changelog.html#destroy-plugin-accessor-scan): a step meant to remove plugin accessors matched other internal fields by name coincidence and deleted those too.
+- [A page opened in a background tab now initializes without waiting to be focused](https://www.wildflowerjs.com/changelog.html#init-hidden-tab): startup waited for an animation frame, which browsers withhold from hidden tabs, so the page stayed parsed but inert until it was brought forward.
+- [A component registered after page load no longer blocks in proportion to how many elements it matches](https://www.wildflowerjs.com/changelog.html#late-registration-chunked): the first 64 elements and up to 20 ms are handled before `component()` returns, the remainder in 8 ms chunks, the same shape the page-load scan already had.
+- [A `__proto__` path segment can no longer write to `Object.prototype`](https://www.wildflowerjs.com/changelog.html#proto-path-segment): `data-bind` in SSR markup, `data-model` (web components included), and `update('__proto__.x', v)` walked into `Object.prototype` and set the field on every object in the page.
+- [A `__proto__` key in JSON data stays data](https://www.wildflowerjs.com/changelog.html#proto-key-data): several copies and merges, from `update()` and `reset()` to query `patch()`, `data-seed`, and `pool.update()`, assigned the key and replaced the object's prototype, so its fields read the payload's values.
+- [A pool with `props` no longer shows one entity's fields on another](https://www.wildflowerjs.com/changelog.html#pool-props-stale-fields): an entity missing a field rendered the previous entity's value for it.
+- [State fields named `constructor`, `toString`, or `valueOf` render as data](https://www.wildflowerjs.com/changelog.html#state-field-object-member-names): they were mistaken for computed properties or, in CSP-safe mode, for literals, so `data-bind="constructor"` showed `[object Object]` or the function's source, and `data-show` on a list item or query row field of that name stayed hidden.
+- [URL query keys named like built-in object members parse as plain keys](https://www.wildflowerjs.com/changelog.html#router-query-builtin-names): `?toString=a` became an array holding a native function, which the router then wrote back into the URL, and `?__proto__=x` replaced the query object's prototype.
+
+
 ## [1.5.2] - 2026-09-15
 
 ### Fixed

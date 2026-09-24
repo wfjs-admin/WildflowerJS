@@ -6,7 +6,28 @@
 
 import { createStateManager } from '../state/createStateManager.js';
 import { RAW_TARGET } from '../state/ContextProxy.js';
-import { objectUtils, pathResolver, wfError, WF_ERRORS, COMPUTED_EVAL } from '../core/wfUtils.js';
+import { objectUtils, pathResolver, wfError, WF_ERRORS, COMPUTED_EVAL, wfYield } from '../core/wfUtils.js';
+
+// Late registration (wildflower.component() after the page-load scan) used to
+// initialize every matching element in one synchronous loop with no cap, so a
+// component registered from a lazily loaded script, a script at the end of
+// <body>, or added dynamically blocked the main thread in proportion to how
+// many elements it matched: measured 2026-09-18 under 4x CPU throttle at about
+// 8 ms fixed plus 0.06-0.12 ms per element, one long task (50 ms+) from a few
+// hundred elements, 310 ms at 25,000 nodes. The page-load scan does the same
+// work as a 20 ms sprint then 8 ms chunks and stays flat.
+//
+// The late path now mirrors it, with a floor: the first LATE_INIT_SYNC_FLOOR
+// elements are always initialized before the call returns, whatever the clock
+// says, so small pages keep the synchronous contract every existing test and
+// most applications rely on (no test in the suite registers more than 32 late).
+// Past the floor, work continues synchronously until LATE_INIT_SYNC_BUDGET_MS
+// has been spent, then the remainder runs in LATE_INIT_CHUNK_MS chunks between
+// yields. whenIdle() and the wildflower:idle event report the moment the
+// chunked remainder finishes.
+const LATE_INIT_SYNC_FLOOR = 64;
+const LATE_INIT_SYNC_BUDGET_MS = 20;
+const LATE_INIT_CHUNK_MS = 8;
 
 // Named constants (replaces magic numbers)
 const READY_POLL_INTERVAL_MS = 10;     // Polling interval for waitForReady()
@@ -115,11 +136,51 @@ export const ComponentLifecycleMethods = {
             .map(s => `${s}:not([data-component-id])`)
             .join(',');
         const elements = this.root.querySelectorAll(selector);
+        const total = elements.length;
 
-        elements.forEach(element =>
+        // Synchronous phase: the floor unconditionally, then while the budget lasts.
+        const start = performance.now();
+        let index = 0;
+        while (index < total && (index < LATE_INIT_SYNC_FLOOR || performance.now() - start < LATE_INIT_SYNC_BUDGET_MS))
         {
-            this._initializeComponentElement(element, componentName);
-        });
+            this._initializeComponentElement(elements[index], componentName);
+            index++;
+        }
+        if (index >= total) return;
+
+        if (__DEV__) {
+            wfError(WF_ERRORS.LATE_INIT_CHUNKED, {
+                warn: true,
+                context: `component "${componentName}" was registered after the page-load scan with ${total} matching elements already in the document; ${index} initialized synchronously within the ${LATE_INIT_SYNC_BUDGET_MS} ms budget and the remaining ${total - index} are initializing in ${LATE_INIT_CHUNK_MS} ms chunks`,
+                suggestion: `Load the registration with defer in <head> so the page-load scan handles it, or await wildflower.whenIdle() (or listen for the wildflower:idle event) before reading elements this registration initializes`
+            });
+        }
+
+        const remainder = Array.prototype.slice.call(elements, index);
+        this._trackIdle(this._initializeElementsChunked(remainder, componentName, this._destroyGeneration || 0));
+    },
+    /**
+     * Chunked remainder of a late registration: the same 8 ms budget and
+     * cooperative yield the page-load scan uses. Elements initialized or
+     * detached in the meantime are skipped; a destroy() mid-way stops the
+     * loop (destroy() bumps _destroyGeneration).
+     * @private
+     */
+    async _initializeElementsChunked(elements, componentName, generation)
+    {
+        let i = 0;
+        while (i < elements.length)
+        {
+            await wfYield();
+            if ((this._destroyGeneration || 0) !== generation) return;
+            const chunkStart = performance.now();
+            while (i < elements.length && performance.now() - chunkStart < LATE_INIT_CHUNK_MS)
+            {
+                const element = elements[i++];
+                if (!element.isConnected || element.dataset.componentId) continue;
+                this._initializeComponentElement(element, componentName);
+            }
+        }
     },
     /**
      * Initialize a single component element.
@@ -3011,6 +3072,35 @@ export const ComponentLifecycleMethods = {
      */
     destroy()
     {
+        // Stops any chunked late registration still running.
+        this._destroyGeneration = (this._destroyGeneration || 0) + 1;
+
+        // Disconnect the dynamic-component-detection observer. Without this
+        // the observer (and the DOMContentLoaded listener that arms it when
+        // neither document.body nor documentElement exist yet at
+        // construction) kept `this` reachable from `document` forever, so a
+        // "destroyed" instance was never actually collectable.
+        if (this._mutationObserver) {
+            this._mutationObserver.disconnect();
+            this._mutationObserver = null;
+        }
+        if (this._domReadyMutationHandler) {
+            document.removeEventListener('DOMContentLoaded', this._domReadyMutationHandler);
+            this._domReadyMutationHandler = null;
+        }
+
+        // Tear down every query controller: clears poll/lifecycle timers,
+        // closes any open SSE stream, removes its focus/reconnect window
+        // listeners, and aborts an in-flight fetch. _queryTeardown already
+        // does all of this for the lifecycle-grace path; destroy() reuses it
+        // rather than re-deriving the same cleanup.
+        if (__FEATURE_QUERY__ && this._queryControllers) {
+            this._queryControllers.forEach((c) => {
+                try { this._queryTeardown(c); } catch { /* mid-flight teardown */ }
+            });
+            this._queryControllers.clear();
+        }
+
         // Destroy all components
         const componentIds = [...this.componentInstances.keys()];
         componentIds.forEach(id => this._destroyComponentQuiet(id));
@@ -3060,11 +3150,18 @@ export const ComponentLifecycleMethods = {
             this._pluginStates.clear();
             this._providers.clear();
 
-            // Remove dynamic $pluginName accessors
-            for (const key of Object.keys(this)) {
-                if (key.startsWith('$') && key !== '$') {
+            // Remove dynamic $pluginName accessors. Tracked explicitly by
+            // _createPluginAccessor rather than scanned by a `$`-prefix
+            // match on Object.keys(this): a terser-mangled internal field
+            // (one with no pinned short name in mangle.json) can legitimately
+            // land on a `$`-prefixed name in some builds, and deleting it as
+            // if it were a plugin accessor silently corrupts unrelated state
+            // (found via _deferredReactiveUpdates -> $t in a full.min build).
+            if (this._pluginAccessorKeys) {
+                for (const key of this._pluginAccessorKeys) {
                     delete this[key];
                 }
+                this._pluginAccessorKeys.clear();
             }
         }
 

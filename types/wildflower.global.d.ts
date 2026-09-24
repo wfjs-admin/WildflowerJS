@@ -33,7 +33,7 @@ declare namespace WF {
 
     type ActionHandler<T = any> = (event: Event, element: HTMLElement, details: ActionDetails<T>) => any;
 
-    /** `data-pool-action` handlers receive the entity first. */
+    /** A `data-action` inside a pool template receives the entity first. */
     type PoolActionHandler<T = any> = (item: T, event: Event) => any;
 
     // ── this.$el ─────────────────────────────────────────────────────────
@@ -510,6 +510,13 @@ declare namespace WF {
         unregister(name: string): void;
         /** Initialize components under `scope`. Rarely needed; the mutation observer does this. */
         scan(scope?: Element | Document): void;
+        /**
+         * Resolves once no deferred initialization is pending: the page-load
+         * scan, and the chunked remainder of a component registered after it.
+         * Resolves immediately when nothing is pending. The same moment fires
+         * a `wildflower:idle` event on document.
+         */
+        whenIdle(): Promise<void>;
         config(options: Partial<ConfigOptions>): Api;
         /** Deep plain-object snapshot of reactive state, for structured clone (IndexedDB, postMessage). */
         toRaw<T>(value: T): T;

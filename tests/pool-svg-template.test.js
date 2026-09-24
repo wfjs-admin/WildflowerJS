@@ -135,13 +135,16 @@ suite('pool templates inside <svg>', () => {
         await settle()
 
         dot.x = 150
-        dot.tf = 'translate(5px, 0px)'
+        // Both arguments non-zero on purpose: Firefox serializes
+        // 'translate(5px, 0px)' back as 'translate(5px)', Chromium keeps it,
+        // so a zero second argument made this oracle browser-specific.
+        dot.tf = 'translate(5px, 2px)'
         dot.cls = 'hot'
         await settle()
 
         const circle = container.querySelector('g.dots circle')
         expect(circle.getAttribute('cx'), 'attribute follows the entity').toBe('150')
-        expect(circle.style.transform, 'style binding writes to SVG element style').toBe('translate(5px, 0px)')
+        expect(circle.style.transform, 'style binding writes to SVG element style').toBe('translate(5px, 2px)')
         expect(circle.classList.contains('hot')).toBe(true)
     })
 

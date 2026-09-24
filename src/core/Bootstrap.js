@@ -210,7 +210,10 @@ function _createDevToolsHook(wf) {
  * @returns {WildflowerJS} Configured instance
  */
 export function createInstance(WildflowerClass) {
-    const instance = new WildflowerClass(document, _scriptConfig);
+    // Headless host (a Web Worker, a test runner without a DOM): no document,
+    // so the instance is created with no root and no auto-init, and stores,
+    // computeds and subscriptions work as on a page. See the constructor.
+    const instance = new WildflowerClass(typeof document !== 'undefined' ? document : null, _scriptConfig);
 
     // Expose globals for script tag usage
     if (typeof window !== 'undefined') {

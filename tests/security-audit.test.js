@@ -104,7 +104,7 @@ describe('Security Audit', () => {
       // Realistic path: app uses data-bind-html with unsanitized content.
       // Attacker injects <span data-bind="x.constructor.constructor(...)()"></span>.
       // When the framework re-scans the outlet, the expression evaluator compiles
-      // it via new Function(). _UNSAFE_EXPR_RE blocks bracket-form but not
+      // it via new Function(). _EXPR_FOOTGUN_RE blocks bracket-form but not
       // dot-form access to .constructor.
       wildflower.component('host', {
         state: {
@@ -124,7 +124,7 @@ describe('Security Audit', () => {
       await waitForCompleteRender()
 
       // If this assertion FAILS (pwned === true), finding #1 is exploitable.
-      // Fix: extend _UNSAFE_EXPR_RE to match \.constructor\b and \.__proto__\b.
+      // Fix: extend _EXPR_FOOTGUN_RE to match \.constructor\b and \.__proto__\b.
       expect(window.__xssPwned).toBe(false)
     })
 

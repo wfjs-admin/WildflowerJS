@@ -1930,13 +1930,19 @@ class URLParser {
             if (key) {
                 const decodedKey = decodeURIComponent(key);
                 const decodedValue = decodeURIComponent(value);
-                if (decodedKey in query) {
+                // Own keys only: `in` also finds Object.prototype's members,
+                // so `?toString=a` read as a second occurrence.
+                if (Object.prototype.hasOwnProperty.call(query, decodedKey)) {
                     // Convert to array on second occurrence
                     if (Array.isArray(query[decodedKey])) {
                         query[decodedKey].push(decodedValue);
                     } else {
                         query[decodedKey] = [query[decodedKey], decodedValue];
                     }
+                } else if (decodedKey === '__proto__') {
+                    // Assigning would replace the object's prototype; keep
+                    // the URL's key as a key.
+                    Object.defineProperty(query, decodedKey, { value: decodedValue, enumerable: true, writable: true, configurable: true });
                 } else {
                     query[decodedKey] = decodedValue;
                 }
@@ -2080,7 +2086,8 @@ RouteManager._frameworkIntegration = {
 };
 
 // Auto-initialize framework integration
-RouteManager._frameworkIntegration.init();
+// Headless host (a Web Worker): no document, no components, nothing to wire.
+if (typeof document !== 'undefined') RouteManager._frameworkIntegration.init();
 
 // ==================== WILDFLOWER.CREATEROUTER() FACTORY ====================
 

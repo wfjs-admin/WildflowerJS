@@ -5,8 +5,17 @@
  */
 
 import { createContextProxy, patchSelfReferences, warnCollisions } from '../state/ContextProxy.js';
-import { validateEntityDefinition, warnDefinitionCollisions, wfYield } from '../core/wfUtils.js';
+import { validateEntityDefinition, warnDefinitionCollisions, wfYield, WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { warnLifecycleActionNames } from './ComponentLifecycle.js';
+
+// Presence-only modifiers: the framework reads hasAttribute(), never the
+// value, so ="false" (or these other falsy spellings) is read as PRESENT
+// and turns the modifier ON — the opposite of the author's intent, with no
+// diagnostic anywhere near the read sites (FormHandling.js, EventSystem.js,
+// ComponentLifecycle.js). Checked once per scan here rather than at each of
+// those read sites.
+const PRESENCE_ONLY_MODIFIERS = ['model-lazy', 'model-number', 'model-trim', 'event-self', 'event-stop', 'event-prevent', 'event-outside', 'external'];
+const FALSY_MODIFIER_VALUES = new Set(['false', '0', 'no', 'off']);
 
 // Non-function definition keys the component factory actually consumes
 // (validateEntityDefinition allowlist — keep in sync with the reads in
@@ -157,15 +166,20 @@ _setupDynamicComponentDetection()
                 subtree: true
             });
         } else {
-            // Neither exists yet (document not yet parsed at all)
-            document.addEventListener('DOMContentLoaded', () => {
+            // Neither exists yet (document not yet parsed at all). Stored so
+            // destroy() can remove it — an anonymous listener here would
+            // keep this instance reachable from `document` forever, since
+            // DOMContentLoaded fires at most once and nothing else ever
+            // triggers its removal.
+            this._domReadyMutationHandler = () => {
                 if (document.body && this._mutationObserver) {
                     this._mutationObserver.observe(document.body, {
                         childList: true,
                         subtree: true
                     });
                 }
-            });
+            };
+            document.addEventListener('DOMContentLoaded', this._domReadyMutationHandler);
         }
     },
 // Method to scan for newly added components
@@ -282,7 +296,82 @@ _setupDynamicComponentDetection()
         // is the case being diagnosed.
         if (__DEV__ && this._queryOrphanSweep) this._queryOrphanSweep(searchRoot);
 
+        // WF-513: same shape, for the four core binding attributes.
+        if (__DEV__) this._bindingOrphanSweep(searchRoot);
+
+        // WF-514: presence-only modifiers written with a falsy value.
+        if (__DEV__) this._modifierFalsyValueSweep(searchRoot);
+
         return initializedCount;
+    },
+    /**
+     * WF-513: data-bind/data-show/data-model/data-action outside every
+     * component never initialize (bindings only process inside a
+     * component) and, until this, never said so. Mirrors _queryOrphanSweep's
+     * shape (WF-963) for the four attributes every tier ships.
+     * @private
+     */
+    _bindingOrphanSweep(root) {
+        // Guard INSIDE the method, not only at the call site. A production
+        // build substitutes __DEV__ with false, so this folds to an
+        // unconditional return and terser drops the rest of the body as
+        // unreachable. Guarding only at the call site leaves the whole body
+        // in the bundle: terser cannot prove a method is unreachable, since
+        // nothing rules out a dynamic this[name] read. Mirrors
+        // _queryOrphanSweep (WF-963).
+        if (!__DEV__) return;
+        if (!root || !root.querySelectorAll) return;
+        for (const base of ['bind', 'show', 'model', 'action']) {
+            const selector = this._attrSelector(base);
+            const els = [];
+            if (root.matches && root.matches(selector)) els.push(root);
+            root.querySelectorAll(selector).forEach((el) => els.push(el));
+            for (const el of els) {
+                if (el._wfBindingOrphanWarned) continue;
+                // data-portaled-from marks content a portal moved out of its
+                // component, which still drives it.
+                if (el.closest('[data-component],[data-wf-component],[data-portaled-from]')) continue;
+                el._wfBindingOrphanWarned = true;
+                const attrName = el.hasAttribute(`data-${base}`) ? `data-${base}` : `data-wf-${base}`;
+                wfError(WF_ERRORS.BINDING_ORPHAN, {
+                    warn: true,
+                    context: `${attrName}="${el.getAttribute(attrName)}" has no component ancestor; bindings only process inside a component, so this element never initializes`,
+                    suggestion: `Wrap it in a component — an empty definition is enough: wildflower.component('shell', {}) + <div data-component="shell">`
+                });
+            }
+        }
+    },
+    /**
+     * WF-514: a presence-only modifier (the framework reads hasAttribute(),
+     * never the value) written as ="false" (or "0"/"no"/"off") is read as
+     * PRESENT and turns the modifier ON — the opposite of what was written,
+     * with no message anywhere near the actual read sites.
+     * @private
+     */
+    _modifierFalsyValueSweep(root) {
+        // See _bindingOrphanSweep: the internal __DEV__ guard is what lets a
+        // production build drop this body rather than ship it unreachable.
+        if (!__DEV__) return;
+        if (!root || !root.querySelectorAll) return;
+        for (const base of PRESENCE_ONLY_MODIFIERS) {
+            const selector = this._attrSelector(base);
+            const els = [];
+            if (root.matches && root.matches(selector)) els.push(root);
+            root.querySelectorAll(selector).forEach((el) => els.push(el));
+            for (const el of els) {
+                const attrName = el.hasAttribute(`data-${base}`) ? `data-${base}` : `data-wf-${base}`;
+                const value = el.getAttribute(attrName);
+                if (value === null || !FALSY_MODIFIER_VALUES.has(value.toLowerCase())) continue;
+                const markerKey = `_wfModifierFalsyWarned_${base}`;
+                if (el[markerKey]) continue;
+                el[markerKey] = true;
+                wfError(WF_ERRORS.MODIFIER_FALSY_VALUE, {
+                    warn: true,
+                    context: `${attrName}="${value}" is still ON — it's a presence-only modifier, so the value isn't read`,
+                    suggestion: `Remove the attribute entirely to turn it off (delete ${attrName}) instead of setting it to "${value}"`
+                });
+            }
+        }
     },
     // Public alias for _scanForDynamicComponents with cleaner API
     // @param {string|Element} [scope] - Optional scope to limit scanning (selector string or Element)
