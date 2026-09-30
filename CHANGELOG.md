@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - [A warning for an underscore key in `state` (WF-236)](https://www.wildflowerjs.com/changelog.html#state-underscore-key)
 - [`wildflower.tier` and `wildflower.features`](https://www.wildflowerjs.com/changelog.html#tier-and-features)
 - [`pool.version`](https://www.wildflowerjs.com/changelog.html#pool-version)
+- [Trillium, an extension that draws stores and pools with three.js](https://www.wildflowerjs.com/docs/three/)
 
 ### Changed
 - [Plugin `watch` works as a component's](https://www.wildflowerjs.com/changelog.html#plugin-watch-shared)
