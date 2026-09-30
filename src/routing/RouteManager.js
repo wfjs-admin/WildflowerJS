@@ -663,8 +663,10 @@ export class RouteManager {
         // Skip if link has download attribute
         if (link.hasAttribute('download')) return;
 
-        // Skip if link has data-no-router attribute
-        if (link.hasAttribute('data-no-router')) return;
+        // Skip if link has data-no-router (or data-wf-no-router: through the
+        // framework's prefix helper when the router runs beside it)
+        const wf = typeof wildflower !== 'undefined' ? wildflower : null;
+        if (wf && wf._hasAttr ? wf._hasAttr(link, 'no-router') : link.hasAttribute('data-no-router')) return;
 
         // Get the href attribute (not the resolved href property)
         const href = link.getAttribute('href');

@@ -970,7 +970,7 @@ export const PortalSystemMethods = {
         const portalRecord = portals[portalIndex];
 
         // Move content back to source (or remove for data-render)
-        const isRenderCondition = portalElement.hasAttribute('data-render');
+        const isRenderCondition = this._hasAttr(portalElement, 'render');
 
         portalRecord.content.forEach(child => {
             child.removeAttribute('data-portaled-from');

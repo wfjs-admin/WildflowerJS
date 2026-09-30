@@ -212,7 +212,7 @@ export const ErrorBoundariesMethods = {
 
         // Check for data-error-fallback attribute (cached on first access)
         if (instance._errorFallbackSelector === undefined) {
-            instance._errorFallbackSelector = instance.element.dataset.errorFallback || null;
+            instance._errorFallbackSelector = this._getAttr(instance.element, 'error-fallback') || null;
         }
         const fallbackSelector = instance._errorFallbackSelector;
         if (!fallbackSelector)

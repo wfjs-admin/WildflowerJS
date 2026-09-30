@@ -186,14 +186,14 @@ export const wfYield = (() => {
  *   ─────  ──────────────────────────  ──────────────  ─────────────────────
  *   000s   core, initialization        001-003         004-099
  *   100s   components                  101-108         109-199
- *   200s   state, computed, watch      201-235         236-299
+ *   200s   state, computed, watch      201-236         237-299
  *   300s   context                     301-304         305-399
- *   400s   templates, lists            401-415         416-499
+ *   400s   templates, lists            401-418         419-499
  *   500s   bindings, forms             501-512         513-599
  *   600s   actions, events             601-606         607-699
  *   700s   routing                     701-712         713-799
  *   800s   SSR                         801-802         803-899
- *   900s   stores    901-910           queries 940,950-999  911-939 (shared), 941-949
+ *   900s   stores    901-911           queries 940-942,950-999  912-939 (shared), 943-949
  *
  * The 900s hold two owners and are the one block to think about before
  * allocating. Stores grew up from 901 and queries were given 950-999, which
@@ -266,6 +266,7 @@ export const WF_ERRORS = {
     RULE_EVAL_ERROR: { code: 'WF-229', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule check threw; rule skipped for this pass' }) },
     RULE_VERDICT_INVALID: { code: 'WF-234', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule check returned something that is not a verdict; rule skipped' }) },
     ITEM_COMPUTED_ASYNC: { code: 'WF-235', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Item-level list computed returned a Promise; async computeds are component/store/plugin-level only' }) },
+    STATE_UNDERSCORE_KEY: { code: 'WF-236', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'An underscore key in state is not reachable as this._name (underscore names are raw instance fields)' }) },
 
     // Context system (300-399)
     CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
@@ -282,12 +283,15 @@ export const WF_ERRORS = {
     LIST_SWAP_ERROR: { code: 'WF-406', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in swap optimization' }) },
     LIST_SPARSE_ERROR: { code: 'WF-407', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in sparse update optimization' }) },
     POOL_CONTAINER_UNDECLARED: { code: 'WF-408', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-pool container references a pool name that is not in the component\'s pools block' }) },
-    POOL_NEVER_POPULATED: { code: 'WF-409', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool has a data-pool container but was never populated, so it renders nothing' }) },
+    POOL_NEVER_POPULATED: { code: 'WF-409', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool has a data-pool container but nothing has been added yet (expected if it fills later)' }) },
     POOL_MIXED_ENTITY_SHAPES: { code: 'WF-410', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Entity spawns in this pool produce different shapes (fields or field order), which breaks V8\'s hidden-class optimization for every entity in the pool' }) },
     POOL_COMPUTED_FRAME_BUDGET: { code: 'WF-411', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool with entity.computed reached a size where per-flush computed evaluation threatens the frame budget' }) },
     TEMPLATE_LOOKUP_MISS: { code: 'WF-412', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A named or typed template never resolved' }) },
     POOL_ARRAY_MISUSE: { code: 'WF-414', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Index-dependent array method or direct items mutation on pool storage' }) },
     POOL_ENTITY_KEY: { code: 'WF-415', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Pool entity key missing or duplicate' }) },
+    POOL_DECLARED_NO_CONTAINER: { code: 'WF-416', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A pool declared in a component\'s pools block has no data-pool container, so there is no handle for it' }) },
+    POOL_KEY_MISMATCH: { code: 'WF-417', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A pool\'s data-key attribute and the key in its pools block disagree; data-key is used' }) },
+    POOL_KEY_INVALID: { code: 'WF-418', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A pool\'s key in its pools block is not a non-empty string, so it is ignored' }) },
 
     // Binding errors (500-599)
     BINDING_EVAL_ERROR: { code: 'WF-501', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating binding expression' }) },
@@ -348,6 +352,7 @@ export const WF_ERRORS = {
     STORE_REENTRANT_WRITE: { code: 'WF-908', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store path written from inside its own change notification' }) },
     STORE_NEVER_REGISTERED: { code: 'WF-909', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A subscribed or watched store never registered' }) },
     STORE_WAIT_TIMEOUT: { code: 'WF-910', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Timed out waiting for a subscribed store to become ready' }) },
+    STORE_POOLS_NOT_PERSISTED: { code: 'WF-911', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A store with storageKey also declares pools; storageKey persists state only, so pool entities are not saved or restored' }) },
 
     // Query diagnostics: queries are stores with a source, so their codes
     // live in the store century, in their own block. 950-999 filled, so the
@@ -355,6 +360,7 @@ export const WF_ERRORS = {
     // (966 is not a query code; FACADE_IN_RAW sits inside the run.)
     QUERY_CONFIRM_NOT_INHERITED: { code: 'WF-940', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A query-level `confirmation` reaches update and create only, so this named operation discarded its response body and refetched the whole collection instead' }) },
     QUERY_ATTR_ON_TEMPLATE: { code: 'WF-941', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-query is on the <template> element itself; its content is inert light DOM, so nothing was bound' }) },
+    QUERY_UNKNOWN_KEY: { code: 'WF-942', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A query config key that queries do not read, so it was ignored' }) },
 
     QUERY_STORE_EXTERNAL_WRITE: { code: 'WF-950', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'External write to a query-owned store' }) },
     QUERY_DUPLICATE: { code: 'WF-951', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query name already registered; second registration ignored' }) },
@@ -408,8 +414,8 @@ export const WF_ERRORS = {
     QUERY_CONFIRMATION_THREW: { code: 'WF-998', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A confirmation: callback threw, so the write rejected and rolled back even though the server answered ok; confirmation receives the parsed response body, not the Response' }) },
     QUERY_WRITE_BODY_UNPARSED: { code: 'WF-999', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A write succeeded but its response body is not JSON, so there was nothing to apply and the query refetched; an empty body is normal and says nothing here' }) },
     // 950-999 is full. Queries claimed 940-949 and fill it UPWARD from the
-    // top of this block, so the next query code is WF-941 (940 is taken, and
-    // is declared up there in numeric order, not down here). See CODE
+    // top of this block, so the next query code is WF-943 (940-942 are taken,
+    // and are declared up there in numeric order, not down here). See CODE
     // ALLOCATION at the top of this
     // file before claiming another block: 911-939 is shared headroom that
     // stores also grow into.
@@ -450,6 +456,8 @@ export const QUERY_ENGINE_WRITE = { depth: 0 };
  * Sibling of the older '_subscribe_' marker in the same registry.
  */
 export const PENDING_BINDING = '_binding_';
+// Pending key for 'store:' watchers waiting on a store registered again.
+export const PENDING_STORE_WATCH = '_watch_';
 
 /**
  * Depth marker for "a computed is currently evaluating".
@@ -525,8 +533,13 @@ export function wfError(errorDef, options = {}) {
         }
         console.warn(`  ↳ Docs: ${errorDocUrl(errorDef.code)}`);
     } else {
-        // Production: compact error code + doc link
+        // Production: compact error code + doc link. A `cause` is the
+        // exception the framework caught from the author's own code (an
+        // init(), a store definition), and that reaches the console in every
+        // build: the framework's diagnostics are stripped, an app's own error
+        // is not.
         log(`[${errorDef.code}] ${errorDocUrl(errorDef.code)}`);
+        if (cause) log(cause);
     }
 }
 
@@ -592,6 +605,18 @@ export function warnDefinitionCollisions(kind, name, definition) {
     _warnedDefContracts.add(guard);
     const state = (definition.state && typeof definition.state === 'object') ? definition.state : null;
     const computed = (definition.computed && typeof definition.computed === 'object') ? definition.computed : null;
+    // An underscore name on `this` is a raw instance field: the context proxy
+    // routes it past state, so a declared state._x is never what this._x reads.
+    if (state) {
+        for (const key of Object.keys(state)) {
+            if (key.charCodeAt(0) !== 95) continue;
+            wfError(WF_ERRORS.STATE_UNDERSCORE_KEY, {
+                warn: true,
+                context: `${kind} '${name}': state.${key} is declared in state, but this.${key} reads a raw instance field (only this.state.${key} reaches the state value), so this.${key} starts undefined`,
+                suggestion: `Drop the underscore to make it ordinary state, or set this.${key} in init() for a non-reactive field.`
+            });
+        }
+    }
     for (const key of Object.keys(definition)) {
         if (typeof definition[key] !== 'function') continue;
         if (state && key in state) {

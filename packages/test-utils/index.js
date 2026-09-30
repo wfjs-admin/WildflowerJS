@@ -619,6 +619,29 @@ export function resetFramework() {
     wildflower._contextRegistry.dispose()
   }
 
+  // Destroy every live instance (components, stores, plugins) before
+  // forgetting it. Clearing the map alone left ticks and pools running on the
+  // frame loop into the next test, and effects and listeners attached.
+  // destroyComponent is public, so this also works on min builds; its quiet
+  // twin skips the dev-only "element still connected" warning.
+  if (wildflower.componentInstances) {
+    const destroyOne = wildflower._destroyComponentQuiet || wildflower.destroyComponent
+    if (typeof destroyOne === 'function') {
+      for (const id of [...wildflower.componentInstances.keys()]) {
+        try { destroyOne.call(wildflower, id) } catch { /* a throwing destroy hook */ }
+      }
+    }
+  }
+  // Belt and braces for dev builds (these names are mangled in min builds,
+  // where the destroy pass above has already emptied them).
+  if (Array.isArray(wildflower._tickableInstances)) wildflower._tickableInstances.length = 0
+  if (Array.isArray(wildflower._activePoolHandles)) wildflower._activePoolHandles.length = 0
+  if (wildflower._poolLoopRunning) {
+    wildflower._poolLoopRunning = false
+    if (wildflower._poolLoopId) cancelAnimationFrame(wildflower._poolLoopId)
+    wildflower._poolLoopId = null
+  }
+
   // Clear component definitions and instances
   if (wildflower.componentDefinitions) {
     wildflower.componentDefinitions.clear()
@@ -632,7 +655,13 @@ export function resetFramework() {
   // persistence state) leak across resets, and re-registering a query
   // name from a previous test hits the duplicate guard and resurrects
   // stale state instead of starting fresh.
+  // unregister() removes the backing store as well, through public API, so a
+  // query name can be registered again (the store registries are mangled in
+  // production builds and cannot be cleared from here).
   if (wildflower._queryControllers) {
+    for (const name of [...wildflower._queryControllers.keys()]) {
+      try { wildflower.unregister(name) } catch { /* mid-flight teardown */ }
+    }
     wildflower._queryControllers.forEach((c) => {
       try { wildflower._queryTeardown(c) } catch { /* mid-flight teardown */ }
     })
@@ -688,9 +717,22 @@ export function resetFramework() {
     wildflower._globalErrorHandlers.length = 0
   }
 
-  // Clear plugin registry (if it's a Map)
-  if (wildflower._plugins && typeof wildflower._plugins.clear === 'function') {
+  // Clear plugin registry, state and $name accessors, as wildflower.destroy()
+  // does. _plugins is an array (the old Map check never matched).
+  if (Array.isArray(wildflower._plugins)) {
+    wildflower._plugins.length = 0
+  } else if (wildflower._plugins && typeof wildflower._plugins.clear === 'function') {
     wildflower._plugins.clear()
+  }
+  if (wildflower._pluginsByName && typeof wildflower._pluginsByName.clear === 'function') {
+    wildflower._pluginsByName.clear()
+  }
+  if (wildflower._pluginStates && typeof wildflower._pluginStates.clear === 'function') {
+    wildflower._pluginStates.clear()
+  }
+  if (wildflower._pluginAccessorKeys) {
+    for (const key of wildflower._pluginAccessorKeys) delete wildflower[key]
+    wildflower._pluginAccessorKeys.clear()
   }
 
   // Clear entity dependents (if it's a Map)

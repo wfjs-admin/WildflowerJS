@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
 
 const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
@@ -35,26 +35,8 @@ describeIfPools('data-action in Pool Templates', () => {
   })
 
   beforeEach(() => {
+    resetFramework()
     wildflower = window.wildflower
-
-    if (wildflower.componentDefinitions) wildflower.componentDefinitions.clear()
-    if (wildflower.componentInstances) wildflower.componentInstances.clear()
-    if (wildflower.storeManager && wildflower.storeManager._namedStores) {
-      wildflower.storeManager._namedStores.clear()
-    }
-    if (wildflower._templateCache) {
-      if (wildflower._templateCache.general) wildflower._templateCache.general.clear()
-      if (wildflower._templateCache.lists) wildflower._templateCache.lists.clear()
-      if (wildflower._templateCache.compiled) wildflower._templateCache.compiled.clear()
-      if (wildflower._templateCache.extracted) wildflower._templateCache.extracted.clear()
-      if (wildflower._templateCache.fragmentPools) wildflower._templateCache.fragmentPools.clear()
-      if (wildflower._templateCache.stats) wildflower._templateCache.stats.clear()
-    }
-    if (wildflower._tickableInstances) wildflower._tickableInstances.length = 0
-
-    // Clean up context registry (may not exist in all builds)
-    if (wildflower._contextRegistry && typeof wildflower._contextRegistry.clear === 'function') wildflower._contextRegistry.clear()
-    if (wildflower._listRelationships && typeof wildflower._listRelationships.clear === 'function') wildflower._listRelationships.clear()
 
     testContainer = document.createElement('div')
     testContainer.id = 'test-container'
@@ -65,13 +47,6 @@ describeIfPools('data-action in Pool Templates', () => {
   })
 
   afterEach(() => {
-    // Stop pool loop
-    if (wildflower._poolLoopRunning) {
-      wildflower._poolLoopRunning = false
-      if (wildflower._poolLoopId) cancelAnimationFrame(wildflower._poolLoopId)
-    }
-    if (wildflower._activePoolHandles) wildflower._activePoolHandles.length = 0
-
     if (testContainer && testContainer.parentNode) {
       testContainer.parentNode.removeChild(testContainer)
     }
@@ -461,18 +436,8 @@ describeIfPools('pool.swap()', () => {
   })
 
   beforeEach(() => {
+    resetFramework()
     wildflower = window.wildflower
-    if (wildflower.componentDefinitions) wildflower.componentDefinitions.clear()
-    if (wildflower.componentInstances) wildflower.componentInstances.clear()
-    if (wildflower._templateCache) {
-      if (wildflower._templateCache.general) wildflower._templateCache.general.clear()
-      if (wildflower._templateCache.lists) wildflower._templateCache.lists.clear()
-      if (wildflower._templateCache.compiled) wildflower._templateCache.compiled.clear()
-      if (wildflower._templateCache.extracted) wildflower._templateCache.extracted.clear()
-      if (wildflower._templateCache.fragmentPools) wildflower._templateCache.fragmentPools.clear()
-      if (wildflower._templateCache.stats) wildflower._templateCache.stats.clear()
-    }
-    if (wildflower._tickableInstances) wildflower._tickableInstances.length = 0
 
     testContainer = document.createElement('div')
     testContainer.id = 'test-container'
@@ -483,11 +448,6 @@ describeIfPools('pool.swap()', () => {
   })
 
   afterEach(() => {
-    if (wildflower._poolLoopRunning) {
-      wildflower._poolLoopRunning = false
-      if (wildflower._poolLoopId) cancelAnimationFrame(wildflower._poolLoopId)
-    }
-    if (wildflower._activePoolHandles) wildflower._activePoolHandles.length = 0
     if (testContainer && testContainer.parentNode) {
       testContainer.parentNode.removeChild(testContainer)
     }

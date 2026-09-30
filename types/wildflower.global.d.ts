@@ -137,6 +137,12 @@ declare namespace WF {
         readonly length: number;
         /** Alias of length. */
         readonly size: number;
+        /**
+         * Goes up whenever the pool changes through its API. Compare it with a
+         * value you kept to learn whether the pool changed. An in-place change
+         * counts once markDirty() or update() reports it. Not a reactive source.
+         */
+        readonly version: number;
         props: Record<string, any>;
         onChange: ((pool: PoolHandle<T>) => void) | null;
         [Symbol.iterator](): Iterator<T>;
@@ -473,7 +479,30 @@ declare namespace WF {
 
     // ── The global ───────────────────────────────────────────────────────
 
+    /** The framework file's tier (wildflower.tier). */
+    type Tier = 'nano' | 'mini' | 'mini-pool' | 'lite' | 'core' | 'spa' | 'full';
+
+    /** The capabilities that differ between tiers (wildflower.features). */
+    interface Features {
+        lists: boolean;
+        /** Pools, and the frame loop that runs every tick() */
+        pools: boolean;
+        plugins: boolean;
+        portals: boolean;
+        transitions: boolean;
+        router: boolean;
+        query: boolean;
+        ssr: boolean;
+    }
+
     interface Api {
+        /** The framework's version, such as '1.5.4' */
+        readonly version: string;
+        /** The tier this file was built as */
+        readonly tier: Tier;
+        /** What this build can do; extensions read it to check their requirements. Frozen. */
+        readonly features: Readonly<Features>;
+
         /**
          * Register a component. `this` inside every method is the component:
          * state fields, computed values, methods, `pools`, `stores`, `$el`.

@@ -1,6 +1,6 @@
 {
   "name": "wildflowerjs",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "Lightweight reactive JavaScript framework with no build step and no virtual DOM",
   "type": "module",
   "main": "dist/wildflower.min.js",

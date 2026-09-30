@@ -512,11 +512,12 @@ export const RenderingCoreMethods = {
         //FOCUS PRESERVATION - Capture active element state before rendering
         const activeElement = document.activeElement;
         let activeInfo = null;
+        const activeModelPath = __FEATURE_LISTS__ && activeElement &&
+            (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA' || activeElement.tagName === 'SELECT')
+            ? this._getAttr(activeElement, 'model') : null;
 
         // Check if the active element is an input in a list item
-        if (__FEATURE_LISTS__ && activeElement &&
-            (activeElement.tagName === 'INPUT' || activeElement.tagName === 'TEXTAREA' || activeElement.tagName === 'SELECT') &&
-            activeElement.dataset.model)
+        if (activeModelPath)
         {
 
             const listItemElement = this._findListItemAncestor(activeElement);
@@ -526,7 +527,8 @@ export const RenderingCoreMethods = {
                 if (listElement)
                 {
                     activeInfo = {
-                        modelPath: activeElement.dataset.model,
+                        modelPath: activeModelPath,
+                        listPath: this._getAttr(listElement, 'list'),
                         itemIndex: listItemElement._listIndex,
                         listElement: listElement,
                         componentId: this._getComponentId(listElement),
@@ -621,7 +623,7 @@ export const RenderingCoreMethods = {
                     // Find the specific list element and only search its direct children
                     const listElement = activeInfo.listElement.isConnected
                         ? activeInfo.listElement
-                        : componentElement.querySelector(`[data-list="${activeInfo.listElement.dataset.list}"]`);
+                        : componentElement.querySelector(this._attrSelector('list', activeInfo.listPath));
 
                     if (!listElement) return;
 
@@ -634,7 +636,7 @@ export const RenderingCoreMethods = {
                         if (item._listIndex === activeInfo.itemIndex)
                         {
                             // Find the input with matching model path
-                            const input = item.querySelector(`[data-model="${activeInfo.modelPath}"]`);
+                            const input = item.querySelector(this._attrSelector('model', activeInfo.modelPath));
                             if (input)
                             {
                                 // Restore focus
@@ -1007,9 +1009,9 @@ export const RenderingCoreMethods = {
             componentInstance: instance,
             _isModelBinding: true,
             modelModifiers: {
-                trim: element.hasAttribute('data-model-trim'),
-                number: element.hasAttribute('data-model-number'),
-                lazy: element.hasAttribute('data-model-lazy'),
+                trim: this._hasAttr(element, 'model-trim'),
+                number: this._hasAttr(element, 'model-number'),
+                lazy: this._hasAttr(element, 'model-lazy'),
                 event: (inputType === 'checkbox' || inputType === 'radio') ? 'change' : 'input'
             },
             elementMeta: {
@@ -1027,12 +1029,12 @@ export const RenderingCoreMethods = {
         const {element} = instance;
 
         // Find all slot containers
-        element.querySelectorAll('[data-slot-container]').forEach(container =>
+        element.querySelectorAll(this._attrSelector('slot-container')).forEach(container =>
         {
-            const slotName = container.dataset.slotContainer;
+            const slotName = this._getAttr(container, 'slot-container');
 
             // Find matching slot content
-            const slotContent = element.querySelector(`[data-slot="${slotName}"]`);
+            const slotContent = element.querySelector(this._attrSelector('slot', slotName));
             if (slotContent)
             {
                 // Clear container and append slot content
@@ -1103,7 +1105,7 @@ export const RenderingCoreMethods = {
         // Only exclude elements INSIDE a list: the list root itself owns its own bindings
         // (bind-style, bind-class, bind-attr on the container are authored by the component,
         // not by the list renderer, which only manages children).
-        const ancestorList = el.parentElement?.closest('[data-list]');
+        const ancestorList = el.parentElement?.closest(this._attrSelector('list'));
         if (ancestorList && ancestorList !== componentElement && componentElement.contains(ancestorList)) return false;
         const closestComponent = this._getComponentElement(el);
         if (closestComponent === componentElement) return true;
@@ -1266,7 +1268,7 @@ export const RenderingCoreMethods = {
 
         // Skip cleanup for SSR-adopted lists - they have special lifecycle management
         if (__FEATURE_SSR__) {
-            const listParent = rootElement.closest('[data-list]');
+            const listParent = rootElement.closest(this._attrSelector('list'));
             if (listParent && ssrAdoptedElements.has(listParent)) return;
         }
 
@@ -1274,7 +1276,8 @@ export const RenderingCoreMethods = {
         // This is a fast path for list items that never had interactions
         if (!rootElement._needsContexts && !rootElement._listContext && !rootElement._bindingContextId) {
             // Still need to clean up _listContext on descendants, but skip expensive context search
-            const descendants = rootElement.querySelectorAll('[data-list]');
+            // Per removed row: the selector is cached (_attrSelector), not built
+            const descendants = rootElement.querySelectorAll(this._attrSelector('list'));
             for (const el of descendants) {
                 if (el._listContext) delete el._listContext;
             }
@@ -1560,14 +1563,14 @@ export const RenderingCoreMethods = {
 
                 let parent = el.parentElement;
                 while (parent && parent !== componentElement) {
-                    if (parent.hasAttribute('data-component') || parent.hasAttribute('data-wf-component')) return false;
+                    if (this._hasAttr(parent, 'component')) return false;
                     parent = parent.parentElement;
                 }
                 return true;
             };
 
             // Validate data-render bindings
-            const renderElements = componentElement.querySelectorAll('[data-render],[data-wf-render]');
+            const renderElements = componentElement.querySelectorAll(this._attrSelector('render'));
             renderElements.forEach(el => {
                 if (!isOwnedByThisComponent(el)) return;
                 const path = this._getAttr(el, 'render');
@@ -1577,7 +1580,7 @@ export const RenderingCoreMethods = {
             });
 
             // Validate data-bind-class expressions
-            const classBindingElements = componentElement.querySelectorAll('[data-bind-class],[data-wf-bind-class]');
+            const classBindingElements = componentElement.querySelectorAll(this._attrSelector('bind-class'));
             classBindingElements.forEach(el => {
                 if (!isOwnedByThisComponent(el)) return;
                 if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
@@ -1588,7 +1591,7 @@ export const RenderingCoreMethods = {
             });
 
             // Validate data-bind-style expressions
-            const styleBindingElements = componentElement.querySelectorAll('[data-bind-style],[data-wf-bind-style]');
+            const styleBindingElements = componentElement.querySelectorAll(this._attrSelector('bind-style'));
             styleBindingElements.forEach(el => {
                 if (!isOwnedByThisComponent(el)) return;
                 if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
@@ -1599,7 +1602,7 @@ export const RenderingCoreMethods = {
             });
 
             // Validate data-action method references
-            const actionElements = componentElement.querySelectorAll('[data-action],[data-wf-action]');
+            const actionElements = componentElement.querySelectorAll(this._attrSelector('action'));
             actionElements.forEach(el => {
                 if (!isOwnedByThisComponent(el)) return;
                 const actionAttr = this._getAttr(el, 'action');
@@ -2090,6 +2093,13 @@ export const RenderingCoreMethods = {
             return true;
         }
 
+        // An emptied number field: a type="number" input bound with data-model
+        // writes '' (kept so validation can see the field is empty), which is
+        // a legitimate value for a number property, not a mismatch.
+        if (expectedType === 'number' && value === '') {
+            return true;
+        }
+
         // Get actual type of the new value
         const actualType = this._inferTypeFromValue(value);
 
@@ -2190,6 +2200,9 @@ export const RenderingCoreMethods = {
         const element = instance.element;
 
         // Helper to check if element belongs to this component (not nested)
+        // Component boundaries honour the prefix mode: in exclusive mode a
+        // third party's bare data-component is not a boundary.
+        const componentSel = this._attrSelector('component');
         const belongsToComponent = (el) => {
             if (listBoundElements.has(el)) return false; // Skip list-bound elements
             if (el.closest('[data-use-template-rendered]')) return false; // Skip slot template bindings
@@ -2214,7 +2227,7 @@ export const RenderingCoreMethods = {
             // whole meta on rescan. Only rows of a list THIS
             // component owns are row-owned from its point of view.
             if (listAncestor && listAncestor !== el
-                && listAncestor.closest('[data-component], [data-wf-component]') === element) return false;
+                && listAncestor.closest(componentSel) === element) return false;
             // Pool interiors are row-owned in the same way. At init the pool is
             // empty, so this rescan is the only pass that ever sees rendered
             // rows. Collecting one makes the component effect evaluate the row's
@@ -2228,14 +2241,14 @@ export const RenderingCoreMethods = {
             // its own meta.
             const poolAncestor = el.closest(this._attrSelector('pool'));
             if (poolAncestor && poolAncestor !== el
-                && poolAncestor.closest('[data-component], [data-wf-component]') === element) return false;
+                && poolAncestor.closest(componentSel) === element) return false;
             // Use data-component (not data-component-id) to detect component boundaries.
             // Nested components may not have data-component-id yet during init batches.
-            const closestComp = el.closest('[data-component], [data-wf-component]');
+            const closestComp = el.closest(componentSel);
             if (closestComp === element) return true;
             // Parent claims bindings on direct child component root elements
             if (closestComp && closestComp === el && element.contains(el)) {
-                const parentComp = el.parentElement?.closest('[data-component], [data-wf-component]');
+                const parentComp = el.parentElement?.closest(componentSel);
                 return parentComp === element;
             }
             return false;
@@ -2688,7 +2701,7 @@ export const RenderingCoreMethods = {
         const el = meta.element;
         const shouldShow = meta.negate ? !value : Boolean(value);
 
-        if (__FEATURE_TRANSITIONS__ && el.dataset && el.dataset.transition) {
+        if (__FEATURE_TRANSITIONS__ && el.getAttribute && this._getAttr(el, 'transition')) {
             // Delegate to existing TransitionSystem with a minimal show-mode context
             if (this._handleTransitionedVisibilityChange) {
                 const showContext = {
@@ -2723,7 +2736,7 @@ export const RenderingCoreMethods = {
 
         if (__FEATURE_TRANSITIONS__) {
             const el = ctx.element || ctx.templateClone;
-            if (this._handleTransitionedVisibilityChange && el && el.dataset && el.dataset.transition) {
+            if (this._handleTransitionedVisibilityChange && el && el.getAttribute && this._getAttr(el, 'transition')) {
                 this._handleTransitionedVisibilityChange(el, ctx, shouldRender, instance);
                 return;
             }

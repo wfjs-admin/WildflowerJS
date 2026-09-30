@@ -144,13 +144,13 @@ export const FormHandlingMethods = {
         let value = element.value;
 
         // Apply trim modifier first (if present)
-        if (modifiers ? modifiers.trim : element.hasAttribute('data-model-trim')) {
+        if (modifiers ? modifiers.trim : this._hasAttr(element, 'model-trim')) {
             value = value.trim();
         }
 
         // Apply number modifier (if present)
         // Follows Vue's .number behavior: parse if valid, else return original
-        if (modifiers ? modifiers.number : element.hasAttribute('data-model-number')) {
+        if (modifiers ? modifiers.number : this._hasAttr(element, 'model-number')) {
             if (value === '') return '';  // Preserve empty for validation
             const parsed = parseFloat(value);
             return isNaN(parsed) ? value : parsed;  // Return original if invalid
@@ -285,7 +285,7 @@ export const FormHandlingMethods = {
         this._syncFormToState(e.target, instance);
 
         // Check if the form has validation and run it
-        if (e.target.hasAttribute('data-validate-on'))
+        if (this._hasAttr(e.target, 'validate-on'))
         {
             const triggers = this._getValidationTriggers(e.target);
             if (triggers.has('submit'))
@@ -313,7 +313,7 @@ export const FormHandlingMethods = {
         }
 
         // Check if the form has a data-action attribute
-        const actionAttr = this._getAttr(e.target, 'action') || e.target.dataset.action;
+        const actionAttr = this._getAttr(e.target, 'action');
         if (actionAttr)
         {
             // Parse the action to extract method name (handles "submit:methodName" prefix)
@@ -341,7 +341,7 @@ export const FormHandlingMethods = {
     {
         // Only process elements with data-model attribute
         // Guard against non-element targets (text nodes, document, etc.)
-        if (!e.target || !e.target.dataset || !(e.target.dataset.model || e.target.dataset.wfModel)) return;
+        if (!e.target || !e.target.getAttribute || !this._getAttr(e.target, 'model')) return;
 
         // Skip all custom elements; they are handled by element-level listeners
         // set up in _bindWebComponentModel (via registered adapter or smart default)
@@ -371,7 +371,7 @@ export const FormHandlingMethods = {
         const mods = _modelRec?.modelModifiers;
 
         // Handle lazy mode: skip 'input' events, only process 'change' and 'blur'
-        const isLazy = mods ? mods.lazy : e.target.hasAttribute('data-model-lazy');
+        const isLazy = mods ? mods.lazy : this._hasAttr(e.target, 'model-lazy');
         if (isLazy) {
             // Only process change/blur events in lazy mode
             if (e.type === 'input') {
@@ -415,9 +415,9 @@ export const FormHandlingMethods = {
                     if (instance)
                     {
                         // Get required paths
-                        const listPath = listElement.dataset.list;
+                        const listPath = this._getAttr(listElement, 'list');
                         const itemIndex = listItem._listIndex;
-                        const propertyPath = e.target.dataset.model || e.target.dataset.wfModel;
+                        const propertyPath = this._getAttr(e.target, 'model');
 
                         // Skip direct list update for computed/store-backed lists
                         // (no data in instance.state[listPath])
@@ -542,7 +542,7 @@ export const FormHandlingMethods = {
         inputElements.forEach(input =>
         {
             // Only process elements with data-model attribute
-            const modelPath = input.dataset.model;
+            const modelPath = this._getAttr(input, 'model');
             if (!modelPath) return;
 
             // Determine the context of this input using DOM structure
@@ -553,7 +553,7 @@ export const FormHandlingMethods = {
                 const listElement = this._findDirectParentList(listItem);
                 if (listElement)
                 {
-                    const listPath = listElement.dataset.list;
+                    const listPath = this._getAttr(listElement, 'list');
                     const itemIndex = listItem._listIndex;
 
                     // Get value based on input type
@@ -596,11 +596,11 @@ export const FormHandlingMethods = {
      * @private
      */
     _buildNestedListPath(listElement, listItem) {
-        const listPath = listElement.dataset.list;
+        const listPath = this._getAttr(listElement, 'list');
         const itemIndex = listItem._listIndex;
 
         // Check for parent list context
-        const parentListElement = listElement.parentElement?.closest('[data-list],[data-wf-list]');
+        const parentListElement = listElement.parentElement?.closest(this._attrSelector('list'));
         if (!parentListElement) {
             // Not nested - return simple path
             return { fullPath: listPath, itemIndex };
@@ -628,7 +628,7 @@ export const FormHandlingMethods = {
      */
     _syncInputToState(input, instance)
     {
-        const modelPath = input.dataset.model || input.dataset.wfModel;
+        const modelPath = this._getAttr(input, 'model');
         if (!modelPath) return;
 
         // Get appropriate value based on input type
@@ -825,7 +825,7 @@ export const FormHandlingMethods = {
                 }
                 continue;
             }
-            const ruleErrorEl = formElement.querySelector(`[data-error-for="${CSS.escape(rule.name)}"]`);
+            const ruleErrorEl = formElement.querySelector(this._attrSelector('error-for', CSS.escape(rule.name)));
             if (inForce && !holds)
             {
                 anyFailed = true;
@@ -839,13 +839,13 @@ export const FormHandlingMethods = {
                 for (const field of rule.fields)
                 {
                     if (validationErrors) validationErrors[field] = rule.message;
-                    const input = formElement.querySelector(`[data-model="${CSS.escape(field)}"], [data-wf-model="${CSS.escape(field)}"]`);
+                    const input = formElement.querySelector(this._attrSelector('model', CSS.escape(field)));
                     if (input && !input.classList.contains('invalid'))
                     {
                         input.classList.add('invalid');
                         if (elementsToUpdate) elementsToUpdate.push(input);
                     }
-                    const fieldErrorEl = formElement.querySelector(`[data-error-for="${CSS.escape(field)}"]`);
+                    const fieldErrorEl = formElement.querySelector(this._attrSelector('error-for', CSS.escape(field)));
                     if (fieldErrorEl && fieldErrorEl.textContent !== rule.message)
                     {
                         fieldErrorEl.textContent = rule.message;
@@ -868,11 +868,11 @@ export const FormHandlingMethods = {
                 // run (blur path touches only the blurred input).
                 for (const field of rule.fields)
                 {
-                    const input = formElement.querySelector(`[data-model="${CSS.escape(field)}"], [data-wf-model="${CSS.escape(field)}"]`);
+                    const input = formElement.querySelector(this._attrSelector('model', CSS.escape(field)));
                     if (input && input.classList.contains('invalid') && input.validity && input.validity.valid && !this._validateInput(input))
                     {
                         input.classList.remove('invalid');
-                        const fieldErrorEl = formElement.querySelector(`[data-error-for="${CSS.escape(field)}"]`);
+                        const fieldErrorEl = formElement.querySelector(this._attrSelector('error-for', CSS.escape(field)));
                         if (fieldErrorEl && fieldErrorEl.textContent)
                         {
                             fieldErrorEl.textContent = '';
@@ -891,7 +891,7 @@ export const FormHandlingMethods = {
         if (!formElement || !instance) return true;
 
         // Check if validation is enabled for this form
-        if (!formElement.hasAttribute('data-validate-on')) return true;
+        if (!this._hasAttr(formElement, 'validate-on')) return true;
 
         // Track validation errors
         let hasErrors = false;
@@ -920,7 +920,7 @@ export const FormHandlingMethods = {
                 }
 
                 // Update error message element if it exists
-                const errorElement = formElement.querySelector(`[data-error-for="${modelPath}"]`);
+                const errorElement = formElement.querySelector(this._attrSelector('error-for', CSS.escape(modelPath)));
                 if (errorElement)
                 {
                     if (errorElement.textContent !== error)
@@ -940,7 +940,7 @@ export const FormHandlingMethods = {
                 }
 
                 // Clear error message
-                const errorElement = formElement.querySelector(`[data-error-for="${modelPath}"]`);
+                const errorElement = formElement.querySelector(this._attrSelector('error-for', CSS.escape(modelPath)));
                 if (errorElement && errorElement.textContent)
                 {
                     errorElement.textContent = '';
@@ -1008,8 +1008,8 @@ export const FormHandlingMethods = {
         let v = validationCache.get(input);
         if (!v) {
             v = {
-                customValidate: input.dataset.validate || null,
-                customMessage: input.dataset.validateMessage || null
+                customValidate: this._getAttr(input, 'validate') || null,
+                customMessage: this._getAttr(input, 'validate-message') || null
             };
             validationCache.set(input, v);
         }
@@ -1061,7 +1061,7 @@ export const FormHandlingMethods = {
      * @private
      */
     _getValidationTriggers(formElement) {
-        const validateOn = formElement.getAttribute('data-validate-on');
+        const validateOn = this._getAttr(formElement, 'validate-on');
         if (validateOn) {
             return new Set(validateOn.split(',').map(s => s.trim().toLowerCase()));
         }
@@ -1078,10 +1078,12 @@ export const FormHandlingMethods = {
      */
     _handleValidationBlur(e) {
         const input = e.target;
-        if (!input || !input.dataset || !(input.dataset.model || input.dataset.wfModel)) return;
+        if (!input || !input.getAttribute) return;
+        const modelPath = this._getAttr(input, 'model');
+        if (!modelPath) return;
 
-        const form = input.closest('form[data-validate-on]');
-        if (!form) return;
+        const form = input.closest('form');
+        if (!form || !this._hasAttr(form, 'validate-on')) return;
 
         // Change events always validate (selects, checkboxes, radios are complete actions).
         // Focusout events only validate when "blur" is in the trigger list.
@@ -1090,8 +1092,7 @@ export const FormHandlingMethods = {
             if (!triggers.has('blur')) return;
         }
 
-        const modelPath = input.dataset.model || input.dataset.wfModel;
-        const errorEl = form.querySelector(`[data-error-for="${modelPath}"]`);
+        const errorEl = form.querySelector(this._attrSelector('error-for', CSS.escape(modelPath)));
 
         if (errorEl) {
             const error = this._validateInput(input);
@@ -1179,7 +1180,7 @@ export const FormHandlingMethods = {
         // Event resolution: data-model-event > adapter.event > native input+change
         // Smart default (event: null) listens for both input and change,
         // covering text inputs (input event) and selects/booleans (change event).
-        const eventOverride = element.getAttribute('data-model-event');
+        const eventOverride = this._getAttr(element, 'model-event');
         let events;
         if (eventOverride) {
             events = [eventOverride];
@@ -1308,7 +1309,7 @@ export const FormHandlingMethods = {
 
             if (!actionAttr) return;
 
-            const closestList = form.closest('[data-list],[data-wf-list]');
+            const closestList = form.closest(this._attrSelector('list'));
 
             // Only handle submits for THIS list instance
             if (closestList !== listElement) return;

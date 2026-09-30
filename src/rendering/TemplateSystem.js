@@ -313,11 +313,13 @@ export const TemplateSystemMethods = {
         // 3. _templateCache.compiled (Map) - compiled binding metadata
         // NOTE: We must also search descendant components since templates can be referenced
         // from child components via @syntax or ancestor traversal.
-        const listsWithConfigurableTemplates = element.querySelectorAll('[data-list]');
+        const listsWithConfigurableTemplates = element.querySelectorAll(this._attrSelector('list'));
+        // ':scope > template' prefixed onto each alternative of the selector
+        const useTemplateChildSel = this._attrSelector('use-template').split(',').map(s => ':scope > template' + s).join(',');
         for (const listContainer of listsWithConfigurableTemplates) {
             // Check if this list uses configurable templates
             // Method 1: Template element still exists in DOM
-            const useTemplateEl = listContainer.querySelector(':scope > template[data-use-template]');
+            const useTemplateEl = listContainer.querySelector(useTemplateChildSel);
 
             // Method 2: Template was consumed (mapArray mode) but rendered items have the marker
             // Check for data-wf-used-template on any child element (indicates configurable template usage)
@@ -334,7 +336,7 @@ export const TemplateSystemMethods = {
 
                 // Clear _templateCache.lists and .compiled
                 // Find the component that owns this list to determine the cache key
-                const listComponentEl = listContainer.closest('[data-component]');
+                const listComponentEl = listContainer.closest(this._attrSelector('component'));
                 const listComponentId = listComponentEl?.dataset.componentId;
                 const listComponentInstance = listComponentId ? this.componentInstances.get(listComponentId) : null;
                 const listPath = this._getAttr(listContainer, 'list');
@@ -384,9 +386,12 @@ export const TemplateSystemMethods = {
         const element = instance.element;
 
         // Find all data-use-template elements with data-with attribute
-        // Support both standard and wf-prefixed attributes
-        const slotTemplates = element.querySelectorAll(
-            `${this._attrSelector('use-template')}[data-with], ${this._attrSelector('use-template')}[data-wf-with]`
+        // (either prefix; data-wf- only in exclusive mode). Filtered rather
+        // than combined into one selector: appending [data-with] to a
+        // comma-list selector would qualify only its last alternative.
+        const slotTemplates = Array.prototype.filter.call(
+            element.querySelectorAll(this._attrSelector('use-template')),
+            (el) => this._hasAttr(el, 'with')
         );
 
         if (slotTemplates.length === 0) return;
@@ -401,7 +406,7 @@ export const TemplateSystemMethods = {
             // Skip if inside a data-list (lists handle their own template binding)
             const parentList = templateEl.closest(this._attrSelector('list'));
             if (parentList && element.contains(parentList)) {
-                const withValue = templateEl.dataset.with || templateEl.dataset.wfWith;
+                const withValue = this._getAttr(templateEl, 'with');
                 if (__DEV__) console.warn(
                     `[WildflowerJS] data-with="${withValue}" is ignored inside data-list. ` +
                     `List templates automatically bind to each item.`
@@ -432,7 +437,7 @@ export const TemplateSystemMethods = {
     _initializeSlotTemplate(instance, templateEl) {
         const templateName = this._getAttr(templateEl, 'use-template');
         // Get data-with attribute (supporting both data-with and data-wf-with)
-        const dataWithPath = templateEl.dataset.with || templateEl.dataset.wfWith;
+        const dataWithPath = this._getAttr(templateEl, 'with');
 
         if (!templateName || !dataWithPath) return;
 
@@ -617,7 +622,7 @@ export const TemplateSystemMethods = {
         } else if (__DEV__) {
             // Read-binding attrs on the slot root itself OR any descendant. The root
             // check matters for single-element slots (e.g. <td data-bind="name">).
-            const READ_SEL = '[data-bind],[data-wf-bind],[data-bind-class],[data-wf-bind-class],[data-bind-style],[data-wf-bind-style],[data-show],[data-wf-show]';
+            const READ_SEL = ['bind', 'bind-class', 'bind-style', 'show'].map((b) => this._attrSelector(b)).join(',');
             const hasReadBinding = (element.matches && element.matches(READ_SEL)) ||
                                    (element.querySelector && element.querySelector(READ_SEL));
             if (hasReadBinding) {
@@ -1039,7 +1044,7 @@ export const TemplateSystemMethods = {
             queryRoot.querySelector(this._attrSelector('component')) !== null;
 
         // Check for portals - used to skip portal processing if template has none
-        const hasPortals = queryRoot.querySelector('[data-portal]') !== null;
+        const hasPortals = queryRoot.querySelector(this._attrSelector('portal')) !== null;
 
         // Check for custom elements (web components) - disables innerHTML fast path
         // Custom elements need property assignment (el.value = x), not innerHTML text content
@@ -1509,7 +1514,7 @@ export const TemplateSystemMethods = {
             // If the template root IS a component, we must not use innerHTML optimization
             // because the component needs to manage its own internal bindings
             hasExcludedFeatures =
-                queryRoot.querySelector('[data-portal]') !== null ||
+                queryRoot.querySelector(this._attrSelector('portal')) !== null ||
                 queryRoot.querySelector(this._attrSelector('component')) !== null ||
                 this._hasAttr(queryRoot, 'component');  // Check queryRoot itself
         }
@@ -1517,8 +1522,8 @@ export const TemplateSystemMethods = {
         // Check the template element itself (not its content)
         if (canUseInnerHTML && template && template.hasAttribute) {
             hasExcludedFeatures = hasExcludedFeatures ||
-                template.hasAttribute('data-use-template') ||
-                template.hasAttribute('data-item-template');
+                this._hasAttr(template, 'use-template') ||
+                this._hasAttr(template, 'item-template');
         }
 
         // CRITICAL: Configurable templates MUST NOT use innerHTML optimization

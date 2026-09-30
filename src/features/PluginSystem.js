@@ -7,18 +7,56 @@
  */
 
 import { createStateManager } from '../state/createStateManager.js';
-import { createContextProxy, patchSelfReferences, warnCollisions, RAW_TARGET } from '../state/ContextProxy.js';
-import { pathResolver, validateEntityDefinition, warnDefinitionCollisions, wfError, WF_ERRORS } from '../core/wfUtils.js';
+import { createContextProxy, patchSelfReferences, warnCollisions } from '../state/ContextProxy.js';
+import { validateEntityDefinition, warnDefinitionCollisions, wfError, WF_ERRORS } from '../core/wfUtils.js';
 
 // Non-function definition keys the plugin factory actually consumes
 // (validateEntityDefinition allowlist — note plugins DO have a 'methods'
 // block, unlike components/stores).
-const PLUGIN_CONTRACT_KEYS = ['name', 'version', 'install', 'uses', 'methods', 'state', 'computed', 'watch'];
+const PLUGIN_CONTRACT_KEYS = ['name', 'version', 'install', 'uses', 'methods', 'state', 'computed', 'watch', 'pools'];
 
 // Metadata keys that are plugin machinery, never candidate top-level methods.
 // Used to detect a plugin whose functions were declared bare (same shape as
 // components/stores) rather than nested under `methods:`.
 const PLUGIN_NON_METHOD_KEYS = new Set(['name', 'version', 'install', 'setup', 'uses', 'state', 'computed', 'watch', 'tick']);
+
+// Cancel a plugin instance's 'store:' watch subscriptions. A replaced or
+// failed instance is never destroyed, so without this its handlers would
+// keep firing on every change to the watched store.
+function stopStoreWatchers(inst) {
+    const cleanups = inst && inst._storeWatcherCleanups;
+    if (!cleanups) return;
+    for (const unsubscribe of cleanups) {
+        try { if (typeof unsubscribe === 'function') unsubscribe(); } catch (e) { /* already gone */ }
+    }
+    inst._storeWatcherCleanups = [];
+}
+
+// Tear down a plugin that is being replaced under the same name, whichever
+// path (reactive or lightweight) the new definition takes: stop its tick and
+// pools and its store: watchers, dispose its state manager, and drop its
+// registry entries. Its own beforeDestroy() and destroy() run first, while
+// its state is still there to read.
+function retirePlugin(fw, name) {
+    const entityKey = `plugin:${name}`;
+    const previous = fw.componentInstances.get(entityKey);
+    if (previous) {
+        fw._callBeforeDestroyHook(previous);
+        if (typeof previous.context.destroy === 'function') {
+            try { previous.context.destroy(); } catch (error) {
+                fw._handleError(`Error in ${previous.name}.destroy`, error, previous, { lifecycle: 'destroy' });
+            }
+        }
+        if (fw._cleanupPools) fw._cleanupPools(previous);
+        stopStoreWatchers(previous);
+        if (previous.stateManager && previous.stateManager.destroy) previous.stateManager.destroy();
+        fw.componentInstances.delete(entityKey);
+    }
+    fw._pluginStates.delete(name);
+    const info = fw._pluginsByName.get(name);
+    const idx = info ? fw._plugins.indexOf(info) : -1;
+    if (idx !== -1) fw._plugins.splice(idx, 1);
+}
 
 /**
  * True if the metadata has at least one function-valued key that isn't
@@ -99,6 +137,10 @@ export const PluginSystemMethods = {
                 options
             };
 
+            if (metadata?.name != null && this._pluginsByName.has(metadata.name)) {
+                retirePlugin(this, metadata.name);
+            }
+
             this._plugins.push(pluginInfo);
 
             if (metadata?.name !== undefined && metadata?.name !== null) {
@@ -115,7 +157,7 @@ export const PluginSystemMethods = {
                     });
                 }
 
-                if (metadata.state || metadata.methods || metadata.computed || typeof metadata.tick === 'function' || hasTopLevelPluginMethods(metadata)) {
+                if (metadata.state || metadata.methods || metadata.computed || metadata.pools || metadata.watch || typeof metadata.tick === 'function' || hasTopLevelPluginMethods(metadata)) {
                     this._setupPluginState(metadata.name, metadata);
                 } else if (__DEV__ && typeof metadata.install !== 'function') {
                     // install() has already run above, so an install-only plugin
@@ -138,10 +180,12 @@ export const PluginSystemMethods = {
     _setupPluginState(name, metadata)
     {
         const framework = this;
-        // tick registers only on the reactive path, so a tick with no state
-        // takes it with empty state rather than the lightweight path.
+        // tick, pools, watch and the destroy hooks are set up only on the
+        // reactive path, so a plugin with any of them and no state takes it
+        // with empty state rather than the lightweight path.
         const initialState = metadata.state ? { ...metadata.state }
-            : (typeof metadata.tick === 'function' ? {} : null);
+            : ((typeof metadata.tick === 'function' || metadata.pools || metadata.watch ||
+                typeof metadata.destroy === 'function' || typeof metadata.beforeDestroy === 'function') ? {} : null);
 
         // If plugin has state, use ReactiveStateManager for full reactivity
         if (initialState) {
@@ -198,22 +242,15 @@ export const PluginSystemMethods = {
         let context;
 
         // Create ReactiveStateManager for this plugin
-        // Note: We disable microtask batching for plugins to ensure synchronous
-        // watch/subscribe callbacks, which is the expected behavior for plugin APIs
         const stateManager = createStateManager({
             onStateChange: (path, newValue, oldValue) => {
-                // Plugin-specific: Call watch handlers if defined
-                const raw = context ? context[RAW_TARGET] : null;
-                if (raw && raw._watchHandlers) {
-                    this._notifyPluginWatchers(raw, path, newValue, oldValue);
-                }
-
-                // Use unified entity state change handler
+                // Use unified entity state change handler (it also runs the
+                // plugin's watch: {}, as it does a component's and a store's)
                 // This handles marking dependent components and scheduling render
                 framework._handleEntityStateChange(entityKey, path, newValue, oldValue);
             },
             wf: framework,
-            component: { id: pluginId, name: `plugin:${name}`, disableMicrotaskBatching: true }
+            component: { id: pluginId, name: `plugin:${name}` }
         });
 
         // Create reactive state
@@ -229,7 +266,6 @@ export const PluginSystemMethods = {
 
         // Add plugin-specific properties onto the raw context
         rawContext._initialState = initialState;
-        rawContext._watchHandlers = null;
 
         // Use unified subscription API
         rawContext.subscribe = (path, callback, options = {}) => {
@@ -252,6 +288,10 @@ export const PluginSystemMethods = {
                     : value;
             });
 
+            // Pools empty too, as a store's reset() empties its pools.
+            const pools = context.pools;
+            if (pools) for (const poolName in pools) pools[poolName].clear();
+
             return context;
         };
 
@@ -262,7 +302,7 @@ export const PluginSystemMethods = {
         // Wrap with ContextProxy for shorthand access (this.count → this.state.count)
         context = createContextProxy(rawContext, stateManager);
         patchSelfReferences(rawContext, context, stateManager);
-        if (__DEV__) warnCollisions(stateManager, `plugin:${name}`);
+        if (__DEV__) warnCollisions(stateManager, `plugin:${name}`, metadata.computed);
         if (__DEV__) validateEntityDefinition('Plugin', name, metadata, PLUGIN_CONTRACT_KEYS);
         if (__DEV__) warnDefinitionCollisions('Plugin', name, metadata);
 
@@ -285,19 +325,19 @@ export const PluginSystemMethods = {
         if (metadata.computed) {
             const boundComputedProps = {};
             Object.entries(metadata.computed).forEach(([propName, fn]) => {
+                // Reported (onError handlers, else the console, in every
+                // build) and re-thrown, as a store computed is.
                 boundComputedProps[propName] = function() {
-                    return fn.call(context);
+                    try {
+                        return fn.call(context);
+                    } catch (error) {
+                        framework._handleError(`Error in plugin '${name}' computed '${propName}'`, error,
+                            framework.componentInstances.get(`plugin:${name}`) || null, { lifecycle: 'computed', computedName: propName });
+                        throw error;
+                    }
                 };
             });
             stateManager.addComputed(boundComputedProps);
-        }
-
-        // Set up declarative watch handlers
-        if (metadata.watch) {
-            rawContext._watchHandlers = new Map();
-            Object.entries(metadata.watch).forEach(([path, handler]) => {
-                rawContext._watchHandlers.set(path, handler.bind(context));
-            });
         }
 
         // UNIFIED ENTITY SYSTEM: Register plugin as a virtual instance
@@ -307,12 +347,51 @@ export const PluginSystemMethods = {
             state,
             stateManager,
             context,
+            definition: { watch: metadata.watch || null },
             isVirtual: true     // Mark as virtual (no DOM)
         };
+
+        // A plugin registered again under the same name was retired in
+        // _installPlugin (retirePlugin) before this runs.
+
+        // beforeDestroy()/destroy() on the context, where replacement
+        // (retirePlugin) and framework teardown (destroyComponent) call them.
+        for (const hook of ['beforeDestroy', 'destroy']) {
+            if (typeof metadata[hook] === 'function') rawContext[hook] = metadata[hook].bind(context);
+        }
 
         // Register in componentInstances for unified entity handling
         this.componentInstances.set(entityKey, pluginInstance);
 
+        // watch: {} through the same code as a component's and a store's.
+        if (metadata.watch && this._setupWatchers) this._setupWatchers(pluginInstance);
+
+        // Pools: a plugin has no DOM, so its pools are data only, as a store's
+        // are. Guarded: the pool module is absent from tiers without pools.
+        if (this._setupDataPools) {
+            const fw = this;
+            rawContext.getPool = function(poolName, options) {
+                const handle = (pluginInstance._pools && pluginInstance._pools.get(poolName)) || null;
+                if (handle && options) fw._applyPoolHooks(handle, options, pluginInstance.context);
+                return handle;
+            };
+            if (metadata.pools) {
+                try {
+                    this._setupDataPools(pluginInstance, metadata.pools);
+                } catch (error) {
+                    // Leave nothing half-built behind (the install catch reports it).
+                    this._cleanupPools(pluginInstance);
+                    stopStoreWatchers(pluginInstance);
+                    this.componentInstances.delete(entityKey);
+                    throw error;
+                }
+            }
+        } else if (__DEV__ && metadata.pools) {
+            wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
+                warn: true,
+                context: `Plugin '${name}': pools are declared, but this build does not include pools (pool module excluded from this tier); this.pools has no handles`
+            });
+        }
 
         // Register tick lifecycle hook if defined (shared rAF loop with
         // components). Guarded: the frame loop lives in the pool module,
@@ -363,33 +442,6 @@ export const PluginSystemMethods = {
     // NOTE: _createPluginSubscription() has been removed
     // Plugins now use the unified _createEntitySubscription() method
 
-    /**
-     * Notify plugin watchers of state changes
-     * @private
-     */
-    _notifyPluginWatchers(pluginContext, changedPath, newValue, oldValue)
-    {
-        if (!pluginContext._watchHandlers) return;
-
-        pluginContext._watchHandlers.forEach((handler, watchPath) => {
-            // Check if the changed path matches the watch path
-            if (changedPath === watchPath ||
-                changedPath.startsWith(`${watchPath}.`) ||
-                watchPath.startsWith(`${changedPath}.`)) {
-
-                // For nested paths, get the actual value at the watch path
-                let actualNewValue = newValue;
-                let actualOldValue = oldValue;
-
-                if (changedPath !== watchPath) {
-                    // Get the value at the exact watch path
-                    actualNewValue = pathResolver.get(pluginContext.state, watchPath);
-                }
-
-                handler(actualNewValue, actualOldValue);
-            }
-        });
-    },
     /**
      * Get a registered plugin by name
      * @param {string} name - Plugin name

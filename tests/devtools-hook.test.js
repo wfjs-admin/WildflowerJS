@@ -28,7 +28,7 @@ describe('DevTools hook v1.2 surface', () => {
     it('Phase 0 contract: version/schemaVersion/dev ship in all builds; getters are dev-only', () => {
         const h = hook()
         expect(h, 'global hook should exist in every build').toBeTruthy()
-        expect(h.version).toBe('1.5.3')
+        expect(h.version).toBe('1.5.4')
         // wildflower.version is the same build-time string (from package.json).
         expect(wildflower.version).toBe(h.version)
         expect(h.schemaVersion).toBe(1)

@@ -69,7 +69,7 @@ npm install wildflowerjs
 <script defer src="https://cdn.jsdelivr.net/npm/wildflowerjs@1/dist/wildflower.full.min.js"></script>
 ```
 
-Pin a specific version with `wildflowerjs@1.5.1`.
+Pin a specific version with `wildflowerjs@1.5.4`.
 
 ### ES modules
 
@@ -127,7 +127,7 @@ Neither entry carries an issue flag, and all results were run on the benchmark m
 - **Strict-CSP Ready**: Every build runs under a strict Content-Security-Policy with no `unsafe-eval`, via a compiled CSP-safe expression evaluator.
 - **Conditional Rendering**: Show/hide and insert/remove elements based on state.
 - **Client-Side Routing**: History and hash mode routing with guards and transitions.
-- **Server-Side Rendering**: SSR support with hydration.
+- **Server-Side Rendering**: Server-rendered HTML is adopted into state, with no hydration step, from any server.
 - **Web Component Bridge**: First-class integration with Shoelace, Web Awesome, Nord, Carbon, Fluent UI, and any other standards-compliant web component library.
 
 
@@ -294,7 +294,7 @@ Render hundreds of DOM elements at 60fps with `data-pool`:
 wildflower.component('particles', {
     state: { nextId: 1 },
     init() {
-        this._pool = this.pool('sprites');
+        this._pool = this.getPool('sprites');
     },
     spawn() {
         this._pool.add({ id: this.nextId++, x: 0, y: 0, label: 'particle' });
@@ -323,6 +323,17 @@ Each variant is available in three formats:
 - `.js`: Unminified (debugging)
 - `.dev.js`: Minified with console output preserved
 - `.min.js`: Production (minified, console stripped)
+
+## Extensions
+
+Extensions are separate files, loaded with their own script tag after the framework. They use only the framework's public API, so they work with any tier that has the features they need.
+
+| Package | What it does | Tiers |
+|---------|--------------|-------|
+| [`@wildflowerjs/threads`](https://www.wildflowerjs.com/docs/threads/) | Runs a store on a Web Worker. The page binds to a mirror of it, and writes and method calls cross to the worker. | All |
+| [`@wildflowerjs/three`](https://www.wildflowerjs.com/docs/three/) (Trillium) | Draws stores and pools with three.js. A view is a store: pools bind to instanced meshes, and picking, selection and frame cost are state you can bind in markup. | mini-pool, lite, core, spa, full |
+
+See [Extensions](https://www.wildflowerjs.com/docs/extensions/) for the overview.
 
 ## Web Component Integration
 

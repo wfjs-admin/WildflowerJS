@@ -25,6 +25,12 @@ export const DirectiveSystemMethods = {
             throw new Error('Directive name must be a non-empty string');
         }
 
+        // data-wf-X is the prefixed form of directive X, so a directive named
+        // 'wf-X' could never be written: data-wf-X would reach 'X' instead.
+        if (name.startsWith('wf-')) {
+            throw new Error(`Directive name "${name}" cannot start with "wf-": data-wf-${name.slice(3)} is the prefixed form of directive "${name.slice(3)}"`);
+        }
+
         if (!handlers || typeof handlers !== 'object') {
             throw new Error('Directive handlers must be an object');
         }
@@ -50,16 +56,18 @@ export const DirectiveSystemMethods = {
      */
     _processCustomDirectives(element, component)
     {
-        // Get all data-* attributes
+        // Get all data-* attributes: data-X, or data-wf-X (only data-wf-X in
+        // exclusive mode; the wf form wins when an element carries both)
         const attributes = Array.from(element.attributes);
 
         for (const attr of attributes) {
-            if (!attr.name.startsWith('data-')) continue;
+            const directiveName = this._wfBase(attr.name);
+            if (directiveName === null) continue;
 
-            const directiveName = attr.name.slice(5); // Remove 'data-' prefix
             const directive = this._customDirectives.get(directiveName);
 
             if (!directive) continue;
+            if (this._wfTwinWins(element, attr.name)) continue;
 
             const value = attr.value;
             const context = this._buildDirectiveContext(element, value, component);

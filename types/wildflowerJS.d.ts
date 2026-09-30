@@ -2,7 +2,7 @@
  * WildflowerJS TypeScript Definitions
  * A lightweight reactive framework with no build step required
  *
- * @version 1.5.3
+ * @version 1.5.4
  * @license MIT
  *
  * The bundles are IIFEs that assign `window.wildflower`; import this file for
@@ -13,6 +13,29 @@
 // =============================================================================
 // OPTIONS & CONFIGURATION
 // =============================================================================
+
+/** The framework file's tier (wildflower.tier). */
+export type WildflowerTier = 'nano' | 'mini' | 'mini-pool' | 'lite' | 'core' | 'spa' | 'full';
+
+/** The capabilities that differ between tiers (wildflower.features). */
+export interface WildflowerFeatures {
+  /** data-list rendering */
+  lists: boolean;
+  /** Pools, and the frame loop that runs every tick() */
+  pools: boolean;
+  /** wildflower.plugin() */
+  plugins: boolean;
+  /** data-portal */
+  portals: boolean;
+  /** data-transition */
+  transitions: boolean;
+  /** The router (wildflower.createRouter) */
+  router: boolean;
+  /** wildflower.query() and data-query */
+  query: boolean;
+  /** Adoption of server-rendered markup */
+  ssr: boolean;
+}
 
 /**
  * Options for initializing WildflowerJS
@@ -63,6 +86,27 @@ export interface WildflowerOptions {
 export type ComponentState = Record<string, any>;
 
 /**
+ * A watch handler. `path` is the path that changed, which differs from the
+ * key for a wildcard (`'*'`) or a parent path.
+ */
+export type WatchHandler<TCtx> = (this: TCtx, newValue: any, oldValue: any, path: string) => void;
+
+/**
+ * A watch block, shared by components, stores and plugins. Keys are state
+ * paths, computed names, `'*'`, or `'store:name.path'`; append `:immediate`
+ * to run once at setup. A value is a handler or `{ handler }`.
+ */
+export type WatchBlock<TCtx> = Record<string, WatchHandler<TCtx> | { handler: WatchHandler<TCtx> }>;
+
+/** Options for `subscribe()` on a component, store or plugin context. */
+export interface SubscribeOptions {
+  /** Call once right away with the current value */
+  immediate?: boolean;
+  /** Unsubscribe after the first call */
+  once?: boolean;
+}
+
+/**
  * Component definition structure
  * @template TState - The type of the component's state
  */
@@ -106,7 +150,7 @@ export interface ComponentDefinition<TState extends ComponentState = ComponentSt
   pools?: Record<string, PoolConfig> | string[];
 
   /** Watch handlers keyed by state path; append `:immediate` to run once on init */
-  watch?: Record<string, (this: ComponentContext<TState>, newValue: any, oldValue: any) => void>;
+  watch?: WatchBlock<ComponentContext<TState>>;
 
   /** Stores to inject on `this.stores`; init() waits for them (see subscribeTimeout) */
   subscribe?: string[] | Record<string, string[] | boolean>;
@@ -148,9 +192,25 @@ export interface ComponentDefinition<TState extends ComponentState = ComponentSt
  * via declarative template binding, with optional culling, FPS throttling,
  * and DOM recycling.
  */
+/** Hooks passed to `getPool(name, options)`. Functions only; `this` is the owner. */
+export interface PoolHookOptions<T extends Record<string, any> = Record<string, any>> {
+  onAdd?: (item: T) => void;
+  onRemove?: (item: T) => void;
+  /** Called once on clear(), skipping onRemove */
+  onClear?: (items: T[]) => void;
+}
+
 export interface PoolConfig<T extends Record<string, any> = Record<string, any>> {
   /** Initial entities to populate the pool */
   items?: T[];
+
+  /**
+   * The entity property that identifies each entity (default `id`). For a
+   * component pool, a `data-key` attribute on the container wins when both
+   * are given. Store and plugin pools have no container, so this is their
+   * only way to set it.
+   */
+  key?: string;
 
   /** Shared props object (parent-injected data accessible from pool item templates via `props.`) */
   props?: Record<string, any>;
@@ -162,7 +222,7 @@ export interface PoolConfig<T extends Record<string, any> = Record<string, any>>
   onRemove?: string | ((item: T) => void);
 
   /** Called once on clear(), skipping onRemove */
-  onClear?: string | (() => void);
+  onClear?: string | ((items: T[]) => void);
 
   /** Shape shared by every entity in the pool: state defaults, per-entity computeds, methods */
   entity?: PoolEntityShape<T>;
@@ -235,6 +295,16 @@ export interface PoolHandle<T extends Record<string, any> = Record<string, any>>
 
   /** Mark an entity as dirty — its bindings will re-evaluate on next flush */
   markDirty(key: string | number): void;
+
+  /**
+   * Goes up whenever the pool changes through its API (add/push, remove, clear,
+   * update, swap, markDirty). Compare it with a value you kept to learn whether
+   * the pool changed. It only increases, and the size of a step means nothing:
+   * several changes may share one. A change made to an entity in place is not
+   * counted until markDirty() or update() reports it. Not a reactive source:
+   * markup bound to it does not update; bind `length` for markup.
+   */
+  readonly version: number;
 
   /** Swap two entities' DOM positions */
   swap(key1: string | number, key2: string | number): boolean;
@@ -342,8 +412,9 @@ export interface ComponentContext<TState extends ComponentState = ComponentState
   /**
    * Get a pool handle by name, including markup-only pools (a `data-pool`
    * element with no entry in the `pools` field). Renamed from `pool()` in 1.3.0.
+   * `options` sets the pool's hooks.
    */
-  getPool<T extends Record<string, any> = Record<string, any>>(name: string): PoolHandle<T> | null;
+  getPool<T extends Record<string, any> = Record<string, any>>(name: string, options?: PoolHookOptions<T>): PoolHandle<T> | null;
 
   /** Stores declared in `subscribe`, keyed by name, available once init() runs */
   stores: Record<string, StoreContext & Record<string, any>>;
@@ -380,11 +451,11 @@ export interface ComponentContext<TState extends ComponentState = ComponentState
   /** Partial state update: a path and value, or an object of paths */
   update(pathOrUpdates: string | Partial<TState>, value?: any): void;
 
-  /** Subscribe to state changes on a path ('*' for all). Returns an unsubscribe function */
+  /** Subscribe to state changes on a path ('' for every change). Returns an unsubscribe function */
   subscribe(
     path: string,
     callback: (newValue: any, oldValue: any, path: string) => void,
-    options?: { immediate?: boolean; deep?: boolean }
+    options?: SubscribeOptions
   ): () => void;
 
   /** True once init() has completed */
@@ -701,11 +772,21 @@ export interface StoreConfig<TState extends Record<string, any> = Record<string,
   /** Computed properties derived from state */
   computed?: Record<string, (this: StoreContext<TState>) => any>;
 
-  /** Watch handlers for state changes */
-  watch?: Record<string, (this: StoreContext<TState>, newValue: any, oldValue: any) => void>;
+  /** Watch handlers for state changes, as a component's */
+  watch?: WatchBlock<StoreContext<TState>>;
 
-  /** Lifecycle: called when store is initialized */
-  init?: (this: StoreContext<TState>) => void;
+  /** Lifecycle: called when store is initialized; may be async */
+  init?: (this: StoreContext<TState>) => void | Promise<void>;
+
+  /** Called for changes on the paths named in `subscribe` */
+  onStoreUpdate?: (this: StoreContext<TState>, storeName: string, path: string, newValue: any, oldValue: any) => void;
+
+  /**
+   * Receives errors from the store's init(), computeds, watchers, tick() and
+   * methods. With it, a throwing method returns undefined; without it, the
+   * error is thrown to the caller.
+   */
+  onError?: (this: StoreContext<TState>, error: Error, info?: any) => boolean | void;
 
   /** Other stores this store reads through `this.stores` */
   subscribe?: string[] | Record<string, string[] | boolean>;
@@ -723,6 +804,12 @@ export interface StoreConfig<TState extends Record<string, any> = Record<string,
   /** Called every animation frame. dt in ms (clamped to 250), now from performance.now() */
   tick?: (this: StoreContext<TState>, dt: number, now: number) => void;
 
+  /**
+   * Entity pools. A store has no DOM, so its pools are data only: the pool
+   * API without rendering, keyed on `id`. Access as `this.pools.poolName`.
+   */
+  pools?: Record<string, PoolConfig> | string[];
+
   /** Store methods (actions) - defined at top level, not in separate 'actions' block */
   [key: string]: any;
 }
@@ -733,19 +820,6 @@ export interface StoreConfig<TState extends Record<string, any> = Record<string,
 export interface StoreContext<TState extends Record<string, any> = Record<string, any>> {
   /** Reactive state object */
   state: TState;
-
-  /**
-   * Get value at path
-   * @param path - Dot-notation path
-   */
-  get(path: string): any;
-
-  /**
-   * Set value at path
-   * @param path - Dot-notation path
-   * @param value - Value to set
-   */
-  set(path: string, value: any): void;
 
   /**
    * Bulk update state
@@ -761,7 +835,7 @@ export interface StoreContext<TState extends Record<string, any> = Record<string
 
   /**
    * Subscribe to state changes
-   * @param path - Path to watch (or '*' for all)
+   * @param path - Path to watch ('' for every change)
    * @param callback - Callback function
    * @param options - Subscription options
    * @returns Unsubscribe function
@@ -769,7 +843,7 @@ export interface StoreContext<TState extends Record<string, any> = Record<string
   subscribe(
     path: string,
     callback: (newValue: any, oldValue: any, path: string) => void,
-    options?: { immediate?: boolean; deep?: boolean }
+    options?: SubscribeOptions
   ): () => void;
 
   /**
@@ -781,6 +855,12 @@ export interface StoreContext<TState extends Record<string, any> = Record<string
    * Wait for store to be ready
    */
   waitForReady(): Promise<void>;
+
+  /** Data-only pool handles for the pools declared in the store's `pools` field. */
+  pools: Record<string, PoolHandle>;
+
+  /** Get one of the store's pool handles by name. `options` sets the pool's hooks. */
+  getPool<T extends Record<string, any> = Record<string, any>>(name: string, options?: PoolHookOptions<T>): PoolHandle<T> | null;
 }
 
 // =============================================================================
@@ -817,8 +897,30 @@ export interface PluginObject {
   /** Plugin methods */
   methods?: Record<string, Function>;
 
-  /** Watch handlers */
-  watch?: Record<string, Function>;
+  /** Watch handlers, as a component's; a `'store:name.path'` key watches a store */
+  watch?: WatchBlock<any>;
+
+  /** Called every animation frame on the shared loop. dt in ms (clamped to 250), now from performance.now() */
+  tick?: (dt: number, now: number) => void;
+
+  /** Called before the plugin is replaced under the same name, or the framework is torn down */
+  beforeDestroy?: () => void;
+
+  /** Called when the plugin is replaced under the same name, or the framework is torn down */
+  destroy?: () => void;
+
+  /**
+   * Receives errors from the plugin's computeds, watchers, tick() and
+   * methods. With it, a throwing method returns undefined; without it, the
+   * error is thrown to the caller.
+   */
+  onError?: (error: Error, info?: any) => boolean | void;
+
+  /**
+   * Entity pools. A plugin has no DOM, so its pools are data only, as a
+   * store's are. Access as `this.pools.poolName` in the plugin's methods.
+   */
+  pools?: Record<string, PoolConfig> | string[];
 
   /** Top-level functions become plugin methods, callable as `wildflower.$name.method()` */
   [key: string]: any;
@@ -1238,6 +1340,15 @@ export default class WildflowerJS {
 
   /** Framework version string, stamped from the package version at build time */
   readonly version: string;
+
+  /** The tier this file was built as, stamped at build time */
+  readonly tier: WildflowerTier;
+
+  /**
+   * The eight capabilities that differ between tiers, stamped at build time.
+   * `pools` includes the frame loop that runs every tick(). Frozen.
+   */
+  readonly features: Readonly<WildflowerFeatures>;
 
   /** Component definitions registry */
   readonly componentDefinitions: Map<string, ComponentDefinition>;

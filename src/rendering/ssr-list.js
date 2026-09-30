@@ -637,7 +637,17 @@ export const SSRListMethods = {
         // _parentIndex to refresh on rebind here.
 
         // Process root element bindings
-        const ds = itemEl.dataset;
+        // Through the prefix helpers, so data-wf-bind etc. on the row root
+        // work. Read by both root passes: bind/class/style/attr here, and
+        // model/show in _bindRootElementModelShow below.
+        const ds = {
+            bind: this._getAttr(itemEl, 'bind'),
+            bindClass: this._getAttr(itemEl, 'bind-class'),
+            bindStyle: this._getAttr(itemEl, 'bind-style'),
+            bindAttr: this._getAttr(itemEl, 'bind-attr'),
+            model: this._getAttr(itemEl, 'model'),
+            show: this._getAttr(itemEl, 'show')
+        };
         this._bindRootElementData(itemEl, item, ds, itemIndex, context);
 
         // OPTIMIZATION: Use pre-computed metadata if provided (avoids per-item string concat + Map lookup)

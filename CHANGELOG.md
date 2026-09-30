@@ -7,6 +7,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.5.4] - 2026-09-29
+
+### Added
+- [Pools in stores and plugins](https://www.wildflowerjs.com/changelog.html#store-plugin-pools)
+- [A `key` option in the pools block (WF-417, WF-418)](https://www.wildflowerjs.com/changelog.html#pool-key-option)
+- [A warning for a component pool declared with no container (WF-416)](https://www.wildflowerjs.com/changelog.html#pool-declared-no-container)
+- [Plugins run `beforeDestroy()` and `destroy()`](https://www.wildflowerjs.com/changelog.html#plugin-destroy)
+- [Warnings for `storageKey` beside pools (WF-911) and unread query config keys (WF-942)](https://www.wildflowerjs.com/changelog.html#wf-911-wf-942)
+- [A warning for an underscore key in `state` (WF-236)](https://www.wildflowerjs.com/changelog.html#state-underscore-key)
+- [`wildflower.tier` and `wildflower.features`](https://www.wildflowerjs.com/changelog.html#tier-and-features)
+- [`pool.version`](https://www.wildflowerjs.com/changelog.html#pool-version)
+
+### Changed
+- [Plugin `watch` works as a component's](https://www.wildflowerjs.com/changelog.html#plugin-watch-shared)
+- [Store and plugin errors go to their `onError`](https://www.wildflowerjs.com/changelog.html#store-plugin-onerror)
+- [Pool hook and entity action errors go to the owner's `onError`](https://www.wildflowerjs.com/changelog.html#pool-hook-errors)
+- [Query `from` and `params` errors print in every build](https://www.wildflowerjs.com/changelog.html#query-author-errors)
+- [Stores warn for component render hooks (WF-219)](https://www.wildflowerjs.com/changelog.html#store-render-hooks)
+- [`toRaw()` copies the plain data behind reactive state](https://www.wildflowerjs.com/changelog.html#to-raw-plain-walk)
+- [WF-409 identifies a store or plugin pool](https://www.wildflowerjs.com/changelog.html#wf-409-store-pool)
+- [Directive names cannot start with `wf-`](https://www.wildflowerjs.com/changelog.html#directive-wf-names)
+
+### Fixed
+- [Watchers and subscriptions fire when a parent object is replaced](https://www.wildflowerjs.com/changelog.html#replaced-parent)
+- [Server-rendered components adopt only their own bindings](https://www.wildflowerjs.com/changelog.html#ssr-adopt-own-bindings)
+- [No WF-505 for an inline class object inside a portal](https://www.wildflowerjs.com/changelog.html#portal-class-inline)
+- [No type warning for an emptied number field](https://www.wildflowerjs.com/changelog.html#type-check-empty-number)
+- [Stores run their `watch` block; `watch` is reserved on every entity](https://www.wildflowerjs.com/changelog.html#store-watch)
+- [`pool.length` updates after a push with several arguments](https://www.wildflowerjs.com/changelog.html#pool-length-varargs)
+- [A throwing pool render no longer stops the frame loop](https://www.wildflowerjs.com/changelog.html#pool-flush-isolation)
+- [A throwing `tick()` no longer stops the others](https://www.wildflowerjs.com/changelog.html#tick-error-isolation)
+- [Store and plugin errors reach the console in production](https://www.wildflowerjs.com/changelog.html#store-errors-in-production)
+- [Component computed errors reach the console in production, once](https://www.wildflowerjs.com/changelog.html#component-computed-errors)
+- [`query()` refuses a name a store already uses (WF-952)](https://www.wildflowerjs.com/changelog.html#query-store-name-collision)
+- [`unregister()` removes a query completely](https://www.wildflowerjs.com/changelog.html#query-unregister)
+- [A query registered after its subscriber still fetches](https://www.wildflowerjs.com/changelog.html#query-late-subscribe)
+- [A plugin with `watch` and no state sets up its watchers](https://www.wildflowerjs.com/changelog.html#plugin-watch-only)
+- [Replacing a plugin stops the old instance in every case](https://www.wildflowerjs.com/changelog.html#plugin-replacement)
+- [Subscribers re-attach to a store registered again](https://www.wildflowerjs.com/changelog.html#store-reregister-reattach)
+- [Development warning adjustments (WF-213, WF-219, WF-950)](https://www.wildflowerjs.com/changelog.html#dev-warning-fixes)
+- [Stores and plugins registered again are built fresh](https://www.wildflowerjs.com/changelog.html#reregister-fresh)
+- [`pool.length` is current inside `onAdd`](https://www.wildflowerjs.com/changelog.html#pool-length-in-onadd)
+- [Lists of strings or numbers render their values at every size](https://www.wildflowerjs.com/changelog.html#primitive-list-bulk)
+- [Every attribute accepts the `data-wf-` prefix](https://www.wildflowerjs.com/changelog.html#wf-prefix-all-attributes)
+- [Store subscriptions follow a computed by its bare name](https://www.wildflowerjs.com/changelog.html#subscribe-computed-bare-name)
+
+
 ## [1.5.3] - 2026-09-23
 
 ### Added

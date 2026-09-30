@@ -58,12 +58,16 @@ const _warnedLifecycleActions = new Set();
 // A6: >0 while a framework-internal teardown flow is running (see
 // _destroyComponentQuiet); suppresses the auto-resurrect warning.
 let _quietDestroyDepth = 0;
-export function warnLifecycleActionNames(rootEl, componentName) {
+export function warnLifecycleActionNames(rootEl, componentName, wf) {
     if (!rootEl || !rootEl.querySelectorAll) return;
     const values = [];
-    if (rootEl.hasAttribute && rootEl.hasAttribute('data-action')) values.push(rootEl.getAttribute('data-action'));
+    // Through the framework's prefix helpers when given (data-wf-action, and
+    // only that in exclusive mode); plain data-action otherwise.
+    const sel = wf ? wf._attrSelector('action') : '[data-action]';
+    const read = (el) => (wf ? wf._getAttr(el, 'action') : el.getAttribute('data-action'));
+    if (rootEl.matches && rootEl.matches(sel)) values.push(read(rootEl));
     const collect = (root) => {
-        for (const el of root.querySelectorAll('[data-action]')) values.push(el.getAttribute('data-action'));
+        for (const el of root.querySelectorAll(sel)) values.push(read(el));
         for (const t of root.querySelectorAll('template')) { if (t.content) collect(t.content); }
     };
     collect(rootEl);
@@ -407,8 +411,8 @@ export const ComponentLifecycleMethods = {
                 this._handleEntityStateChange(instanceId, path, newValue, oldValue);
             },
             wf: this,
-            storageKey: element.dataset.storageKey || null,
-            autoSave: element.hasAttribute('data-auto-save'),
+            storageKey: this._getAttr(element, 'storage-key') || null,
+            autoSave: this._hasAttr(element, 'auto-save'),
             component: { id: instanceId, name: componentName }
         });
     },
@@ -454,10 +458,37 @@ export const ComponentLifecycleMethods = {
                 } catch (handlerError) {
                     if (__DEV__) console.error('Error in onError handler:', handlerError);
                 }
+            } else if (instance) {
+                // The author's exception: logged in every build (parent
+                // boundaries and global handlers still get their turn).
+                framework._handleError(
+                    `Error in computed property '${propName}'`,
+                    error,
+                    instance,
+                    { lifecycle: 'computed', computedName: propName }
+                );
             } else {
-                // No instance/onError - just log
-                if (__DEV__) console.warn(`Error in computed property ${propName}:`, error);
+                console.error(`[WildflowerJS] Error in computed property '${propName}':`, error);
             }
+        };
+
+        // A computed first runs here, before the component's pools exist and
+        // before init() has set its state, so a correct computed can throw now
+        // and work later. Until init() has run, a throw is only recorded; then
+        // _checkSetupComputedErrors re-runs the recorded ones, and only a
+        // computed that still throws is reported.
+        let settling = true;
+        let setupErrors = null;
+        const reportComputedError = (propName, error) => {
+            if (settling) (setupErrors || (setupErrors = new Set())).add(propName);
+            else handleComputedError(propName, error);
+        };
+        stateManager._computedSetupCheck = () => {
+            settling = false;
+            if (!setupErrors) return;
+            const names = setupErrors;
+            setupErrors = null;
+            for (const name of names) stateManager.scheduleComputedEvaluation(name);
         };
 
         try {
@@ -500,7 +531,7 @@ export const ComponentLifecycleMethods = {
                         if (error.isCircularDependency || error.name === 'CircularDependencyError') {
                             throw error;
                         }
-                        handleComputedError(name, error);
+                        reportComputedError(name, error);
                         // Re-throw to let evaluateComputed cache ERRORED state
                         // This enables the TC39 Signals pattern of error caching
                         throw error;
@@ -521,7 +552,7 @@ export const ComponentLifecycleMethods = {
                     }
                     stateManager.evaluateComputed(propName);
                 } catch (error) {
-                    handleComputedError(propName, error);
+                    reportComputedError(propName, error);
                 }
             });
         } catch (error) {
@@ -554,7 +585,7 @@ export const ComponentLifecycleMethods = {
             // we've left our context and shouldn't inherit its list item data.
             // Check both data-component-id (initialized components) and
             // data-component (not yet initialized, but still a boundary)
-            if (current.dataset && (current.dataset.componentId || current.dataset.component)) {
+            if (current.dataset && (current.dataset.componentId || this._hasAttr(current, 'component'))) {
                 return null;
             }
 
@@ -697,6 +728,17 @@ export const ComponentLifecycleMethods = {
         }
     },
 
+    // Once init() has run (or there is no init()), re-run the computeds that
+    // threw during setup and report the ones that still throw. See
+    // _setupComputedProperties. Runs once per instance.
+    _checkSetupComputedErrors(instance) {
+        const sm = instance.stateManager;
+        const check = sm && sm._computedSetupCheck;
+        if (!check) return;
+        sm._computedSetupCheck = null;
+        check();
+    },
+
     _callInitHook(instance, componentName) {
         if (typeof instance.context.init !== 'function') return;
 
@@ -818,6 +860,7 @@ export const ComponentLifecycleMethods = {
         // subscribed store. _wrapMethod queues those calls; we replay them
         // here so they observe the post-init state the user expected.
         instance._initReady = true;
+        if (this.componentInstances.has(instance.id)) this._checkSetupComputedErrors(instance);
         if (instance._pendingActions && instance._pendingActions.length > 0) {
             const queued = instance._pendingActions;
             instance._pendingActions = null;
@@ -1287,12 +1330,7 @@ export const ComponentLifecycleMethods = {
                 // without the pool module.
                 if (!handle && self._poolRegistryTrack) self._poolRegistryTrack(inst);
                 // Apply imperative hooks if provided
-                if (handle && options) {
-                    const ctx = inst.context;
-                    if (options.onAdd) handle._onAdd = typeof options.onAdd === 'function' ? options.onAdd.bind(ctx) : null;
-                    if (options.onRemove) handle._onRemove = typeof options.onRemove === 'function' ? options.onRemove.bind(ctx) : null;
-                    if (options.onClear) handle._onClear = typeof options.onClear === 'function' ? options.onClear.bind(ctx) : null;
-                }
+                if (handle && options) self._applyPoolHooks(handle, options, inst.context);
                 return handle;
             },
 
@@ -1737,7 +1775,7 @@ export const ComponentLifecycleMethods = {
                 if (prop in target) return target[prop];
 
                 // Look for a child element with matching component name
-                const selector = `[data-component="${prop}"]`;
+                const selector = self._attrSelector('component', prop);
                 const childElement = element.querySelector(selector);
 
                 if (!childElement) return undefined;
@@ -2080,6 +2118,17 @@ export const ComponentLifecycleMethods = {
 
         if (!definition.watch) return;
 
+        // watch is the watchers block on every entity kind, never a method.
+        // A function here has no handlers in it, so it is ignored.
+        if (typeof definition.watch === 'function') {
+            if (__DEV__) wfError(WF_ERRORS.DEFINITION_KEY_IGNORED, {
+                warn: true,
+                context: `'${instance.name}': top-level key 'watch' is a function, but watch is the watchers block ({ path(newValue, oldValue) {} }), so it was ignored`,
+                suggestion: 'Rename the method, or make watch an object of handlers keyed by path.'
+            });
+            return;
+        }
+
         // Initialize store watcher cleanup array
         instance._storeWatcherCleanups = instance._storeWatcherCleanups || [];
 
@@ -2194,6 +2243,10 @@ export const ComponentLifecycleMethods = {
 
         // Store cleanup function for when component is destroyed
         instance._storeWatcherCleanups.push(unsubscribe);
+        // What it watched, so unregisterStore can re-attach it to a store
+        // registered again under the same name.
+        (instance._storeWatchSpecs || (instance._storeWatchSpecs = []))
+            .push({ storeName, fullPath, handler: boundHandler, unsubscribe });
     },
 // ERROR HANDLING
     /**
@@ -2586,7 +2639,7 @@ export const ComponentLifecycleMethods = {
         const childIds = [...(this.componentChildren.get(componentId) || [])];
         childIds.forEach(childId => {
             const childInstance = this.componentInstances.get(childId);
-            if (childInstance && childInstance.element && childInstance.element.hasAttribute('data-external')) {
+            if (childInstance && childInstance.element && this._hasAttr(childInstance.element, 'external')) {
                 return;
             }
             this._destroyComponentQuiet(childId);
@@ -2958,7 +3011,7 @@ export const ComponentLifecycleMethods = {
             }
 
             // Skip components marked as external (preserved components)
-            if (instance.element && instance.element.hasAttribute('data-external')) return;
+            if (instance.element && this._hasAttr(instance.element, 'external')) return;
 
             // When scoped, only collect components within the scope element
             if (scopeElement && instance.element && !scopeElement.contains(instance.element)) return;
@@ -3181,6 +3234,14 @@ export const ComponentLifecycleMethods = {
         // Clear cross-store tracking-proxy cache
         if (this._trackingProxyCache) {
             this._trackingProxyCache.clear();
+        }
+
+        // Forget the stores by name too. The instances were destroyed above,
+        // but the name table kept them, so store(name, ...) after destroy()
+        // handed back the dead store instead of building a new one.
+        if (this.storeManager) {
+            if (this.storeManager._namedStores) this.storeManager._namedStores.clear();
+            if (this.storeManager._virtualComponents) this.storeManager._virtualComponents.clear();
         }
 
         return true;

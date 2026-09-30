@@ -189,7 +189,7 @@ const _eventCore = {
                     this._syncFormToState(el, instance);
 
                     // If validation is enabled, validate the form
-                    if (el.hasAttribute('data-validate'))
+                    if (this._hasAttr(el, 'validate'))
                     {
                         const isValid = this._validateForm(el, instance);
                         if (!isValid)
@@ -626,7 +626,7 @@ const _eventCore = {
             if (!listEl) break;
 
             // Get the path from data-list
-            const listPath = listEl.dataset.list;
+            const listPath = this._getAttr(listEl, 'list');
             if (!listPath) break;  // Only process lists with data-list attribute
 
             // Determine index by finding LI's position among siblings
@@ -1548,10 +1548,10 @@ export const ListEventDelegationMethods = {
             let actionCount = 0;
             for (const tpl of templates) {
                 const root = tpl.content || tpl;
-                const actionEls = root.querySelectorAll('[data-action],[data-wf-action]');
+                const actionEls = root.querySelectorAll(this._attrSelector('action'));
                 actionCount += actionEls.length;
                 for (const el of actionEls) {
-                    const attr = el.getAttribute('data-action') || el.getAttribute('data-wf-action');
+                    const attr = this._getAttr(el, 'action');
                     if (!attr) continue;
                     for (const part of attr.split(/\s+/)) {
                         const ci = part.indexOf(':');
@@ -1613,7 +1613,7 @@ export const ListEventDelegationMethods = {
 
                 while (parent && parent !== closestList)
                 {
-                    if (parent.hasAttribute('data-list'))
+                    if (this._hasAttr(parent, 'list'))
                     {
                         foundNestedList = true;
                         break;
@@ -1781,7 +1781,7 @@ export const ListEventDelegationMethods = {
         const index = rowEl._listIndex;
         if (isNaN(index)) return false;
 
-        const actionAttr = actionEl.dataset.action;
+        const actionAttr = this._getAttr(actionEl, 'action');
         if (!actionAttr) return false;
 
         const actions = this._parseActions(actionAttr);
@@ -1945,7 +1945,7 @@ export const ListEventDelegationMethods = {
             let isInsideNestedList = false;
             let parent = conditionalElement.parentElement;
             while (parent && parent !== itemElement) {
-                if (parent.hasAttribute('data-list') || parent.hasAttribute('data-wf-list')) {
+                if (this._hasAttr(parent, 'list')) {
                     isInsideNestedList = true;
                     break;
                 }
@@ -2740,9 +2740,11 @@ const _eventTail = {
         const attrs = element.attributes;
         for (let i = 0; i < attrs.length; i++)
         {
-            const name = attrs[i].name;
-            if (!name.startsWith('data-event-key-')) continue;
-            const rest = name.slice('data-event-key-'.length);
+            // data-event-key-X or data-wf-event-key-X (only the wf form in
+            // exclusive mode)
+            const base = this._wfBase(attrs[i].name);
+            if (base === null || !base.startsWith('event-key-')) continue;
+            const rest = base.slice('event-key-'.length);
             if (!rest) continue;
 
             spec.empty = false;

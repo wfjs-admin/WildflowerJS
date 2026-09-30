@@ -288,7 +288,7 @@ export const PropsSystemMethods = {
         }
 
         const index = listItem._listIndex;
-        const listEl = listItem.parentElement?.closest('[data-list]') || listItem.parentElement;
+        const listEl = listItem.parentElement?.closest(this._attrSelector('list')) || listItem.parentElement;
 
         // Try list context first
         if (listEl?._listContext)
@@ -297,7 +297,7 @@ export const PropsSystemMethods = {
         }
 
         // Fallback to parent state
-        const listPath = listEl?.dataset?.list;
+        const listPath = listEl ? this._getAttr(listEl, 'list') : undefined;
         if (listPath && parentInstance?.stateManager)
         {
             const data = parentInstance.stateManager.getValue(listPath);

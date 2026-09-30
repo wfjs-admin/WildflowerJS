@@ -2,11 +2,11 @@
 // ES6 MODULE IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
-import { WF_ERRORS, objectUtils, wfError, definitionSignature, validateEntityDefinition, warnDefinitionCollisions, PENDING_BINDING } from '../core/wfUtils.js';
+import { WF_ERRORS, objectUtils, wfError, definitionSignature, validateEntityDefinition, warnDefinitionCollisions, PENDING_BINDING, PENDING_STORE_WATCH } from '../core/wfUtils.js';
 
 // Non-function definition keys the store factory actually consumes
 // (validateEntityDefinition allowlist — keep in sync with createStoreComponent).
-const STORE_CONTRACT_KEYS = ['state', 'computed', 'subscribe', 'storageKey', 'autoSave'];
+const STORE_CONTRACT_KEYS = ['state', 'computed', 'subscribe', 'storageKey', 'autoSave', 'pools', 'watch'];
 import { createStateManager } from './createStateManager.js';
 import { createContextProxy, patchSelfReferences, warnCollisions, RAW_TARGET } from './ContextProxy.js';
 
@@ -252,6 +252,14 @@ export class StoreManager {
                 if (subTarget && subTarget.id && this.framework._registerEntityDependent) {
                     this.framework._registerEntityDependent(subTarget.id, componentId);
                 }
+                // The same observer edge _setupStoreSubscriptions adds when the
+                // query already exists: without it a late query never fetches.
+                const fw = this.framework;
+                if (__FEATURE_QUERY__ && fw._queryControllers && fw._queryControllers.has(storeName)) {
+                    const qc = fw._queryControllers.get(storeName);
+                    if (instance.element) qc.elements.add(instance.element);
+                    fw._queryActivate(qc);
+                }
                 this._wakeComponentForLateEntity(instance);
             }
 
@@ -261,6 +269,16 @@ export class StoreManager {
             // gets. The render-effect re-run below covers the non-list bindings.
             if (computedName === PENDING_BINDING) {
                 this._wakeComponentForLateEntity(instance);
+            }
+
+            // 'store:' watchers left behind when this name was unregistered
+            // (see _queueReattach) attach to the new store.
+            if (computedName === PENDING_STORE_WATCH && instance._storeWatchPending) {
+                const waiting = instance._storeWatchPending;
+                instance._storeWatchPending = waiting.filter((s) => s.storeName !== storeName);
+                for (const s of waiting) {
+                    if (s.storeName === storeName) this.framework._setupStoreWatcher(instance, s.fullPath, s.handler, false);
+                }
             }
 
             // Re-evaluate the computed property to get fresh data
@@ -438,13 +456,18 @@ export class StoreManager {
                     }
                 });
 
+                // Back to the definition, and the definition's pools are empty
+                // (onClear fires). init() is not re-run, for state or pools.
+                const pools = context.pools;
+                if (pools) for (const poolName in pools) pools[poolName].clear();
+
                 return this;
             };
 
             // Wrap context with unified context proxy for shorthand access
             const context = createContextProxy(rawContext, stateManager);
             patchSelfReferences(rawContext, context, stateManager);
-            if (__DEV__) warnCollisions(stateManager, name);
+            if (__DEV__) warnCollisions(stateManager, name, definition.computed);
 
             // BIND METHODS BEFORE INIT
             // This ensures methods are available in init()
@@ -476,9 +499,19 @@ export class StoreManager {
             // so ComputedPropertyManager can set the ERRORED sentinel for caching
             if (definition.computed && Object.keys(definition.computed).length > 0) {
                 const boundComputedProps = {};
+                const framework = this.framework;
                 Object.entries(definition.computed).forEach(([propName, fn]) => {
+                    // The author's exception is reported (onError handlers,
+                    // else the console, in every build) and re-thrown, so the
+                    // graph still caches the errored state.
                     const wrapped = function() {
-                        return fn.call(context);
+                        try {
+                            return fn.call(context);
+                        } catch (error) {
+                            framework._handleError(`Error in store '${name}' computed '${propName}'`, error,
+                                framework.componentInstances.get(instanceId) || null, { lifecycle: 'computed', computedName: propName });
+                            throw error;
+                        }
                     };
                     // Expose the original user function so computed analysis can
                     // inspect the real body, not this call wrapper (whose
@@ -510,10 +543,46 @@ export class StoreManager {
             // Store in our local map
             this._virtualComponents.set(instanceId, instance);
 
+            // Pools: a store has no DOM, so its pools are data only (the same
+            // pool handle a component gets, without the rendering half). Set up
+            // before init() so init can populate them. Guarded: the pool module
+            // is absent from tiers without pools (see the tick() twin below).
+            const fw = this.framework;
+            if (fw._setupDataPools) {
+                rawContext.getPool = function(poolName, options) {
+                    const handle = (instance._pools && instance._pools.get(poolName)) || null;
+                    if (handle && options) fw._applyPoolHooks(handle, options, instance.context);
+                    return handle;
+                };
+            }
+            if (definition.pools) {
+                if (fw._setupDataPools) {
+                    fw._setupDataPools(instance, definition.pools);
+                    // Pool entities are plain objects nothing tracks, so
+                    // autoSave cannot see them change; storageKey is for state.
+                    if (__DEV__ && definition.storageKey) {
+                        wfError(WF_ERRORS.STORE_POOLS_NOT_PERSISTED, {
+                            warn: true,
+                            context: `store '${name}' (storageKey '${definition.storageKey}', pools: ${Object.keys(definition.pools).map(p => `'${p}'`).join(', ')})`,
+                            suggestion: 'Copy what must survive a reload into state before it is saved, and refill the pool from that state in init().'
+                        });
+                    }
+                } else if (__DEV__) {
+                    wfError(WF_ERRORS.FEATURE_NOT_IN_BUILD, {
+                        warn: true,
+                        context: `Store '${name}': pools are declared, but this build does not include pools (pool module excluded from this tier); this.pools has no handles`
+                    });
+                }
+            }
+
 
             // Setup store-to-store subscriptions (subscribe: {} support)
             // This must happen BEFORE init() so this.stores is available
             this._setupStoreSubscriptions(instance);
+
+            // watch: {} with a component's semantics, set up before init() as a
+            // component's is, so a write in init() is heard.
+            if (definition.watch && fw._setupWatchers) fw._setupWatchers(instance);
 
             // Initialize - call init hook from definition
             // Methods are NOW AVAILABLE in init() due to _bindEntityMethods above
@@ -525,11 +594,7 @@ export class StoreManager {
                         instance._initPromise = initResult;
                     }
                 } catch (error) {
-                    this.framework._error(WF_ERRORS.STORE_INIT_ERROR, {
-                        context: name,
-                        suggestion: 'Check the init() function in your store definition',
-                        cause: error
-                    });
+                    this._reportInitError(name, instance, error);
                 }
             }
 
@@ -591,6 +656,15 @@ export class StoreManager {
                 suggestion: 'Check the store definition for errors',
                 cause: error
             });
+            // A throw part way through (an arrow-function entity method in a
+            // pool, say) must not leave a half-built store registered: nothing
+            // could unregister it, and getStore() would return it.
+            const partial = this.framework.componentInstances.get(instanceId);
+            if (partial) {
+                if (this.framework._cleanupPools) this.framework._cleanupPools(partial);
+                this.framework.componentInstances.delete(instanceId);
+            }
+            if (this._virtualComponents) this._virtualComponents.delete(instanceId);
             return null;
         }
     }
@@ -631,6 +705,12 @@ export class StoreManager {
 
         store._pathSubscribers.get(path).add(componentInstance);
         store._hasPathSubscribers = true;
+        // A path naming a computed needs that computed's change notifier
+        // (lazy by default), with or without the computed: prefix. Harmless
+        // for a plain state path: the notifier only exists for a computed.
+        if (store.stateManager?._ensureComputedNotifier) {
+            store.stateManager._ensureComputedNotifier(path.startsWith('computed:') ? path.slice(9) : path);
+        }
         // Invalidate the EntitySystem fast-exit cache. Without this, a store
         // whose first state-change fired before any subscriber registered
         // (e.g. the synthetic `_internal.ready` write done at end of
@@ -711,6 +791,19 @@ export class StoreManager {
         }
 
         return store._pathSubscribers.get(path) || null;
+    }
+
+    /**
+     * All of a store's path subscribers, keyed by path, or null when it has
+     * none. EntitySystem reads it to find subscribers below a replaced object.
+     *
+     * @param {string} storeName - Name of the store
+     * @returns {Map<string, Set<Object>>|null}
+     */
+    getPathSubscriberMap(storeName) {
+        const store = this._namedStores.get(storeName);
+        if (!store || !store._hasPathSubscribers) return null;
+        return store._pathSubscribers;
     }
 
     /**
@@ -878,6 +971,18 @@ export class StoreManager {
                                     enumerable: false,
                                     configurable: true
                                 });
+                                // And the store's pools, so this.stores.other.pools.x works
+                                // in a store as it does in a component. An object, so the
+                                // function filter above skips it; pool.length stays reactive
+                                // through the pool itself, whichever proxy reached it.
+                                const storePools = store.pools;
+                                if (storePools) {
+                                    Object.defineProperty(leanProxy, 'pools', {
+                                        value: storePools,
+                                        enumerable: false,
+                                        configurable: true
+                                    });
+                                }
                             }
                             Object.defineProperty(context.stores, storeName, {
                                 value: leanProxy,
@@ -967,11 +1072,21 @@ export class StoreManager {
         // rebuilt definition with placeholder keys, so it cannot be checked there).
         if (__DEV__) validateEntityDefinition('Store', name, config, STORE_CONTRACT_KEYS);
         if (__DEV__) warnDefinitionCollisions('Store', name, config);
+        // Component render hooks: a store has no render, so they are dropped.
+        if (__DEV__) {
+            for (const hook of ['beforeInit', 'beforeUpdate', 'onUpdate']) {
+                if (typeof config[hook] === 'function') wfError(WF_ERRORS.DEFINITION_KEY_IGNORED, {
+                    warn: true,
+                    context: `Store '${name}': ${hook}() is a component render hook; a store has no render, so it is never called`,
+                    suggestion: 'Put setup in init(). To react to a change in the store, use watch: { path() {} }.'
+                });
+            }
+        }
 
         // Extract special properties from config
         // storageKey and autoSave enable localStorage persistence (like components)
         // subscribe and onStoreUpdate enable store-to-store subscriptions (like components)
-        const { state, computed, init, storageKey, autoSave, subscribe, onStoreUpdate, ...methods } = config;
+        const { state, computed, init, storageKey, autoSave, subscribe, onStoreUpdate, watch, ...methods } = config;
 
         // Format the store definition with methods at top level
         // Methods are extracted from config and added directly to definition
@@ -988,6 +1103,7 @@ export class StoreManager {
             autoSave: autoSave || false,      // Auto-save on every state change
             subscribe: subscribe || null,     // Store-to-store subscriptions
             onStoreUpdate: onStoreUpdate || null,  // Store-to-store update handler
+            watch: watch || null,             // Watchers, as a component's
             ...methods  // All other properties are methods (bound before init)
         };
 
@@ -1026,7 +1142,7 @@ export class StoreManager {
             store._initPromise
                 .then(() => finalizeStore())
                 .catch((error) => {
-                    if (__DEV__) console.error(`[WF] Store '${name}' init failed:`, error);
+                    this._reportInitError(name, store, error);
                     // Still mark as ready so waiting components don't hang forever
                     finalizeStore();
                 });
@@ -1069,7 +1185,63 @@ export class StoreManager {
         }
         this._namedStores.delete(name);
         if (this._pendingStoreDependencies) this._pendingStoreDependencies.delete(name);
+        this._queueReattach(name, store && store.id);
         return true;
+    }
+
+    /**
+     * A store init() error, sync or async: to the store's onError when it
+     * has one, as a component's init error goes to its own; otherwise
+     * WF-903 with the cause, which prints in every build.
+     * @private
+     */
+    _reportInitError(name, instance, error) {
+        if (instance && instance.context && typeof instance.context.onError === 'function') {
+            this.framework._handleError(`Error in store '${name}' init`, error, instance, { lifecycle: 'init' });
+            return;
+        }
+        this.framework._error(WF_ERRORS.STORE_INIT_ERROR, {
+            context: name,
+            suggestion: 'Check the init() function in your store definition',
+            cause: error
+        });
+    }
+
+    /**
+     * Entities attached to a store that was just unregistered (subscribe: {}
+     * paths, 'store:' watchers) wait for the name to register again and then
+     * re-attach, through the same pending path a subscriber takes when it
+     * set up before its store existed. Without this they stayed on the
+     * discarded instance and went silent.
+     * @private
+     */
+    _queueReattach(name, storeId) {
+        const instances = this.framework.componentInstances;
+        if (!instances) return;
+        instances.forEach((inst, id) => {
+            if (id === storeId) return;
+            // The definition, not _storeSubscriptions: the wait-only form
+            // (subscribe: { name: [] }) records no paths.
+            const declared = inst.definition && inst.definition.subscribe;
+            if (declared && this._parseSubscribeDeclaration(declared)[name] !== undefined) {
+                if (inst._storeSubscriptions) {
+                    inst._storeSubscriptions = inst._storeSubscriptions.filter((s) => s.storeName !== name);
+                }
+                this.registerPendingStoreDependency(name, id, '_subscribe_', null);
+            }
+            const specs = inst._storeWatchSpecs;
+            if (specs && specs.some((s) => s.storeName === name)) {
+                for (const s of specs) {
+                    if (s.storeName !== name) continue;
+                    try { s.unsubscribe(); } catch (e) { /* already gone */ }
+                    const at = inst._storeWatcherCleanups ? inst._storeWatcherCleanups.indexOf(s.unsubscribe) : -1;
+                    if (at !== -1) inst._storeWatcherCleanups.splice(at, 1);
+                }
+                inst._storeWatchSpecs = specs.filter((s) => s.storeName !== name);
+                inst._storeWatchPending = (inst._storeWatchPending || []).concat(specs.filter((s) => s.storeName === name));
+                this.registerPendingStoreDependency(name, id, PENDING_STORE_WATCH, null);
+            }
+        });
     }
 
     /**

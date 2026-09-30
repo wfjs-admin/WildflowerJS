@@ -621,15 +621,16 @@ export const ListItemBindingMethods = {
             if (!actionAttr) continue;
 
             // Check if this action element is in a nested list
-            const nestedListParent = actionEl.closest('[data-list],[data-wf-list]');
-            if (nestedListParent && nestedListParent !== itemEl.closest('[data-list],[data-wf-list]')) {
+            const listSel = this._attrSelector('list');
+            const nestedListParent = actionEl.closest(listSel);
+            if (nestedListParent && nestedListParent !== itemEl.closest(listSel)) {
                 // Skip actions that belong to a nested list
                 continue;
             }
 
             // Check if this action element is inside a nested component
             // If so, let that component handle its own actions
-            const closestComponent = actionEl.closest('[data-component]');
+            const closestComponent = actionEl.closest(this._attrSelector('component'));
             if (closestComponent && closestComponent !== componentInstance.element) {
                 // Skip actions that belong to a nested component
                 continue;

@@ -149,4 +149,42 @@ describe('Application errors are visible in every build', () => {
             wildflower.offError(handler)
         }
     })
+
+    // Stores and plugins (2026-09-24 review): the store init path reported
+    // through the framework-diagnostic channel, which dropped the author's
+    // exception in production; store and plugin computeds reported nothing
+    // in any build.
+    function seenAnywhere(text, fn) {
+        const warns = []
+        const realWarn = console.warn
+        console.warn = (...a) => { warns.push(a.map(String).join(' ')) }
+        try { fn() } finally { console.warn = realWarn }
+        return errors.concat(warns).some(line => line.includes(text))
+    }
+
+    it('an error thrown in a store init() reaches the console with its message', () => {
+        const name = 'evpStoreInit' + (++seq)
+        expect(seenAnywhere('AUTHOR-store-init', () => {
+            wildflower.store(name, { init() { throw new Error('AUTHOR-store-init') } })
+        })).toBe(true)
+        wildflower.unregister(name)
+    })
+
+    it('a store computed that throws is reported with its message', () => {
+        const name = 'evpStoreComputed' + (++seq)
+        expect(seenAnywhere('AUTHOR-store-computed', () => {
+            wildflower.store(name, { state: { a: 1 }, computed: { bad() { throw new Error('AUTHOR-store-computed') } } })
+            void wildflower.getStore(name).bad
+        })).toBe(true)
+        wildflower.unregister(name)
+    })
+
+    it('a plugin computed that throws is reported with its message', () => {
+        if (!wildflower.plugin) return
+        const name = 'evpPluginComputed' + (++seq)
+        expect(seenAnywhere('AUTHOR-plugin-computed', () => {
+            wildflower.plugin({ name, state: { a: 1 }, computed: { bad() { throw new Error('AUTHOR-plugin-computed') } } })
+            void wildflower['$' + name].bad
+        })).toBe(true)
+    })
 })

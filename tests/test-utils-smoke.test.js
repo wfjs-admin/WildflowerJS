@@ -145,6 +145,49 @@ describe('@wildflowerjs/test-utils', () => {
 
         expect(window.wildflower.componentDefinitions.has('smoke-test-comp')).toBe(false)
       })
+
+      const frames = (k) => new Promise((resolve) => {
+        let left = k
+        const step = () => { if (--left <= 0) resolve(); else requestAnimationFrame(step) }
+        requestAnimationFrame(step)
+      })
+
+      it.skipIf(!hasFeature('pools'))('stops the tick of every component, store and plugin, and destroys the instances', async () => {
+        const wf = window.wildflower
+        const ticks = { comp: 0, store: 0, plugin: 0 }
+        let destroyed = 0
+        wf.component('smoke-ticker', { state: {}, tick() { ticks.comp++ }, destroy() { destroyed++ } })
+        wf.store('smoke-ticker-store', { state: {}, pools: { a: {} }, tick() { ticks.store++ } })
+        if (hasFeature('plugins')) wf.plugin({ name: 'smokeTickerPlugin', state: {}, tick() { ticks.plugin++ } })
+        const host = document.createElement('div')
+        host.innerHTML = '<div data-component="smoke-ticker"></div>'
+        document.body.appendChild(host)
+        if (wf._setupDynamicComponentDetection) wf._setupDynamicComponentDetection()
+        await frames(4)
+        expect(ticks.comp).toBeGreaterThan(0)
+        expect(ticks.store).toBeGreaterThan(0)
+
+        resetFramework()
+        host.remove()
+        const before = { ...ticks }
+        await frames(4)
+        expect(ticks).toEqual(before)
+        expect(destroyed).toBe(1)
+        expect(wf.componentInstances.size).toBe(0)
+      })
+
+      it.skipIf(!hasFeature('plugins'))('removes plugins, their state and their $name accessors', () => {
+        const wf = window.wildflower
+        wf.plugin({ name: 'smokeResetPlugin', state: { n: 1 }, bump() { this.n++ } })
+        expect(wf.$smokeResetPlugin).toBeTruthy()
+
+        resetFramework()
+
+        expect(wf.$smokeResetPlugin).toBeUndefined()
+        expect(wf.hasPlugin('smokeResetPlugin')).toBe(false)
+        wf.plugin({ name: 'smokeResetPlugin', state: { n: 5 } })
+        expect(wf.$smokeResetPlugin.n).toBe(5)
+      })
     })
 
     describe('initContextSystem', () => {

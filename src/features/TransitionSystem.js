@@ -19,7 +19,7 @@ export const TransitionSystemMethods = {
      */
     _handleTransitionedVisibilityChange(element, context, isVisible, instance)
     {
-        const transitionName = element.dataset.transition;
+        const transitionName = this._getAttr(element, 'transition');
         if (!transitionName) {
             // No transition, use default behavior
             context._updateConditionalElement(isVisible);

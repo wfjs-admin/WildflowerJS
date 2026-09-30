@@ -6,7 +6,38 @@
 
 import { RAW_TARGET } from '../state/ContextProxy.js';
 import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING, setOwn } from '../core/wfUtils.js';
-import { beginBatchScope, endBatchScope, discardScheduled } from '../state/reactive-graph/core.js';
+import { beginBatchScope, endBatchScope, discardScheduled, toRaw as graphToRaw } from '../state/reactive-graph/core.js';
+
+/**
+ * Path listeners strictly below a path whose value was replaced, each with
+ * its own new and old value, for the ones whose value changed.
+ *
+ * obj = { a: 2 } is reported at 'obj', but a listener on 'obj.a' needs to
+ * hear it as surely as it hears obj.a = 2. Only a replacement can move a
+ * value below the changed path: the same object reported again (an in-place
+ * change announced at its parent) and a primitive (nothing below it) return
+ * null before any listener path is looked at.
+ *
+ * @param {Iterable<string>} paths - Listener paths to check
+ * @returns {Array<[string, *, *]>|null} [path, newValue, oldValue] entries
+ */
+function changedBelow(paths, changedPath, newValue, oldValue) {
+    if (newValue === oldValue) return null;
+    const newObj = newValue !== null && typeof newValue === 'object';
+    const oldObj = oldValue !== null && typeof oldValue === 'object';
+    if (!newObj && !oldObj) return null;
+    const prefix = changedPath + '.';
+    let out = null;
+    for (const p of paths) {
+        if (typeof p !== 'string' || !p.startsWith(prefix)) continue;
+        const rel = p.slice(prefix.length);
+        const nv = newObj ? pathResolver.get(newValue, rel) : undefined;
+        const ov = oldObj ? pathResolver.get(oldValue, rel) : undefined;
+        if (Object.is(nv, ov)) continue;
+        (out || (out = [])).push([p, nv, ov]);
+    }
+    return out;
+}
 
 /**
  * Internal worker for wildflower.toRaw().
@@ -24,6 +55,11 @@ import { beginBatchScope, endBatchScope, discardScheduled } from '../state/react
  */
 function _toRawWalk(value, seen) {
     if (value === null || typeof value !== 'object') return value;
+    // Walk the plain object behind a reactive proxy: element and field reads
+    // on the proxy each went through a get trap (slow on a large array, a
+    // false WF-216 when repeated, and a dependency per walked path inside a
+    // computed). Each level unwraps, since a raw array can hold proxies.
+    value = graphToRaw(value);
     if (typeof Node !== 'undefined' && value instanceof Node) return value;
     if (seen.has(value)) return seen.get(value);
 
@@ -577,6 +613,14 @@ export const EntitySystemMethods = {
 
         const isComponent = !instance.isVirtual;
 
+        // A store's or plugin's own watch: {} (components run theirs below).
+        // Ahead of the fast exit: a store nobody depends on can still watch
+        // its own state. A store's _internal (its ready flag) is framework
+        // bookkeeping, not the author's state, so no watcher hears it.
+        if (!isComponent && instance._watcherHandlers && !path.startsWith('_internal')) {
+            this._executeWatchers(instance, path, newValue, oldValue);
+        }
+
         // === VIRTUAL STORE FAST EXIT ===
         // For headless stores with no dependents, skip all notification work.
         // This saves ~22% of profile time in cross-store computed benchmarks.
@@ -689,7 +733,7 @@ export const EntitySystemMethods = {
             if (__FEATURE_LISTS__ && dependentInstance.element && this._refreshListItemComputedBindings
                 && !dependentInstance._renderEffect
                 && dependentInstance.stateManager?._hasItemComputeds) {
-                const listElements = dependentInstance.element.querySelectorAll('[data-list]');
+                const listElements = dependentInstance.element.querySelectorAll(this._attrSelector('list'));
                 listElements.forEach(listEl => {
                     if (listEl._listContext) {
                         const listContext = listEl._listContext;
@@ -721,29 +765,26 @@ export const EntitySystemMethods = {
                 const subscribers = this.storeManager.getPathSubscribers(storeName, path);
 
                 if (subscribers && subscribers.size > 0) {
-                    // Check for computed evaluation (defer notifications during computed)
-                    const isDeferring = this._isEvaluatingComputed;
+                    this._dispatchPathSubscribers(storeName, path, newValue, oldValue, subscribers);
+                }
 
-                    if (isDeferring) {
-                        // Defer notification until computed evaluation is complete
-                        this._deferredStoreNotifications = this._deferredStoreNotifications || [];
+                // A computed's change pulses as "computed:NAME"; subscribers
+                // that declared the bare name hear it too (the prefix is optional).
+                if (path.startsWith('computed:')) {
+                    const bare = path.slice(9);
+                    const bareSubs = this.storeManager.getPathSubscribers(storeName, bare);
+                    if (bareSubs && bareSubs.size > 0) {
+                        this._dispatchPathSubscribers(storeName, bare, newValue, oldValue, bareSubs);
+                    }
+                }
 
-                        // Limit queue size to prevent memory issues
-                        if (this._deferredStoreNotifications.length > 1000) {
-                            if (__DEV__) console.warn('[WF] Deferred store notifications exceeded limit, forcing flush');
-                            this._flushDeferredStoreNotifications();
-                        }
-
-                        this._deferredStoreNotifications.push({
-                            storeName,
-                            path,
-                            newValue,
-                            oldValue,
-                            subscribers: new Set(subscribers)
-                        });
-                    } else {
-                        // Notify subscribers immediately
-                        this._notifyPathSubscribers(storeName, path, newValue, oldValue, subscribers);
+                // Subscribers below a replaced object: obj = {...} with a
+                // subscription on obj.a, each told about its own path.
+                const byPath = this.storeManager.getPathSubscriberMap(storeName);
+                const below = byPath && changedBelow(byPath.keys(), path, newValue, oldValue);
+                if (below) {
+                    for (const [childPath, childNew, childOld] of below) {
+                        this._dispatchPathSubscribers(storeName, childPath, childNew, childOld, byPath.get(childPath));
                     }
                 }
             }
@@ -767,9 +808,9 @@ export const EntitySystemMethods = {
                     // Effect-backed components: effects re-run automatically when external() deps change
                     if (!dependentInstance._renderEffect) {
                         // Find all list contexts in this component
-                        const listElements = dependentInstance.element.querySelectorAll('[data-list]');
+                        const listElements = dependentInstance.element.querySelectorAll(this._attrSelector('list'));
                         listElements.forEach(listEl => {
-                            const listPath = listEl.dataset.list;
+                            const listPath = this._getAttr(listEl, 'list');
 
                             // Check if this list uses external() or $store.path syntax
                             const usesExternalStore = listPath && (
@@ -822,10 +863,10 @@ export const EntitySystemMethods = {
                         // queries existing: the subtree scan is on the store-
                         // change hot path, and adopted-list updates only arise
                         // from the query feature.
-                        const listElements = dependentInstance.element.querySelectorAll('[data-list]');
+                        const listElements = dependentInstance.element.querySelectorAll(this._attrSelector('list'));
                         listElements.forEach(listEl => {
                             if (listEl._mapArrayInitialized) return;
-                            const listPath = listEl.dataset.list;
+                            const listPath = this._getAttr(listEl, 'list');
                             const usesExternalStore = listPath && (
                                 listPath.includes('external(') ||
                                 listPath.includes('$')
@@ -1009,6 +1050,19 @@ export const EntitySystemMethods = {
                     try {
                         return value.apply(context, args);
                     } catch (error) {
+                        // An entity with onError handles its own method
+                        // errors, as a component does; without one the error
+                        // belongs to the caller. The owner lookup runs only
+                        // on this path.
+                        if (key !== 'onError' && typeof context.onError === 'function') {
+                            let owner = instance;
+                            if (!owner) {
+                                for (const inst of framework.componentInstances.values()) {
+                                    if (inst.context === context) { owner = inst; break; }
+                                }
+                            }
+                            if (owner) return framework._handleError(`Error in ${owner.name}.${key}`, error, owner, { methodName: key });
+                        }
                         if (__DEV__) console.error(`Error in ${key}:`, error);
                         throw error;
                     }
@@ -1054,7 +1108,10 @@ export const EntitySystemMethods = {
         // FIRST observed; after a splice/reorder the subscription misfires or
         // goes silent. WF-213, dev-only, warn-severity (recoverable diagnostic;
         // must not trip error-tracking pipelines).
-        if (__DEV__ && typeof path === 'string' && (/(^|\.)\d+(\.|$)|\[\d+\]/.test(path))) {
+        // A query store is exempt: every ingest and write replaces rows
+        // wholesale, so 'rows.0.x' tracks the current first row (pinned by
+        // query-index-path-watch.test.js).
+        if (__DEV__ && typeof path === 'string' && !stateManager._wfQueryOwned && (/(^|\.)\d+(\.|$)|\[\d+\]/.test(path))) {
             wfError(WF_ERRORS.INDEXED_PATH_OBSERVER, {
                 warn: true,
                 context: `subscribe path "${path}"`,
@@ -1086,17 +1143,32 @@ export const EntitySystemMethods = {
                         const { subPath, handler, options: subOptions } = subInfo;
 
                         // Only call if path matches subscription path
+                        let fired = false;
                         if (changedPath === subPath ||
                             changedPath.startsWith(`${subPath}.`) ||
                             (subPath === '' && changedPath)) {
 
                             // Call the handler
                             handler(newValue, oldValue, changedPath);
-
-                            // Handle once option
-                            if (subOptions && subOptions.once) {
-                                stateManager._subscriptions.delete(subId);
+                            fired = true;
+                        } else if (changedPath.startsWith('computed:') && changedPath.slice(9) === subPath) {
+                            // A computed's change pulses as "computed:NAME"; a
+                            // subscription on the bare name hears it too, as a
+                            // watcher does (the prefix is optional).
+                            handler(newValue, oldValue, subPath);
+                            fired = true;
+                        } else if (subPath.length > changedPath.length && subPath.startsWith(`${changedPath}.`)) {
+                            // Below a replaced object: obj = {...} with a subscription on obj.a
+                            const below = changedBelow([subPath], changedPath, newValue, oldValue);
+                            if (below) {
+                                handler(below[0][1], below[0][2], subPath);
+                                fired = true;
                             }
+                        }
+
+                        // Handle once option
+                        if (fired && subOptions && subOptions.once) {
+                            stateManager._subscriptions.delete(subId);
                         }
                     });
                 }
@@ -1138,6 +1210,34 @@ export const EntitySystemMethods = {
      * @param {Set<Object>} subscribers - Set of subscribed component instances
      * @private
      */
+    /**
+     * Notify path subscribers now, or queue the notification while a computed
+     * is evaluating (flushed by _flushDeferredStoreNotifications).
+     * @private
+     */
+    _dispatchPathSubscribers(storeName, path, newValue, oldValue, subscribers) {
+        if (!subscribers || subscribers.size === 0) return;
+        if (this._isEvaluatingComputed) {
+            this._deferredStoreNotifications = this._deferredStoreNotifications || [];
+
+            // Limit queue size to prevent memory issues
+            if (this._deferredStoreNotifications.length > 1000) {
+                if (__DEV__) console.warn('[WF] Deferred store notifications exceeded limit, forcing flush');
+                this._flushDeferredStoreNotifications();
+            }
+
+            this._deferredStoreNotifications.push({
+                storeName,
+                path,
+                newValue,
+                oldValue,
+                subscribers: new Set(subscribers)
+            });
+        } else {
+            this._notifyPathSubscribers(storeName, path, newValue, oldValue, subscribers);
+        }
+    },
+
     _notifyPathSubscribers(storeName, path, newValue, oldValue, subscribers) {
         // Re-entrancy guard: prevent infinite loops if onStoreUpdate modifies the store
         const pathKey = `${storeName}:${path}`;
@@ -1411,6 +1511,22 @@ export const EntitySystemMethods = {
             } catch (error)
             {
                 this._handleError(`Error in wildcard watcher`, error, instance);
+            }
+        }
+
+        // Watchers below a replaced object: obj = {...} with a watcher on obj.a
+        const below = changedBelow(instance._watcherHandlers.keys(), path, newValue, oldValue);
+        if (below)
+        {
+            for (const [childPath, childNew, childOld] of below)
+            {
+                try
+                {
+                    instance._watcherHandlers.get(childPath)(childNew, childOld, childPath);
+                } catch (error)
+                {
+                    this._handleError(`Error in watcher for ${childPath}`, error, instance);
+                }
             }
         }
     },
@@ -1713,10 +1829,10 @@ export const EntitySystemMethods = {
      * Array, plain Object. Cyclic references are preserved. DOM nodes are
      * returned by reference (not cloned). Functions are skipped.
      *
-     * Caveat: calling toRaw() from inside a reactive effect/computed will
-     * register every walked path as a dependency. Snapshotting is typically
-     * done from async callbacks (debounced save, postMessage trigger), so
-     * this rarely matters in practice, but worth knowing.
+     * The walk reads the plain data behind each reactive proxy, so it
+     * registers no dependencies: a computed that calls toRaw() does not
+     * re-run when the copied data changes. Read the reactive value itself
+     * where a computed should track it.
      *
      * @param {*} value - Any value: primitive, object, array, proxy.
      * @returns {*} A structured-clone-safe deep copy.

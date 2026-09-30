@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, isMinifiedBuild, hasFeature } from './helpers/load-framework.js'
 
 const describeIfPools = hasFeature('pools') ? describe : describe.skip
 
@@ -23,22 +23,8 @@ describeIfPools('pool.onChange Callback', () => {
   })
 
   beforeEach(() => {
+    resetFramework()
     wildflower = window.wildflower
-
-    if (wildflower.componentDefinitions) wildflower.componentDefinitions.clear()
-    if (wildflower.componentInstances) wildflower.componentInstances.clear()
-    if (wildflower.storeManager && wildflower.storeManager._namedStores) {
-      wildflower.storeManager._namedStores.clear()
-    }
-    if (wildflower._templateCache) {
-      if (wildflower._templateCache.general) wildflower._templateCache.general.clear()
-      if (wildflower._templateCache.lists) wildflower._templateCache.lists.clear()
-      if (wildflower._templateCache.compiled) wildflower._templateCache.compiled.clear()
-      if (wildflower._templateCache.extracted) wildflower._templateCache.extracted.clear()
-      if (wildflower._templateCache.fragmentPools) wildflower._templateCache.fragmentPools.clear()
-      if (wildflower._templateCache.stats) wildflower._templateCache.stats.clear()
-    }
-    if (wildflower._tickableInstances) wildflower._tickableInstances.length = 0
 
     testContainer = document.createElement('div')
     testContainer.id = 'test-container'

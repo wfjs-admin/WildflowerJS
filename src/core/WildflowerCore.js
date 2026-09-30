@@ -86,6 +86,15 @@ export class WildflowerJS
         // is a build-time define, like __DEV__). Read it as wildflower.version.
         this.version = typeof __VERSION__ !== 'undefined' ? __VERSION__ : '0.0.0';
 
+        // Which tier file this is ('nano', 'mini', 'mini-pool', 'lite',
+        // 'core', 'spa' or 'full'), and the eight capabilities that differ
+        // between tiers: lists, pools (with the frame loop that runs tick()),
+        // plugins, portals, transitions, router, query, ssr. Both are stamped
+        // at build time from the output file (__TIER__, __CAPS__). Extensions
+        // read features to learn what the build can do.
+        this.tier = typeof __TIER__ !== 'undefined' ? __TIER__ : null;
+        this.features = Object.freeze(Object.assign({}, typeof __CAPS__ !== 'undefined' ? __CAPS__ : null));
+
         // Strict props mode (throw on validation failure even in production)
         this.strictProps = this.options.strictProps;
 
@@ -273,6 +282,10 @@ export class WildflowerJS
         // Web Component adapter registry
         // Maps custom element tag names to { prop, event } configurations
         this._webComponentAdapters = new Map();
+
+        // _attrSelector's per-mode caches of value-less selectors
+        this._wfSelectorsDual = null;
+        this._wfSelectorsExclusive = null;
     }
 
 
@@ -288,8 +301,36 @@ export class WildflowerJS
         if (this.options.useWfPrefixOnly) {
             return el.getAttribute(`data-wf-${baseName}`);
         }
-        // Default: Check wf-prefixed version first (explicit namespace takes precedence)
-        return el.getAttribute(`data-wf-${baseName}`) || el.getAttribute(`data-${baseName}`);
+        // Default: the wf-prefixed version wins when present (explicit namespace
+        // takes precedence), even with an empty value: data-wf-X="" is present,
+        // which presence attributes (data-wf-pool-static) rely on.
+        const wf = el.getAttribute(`data-wf-${baseName}`);
+        return wf !== null ? wf : el.getAttribute(`data-${baseName}`);
+    }
+
+    /**
+     * The base name of a framework attribute, for code that walks an element's
+     * attributes (directives, key filters): 'data-wf-X' gives 'X', 'data-X'
+     * gives 'X' unless exclusive mode is on, anything else null. When an
+     * element carries both forms, callers skip the plain one (see
+     * _wfTwinWins) so the wf form takes precedence, as in _getAttr.
+     * @param {string} name - Attribute name
+     * @returns {string|null}
+     * @private
+     */
+    _wfBase(name) {
+        if (name.startsWith('data-wf-')) return name.slice(8);
+        if (!this.options.useWfPrefixOnly && name.startsWith('data-')) return name.slice(5);
+        return null;
+    }
+
+    /**
+     * True when a plain data-X attribute should be skipped because the same
+     * element also carries data-wf-X (the wf form wins).
+     * @private
+     */
+    _wfTwinWins(el, name) {
+        return !name.startsWith('data-wf-') && el.hasAttribute('data-wf-' + name.slice(5));
     }
 
     /**
@@ -316,17 +357,27 @@ export class WildflowerJS
      * @private
      */
     _attrSelector(baseName, value) {
-        // In exclusive mode, only generate wf-prefixed selector
-        if (this.options.useWfPrefixOnly) {
-            return value !== undefined
-                ? `[data-wf-${baseName}="${value}"]`
-                : `[data-wf-${baseName}]`;
-        }
-        // Default: Generate selector for both prefixes
+        const exclusive = this.options.useWfPrefixOnly;
         if (value !== undefined) {
-            return `[data-${baseName}="${value}"],[data-wf-${baseName}="${value}"]`;
+            // In exclusive mode, only generate wf-prefixed selector
+            return exclusive
+                ? `[data-wf-${baseName}="${value}"]`
+                : `[data-${baseName}="${value}"],[data-wf-${baseName}="${value}"]`;
         }
-        return `[data-${baseName}],[data-wf-${baseName}]`;
+        // Value-less selectors are cached per mode: some run per list row
+        // (row removal, per-row closest lookups), where rebuilding the
+        // string each call would cost more than the plain literal it replaces.
+        // Keyed by mode rather than cleared on change, so a direct write to
+        // options.useWfPrefixOnly stays correct.
+        const cache = exclusive
+            ? (this._wfSelectorsExclusive || (this._wfSelectorsExclusive = new Map()))
+            : (this._wfSelectorsDual || (this._wfSelectorsDual = new Map()));
+        let sel = cache.get(baseName);
+        if (sel === undefined) {
+            sel = exclusive ? `[data-wf-${baseName}]` : `[data-${baseName}],[data-wf-${baseName}]`;
+            cache.set(baseName, sel);
+        }
+        return sel;
     }
 
     /**
@@ -633,7 +684,7 @@ export class WildflowerJS
      * tests. See also WF-215, the dev warning for a re-registration that skipped
      * this step.
      *
-     * @param {string} name - The component and/or store name to unregister
+     * @param {string} name - The component, store and/or query name to unregister
      * @returns {boolean} True if a component or a store was removed
      *
      * @example
@@ -642,6 +693,13 @@ export class WildflowerJS
     unregister(name)
     {
         if (!name || typeof name !== 'string') return false;
+        // A query's controller (poll, stream, window listeners) goes with its
+        // store, or a second query(name) is taken for a duplicate.
+        const queryController = this._queryControllers && this._queryControllers.get(name);
+        if (queryController) {
+            this._queryTeardown(queryController);
+            this._queryControllers.delete(name);
+        }
         const removedComponent = this.unregisterComponent ? this.unregisterComponent(name) : false;
         const removedStore = this.storeManager && this.storeManager.unregisterStore
             ? this.storeManager.unregisterStore(name) : false;

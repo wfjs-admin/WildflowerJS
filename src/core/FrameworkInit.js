@@ -582,7 +582,7 @@ export const FrameworkInitMethods = {
             const templateId = template.id || `template-${++this._templateIdCounter}`;
 
             // Determine component type based on template
-            let componentType = template.dataset.component;
+            let componentType = this._getAttr(template, 'component');
 
             // Check if it's a list template
             const listElement = template.closest(this._attrSelector('list'));
@@ -609,7 +609,7 @@ export const FrameworkInitMethods = {
                 // COMPILE TEMPLATE: Extract binding metadata at initialization
                 // Use composite key: componentType:listName to avoid collisions between different components
                 const componentElement = template.closest(this._attrSelector('component'));
-                const actualComponentType = componentElement?.dataset?.component || componentType;
+                const actualComponentType = (componentElement && this._getAttr(componentElement, 'component')) || componentType;
 
                 const compilationKey = actualComponentType ? `${actualComponentType}:${listName}` : listName;
 

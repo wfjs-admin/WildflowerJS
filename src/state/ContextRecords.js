@@ -561,7 +561,11 @@ class PortalBindingRecord
         // path only handles strings. Coerce objects rather than throw so
         // the page keeps rendering, and warn once per binding record.
         if (newValue && typeof newValue === 'object') {
-            if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._classBindingShapeWarned) {
+            // An inline {'is-active': cond} expression is the documented object
+            // form (portal content paints through here), so only a named
+            // computed returning an object is reported.
+            const inlineObject = typeof this.path === 'string' && this.path.trim().charAt(0) === '{';
+            if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._classBindingShapeWarned && !inlineObject) {
                 this._classBindingShapeWarned = true;
                 wfError(WF_ERRORS.CLASS_BINDING_SHAPE, {
                     context: 'computed returned an object; coercing truthy keys to a class string',
@@ -588,21 +592,11 @@ class PortalBindingRecord
         // On first call, capture static classes and clean up any stale dynamic classes
         if (this._staticClasses === undefined)
         {
-            // Get static classes from data attribute (set by WfBuilder) or current classes
-            const staticClassAttr = this.element.dataset.staticClass;
-            if (staticClassAttr !== undefined)
-            {
-                // WfBuilder-generated element: use explicit static classes
-                this._staticClasses = new Set(staticClassAttr.split(/\s+/).filter(Boolean));
-            }
-            else
-            {
-                // Regular HTML: current classes minus new dynamic classes are static
-                const newClasses = newValue ? new Set(newValue.split(/\s+/).filter(Boolean)) : new Set();
-                this._staticClasses = new Set(
-                    Array.from(this.element.classList).filter(c => !newClasses.has(c))
-                );
-            }
+            // Current classes minus new dynamic classes are static
+            const newClasses = newValue ? new Set(newValue.split(/\s+/).filter(Boolean)) : new Set();
+            this._staticClasses = new Set(
+                Array.from(this.element.classList).filter(c => !newClasses.has(c))
+            );
 
             // Clean up any stale dynamic classes (classes that aren't static and aren't the new value)
             const newClassSet = newValue ? new Set(newValue.split(/\s+/).filter(Boolean)) : new Set();

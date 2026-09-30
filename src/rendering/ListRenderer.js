@@ -353,7 +353,7 @@ export const ListRendererMethods = {
             let insideChildComponent = false;
             let cur = element.parentElement;
             while (cur) {
-                if (cur.dataset.component) {
+                if (this._hasAttr(cur, 'component')) {
                     insideChildComponent = true;
                     break;
                 }
@@ -2160,9 +2160,16 @@ export const ListRendererMethods = {
 
             // === INTEGRATION: Handle root element model/show bindings ===
             // This covers data-model and data-show on the item root element itself
-            const ds = itemEl.dataset;
-            const rootContext = itemCompiledMetadata ? { ...context, componentInstance: instance, listLength: data?.length || 0 } : context;
-            self._bindRootElementModelShow(itemEl, itemProxy, ds, index, rootContext);
+            // Read through the prefix helpers (data-wf-model / data-wf-show). A
+            // compiled template records whether its root has either, so a row
+            // whose template root has neither skips the reads (they could only
+            // come back empty).
+            const rb = itemCompiledMetadata && itemCompiledMetadata.rootBindings;
+            if (!rb || rb.hasModel || rb.hasShow) {
+                const ds = { model: self._getAttr(itemEl, 'model'), show: self._getAttr(itemEl, 'show') };
+                const rootContext = itemCompiledMetadata ? { ...context, componentInstance: instance, listLength: data?.length || 0 } : context;
+                self._bindRootElementModelShow(itemEl, itemProxy, ds, index, rootContext);
+            }
 
             // Store binding data for context creation
             itemEl._needsContexts = true;
@@ -2451,7 +2458,7 @@ export const ListRendererMethods = {
                         // === INTEGRATION: Handle root element model/show bindings ===
                         // PERF: Only call if template actually has root model/show bindings
                         if (hasRootModelOrShow) {
-                            const ds = row.dataset;
+                            const ds = { model: self._getAttr(row, 'model'), show: self._getAttr(row, 'show') };
                             self._bindRootElementModelShow(row, itemProxy, ds, i, enrichedContext);
                         }
 
@@ -2881,7 +2888,7 @@ export const ListRendererMethods = {
                     // Update nested list contexts with the new parent proxy
                     const childListPaths = self._listRelationships.get(context.path) || new Set();
                     childListPaths.forEach(childPath => {
-                        const nestedListElements = itemEl.querySelectorAll(`[data-list="${childPath}"]`);
+                        const nestedListElements = itemEl.querySelectorAll(self._attrSelector('list', childPath));
                         nestedListElements.forEach(nestedListEl => {
                             const childContext = nestedListEl._listContext;
                             if (childContext) {
@@ -3315,7 +3322,7 @@ export const ListRendererMethods = {
         // needsProxy: simple flat item props are read directly (bypassing the Proxy
         // GET trap); dotted / context / state / computed paths go through a shared
         // merged-context proxy.
-        const _isComplex = p => !p || p.includes('.') || p.startsWith('_') || p === '$item' || (p in state) || (p in computed);
+        const _isComplex = p => !p || p.includes('.') || p.startsWith('_') || p === '$item' || p === '$this' || (p in state) || (p in computed);
         const needsProxy = bindings.some(b => _isComplex(b.path)) || (rootBindPath != null && _isComplex(rootBindPath));
 
         let currentItem = null;
@@ -3324,7 +3331,8 @@ export const ListRendererMethods = {
         if (needsProxy) {
             mergedContext = new Proxy({}, {
                 get(target, prop) {
-                    if (prop === '$item') return currentItem;
+                    // Whole-item reference, as BindingResolver reads it.
+                    if (prop === '$item' || prop === '$this') return currentItem;
                     if (prop === '_index') return currentIndex;
                     if (prop === '_length') return listLength;
                     if (prop === '_first') return currentIndex === 0;
@@ -3381,7 +3389,8 @@ export const ListRendererMethods = {
         const fragment = document.createDocumentFragment();
         for (let i = startIndex; i < endIndex; i++) {
             const item = rawData[i];
-            if (!item) continue;
+            // A primitive list's 0, '' or false is a row like any other.
+            if (item == null) continue;
 
             const row = proto.cloneNode(true);
             if (_lazyEls) {
@@ -4768,16 +4777,20 @@ export const ListRendererMethods = {
         // Custom directives (e.g. data-directive="highlight")
         if (this._processCustomDirectives && this._customDirectives && this._customDirectives.size > 0) {
             this._processCustomDirectives(itemEl, instance);
-            if (!this._customDirectivesSelector) {
+            // Built once per directive set and prefix mode (the string depends
+            // on both: data-X and data-wf-X, or data-wf-X alone).
+            const exclusive = !!this.options.useWfPrefixOnly;
+            if (!this._customDirectivesSelector || this._customDirectivesSelectorExclusive !== exclusive) {
                 const dirNames = Array.from(this._customDirectives.keys());
                 this._customDirectivesSelector = dirNames
-                    .map(name => `[data-${name}]`)
+                    .map(name => this._attrSelector(name))
                     .join(',');
+                this._customDirectivesSelectorExclusive = exclusive;
             }
             if (this._customDirectivesSelector) {
                 const descendants = itemEl.querySelectorAll(this._customDirectivesSelector);
                 for (const descendant of descendants) {
-                    if (!descendant.hasAttribute('data-component') && !descendant.hasAttribute('data-wf-component')) {
+                    if (!this._hasAttr(descendant, 'component')) {
                         this._processCustomDirectives(descendant, instance);
                     }
                 }
@@ -5078,7 +5091,7 @@ export const ListRendererMethods = {
                 // Only include lists that belong to this component
                 // IMPORTANT: Use [data-component] not [data-component-id] because nested
                 // components may not have been assigned their ID yet during init
-                const closestComponentEl = el.closest('[data-component], [data-wf-component]');
+                const closestComponentEl = el.closest(this._attrSelector('component'));
                 return closestComponentEl === instance.element;
             });
 
@@ -5090,7 +5103,7 @@ export const ListRendererMethods = {
         // Create contexts for visible lists
         visibleLists.forEach(listElement =>
         {
-            const listPath = listElement.dataset.list;
+            const listPath = this._getAttr(listElement, 'list');
             if (!listPath) return;
 
             // Skip if context already exists for this list
@@ -5147,7 +5160,7 @@ export const ListRendererMethods = {
         // These will be placeholder contexts that get populated during rendering
         templateLists.forEach(listElement =>
         {
-            const listPath = listElement.dataset.list;
+            const listPath = this._getAttr(listElement, 'list');
             if (!listPath) return;
 
             // For lists in templates, we don't have data yet, but we can prepare the structure

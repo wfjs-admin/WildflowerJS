@@ -550,6 +550,11 @@ function observeElement(controller, el) {
     controller.elements.add(el);
 }
 
+// Every key query() and its helpers read from a config. WF-942 warns on any
+// other. Keep in step with the reads in this file when a key is added.
+const QUERY_CONFIG_KEYS = ['from', 'key', 'refresh', 'params', 'initial', 'stream', 'deleted', 'retry',
+    'to', 'persist', 'select', 'create', 'headers', 'body', 'confirmation'];
+
 export const QuerySystemMethods = {
 
     /**
@@ -569,7 +574,7 @@ export const QuerySystemMethods = {
             });
             return this.getQuery(name);
         }
-        if (this.getStoreComponentByName && this.getStoreComponentByName(name)) {
+        if (this.storeManager && this.storeManager.getStoreComponentByName(name)) {
             if (__DEV__) wfError(WF_ERRORS.QUERY_NAME_COLLISION, {
                 warn: true,
                 context: `Query "${name}" collides with an existing store of the same name; registration ignored`,
@@ -583,6 +588,24 @@ export const QuerySystemMethods = {
                 context: `Query "${name}": \`from\` must be a URL string or a function`
             });
             return null;
+        }
+        // A key queries do not read is ignored: a typo, or a key from another
+        // entity kind. Queries take no pools (their collection is `rows`) and
+        // no state/computed (the engine authors the shape).
+        if (__DEV__) {
+            for (const k of Object.keys(config)) {
+                if (QUERY_CONFIG_KEYS.indexOf(k) !== -1) continue;
+                const similar = this._findSimilarPropertyNames ? this._findSimilarPropertyNames(k, QUERY_CONFIG_KEYS) : [];
+                wfError(WF_ERRORS.QUERY_UNKNOWN_KEY, {
+                    warn: true,
+                    context: `Query "${name}": \`${k}\``,
+                    suggestion: (similar.length ? `Did you mean \`${similar[0]}\`? ` : '')
+                        + (k === 'pools' ? 'A query\'s collection is its rows; to hold them in a pool, copy them into a store\'s pool from a watcher. ' : '')
+                        + (k === 'storageKey' || k === 'autoSave' ? 'A query keeps its rows across reloads with `persist: true` (or a key string). ' : '')
+                        + (k === 'watch' ? `To react to new rows, watch \`store:${name}.rows\` from the component or store that uses them. ` : '')
+                        + `A query reads ${QUERY_CONFIG_KEYS.map(x => '`' + x + '`').join(', ')}.`
+                });
+            }
         }
         const effectiveKey = config.key || 'id';
         // Operations are derived ONCE, at declaration time: an operation
@@ -900,6 +923,10 @@ export const QuerySystemMethods = {
         // prefix routes the write past state onto the raw context, where
         // the ContextProxy set trap can read it cheaply.
         if (handle) handle._wfQueryOwned = name;
+        // And on the state manager, where a subscription can see it: WF-213
+        // (index path) does not apply to a query store, whose rows are
+        // replaced wholesale, so an index path always means "now".
+        if (__DEV__ && handle && handle.stateManager) handle.stateManager._wfQueryOwned = name;
         return handle;
     },
 
@@ -1067,23 +1094,24 @@ export const QuerySystemMethods = {
     _transformQueryElementsInTemplate(root) {
         if (!root || !root.querySelectorAll) return;
         const els = [];
-        if (root.matches && root.matches('[data-query],[data-wf-query]')) els.push(root);
-        root.querySelectorAll('[data-query],[data-wf-query]').forEach((el) => els.push(el));
+        const querySel = this._attrSelector('query');
+        if (root.matches && root.matches(querySel)) els.push(root);
+        root.querySelectorAll(querySel).forEach((el) => els.push(el));
         for (const el of els) {
-            const name = el.getAttribute('data-query') || el.getAttribute('data-wf-query');
+            const name = this._getAttr(el, 'query');
             if (!name) continue;
-            const wfPrefixed = !el.getAttribute('data-query') && !!el.getAttribute('data-wf-query');
+            const wfPrefixed = el.hasAttribute('data-wf-query');
             const controller = this._queryControllers && this._queryControllers.get(name);
             if (!el.querySelector(':scope > template')) {
                 this._queryRewriteRecordPaths(el, name);
                 if (controller) controller.hasRecord = true;
                 continue;
             }
-            if (!el.hasAttribute('data-list') && !el.hasAttribute('data-wf-list')) {
+            if (!this._hasAttr(el, 'list')) {
                 el.setAttribute(wfPrefixed ? 'data-wf-list' : 'data-list', '$' + name + '.rows');
             }
             if (controller) {
-                if (!el.hasAttribute('data-key') && !el.hasAttribute('data-wf-key')) {
+                if (!this._hasAttr(el, 'key')) {
                     el.setAttribute(wfPrefixed ? 'data-wf-key' : 'data-key', controller.key);
                 }
                 controller.hasList = true;
@@ -1120,10 +1148,13 @@ export const QuerySystemMethods = {
         // under 1.5 ms once, at init, and nothing per frame. Apps that use
         // queries always paid this.
         const els = [];
-        if (rootEl.matches && rootEl.matches('[data-query],[data-wf-query]')) els.push(rootEl);
-        rootEl.querySelectorAll('[data-query],[data-wf-query]').forEach((el) => els.push(el));
+        // In exclusive mode a bare data-query belongs to someone else: it is
+        // neither matched nor rewritten.
+        const querySel = this._attrSelector('query');
+        if (rootEl.matches && rootEl.matches(querySel)) els.push(rootEl);
+        rootEl.querySelectorAll(querySel).forEach((el) => els.push(el));
         for (const el of els) {
-            const name = el.getAttribute('data-query') || el.getAttribute('data-wf-query');
+            const name = this._getAttr(el, 'query');
             if (!name) continue;
             // The attribute belongs on the CONTAINER, with <template> as its
             // child — the mirror of WF-401 ("no <template> found"), which
@@ -1176,8 +1207,8 @@ export const QuerySystemMethods = {
                 // half (key, observation, activation) is finished by the drain in
                 // query(), and the pending-entity wake renders the rows.
                 if (hasTemplateEarly) {
-                    const wfPre = !el.getAttribute('data-query') && !!el.getAttribute('data-wf-query');
-                    if (!el.hasAttribute('data-list') && !el.hasAttribute('data-wf-list')) {
+                    const wfPre = el.hasAttribute('data-wf-query');
+                    if (!this._hasAttr(el, 'list')) {
                         el.setAttribute(wfPre ? 'data-wf-list' : 'data-list', '$' + name + '.rows');
                     }
                 } else {
@@ -1190,7 +1221,7 @@ export const QuerySystemMethods = {
                 // data-expect (§4b, WF-962): dev-only shape-drift warn.
                 // Parsed once per query, first declaring element wins; the
                 // attribute is never read in production builds.
-                const expectSpec = el.getAttribute('data-expect') || el.getAttribute('data-wf-expect');
+                const expectSpec = this._getAttr(el, 'expect');
                 if (expectSpec && !controller.expect) {
                     controller.expect = this._parseQueryExpect(expectSpec, name);
                 }
@@ -1199,7 +1230,7 @@ export const QuerySystemMethods = {
             // SSR adoption: inside data-ssr="true", the server-rendered DOM
             // IS the seed; parse it back into the store before anything
             // renders. An explicit initial: wins over the parse.
-            if (el.closest('[data-ssr="true"]')) {
+            if (el.closest(this._attrSelector('ssr', 'true'))) {
                 this._queryAdoptSSRContent(controller, el, hasTemplate);
             }
             if (!hasTemplate) {
@@ -1225,11 +1256,11 @@ export const QuerySystemMethods = {
                 continue;
             }
             if (hidden) {
-                const wfPre = !el.getAttribute('data-query') && !!el.getAttribute('data-wf-query');
-                if (!el.hasAttribute('data-list') && !el.hasAttribute('data-wf-list')) {
+                const wfPre = el.hasAttribute('data-wf-query');
+                if (!this._hasAttr(el, 'list')) {
                     el.setAttribute(wfPre ? 'data-wf-list' : 'data-list', '$' + name + '.rows');
                 }
-                if (!el.hasAttribute('data-key') && !el.hasAttribute('data-wf-key')) {
+                if (!this._hasAttr(el, 'key')) {
                     el.setAttribute(wfPre ? 'data-wf-key' : 'data-key', controller.key);
                 }
                 continue;
@@ -1244,13 +1275,13 @@ export const QuerySystemMethods = {
             observeElement(controller, el);
             // Prefix parity: a data-wf-query element gets data-wf-* transform
             // attributes, so wf-prefixed markup stays uniformly prefixed.
-            const wfPrefixed = !el.getAttribute('data-query') && !!el.getAttribute('data-wf-query');
+            const wfPrefixed = el.hasAttribute('data-wf-query');
             const listAttr = wfPrefixed ? 'data-wf-list' : 'data-list';
             const keyAttr = wfPrefixed ? 'data-wf-key' : 'data-key';
-            if (!el.hasAttribute('data-list') && !el.hasAttribute('data-wf-list')) {
+            if (!this._hasAttr(el, 'list')) {
                 el.setAttribute(listAttr, '$' + name + '.rows');
             }
-            if (!el.hasAttribute('data-key') && !el.hasAttribute('data-wf-key')) {
+            if (!this._hasAttr(el, 'key')) {
                 el.setAttribute(keyAttr, controller.key);
             }
             this._queryActivate(controller);
@@ -1275,7 +1306,7 @@ export const QuerySystemMethods = {
             // Whole-attribute bare paths keep the rewrite. It already works and
             // it is reactive by construction, since $name.rows.0.x is an
             // ordinary tracked read.
-            for (const attr of ['data-bind', 'data-wf-bind']) {
+            for (const attr of (this.options.useWfPrefixOnly ? ['data-wf-bind'] : ['data-bind', 'data-wf-bind'])) {
                 const v = node.getAttribute(attr);
                 if (v && BARE_PATH.test(v) && !v.startsWith('computed:')) {
                     node.setAttribute(attr, prefix + v);
@@ -1369,7 +1400,8 @@ export const QuerySystemMethods = {
         if (store.rows && store.rows.length > 0 && !controller._persistRestored) return;
 
         const SIMPLE = /^[a-zA-Z_]\w*(\.[a-zA-Z_]\w*)*$/;
-        const CONTAINERS = '[data-list],[data-wf-list],[data-query],[data-wf-query]';
+        const CONTAINERS = this._attrSelector('list') + ',' + this._attrSelector('query');
+        const BIND_SEL = this._attrSelector('bind');
         const setPath = (obj, path, value) => {
             const parts = path.split('.');
             // `__proto__.x` would walk into Object.prototype and write there.
@@ -1382,7 +1414,7 @@ export const QuerySystemMethods = {
             cur[parts[parts.length - 1]] = value;
         };
         const readSeed = (node) => {
-            const raw = node.getAttribute('data-seed') || node.getAttribute('data-wf-seed');
+            const raw = this._getAttr(node, 'seed');
             if (!raw) return null;
             try {
                 const parsed = JSON.parse(raw);
@@ -1397,8 +1429,8 @@ export const QuerySystemMethods = {
         };
         const readFields = (root, into) => {
             const nodes = [];
-            if (root.hasAttribute && (root.hasAttribute('data-bind') || root.hasAttribute('data-wf-bind'))) nodes.push(root);
-            root.querySelectorAll('[data-bind],[data-wf-bind]').forEach((n) => nodes.push(n));
+            if (root.hasAttribute && this._hasAttr(root, 'bind')) nodes.push(root);
+            root.querySelectorAll(BIND_SEL).forEach((n) => nodes.push(n));
             for (const n of nodes) {
                 // Boundary guard (mirrors SSRManager's list-parse discipline):
                 // a binding whose nearest list/query container is NOT this
@@ -1408,9 +1440,9 @@ export const QuerySystemMethods = {
                     const container = n.closest(CONTAINERS);
                     if (container !== el && container !== root) continue;
                 }
-                const field = n.getAttribute('data-bind') || n.getAttribute('data-wf-bind');
+                const field = this._getAttr(n, 'bind');
                 if (!field || !SIMPLE.test(field)) continue;
-                const type = n.getAttribute('data-type');
+                const type = this._getAttr(n, 'type');
                 const text = n.textContent.trim();
                 setPath(into, field, type === 'number' ? Number(text)
                     : type === 'boolean' ? text === 'true'
@@ -1961,13 +1993,14 @@ export const QuerySystemMethods = {
         if (!__DEV__) return;
         if (!root || !root.querySelectorAll) return;
         const els = [];
-        if (root.matches && root.matches('[data-query],[data-wf-query]')) els.push(root);
-        root.querySelectorAll('[data-query],[data-wf-query]').forEach((el) => els.push(el));
+        const querySel = this._attrSelector('query');
+        if (root.matches && root.matches(querySel)) els.push(root);
+        root.querySelectorAll(querySel).forEach((el) => els.push(el));
         for (const el of els) {
             if (el._wfQueryBound || el._wfQueryOrphanWarned) continue;
-            if (el.closest('[data-component],[data-wf-component]')) continue;
+            if (el.closest(this._attrSelector('component'))) continue;
             el._wfQueryOrphanWarned = true;
-            const name = el.getAttribute('data-query') || el.getAttribute('data-wf-query') || '(unnamed)';
+            const name = this._getAttr(el, 'query') || '(unnamed)';
             wfError(WF_ERRORS.QUERY_ORPHAN, {
                 warn: true,
                 context: `data-query="${name}" has no component ancestor; queries bind during component binding, so this element renders nothing`,
@@ -2876,6 +2909,10 @@ export const QuerySystemMethods = {
                 return;
             }
             const msg = err && err.message ? err.message : String(err);
+            // A function source is the application's own code, so its
+            // failure reaches the console in every build, once it lands.
+            // (A URL source's failed request is already in the network log.)
+            if (typeof cfg.from === 'function') console.error(`[WildflowerJS] Query "${controller.name}": from() failed:`, err);
             engineWrite(() => {
                 if (hadData) {
                     store.syncError = msg;      // transient: rows preserved
@@ -4287,6 +4324,12 @@ export const QuerySystemMethods = {
                 context: `Query "${controller.name}": the params function threw`,
                 cause: e
             });
+            // The application's own exception: production prints it too,
+            // once per query (params resolves on every fetch and poll).
+            if (!__DEV__ && !controller._paramsThrewLogged) {
+                controller._paramsThrewLogged = true;
+                console.error(`[WildflowerJS] Query "${controller.name}": params() threw:`, e);
+            }
             return null;
         }
     },

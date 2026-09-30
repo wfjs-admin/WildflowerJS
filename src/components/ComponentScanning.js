@@ -20,7 +20,7 @@ const FALSY_MODIFIER_VALUES = new Set(['false', '0', 'no', 'off']);
 // Non-function definition keys the component factory actually consumes
 // (validateEntityDefinition allowlist — keep in sync with the reads in
 // ComponentScanning/ComponentLifecycle/ComponentRegistry/EntitySystem).
-const COMPONENT_CONTRACT_KEYS = ['state', 'computed', 'watch', 'subscribe', 'subscribeTimeout', 'types', 'events', 'props', 'stores', 'pools', 'rules'];
+const COMPONENT_CONTRACT_KEYS = ['state', 'computed', 'watch', 'subscribe', 'subscribeTimeout', 'types', 'events', 'props', 'stores', 'pools', 'rules', 'uses'];
 
 const GC_DELAY_MS = 40; // Delay before GC runs (allows DOM to settle)
 
@@ -330,7 +330,7 @@ _setupDynamicComponentDetection()
                 if (el._wfBindingOrphanWarned) continue;
                 // data-portaled-from marks content a portal moved out of its
                 // component, which still drives it.
-                if (el.closest('[data-component],[data-wf-component],[data-portaled-from]')) continue;
+                if (el.closest(this._attrSelector('component') + ',[data-portaled-from]')) continue;
                 el._wfBindingOrphanWarned = true;
                 const attrName = el.hasAttribute(`data-${base}`) ? `data-${base}` : `data-wf-${base}`;
                 wfError(WF_ERRORS.BINDING_ORPHAN, {
@@ -452,7 +452,7 @@ _setupDynamicComponentDetection()
      */
     _updateHTMLWithPreservation(element, htmlValue) {
         // Find all data-external elements before update
-        const externalElements = element.querySelectorAll('[data-external]');
+        const externalElements = element.querySelectorAll(this._attrSelector('external'));
 
         // If no external elements, use normal innerHTML
         if (externalElements.length === 0) {
@@ -722,6 +722,9 @@ _setupDynamicComponentDetection()
             // immediately rather than being queued indefinitely by
             // _wrapMethod's action-before-init guard.
             instance._initReady = true;
+            // Pools are set up by now too, so this is the point to decide
+            // which setup-time computed errors were real.
+            this._checkSetupComputedErrors(instance);
             // This branch never reaches _initWithStoreWait, where tick()
             // registration lives for init-bearing components, so register
             // here too. Without this, a page-load component with tick() and
@@ -1043,7 +1046,7 @@ _setupDynamicComponentDetection()
         if (__DEV__) validateEntityDefinition('Component', componentName, definition, COMPONENT_CONTRACT_KEYS);
         if (__DEV__) warnDefinitionCollisions('Component', componentName, definition);
         // Lifecycle-hook names wired as event handlers (self-guards per name).
-        if (__DEV__) warnLifecycleActionNames(element, componentName);
+        if (__DEV__) warnLifecycleActionNames(element, componentName, this);
 
         // SSR: Enhance definition if this is an SSR component
         if (__FEATURE_SSR__ && options.ssrEnhance && this.ssrManager) {
@@ -1067,7 +1070,7 @@ _setupDynamicComponentDetection()
         const rawContext = this._createComponentContext(element, state, stateManager, instanceId, parentInstance);
         const context = createContextProxy(rawContext, stateManager);
         patchSelfReferences(rawContext, context, stateManager);
-        if (__DEV__) warnCollisions(stateManager, componentName);
+        if (__DEV__) warnCollisions(stateManager, componentName, definition.computed);
 
         // Create instance using helper (handles type inference internally)
         const instance = this._createComponentInstance({

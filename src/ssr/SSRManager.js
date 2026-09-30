@@ -369,7 +369,19 @@ export class SSRManager {
 
         // Get parsed state from SSR data
         const ssrData = this.ssrComponents.get(element);
-        const parsedState = ssrData ? ssrData.parsedState : {};
+        const parsedState = { ...(ssrData ? ssrData.parsedState : {}) };
+
+        // A binding that names a computed (bare: the computed: prefix is
+        // optional) shows a derived value, which is not state. The parse runs
+        // before the definition is known, so it is dropped here, unless state
+        // declares the same name.
+        const computedDefs = originalDefinition.computed;
+        if (computedDefs) {
+            const declared = originalDefinition.state || {};
+            for (const key of Object.keys(parsedState)) {
+                if (key in computedDefs && !(key in declared)) delete parsedState[key];
+            }
+        }
 
         // Merge parsed state with original definition state
         const enhanced = {
@@ -683,6 +695,17 @@ export class SSRManager {
                 return;
             }
 
+            // Skip bindings that belong to something else: a data-query's rows
+            // (the query adopts them), a data-pool's rows (the pool's), and a
+            // nested component's markup (that component's own state).
+            if (el.closest(this._sel('query')) || el.closest(this._sel('pool'))) {
+                return;
+            }
+            const owner = el.closest(this._sel('component'));
+            if (owner && owner !== element) {
+                return;
+            }
+
             // Parse value based on data-type or content
             const value = this._parseValueFromElement(el);
 
@@ -791,7 +814,7 @@ export class SSRManager {
      * Parse value from DOM element based on type and content
      */
     _parseValueFromElement(element) {
-        const dataType = element.dataset.type;
+        const dataType = this._attr(element, 'type');
         const content = element.textContent.trim();
 
         // Handle different data types

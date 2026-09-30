@@ -128,7 +128,7 @@ export const ListExpressionMethods = {
             // Get component instance - try context first, then DOM lookup
             let componentInstance = context?.componentInstance;
             if (!componentInstance) {
-                const componentElement = element.closest('[data-component],[data-wf-component]');
+                const componentElement = element.closest(this._attrSelector('component'));
                 const componentId = componentElement?.dataset.componentId || componentElement?.dataset.wfComponentId;
                 componentInstance = componentId ? this.componentInstances.get(componentId) : null;
             }
@@ -277,7 +277,7 @@ export const ListExpressionMethods = {
         // Then fall back to DOM lookup
         let instance = context?.componentInstance;
         if (!instance) {
-            const componentElement = element.closest('[data-component],[data-wf-component]');
+            const componentElement = element.closest(this._attrSelector('component'));
             const componentId = componentElement?.dataset.componentId || componentElement?.dataset.wfComponentId;
             instance = componentId ? this.componentInstances.get(componentId) : null;
         }
@@ -708,8 +708,9 @@ export const ListExpressionMethods = {
         const items = this._getListItems(listElement);
 
         // OPTIMIZATION: Hoist helper outside loop (listElement is constant for all items)
+        const listSel = this._attrSelector('list');
         const isInNestedList = (el) => {
-            const closestList = el.closest('[data-list],[data-wf-list]');
+            const closestList = el.closest(listSel);
             return closestList !== listElement;
         };
 
@@ -969,8 +970,8 @@ export const ListExpressionMethods = {
 
         if (!component) {
             // Fallback to DOM traversal for backwards compatibility
-            const listEl = element.closest('[data-list],[data-wf-list]');
-            const componentEl = listEl?.closest('[data-component],[data-wf-component]');
+            const listEl = element.closest(this._attrSelector('list'));
+            const componentEl = listEl?.closest(this._attrSelector('component'));
             if (!componentEl?._wfComponent) {
                 // Don't clear existing classes if we can't find the component.
                 // The classes were set correctly during initial render and should be preserved.

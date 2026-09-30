@@ -172,6 +172,10 @@ function createContextProxy(rawContext, stateManager) {
  */
 function patchSelfReferences(rawContext, proxy, stateManager) {
     rawContext.update = function(pathOrObj, value) {
+        // update() writes past the set trap, so it repeats the trap's check.
+        if (__DEV__ && rawContext._wfQueryOwned && QUERY_ENGINE_WRITE.depth === 0) {
+            warnQueryExternalWrite(rawContext, typeof pathOrObj === 'object' ? Object.keys(pathOrObj).join(', ') : pathOrObj);
+        }
         if (typeof pathOrObj === 'object') {
             Object.entries(pathOrObj).forEach(([key, val]) => {
                 stateManager.setValue(key, val);
@@ -189,10 +193,13 @@ function patchSelfReferences(rawContext, proxy, stateManager) {
  *
  * @param {Object} stateManager - The ReactiveStateManager instance
  * @param {string} entityName - Component or store name (for warning message)
+ * @param {Object} [computedDef] - The definition's computed block. Every
+ *   caller runs before its computeds are added to the state manager, so the
+ *   names are read from the definition.
  */
-function warnCollisions(stateManager, entityName) {
+function warnCollisions(stateManager, entityName, computedDef) {
     const state = stateManager._state || {};
-    const computed = stateManager.computed || {};
+    const computed = computedDef || {};
 
     for (const prop of FRAMEWORK_PROPERTIES) {
         if (prop in state) {

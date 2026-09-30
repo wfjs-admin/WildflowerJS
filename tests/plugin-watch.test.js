@@ -64,7 +64,8 @@ describeIfPlugins('Plugin Watch Object', () => {
 
             wildflower.$watched.increment()
 
-            expect(callback).toHaveBeenCalledWith(1, 0)
+            // (newValue, oldValue, changedPath), as a component's watcher gets
+            expect(callback).toHaveBeenCalledWith(1, 0, 'count')
         })
 
         it('should pass new and old values to watch callback', () => {
@@ -109,7 +110,7 @@ describeIfPlugins('Plugin Watch Object', () => {
 
             wildflower.$nested.setTheme('dark')
 
-            expect(callback).toHaveBeenCalledWith('dark', 'light')
+            expect(callback).toHaveBeenCalledWith('dark', 'light', 'user.profile.theme')
         })
 
         it('should support multiple watchers on different paths', () => {

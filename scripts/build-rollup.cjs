@@ -151,14 +151,37 @@ const FEATURES_LITE = {
 // nano-shipped modules (crash-safe) and drops the cluster spread.
 const FEATURES_NANO = { ...FEATURES_LITE, __FEATURE_LISTS__: 'false' };
 
-function defines(features, dev, headless) {
+// The eight capabilities that differ between tiers, read at runtime as
+// wildflower.features (extensions probe it).
+// `pools` includes the frame loop that runs every tick().
+const TIER_CAPS = {
+    nano:        { lists: false, pools: false, plugins: false, portals: false, transitions: false, router: false, query: false, ssr: false },
+    mini:        { lists: true,  pools: false, plugins: false, portals: false, transitions: false, router: false, query: false, ssr: false },
+    'mini-pool': { lists: false, pools: true,  plugins: false, portals: false, transitions: false, router: false, query: false, ssr: false },
+    lite:        { lists: true,  pools: true,  plugins: false, portals: false, transitions: false, router: false, query: false, ssr: false },
+    core:        { lists: true,  pools: true,  plugins: true,  portals: true,  transitions: true,  router: false, query: false, ssr: false },
+    spa:         { lists: true,  pools: true,  plugins: true,  portals: true,  transitions: true,  router: true,  query: false, ssr: false },
+    full:        { lists: true,  pools: true,  plugins: true,  portals: true,  transitions: true,  router: true,  query: true,  ssr: true },
+};
+
+// The tier an output file belongs to, from its name: wildflower[.<tier>][.esm][.dev|.min].js,
+// where no tier segment is the core tier. Probe and extension outputs are no tier (null).
+function tierOf(file) {
+    const m = /^wildflower(?:\.(nano|mini-pool|mini|lite|spa|full))?(?:\.esm)?(?:\.(?:dev|min))?\.js$/.exec(file || '');
+    return m ? (m[1] || 'core') : null;
+}
+
+function defines(features, dev, headless, file) {
     // __VERSION__ is the single source of the version string inside the bundle
     // (wildflower.version and the DevTools hook); it comes from package.json.
     // __HEADLESS__ is true only for bundles of the reactive graph with no
     // framework around it (the thread extension's worker half): it folds the
     // facade's framework-only surface (persistence, component/props paths,
     // the computed-eval owner stack) out of those bundles. Every tier is false.
-    return { __DEV__: String(!!dev), __HEADLESS__: String(!!headless), __VERSION__: JSON.stringify(VERSION), ...features };
+    // __TIER__ and __CAPS__ are wildflower.tier and wildflower.features.
+    const tier = tierOf(file);
+    return { __DEV__: String(!!dev), __HEADLESS__: String(!!headless), __VERSION__: JSON.stringify(VERSION),
+        __TIER__: JSON.stringify(tier), __CAPS__: JSON.stringify(tier ? TIER_CAPS[tier] : null), ...features };
 }
 
 // -----------------------------------------------------------------------------
@@ -216,12 +239,19 @@ const configs = [
     // built here for the defines and the pinned terser. Own entry and output
     // paths; not a tier: not in the 21-lane matrix, not in the sizes check,
     // no ESM twin (see the loop below). Filter: `node scripts/build-rollup.cjs threads`.
-    ...threadsConfigs(),
+    ...extensionConfigs('threads'),
+
+    // THREE EXTENSION (packages/three): three.js views as stores. Page-only,
+    // public API only; built here like Threads for the defines and the pinned
+    // terser. Filter: `node scripts/build-rollup.cjs three.wf`.
+    ...extensionConfigs('three'),
 ];
 
-function threadsConfigs() {
-    const dir = path.join(ROOT, 'packages', 'threads');
-    const entryPath = path.join(dir, 'src', 'index.js');
+// An extension package's two files, <name>.wf.js and <name>.wf.min.js, from
+// packages/<name>/src/wf.js.
+function extensionConfigs(name) {
+    const dir = path.join(ROOT, 'packages', name);
+    const entryPath = path.join(dir, 'src', 'wf.js');
     if (!fs.existsSync(entryPath)) return [];
     const tpkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
     const tbanner = `/*!
@@ -232,18 +262,14 @@ function threadsConfigs() {
  * Released under the MIT License
  */`;
     const base = { entryPath, features: FEATURES_NANO, banner: tbanner };
-    // The framework file: the same runtime plus the WildflowerJS layer
-    // (src/wf.js), which registers the mirror as a store through public API.
-    // Each output is also written to www/js/extensions/ (gitignored), the
-    // path the site's demos and docs load it from; sync-www publishes that
-    // directory, unlike js/dist.
-    const wfEntry = path.join(dir, 'src', 'wf.js');
+    // The package's WildflowerJS entry (src/wf.js), which registers its
+    // stores through public API. Each output is also written
+    // to www/js/extensions/ (gitignored), the path the site's demos and docs
+    // load it from; sync-www publishes that directory, unlike js/dist.
     const site = (file) => path.join(ROOT, 'www', 'js', 'extensions', file);
     return [
-        { ...base, file: 'threads.js',        outPath: path.join(dir, 'dist', 'threads.js'),        alsoWrite: site('threads.js'),        dev: true,  minify: false, mangleProps: false },
-        { ...base, file: 'threads.min.js',    outPath: path.join(dir, 'dist', 'threads.min.js'),    alsoWrite: site('threads.min.js'),    dev: false, minify: true,  mangleProps: false },
-        { ...base, file: 'threads.wf.js',     outPath: path.join(dir, 'dist', 'threads.wf.js'),     alsoWrite: site('threads.wf.js'),     dev: true,  minify: false, mangleProps: false, entryPath: wfEntry },
-        { ...base, file: 'threads.wf.min.js', outPath: path.join(dir, 'dist', 'threads.wf.min.js'), alsoWrite: site('threads.wf.min.js'), dev: false, minify: true,  mangleProps: false, entryPath: wfEntry },
+        { ...base, file: name + '.wf.js',     outPath: path.join(dir, 'dist', name + '.wf.js'),     alsoWrite: site(name + '.wf.js'),     dev: true,  minify: false, mangleProps: false },
+        { ...base, file: name + '.wf.min.js', outPath: path.join(dir, 'dist', name + '.wf.min.js'), alsoWrite: site(name + '.wf.min.js'), dev: false, minify: true,  mangleProps: false },
     ];
 }
 
@@ -365,7 +391,7 @@ async function buildOne(cfg) {
     const out = cfg.outPath || path.join(DIST, cfg.file);
     if (cfg.outPath) fs.mkdirSync(path.dirname(out), { recursive: true });
     const bannerText = cfg.banner || banner;
-    const defs = defines(cfg.features, cfg.dev, cfg.headless);
+    const defs = defines(cfg.features, cfg.dev, cfg.headless, cfg.file);
 
     process.stdout.write(`${cfg.file.padEnd(28)} ... `);
 

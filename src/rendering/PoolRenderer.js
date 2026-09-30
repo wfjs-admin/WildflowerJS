@@ -20,6 +20,23 @@ const POOL_ENTITY_CONTRACT_KEYS = ['state', 'computed'];
 // (WF-408 undeclared name / WF-409 never populated).
 const _warnedPoolContainers = new Set();
 
+// Dev-only: a pools-block `key` that is given but is not a non-empty string
+// is ignored (the pool keys on data-key or 'id'), so say so once (WF-418).
+function _devCheckPoolKey(ownerKind, ownerName, poolName, poolDef, fallback) {
+    if (!poolDef || poolDef.key === undefined) return;
+    if (typeof poolDef.key === 'string' && poolDef.key) return;
+    const guardKey = `${ownerName}:${poolName}:badkey`;
+    if (_warnedPoolContainers.has(guardKey)) return;
+    _warnedPoolContainers.add(guardKey);
+    let shown;
+    try { shown = JSON.stringify(poolDef.key); } catch (e) { shown = String(poolDef.key); }
+    wfError(WF_ERRORS.POOL_KEY_INVALID, {
+        warn: true,
+        context: `pool '${poolName}' in ${ownerKind} '${ownerName}': key: ${shown}`,
+        suggestion: `key names the entity property to key on, as a non-empty string (key: 'uid'). This one is ignored, so entities key on ${fallback}.`
+    });
+}
+
 // Static blocklist for pool attr binding security (O(1) lookup, no allocation per flush)
 const _POOL_BLOCKED_ATTRS = new Set([
     'class', 'style', 'srcdoc',
@@ -110,6 +127,11 @@ class PoolHandle {
 
     constructor(name, container, keyProp, templateContent, compiledMetadata, framework, options) {
         this.name = name;
+        // The component a drawn pool belongs to (set where it is created),
+        // and how many frames in a row its flush has thrown. Declared here
+        // so every handle has the same shape.
+        this._owner = null;
+        this._flushErrors = 0;
         this._container = container;
         this._keyProp = keyProp;
         this._templateContent = templateContent;
@@ -119,7 +141,9 @@ class PoolHandle {
         // row inside a throwaway fragment, so the bulk fragment.appendChild
         // paid a removal from that parent on every row (~6x the cost of
         // appending a parentless node at bulk create).
-        this._rowProto = templateContent.firstElementChild || null;
+        // A data-only pool (a store's) has no container, template or bindings;
+        // every DOM step below is skipped for it.
+        this._rowProto = templateContent ? (templateContent.firstElementChild || null) : null;
         this._compiledMetadata = compiledMetadata;
         this._framework = framework;
 
@@ -181,6 +205,14 @@ class PoolHandle {
 
         /** @type {Array<Object>} The raw entity array; mutate freely */
         this.items = [];
+
+        /** @type {number} Goes up whenever the pool changes through its API
+         *  (add/push, remove, clear, update, swap, markDirty). Public: code
+         *  outside the framework, such as an extension drawing the pool,
+         *  compares it with a value it kept to learn whether anything changed.
+         *  Only ever increases; the size of a step means nothing, so several
+         *  changes may share one. */
+        this.version = 0;
 
         /** @type {Map<*, {el: Element, elementsArray: Array}>} entity key → DOM info */
         this._entities = new Map();
@@ -358,23 +390,32 @@ class PoolHandle {
      * @returns {Object} The same object (for chaining)
      */
     add(objOrArray) {
+        // A handle kept after its owner is gone (component destroyed, store
+        // unregistered) drops the write: typically a fetch or socket message
+        // arriving after navigation. _destroy() nulls _framework; a data-only
+        // pool keeps it, so the missing container is not the signal.
+        if (!this._framework) return objOrArray;
         if (typeof __DEV__ !== 'undefined' && __DEV__) {
             this._devAssertItemsConsistency();
             this._everAdded = true; // suppresses the never-populated settle note
         }
-        // Varargs like Array.push: add(a, b, c) — the name push invites the
-        // Array mental model, so honor it rather than silently dropping args.
-        if (arguments.length > 1) {
-            return this._addBulk(Array.prototype.slice.call(arguments));
-        }
         // Bulk add: array of objects → DocumentFragment for single DOM operation
         try {
+            // Varargs like Array.push: add(a, b, c) — the name push invites the
+            // Array mental model, so honor it rather than silently dropping args.
+            // Inside the try, so the finally's length pulse runs for it too: a
+            // varargs add used to return before it, leaving every computed
+            // over pool.length stale.
+            if (arguments.length > 1) {
+                return this._addBulk(Array.prototype.slice.call(arguments));
+            }
             if (Array.isArray(objOrArray)) {
                 return this._addBulk(objOrArray);
             }
             return this._addSingle(objOrArray);
         } finally {
             if (typeof __DEV__ !== 'undefined' && __DEV__) this._devCheckComputedBudget();
+            this.version++;
             this._syncAggregate(); // one pulse per call, batch or single
         }
     }
@@ -401,6 +442,23 @@ class PoolHandle {
         this._installEntityMethods(obj);
         if (typeof __DEV__ !== 'undefined' && __DEV__) this._devCheckEntityShape(obj);
         this.items.push(obj);
+
+        if (!this._container) {
+            // Data-only pool: the entity is stored and indexed, nothing is drawn.
+            const entry = {
+                el: null, elementsArray: null, item: obj,
+                itemsIdx: this.items.length - 1,
+                entitiesIdx: this._entitiesArray.length,
+                subIdx: this._dynamicArray.length,
+                _isStatic: false
+            };
+            this._entities.set(key, entry);
+            this._entitiesArray.push(entry);
+            this._dynamicArray.push(entry);
+            if (this._onAdd) this._onAdd(obj);
+            if (this.onChange) this.onChange(this);
+            return obj;
+        }
 
         let el, elementsArray;
 
@@ -462,6 +520,8 @@ class PoolHandle {
 
     /**
      * Bulk add an array of entities via DocumentFragment (single DOM operation).
+     * A drawn pool only; a data-only pool is a DataPoolHandle, which overrides
+     * this (see below the class).
      * @private
      * @param {Array<Object>} items - Array of plain objects
      * @returns {Array<Object>} The same array
@@ -560,10 +620,12 @@ class PoolHandle {
         if (this._onRemove) this._onRemove(entry.item);
 
         // Detach from DOM and recycle if free list has capacity
-        entry.el.remove();
-        if (this._freeList.length < this._maxFreeListSize) {
-            this._resetElementCaches(entry.el, entry.elementsArray);
-            this._freeList.push({ el: entry.el, elementsArray: entry.elementsArray });
+        if (entry.el) {
+            entry.el.remove();
+            if (this._freeList.length < this._maxFreeListSize) {
+                this._resetElementCaches(entry.el, entry.elementsArray);
+                this._freeList.push({ el: entry.el, elementsArray: entry.elementsArray });
+            }
         }
 
         // O(1) swap-with-last removal from items array
@@ -601,6 +663,7 @@ class PoolHandle {
 
         // Remove from map
         this._entities.delete(key);
+        this.version++;
 
         // Stop loop if all pools are empty
         if (this._entities.size === 0) {
@@ -617,8 +680,10 @@ class PoolHandle {
      * Remove all entities from the pool.
      */
     clear() {
-        // Guard against post-destroy calls (e.g., from onDestroy hooks)
-        if (!this._freeList || !this._container) return;
+        // Guard against post-destroy calls (e.g., from onDestroy hooks).
+        // _destroy() nulls the free list; a data-only pool has no container
+        // from the start, so the container cannot be the destroyed signal.
+        if (!this._freeList) return;
 
         // Lifecycle hooks: onClear gets bulk call, otherwise onRemove per item
         if (this._onClear) {
@@ -638,14 +703,14 @@ class PoolHandle {
         // loop no longer pays a per-element remove() and its own record each.
         const container = this._container;
         const arr = this._entitiesArray;
-        if (arr.length > 0 && container.childElementCount === arr.length) {
+        if (container && arr.length > 0 && container.childElementCount === arr.length) {
             // The record reports every removed child node, whitespace text
             // included, so stamp the childNodes count the observer will see.
             container._wfOwnedRemoval = container.childNodes.length;
         }
-        container.replaceChildren();
+        if (container) container.replaceChildren();
         // Populate free list from the detached entities
-        const space = this._maxFreeListSize - this._freeList.length;
+        const space = container ? this._maxFreeListSize - this._freeList.length : 0;
         if (space > 0) {
             const count = Math.min(space, arr.length);
             for (let i = 0; i < count; i++) {
@@ -659,6 +724,7 @@ class PoolHandle {
         this._entitiesArray.length = 0;
         this._dynamicArray.length = 0;
         this._staticArray.length = 0;
+        this.version++;
         this._syncAggregate();
         if (this.onChange) this.onChange(this);
         this._framework._checkPoolLoopNeeded();
@@ -676,6 +742,8 @@ class PoolHandle {
         const entry = this._entities.get(key);
         if (!entry) return null;
         if (props) mergeData(entry.item, props);
+        this.version++;
+        if (!this._container) return entry.item; // data-only pool: nothing to draw
         if (this._isPassive) {
             // Passive pools: apply bindings synchronously since rAF flush is skipped
             this._applyBindings(entry.el, entry.item);
@@ -698,6 +766,8 @@ class PoolHandle {
         const entry1 = this._entities.get(key1);
         const entry2 = this._entities.get(key2);
         if (!entry1 || !entry2) return false;
+        // Data-only pool: there is no DOM order to swap.
+        if (!this._container) return true;
 
         const el1 = entry1.el;
         const el2 = entry2.el;
@@ -726,6 +796,7 @@ class PoolHandle {
         // Mark both as dirty so targeted flush re-evaluates their bindings
         this._dirtySet.add(key1);
         this._dirtySet.add(key2);
+        this.version++;
         return true;
     }
 
@@ -750,6 +821,9 @@ class PoolHandle {
      * @returns {Object|undefined} The entity object, or undefined if out of range
      */
     at(index) {
+        // Data-only pool: no DOM order, so storage order (see the note on
+        // swap-with-last above).
+        if (!this._container) return this.items[index];
         const el = this._container.children[index];
         return el ? el._poolItem : undefined;
     }
@@ -763,6 +837,10 @@ class PoolHandle {
      * @param {*} key - The key value identifying the entity
      */
     markDirty(key) {
+        // The entity changed in place: code reading the pool from outside
+        // (an extension drawing it) learns that through the version.
+        this.version++;
+        if (!this._container) return; // data-only pool: no bindings to apply
         // Apply bindings immediately: synchronous update like static pools.
         // This avoids rAF latency for data-mode pools where changes are sparse.
         // Also sets targeted mode: rAF flush skips full scan, only processes
@@ -804,7 +882,7 @@ class PoolHandle {
      * @returns {Element|undefined}
      */
     getElement(key) {
-        return this._entities.get(key)?.el;
+        return this._entities.get(key)?.el || undefined;
     }
 
     /**
@@ -832,7 +910,10 @@ class PoolHandle {
     // Shared aggregate read: reactive when a box exists or tracking is
     // active; a plain Map.size read otherwise (zero machinery).
     _aggregateRead() {
-        if (this._lenBox) return this._lenBox.n;
+        // Read the box (a tracked read registers the dependency) but answer
+        // with the live size: the box syncs when a mutation finishes, and
+        // onAdd/onChange run before that, so the box alone reads one behind.
+        if (this._lenBox) { void this._lenBox.n; return this._entities.size; }
         if (rgIsTracking()) {
             this._lenBox = rgReactive({ n: this._entities.size });
             return this._lenBox.n;
@@ -1239,8 +1320,9 @@ class PoolHandle {
      * @private
      */
     _flush(now) {
-        // Passive pools skip the rAF flush entirely; updates via add()/update() only
-        if (this._isPassive) return;
+        // Passive pools skip the rAF flush entirely; updates via add()/update() only.
+        // A data-only pool has nothing to draw.
+        if (this._isPassive || !this._container) return;
 
         if (this._frameInterval > 0) {
             if (now - this._lastFlushTime < this._frameInterval) return;
@@ -1389,6 +1471,31 @@ class PoolHandle {
     }
 }
 
+/**
+ * A data-only pool (a store's or a plugin's): no container, so no fragment to
+ * build. Its bulk add goes one at a time, with onChange once for the batch, as
+ * the drawn path fires it.
+ *
+ * A subclass rather than a branch in PoolHandle._addBulk: that branch, never
+ * taken by a drawn pool, still cost drawn pools about 45 ns per row, and
+ * choosing between the two in add() moved a similar cost to append (Krausest
+ * 02_replace1k and 08_create1k-after1k_x2 script, rotated A/B, 2026-09-28).
+ */
+class DataPoolHandle extends PoolHandle {
+    _addBulk(items) {
+        if (items.length === 0) return items;
+        const onChange = this.onChange;
+        this.onChange = null;
+        try {
+            for (let i = 0; i < items.length; i++) this._addSingle(items[i]);
+        } finally {
+            this.onChange = onChange;
+        }
+        if (onChange) onChange(this);
+        return items;
+    }
+}
+
 // A7 (DX diagnostics sweep, dev builds only — the whole block is dead-code-
 // eliminated in production, keeping the lean tiers byte-identical):
 // (a) the deliberately-omitted index-dependent array methods exist as throwing
@@ -1438,7 +1545,7 @@ if (typeof __DEV__ !== 'undefined' && __DEV__) {
     // (~60us/entity/flush measured), so per-frame cost scales with pool size.
     // Warn once when a non-passive pool with computeds reaches the threshold.
     PoolHandle.prototype._devCheckComputedBudget = function () {
-        if (this._computedBudgetWarned || this._isPassive || !this._entityComputedNames) return;
+        if (this._computedBudgetWarned || this._isPassive || !this._container || !this._entityComputedNames) return;
         if (this.size < 200) return;
         this._computedBudgetWarned = true;
         const names = this._entityComputedNames.map(n => `'${n}'`).join(', ');
@@ -1448,6 +1555,63 @@ if (typeof __DEV__ !== 'undefined' && __DEV__) {
             suggestion: `entity.computed re-evaluates on every read of every flush (~60us per entity per flush measured); at this pool size that cost lands on every animation frame. For per-frame pools this large, store the derived value as a plain data field updated on mutation instead of entity.computed, or mark non-animating entities static (data-pool-static="prop").`
         });
     };
+}
+
+// A tick() that throws: report the first few consecutive throws, stop it after
+// this many in a row (see _tickThrew). Matches the threads extension.
+const TICK_ERRORS_REPORTED = 3;
+const TICK_ERRORS_BEFORE_STOP = 5;
+
+// A pool hook (onAdd / onRemove / onClear), wrapped once where it is bound so
+// the add/remove paths stay unchanged: what it throws goes to the owner's
+// onError (else the console, in every build), and the pool operation that
+// called it completes. getOwner is resolved only when a hook throws.
+function guardPoolHook(fw, fn, getOwner, hook) {
+    if (typeof fn !== 'function') return null;
+    return function (arg) {
+        try {
+            return fn(arg);
+        } catch (error) {
+            fw._handleError(`Error in pool ${hook}`, error, getOwner(), { lifecycle: 'pool-hook', hook });
+        }
+    };
+}
+
+/**
+ * Dev only: a data-pool container that stays empty because its name points at
+ * a pool it can never render. Stores and plugins hold data-only pools, and a
+ * container renders only its own component's pool, so `data-pool="bees"` for a
+ * store's `bees` (or `data-pool="$swarm.bees"`, a path where a name belongs)
+ * never fills. Returns { owner, pool, plugin } for the store or plugin that
+ * declares it, or null.
+ */
+function devDataPoolOwner(fw, name, self) {
+    let entity = null, pool = name;
+    if (name.charAt(0) === '$') {
+        const dot = name.indexOf('.');
+        if (dot > 1) { entity = name.slice(1, dot); pool = name.slice(dot + 1); }
+    }
+    for (const inst of fw.componentInstances.values()) {
+        if (inst === self || !inst.isVirtual || !inst._pools) continue;
+        // Virtual instances are named 'plugin:<name>' and 'store-<name>'.
+        const plugin = inst.name.startsWith('plugin:');
+        const owner = plugin ? inst.name.slice(7) : inst.name.replace(/^store-/, '');
+        if (entity && owner !== entity) continue;
+        const handle = inst._pools.get(pool);
+        if (handle && !handle._container) return { owner, pool, plugin };
+    }
+    return null;
+}
+
+// Dev only: the advice for a container pointing at another entity's pool,
+// shared by WF-408 (checked at setup) and WF-409 (after the settle window).
+function devElsewhereAdvice(other, isPath) {
+    const renderHere = `a data-pool container renders only a pool its own component declares. Draw it in this component's tick(), or copy what this view needs into a pool this component declares.`;
+    const pathNote = isPath ? 'data-pool takes a pool name, not a path. ' : '';
+    if (other.plugin) {
+        return `'${other.pool}' is a pool of plugin '${other.owner}'. ${pathNote}Plugin pools hold data only, and ${renderHere} Reach the pool through the plugin's methods.`;
+    }
+    return `'${other.pool}' is a pool of store '${other.owner}'. ${pathNote}Store pools hold data only, and ${renderHere} Read it as this.stores.${other.owner}.pools.${other.pool} (with subscribe: ['${other.owner}']).`;
 }
 
 /**
@@ -1481,9 +1645,35 @@ export const PoolRendererMethods = {
                         if (pd && pd.entity && typeof pd.entity === 'object') {
                             validateEntityDefinition('Pool entity', `${instance.name}.${names[i]}`, pd.entity, POOL_ENTITY_CONTRACT_KEYS);
                         }
+                        _devCheckPoolKey('component', instance.name, names[i], pd, "the container's data-key, else 'id'");
                     }
                 }
             }
+        }
+
+        if (__DEV__ && instance._poolDefinitions && instance._poolDefinitions.size > 0 && !instance._declaredPoolCheck) {
+            // A component pool is drawn into its data-pool container; a pool
+            // declared with no container gets no handle (this.pools.x reads
+            // null) and says nothing. Checked after the settle window, not now:
+            // the container may arrive later (a data-render section, a scan).
+            instance._declaredPoolCheck = true;
+            const settleMs = this._devPoolSettleMs ?? 1500;
+            const instanceId = instance.id;
+            setTimeout(() => {
+                if (this.componentInstances.get(instanceId) !== instance) return; // gone or reset
+                if (instance._poolContainerTypo) return;                         // WF-408 already said why
+                instance._poolDefinitions.forEach((def, name) => {
+                    if (instance._pools && instance._pools.has(name)) return;
+                    const guardKey = `${instance.name}:${name}:declared`;
+                    if (_warnedPoolContainers.has(guardKey)) return;
+                    _warnedPoolContainers.add(guardKey);
+                    wfError(WF_ERRORS.POOL_DECLARED_NO_CONTAINER, {
+                        warn: true,
+                        context: `pool '${name}' in component '${instance.name}'`,
+                        suggestion: `Add its container inside the component, <div data-pool="${name}" data-key="id"><template>...</template></div>. A pool that is never drawn belongs in a store, where pools are data only.`
+                    });
+                });
+            }, settleMs);
         }
 
         if (!this.domElements.pools || this.domElements.pools.length === 0) return;
@@ -1497,7 +1687,22 @@ export const PoolRendererMethods = {
 
         for (const poolEntry of pools) {
             const { element, path } = poolEntry;
-            const keyProp = this._getAttr(element, 'key') || 'id';
+            // data-key on the container wins; else the pools block's `key`
+            // (the form stores and plugins use, having no container); else id.
+            const blockKey = instance._poolDefinitions?.get(path)?.key;
+            const attrKey = this._getAttr(element, 'key');
+            const keyProp = attrKey || (typeof blockKey === 'string' && blockKey) || 'id';
+            if (__DEV__ && attrKey && typeof blockKey === 'string' && blockKey && attrKey !== blockKey) {
+                const guardKey = `${instance.name}:${path}:key`;
+                if (!_warnedPoolContainers.has(guardKey)) {
+                    _warnedPoolContainers.add(guardKey);
+                    wfError(WF_ERRORS.POOL_KEY_MISMATCH, {
+                        warn: true,
+                        context: `pool '${path}' in component '${instance.name}': data-key="${attrKey}" on the container, key: '${blockKey}' in the pools block`,
+                        suggestion: `Entities are keyed on '${attrKey}'. Keep one of the two, or make them the same.`
+                    });
+                }
+            }
             const fpsAttr = this._getAttr(element, 'pool-fps');
             const targetFps = fpsAttr ? parseInt(fpsAttr, 10) : 0;
 
@@ -1506,7 +1711,7 @@ export const PoolRendererMethods = {
             const cullPadding = cullAttr !== null ? parseInt(cullAttr, 10) : -1;
 
             // Data-based culling: data-pool-cull-props="x,y" or "x,y,w,h"
-            const cullPropsAttr = element.getAttribute('data-pool-cull-props') || element.getAttribute('data-wf-pool-cull-props');
+            const cullPropsAttr = this._getAttr(element, 'pool-cull-props');
             let cullProps = null;
             if (cullPropsAttr) {
                 const parts = cullPropsAttr.split(',').map(s => s.trim());
@@ -1516,7 +1721,9 @@ export const PoolRendererMethods = {
             // Static pool / per-entity static:
             // data-pool-static (boolean, no value) = passive pool, skip rAF flush entirely
             // data-pool-static="propName" (with value) = per-entity opt-out from flush
-            const staticAttrRaw = element.getAttribute('data-pool-static') ?? element.getAttribute('data-wf-pool-static');
+            // _getAttr treats an empty value as present, so bare
+            // data-wf-pool-static reads as '' (passive), not as absent.
+            const staticAttrRaw = this._getAttr(element, 'pool-static');
             const isPassive = staticAttrRaw === '';
             const staticProp = (staticAttrRaw && staticAttrRaw !== '') ? staticAttrRaw : null;
 
@@ -1589,48 +1796,14 @@ export const PoolRendererMethods = {
             }
 
             // Resolve lifecycle hooks and props from declarative pools block
-            const poolDef = instance._poolDefinitions?.get(path);
-            let onAdd = null, onRemove = null, onClear = null, poolProps = null, entityComputed = null, entityMethods = null, entityStateTemplate = null;
-            if (poolDef) {
-                const ctx = instance.context;
-                const resolve = (hook) => typeof hook === 'string' ? ctx[hook]?.bind(ctx) :
-                    typeof hook === 'function' ? hook.bind(ctx) : null;
-                onAdd = resolve(poolDef.onAdd);
-                onRemove = resolve(poolDef.onRemove);
-                onClear = resolve(poolDef.onClear);
-                if (poolDef.props && typeof poolDef.props === 'object') {
-                    poolProps = poolDef.props;
-                }
-                // entity.computed: per-entity derived values
-                if (poolDef.entity && poolDef.entity.computed && typeof poolDef.entity.computed === 'object') {
-                    entityComputed = poolDef.entity.computed;
-                }
-                // entity.state: default-state template merged into new entities
-                if (poolDef.entity && poolDef.entity.state && typeof poolDef.entity.state === 'object') {
-                    entityStateTemplate = poolDef.entity.state;
-                }
-                // Entity methods live at the top level of the entity block
-                // (matching component/store shape, where methods are also top-level).
-                // Any function property on the entity block that isn't a reserved
-                // key (state, computed) becomes an entity method.
-                if (poolDef.entity && typeof poolDef.entity === 'object') {
-                    const collected = {};
-                    let hasAny = false;
-                    for (const key of Object.keys(poolDef.entity)) {
-                        if (key === 'state' || key === 'computed') continue;
-                        const v = poolDef.entity[key];
-                        if (typeof v !== 'function') continue;
-                        collected[key] = v;
-                        hasAny = true;
-                    }
-                    if (hasAny) entityMethods = collected;
-                }
-            }
+            const def = this._resolvePoolDefinition(instance, instance._poolDefinitions?.get(path));
 
             const handle = new PoolHandle(path, element, keyProp, templateContent, compiledMetadata, this, {
                 targetFps, cullPadding, sortProp, sortDesc, cullProps, defaultEntityWidth, defaultEntityHeight, staticProp, isPassive,
-                props: poolProps, onAdd, onRemove, onClear, entityComputed, entityMethods, entityStateTemplate
+                props: def.props, onAdd: def.onAdd, onRemove: def.onRemove, onClear: def.onClear,
+                entityComputed: def.entityComputed, entityMethods: def.entityMethods, entityStateTemplate: def.entityStateTemplate
             });
+            handle._owner = instance;   // a flush error reports to this component (_flushThrew)
             instance._pools.set(path, handle);
 
             if (__DEV__) {
@@ -1644,14 +1817,18 @@ export const PoolRendererMethods = {
                 const defs = instance._poolDefinitions;
                 if (defs && defs.size > 0 && !defs.has(path)) {
                     handle._undeclaredWarned = true;
+                    instance._poolContainerTypo = true;
                     if (!_warnedPoolContainers.has(guardKey)) {
                         _warnedPoolContainers.add(guardKey);
                         const declared = Array.from(defs.keys());
                         const similar = this._findSimilarPropertyNames(path, declared);
+                        // Pointing at a store's or plugin's pool is not a typo.
+                        const other = devDataPoolOwner(this, path, instance);
                         wfError(WF_ERRORS.POOL_CONTAINER_UNDECLARED, {
                             warn: true,
                             context: `data-pool="${path}" in component '${instance.name}' (declared pools: ${declared.map(n => `'${n}'`).join(', ')})`,
-                            suggestion: (similar.length ? `Did you mean data-pool="${similar[0]}"? ` : '') +
+                            suggestion: other ? devElsewhereAdvice(other, path.charAt(0) === '$') :
+                                (similar.length ? `Did you mean data-pool="${similar[0]}"? ` : '') +
                                 `Pool names must match exactly; code populating getPool('${similar[0] || declared[0]}') never reaches this container. If '${path}' is intentional, populate it via this.getPool('${path}').add(...) or add it to the pools block.`
                         });
                     }
@@ -1667,10 +1844,23 @@ export const PoolRendererMethods = {
                     if (handle._undeclaredWarned) return;                 // already diagnosed at setup
                     if (_warnedPoolContainers.has(guardKey)) return;
                     _warnedPoolContainers.add(guardKey);
+                    // Empty because it points at a pool it can't render (a
+                    // store's or plugin's, or a $path)? Then say that, rather
+                    // than advise filling a pool of the same name here.
+                    const isPath = path.charAt(0) === '$';
+                    const other = (isPath || !instance._poolDefinitions?.has(path)) ? devDataPoolOwner(this, path, instance) : null;
+                    let suggestion;
+                    if (other) {
+                        suggestion = devElsewhereAdvice(other, isPath);
+                    } else if (isPath) {
+                        suggestion = `data-pool takes a pool name, not a path, so '${path}' names an empty pool of this component. To show a store's pool, read it as this.stores.<store>.pools.<name> and draw it in tick(); to render entities here, declare a pool in this component's pools block and fill it.`;
+                    } else {
+                        suggestion = `If this pool fills later by design (on user interaction, or once something loads), nothing is wrong and this note can be ignored. Otherwise the container and template are wired but nothing was ever added, so nothing renders: populate it with this.getPool('${path}').add({ ${keyProp}: 1, ... }).`;
+                    }
                     wfError(WF_ERRORS.POOL_NEVER_POPULATED, {
                         warn: true,
                         context: `pool '${path}' in component '${componentName}'`,
-                        suggestion: `The container and template are wired, but nothing was ever added, so nothing renders. Populate it with this.getPool('${path}').add({ ${keyProp}: 1, ... }). If this pool fills later by design (e.g. on user interaction), ignore this note.`
+                        suggestion
                     });
                 }, settleMs);
             }
@@ -1727,7 +1917,13 @@ export const PoolRendererMethods = {
                                 // Entity method wins over component method when both exist
                                 const entityFn = item[method];
                                 if (typeof entityFn === 'function') {
-                                    entityFn.call(item, event);
+                                    // An entity method is not wrapped as a
+                                    // component method is: report it here.
+                                    try {
+                                        entityFn.call(item, event);
+                                    } catch (error) {
+                                        this._handleError(`Error in pool '${handle.name}' entity method ${method}`, error, instance, { methodName: method, pool: handle.name });
+                                    }
                                 } else if (typeof ctx[method] === 'function') {
                                     ctx[method](item, event);
                                 }
@@ -1759,6 +1955,84 @@ export const PoolRendererMethods = {
 
         // Wake any computed/effect that read this.getPool(name) (or this.pools.x)
         // before the pools existed (B2: they tracked the registry pulse, not a handle).
+        this._poolRegistryPulse(instance);
+    },
+
+    /**
+     * Read one entry of a pools block: hooks bound to the owner's context,
+     * props, and the entity block's state, computed and methods. Shared by
+     * component pools and store pools so both read a definition the same way.
+     * @private
+     */
+    _resolvePoolDefinition(instance, poolDef) {
+        const out = { onAdd: null, onRemove: null, onClear: null, props: null, entityComputed: null, entityMethods: null, entityStateTemplate: null };
+        if (!poolDef) return out;
+        const ctx = instance.context;
+        const resolve = (hook) => typeof hook === 'string' ? ctx[hook]?.bind(ctx) :
+            typeof hook === 'function' ? hook.bind(ctx) : null;
+        const owner = () => instance;
+        out.onAdd = guardPoolHook(this, resolve(poolDef.onAdd), owner, 'onAdd');
+        out.onRemove = guardPoolHook(this, resolve(poolDef.onRemove), owner, 'onRemove');
+        out.onClear = guardPoolHook(this, resolve(poolDef.onClear), owner, 'onClear');
+        if (poolDef.props && typeof poolDef.props === 'object') out.props = poolDef.props;
+        const entity = poolDef.entity;
+        if (entity && typeof entity === 'object') {
+            // entity.computed: per-entity derived values
+            if (entity.computed && typeof entity.computed === 'object') out.entityComputed = entity.computed;
+            // entity.state: default-state template merged into new entities
+            if (entity.state && typeof entity.state === 'object') out.entityStateTemplate = entity.state;
+            // Entity methods live at the top level of the entity block
+            // (matching component/store shape, where methods are also top-level).
+            // Any function property that isn't a reserved key (state, computed)
+            // becomes an entity method.
+            const collected = {};
+            let hasAny = false;
+            for (const key of Object.keys(entity)) {
+                if (key === 'state' || key === 'computed') continue;
+                const v = entity[key];
+                if (typeof v !== 'function') continue;
+                collected[key] = v;
+                hasAny = true;
+            }
+            if (hasAny) out.entityMethods = collected;
+        }
+        return out;
+    },
+
+    /**
+     * Set up the pools block of an entity with no DOM (a store or a plugin).
+     * Every pool is data only: the same PoolHandle with no container, template
+     * or bindings. Nothing to draw, so it is not on the frame loop's flush
+     * list; the owner's tick() still runs on that loop. Entities key on the
+     * block's `key`, else `id` (a data-pool container's default).
+     * @private
+     */
+    _setupDataPools(instance, poolsDef) {
+        if (!poolsDef || typeof poolsDef !== 'object') return;
+        const names = Array.isArray(poolsDef) ? poolsDef : Object.keys(poolsDef);
+        if (!instance._pools) instance._pools = new Map();
+        const poolsObj = {};
+        for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            const poolDef = Array.isArray(poolsDef) ? {} : (poolsDef[name] || {});
+            if (__DEV__ && poolDef.entity && typeof poolDef.entity === 'object') {
+                validateEntityDefinition('Pool entity', `${instance.name}.${name}`, poolDef.entity, POOL_ENTITY_CONTRACT_KEYS);
+            }
+            if (__DEV__) {
+                const isPlugin = instance.name.startsWith('plugin:');
+                _devCheckPoolKey(isPlugin ? 'plugin' : 'store', isPlugin ? instance.name.slice(7) : instance.name, name, poolDef, "'id'");
+            }
+            const def = this._resolvePoolDefinition(instance, poolDef);
+            const keyProp = (typeof poolDef.key === 'string' && poolDef.key) || 'id';
+            const handle = new DataPoolHandle(name, null, keyProp, null, null, this, {
+                props: def.props, onAdd: def.onAdd, onRemove: def.onRemove, onClear: def.onClear,
+                entityComputed: def.entityComputed, entityMethods: def.entityMethods, entityStateTemplate: def.entityStateTemplate
+            });
+            instance._pools.set(name, handle);
+            poolsObj[name] = handle;
+        }
+        instance.pools = poolsObj;
+        if (instance.context) instance.context.pools = poolsObj;
         this._poolRegistryPulse(instance);
     },
 
@@ -1810,22 +2084,84 @@ export const PoolRendererMethods = {
                 if (dt > 250) dt = 250; // clamp
                 this._lastTickTime = now;
                 for (let i = 0; i < tickables.length; i++) {
-                    tickables[i]._tickFn(dt, now);
+                    const t = tickables[i];
+                    try {
+                        t._tickFn(dt, now);
+                        if (t._tickErrors) t._tickErrors = 0;
+                    } catch (error) {
+                        if (this._tickThrew(t, error)) { tickables.splice(i, 1); i--; }
+                    }
                 }
             }
         }
 
-        // Flush all active pools: flat array, zero iterator allocation
+        // Flush all active pools: flat array, zero iterator allocation. Each
+        // flush is isolated as each tick is: a throw here used to escape
+        // before the frame below was requested, stopping every pool and tick.
         const handles = this._activePoolHandles;
         if (handles) {
             for (let i = 0; i < handles.length; i++) {
-                if (handles[i].size > 0) {
-                    handles[i]._flush(now);
+                const h = handles[i];
+                if (h.size > 0) {
+                    try {
+                        h._flush(now);
+                        if (h._flushErrors) h._flushErrors = 0;
+                    } catch (error) {
+                        if (this._flushThrew(h, error)) { handles.splice(i, 1); i--; }
+                    }
                 }
             }
         }
 
         this._poolLoopId = requestAnimationFrame(this._boundPoolLoopTick);
+    },
+
+    /**
+     * A tick() threw. One throwing tick must not stop the frame loop for
+     * everything else, so each is isolated: the error goes to the error sink
+     * (onError handlers, else the console, since it is the author's
+     * exception). A tick that throws on one frame carries on; one that throws
+     * on every frame is broken, and reporting it sixty times a second buries
+     * the first report, so the first few are reported and after
+     * TICK_ERRORS_BEFORE_STOP in a row that entity's tick is stopped. The
+     * same rule as the threads extension's worker loop.
+     * Returns true when the tick was stopped (the caller removes it).
+     * @private
+     */
+    _tickThrew(instance, error) {
+        const count = instance._tickErrors = (instance._tickErrors || 0) + 1;
+        if (count <= TICK_ERRORS_REPORTED) {
+            this._handleError(`Error in ${instance.name}.tick`, error, instance, { lifecycle: 'tick' });
+        }
+        if (count < TICK_ERRORS_BEFORE_STOP) return false;
+        instance._tickFn = null;
+        this._handleError(`Error in ${instance.name}.tick`,
+            new Error(`${instance.name}.tick() threw on ${count} consecutive frames, so it was stopped; everything else keeps running`),
+            instance, { lifecycle: 'tick' });
+        return true;
+    },
+
+    /**
+     * A pool's flush threw (an entity computed or a binding it reads). The
+     * same rule as _tickThrew: the error goes to the owning component's
+     * onError (else the console), the first few are reported, and a pool
+     * whose flush throws on TICK_ERRORS_BEFORE_STOP frames in a row stops
+     * rendering so the rest of the page keeps running.
+     * Returns true when the pool was stopped (the caller removes it).
+     * @private
+     */
+    _flushThrew(handle, error) {
+        const owner = handle._owner;
+        const label = `${owner ? owner.name : 'component'} pool '${handle.name}'`;
+        const count = handle._flushErrors = (handle._flushErrors || 0) + 1;
+        if (count <= TICK_ERRORS_REPORTED) {
+            this._handleError(`Error rendering ${label}`, error, owner, { lifecycle: 'pool-flush', pool: handle.name });
+        }
+        if (count < TICK_ERRORS_BEFORE_STOP) return false;
+        this._handleError(`Error rendering ${label}`,
+            new Error(`${label} threw on ${count} consecutive frames, so it stopped rendering; everything else keeps running`),
+            owner, { lifecycle: 'pool-flush', pool: handle.name });
+        return true;
     },
 
     /**
@@ -1839,7 +2175,9 @@ export const PoolRendererMethods = {
         for (const instance of this.componentInstances.values()) {
             if (!instance._pools) continue;
             for (const pool of instance._pools.values()) {
-                if (pool.size > 0) return; // At least one pool has entities, keep running
+                // At least one drawn pool has entities, keep running. A
+                // data-only pool (a store's) has nothing to flush.
+                if (pool.size > 0 && pool._container) return;
             }
         }
         // No entities in any pool and no tickables: stop the loop
@@ -1890,5 +2228,23 @@ export const PoolRendererMethods = {
     _getPool(instance, name) {
         if (!instance._pools) return null;
         return instance._pools.get(name) || null;
+    },
+
+    /**
+     * The imperative hooks form, getPool(name, { onAdd, onRemove, onClear }),
+     * shared by components, stores and plugins. Each hook given replaces the
+     * pool's, bound to the owner's context; a non-function clears it.
+     * @private
+     */
+    _applyPoolHooks(handle, options, ctx) {
+        const owner = () => {
+            if (handle._owner) return handle._owner;
+            for (const inst of this.componentInstances.values()) if (inst.context === ctx) return inst;
+            return null;
+        };
+        const bind = (fn, hook) => typeof fn === 'function' ? guardPoolHook(this, fn.bind(ctx), owner, hook) : null;
+        if (options.onAdd) handle._onAdd = bind(options.onAdd, 'onAdd');
+        if (options.onRemove) handle._onRemove = bind(options.onRemove, 'onRemove');
+        if (options.onClear) handle._onClear = bind(options.onClear, 'onClear');
     }
 };

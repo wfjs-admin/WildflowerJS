@@ -30,7 +30,6 @@ describeIfPools('tick() registration without init()', () => {
     beforeEach(() => {
         resetFramework()
         wildflower = window.wildflower
-        if (wildflower._tickableInstances) wildflower._tickableInstances.length = 0
         container = document.createElement('div')
         document.body.appendChild(container)
     })

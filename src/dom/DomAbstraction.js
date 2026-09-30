@@ -107,7 +107,7 @@ export const DomAbstractionMethods = {
                 if (v === undefined) return els[0]?.innerHTML;
                 const sanitized = framework._sanitizeOrPassHTML ? framework._sanitizeOrPassHTML(v) : v;
                 els.forEach(el => {
-                    if (framework.debug && (el.hasAttribute('data-bind-html') || el.hasAttribute('data-list'))) {
+                    if (framework.debug && (framework._hasAttr(el, 'bind-html') || framework._hasAttr(el, 'list'))) {
                         wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .html() overwrite on reactive node', data: el });
                     }
                     el.innerHTML = sanitized;
@@ -121,7 +121,7 @@ export const DomAbstractionMethods = {
             text(v) {
                 if (v === undefined) return els[0]?.textContent;
                 els.forEach(el => {
-                    if (framework.debug && el.hasAttribute('data-bind')) {
+                    if (framework.debug && framework._hasAttr(el, 'bind')) {
                         wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .text() overwrite on bound node', data: el });
                     }
                     el.textContent = v;
@@ -133,7 +133,7 @@ export const DomAbstractionMethods = {
                 els.forEach(el => {
                     el.value = v;
                     // Magic Bridge: Dispatch input event to sync with data-model
-                    if (el.hasAttribute('data-model')) {
+                    if (framework._hasAttr(el, 'model')) {
                         el.dispatchEvent(new Event('input', { bubbles: true }));
                     }
                 });
@@ -210,7 +210,7 @@ export const DomAbstractionMethods = {
             // --- UTILS ---
             remove() {
                 els.forEach(el => {
-                    if (framework.debug && (el.hasAttribute('data-component') || el.hasAttribute('data-list-item'))) {
+                    if (framework.debug && framework._hasAttr(el, 'component')) {
                         wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .remove() on managed node', suggestion: 'Consider updating state instead.', data: el });
                     }
                     el.remove();
