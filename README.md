@@ -8,6 +8,8 @@
 [![CI](https://github.com/wfjs-admin/WildflowerJS/actions/workflows/ci.yml/badge.svg)](https://github.com/wfjs-admin/WildflowerJS/actions/workflows/ci.yml)
 
 A reactive JavaScript framework with no build step, no virtual DOM, just standard HTML, CSS, and JavaScript.
+No npm is required.
+Load it with one script tag from a CDN, and treat the npm package as optional.
 
 **[Documentation](https://wildflowerjs.com)** | **[Getting Started](https://wildflowerjs.com/getting-started/quickstart)** | **[Demos](https://wildflowerjs.com/demos)**
 
@@ -99,16 +101,16 @@ import wildflower from 'wildflowerjs/full';    // or nano, mini-pool, mini, lite
 
 Build steps optimize bundle delivery, not the runtime work that follows it. WildflowerJS writes directly to the DOM, with no virtual DOM and no reconciliation pass between a state change and the screen.
 
-WildflowerJS entered the official Krausest [js-framework-benchmark](https://krausest.github.io/js-framework-benchmark/2026/chrome152.html) with the Chrome 152 run, published September 1, 2026, on the then-current v1.4.0. Both entries measure the framework exactly as it ships from this package, script tag and all.
+On the official Krausest [js-framework-benchmark](https://krausest.github.io/js-framework-benchmark/2026/chrome154.html), Chrome 154 run, WildflowerJS v1.5.1 is at or better than the most full-featured reactive frameworks, with the pool implementation approaching vanilla JS. Both entries measure the framework exactly as it ships from this package, script tag and all.
 
-- **`wildflowerjs-v1.4.0`** posted a **1.16** weighted geomean slowdown, level with the fastest signal-based compilers, between Solid at 1.13 and Svelte at 1.17. This entry renders through `data-list`, the same fully reactive model every framework on the board benchmarks.
-- **`wildflowerjs-pool-v1.4.0`** posted a **1.09**, ahead of every major framework, rendering the same markup through entity pools, the per-frame primitive WildflowerJS ships for bulk and high-frequency workloads.
+- **`wildflowerjs-v1.5.1`** posted a **1.11** weighted geomean slowdown, level with Vue Vapor and ahead of Inferno and Solid at 1.13, Svelte at 1.18, Vue at 1.31 and React at 1.59. This entry renders through `data-list`, the same fully reactive model every framework on the board benchmarks.
+- **`wildflowerjs-pool-v1.5.1`** posted a **1.08**, ahead of every major framework and approaching vanilla JS at 1.05, rendering the same markup through entity pools, the per-frame primitive WildflowerJS ships for bulk and high-frequency workloads.
 
-Neither entry carries an issue flag, and all results were run on the benchmark maintainer's hardware.
+Both entries run in CSP-safe mode and suffer no performance penalty. Neither carries an issue flag, and all results were run on the benchmark maintainer's hardware.
 
-![The official js-framework-benchmark results table for Chrome 152, showing all nine duration benchmarks and the weighted geometric mean for vanillajs (1.04), wildflowerjs-pool-v1.4.0 (1.09), vue-vapor-v3.6.0-beta.17 (1.12), solid-v1.9.3 (1.13), wildflowerjs-v1.4.0 (1.16), svelte-v5.42.1 (1.17), vue-v3.5.39 (1.31), and react-hooks-v19.2.0 (1.58).](assets/benchmarks/krausest-chrome152-official.png)
+![The official js-framework-benchmark results table for Chrome 154, showing all nine duration benchmarks and the weighted geometric mean for vanillajs (1.05), wildflowerjs-pool-v1.5.1 (1.08), wildflowerjs-v1.5.1 (1.11), vue-vapor-v3.6.0-rc.5 (1.11), inferno-v8.2.2 (1.13), solid-v1.9.3 (1.13), octane-v0.2.7 (1.15), svelte-v5.42.1 (1.18), vue-v3.5.39 (1.31), and react-hooks-v19.2.0 (1.59).](assets/benchmarks/krausest-chrome154-official.png)
 
-*The official results table, framework selection made with the results page's own picker. Verify against the [interactive board](https://krausest.github.io/js-framework-benchmark/2026/chrome152.html).*
+*The official results table, framework selection made with the results page's own picker. Octane v0.2.7 (alpha) and Vue Vapor v3.6.0-rc.5 (release candidate) are pre-stable; all other entries are stable releases. Verify against the [interactive board](https://krausest.github.io/js-framework-benchmark/2026/chrome154.html).*
 
 ## Features
 
@@ -124,7 +126,7 @@ Neither entry carries an issue flag, and all results were run on the benchmark m
 - **List Rendering**: Efficient array rendering with keyed reconciliation.
 - **Event Handling**: Declarative event binding with modifiers and form handling.
 - **Form Validation**: Declarative per-input validation plus cross-field rules, gating submit through one shared error surface.
-- **Strict-CSP Ready**: Every build runs under a strict Content-Security-Policy with no `unsafe-eval`, via a compiled CSP-safe expression evaluator.
+- **Strict-CSP Mode**: Add `data-csp-safe` to the script tag and any build runs under a strict Content-Security-Policy with no `unsafe-eval`, via a compiled CSP-safe expression evaluator.
 - **Conditional Rendering**: Show/hide and insert/remove elements based on state.
 - **Client-Side Routing**: History and hash mode routing with guards and transitions.
 - **Server-Side Rendering**: Server-rendered HTML is adopted into state, with no hydration step, from any server.
