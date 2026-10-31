@@ -86,6 +86,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - [A store that declares `subscribe:` on another store reads, through `this.stores.X`, the store registered again after X was unregistered, and `null` once X is unregistered and not registered again](https://www.wildflowerjs.com/changelog.html#store-subscribe-reregistered-store)
 - [A list removes the whitespace around its `<template>` when it mounts; it stayed until the list was first emptied, so a list in an inline element showed a space before its first row until then](https://www.wildflowerjs.com/changelog.html#list-container-whitespace)
 - [An error thrown inside an async `init()` reaches the component's `onError`, as one thrown by a plain `init()` does](https://www.wildflowerjs.com/changelog.html#async-init-error-on-error)
+- [A server-rendered component whose definition registers after the page has loaded (from a later script, or from the inline one on a slow device) adopts its server-rendered rows instead of replacing them with its empty initial state](https://www.wildflowerjs.com/changelog.html#ssr-late-registration-keeps-rows)
 
 
 ## [1.5.4] - 2026-09-29

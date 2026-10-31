@@ -1161,5 +1161,24 @@ describeIfSSR('SSR nested lists (page load)', () => {
             expect(postsView(hosts[1])).toEqual(['First!', 'Second!', 'Third'])
             expectCleanPage(win)
         })
+
+        // The page-load pass activates the server markup it protected on a
+        // timer after init. A component registered after that timer (a later
+        // script, or the inline one on a slow device) still adopts its rows.
+        it(`PL3 components registered after the page-load activation keep their server rows [${framework}]`, async () => {
+            const script = `setTimeout(function () {
+                wildflower.component('pl3', { state: { groups: [] } });
+                wildflower.component('pl3t', { state: { posts: [] } })
+            }, 50)`
+            const { win, hosts, initial, ctxOf } = await loadPage({ framework, body: groupsHtml('pl3', G2) + postsHtml('pl3t'), script })
+            expect(groupsView(hosts[0])).toEqual(['G0:320|150', 'G1:0|80'])
+            expect(idsOf(hosts[0], initial[0])).toEqual({ rows: [0, 1], cells: [[0, 1], [2, 3]] })
+            expect(postsView(hosts[1])).toEqual(['First', 'Second'])
+            await step(() => { ctxOf(hosts[0]).groups[1].cells.push({ label: 'NEW1' }) })
+            await step(() => { ctxOf(hosts[1]).posts[0].title = 'First!' })
+            expect(groupsView(hosts[0])).toEqual(['G0:320|150', 'G1:0|80|NEW1'])
+            expect(postsView(hosts[1])).toEqual(['First!', 'Second'])
+            expectCleanPage(win)
+        })
     }
 })

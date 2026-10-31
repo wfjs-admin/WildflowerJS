@@ -572,7 +572,11 @@ export class SSRManager {
         // Snapshot protected elements before activation; activateComponent() removes
         // each element from this.protectedElements as part of its cleanup, so by the
         // time the post-activation steps run, the live set would be empty.
-        const elementsToActivate = Array.from(this.protectedElements);
+        // An element no component has mounted yet stays protected: its
+        // definition registers later (a later script, or the inline one on a
+        // slow device), and activating it now would drop the server state that
+        // registration adopts. The late-registration path activates it.
+        const elementsToActivate = Array.from(this.protectedElements).filter(el => el.dataset.componentId);
 
         // Nothing to activate on a page without data-ssr components: return
         // quietly. (Before 1.5.1 every dev page load logged two activation
