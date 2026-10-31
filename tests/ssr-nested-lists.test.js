@@ -980,6 +980,42 @@ window.__canary = { warns: [], errors: [] };
     window.addEventListener('error', function (ev) { window.__canary.errors.push('error: ' + ev.message); });
     window.addEventListener('unhandledrejection', function (ev) { window.__canary.errors.push('rejection: ' + (ev.reason && ev.reason.message || ev.reason)); });
 })();
+// A trace of the load, read only when a page's server rows are missing after
+// load (see loadPage): the document's states, every row an outer list loses,
+// and the call that removed it. The patched methods call through unchanged.
+window.__trace = [];
+(function () {
+    var t0 = performance.now();
+    var log = function (what, extra) { window.__trace.push(Math.round(performance.now() - t0) + 'ms ' + what + (extra ? ' ' + extra : '')); };
+    var stack = function () { return (new Error().stack || '').split('\\n').slice(2, 9).map(function (s) { return s.trim(); }).join(' < '); };
+    var isOuter = function (n) { return !!(n && n.nodeType === 1 && n.classList.contains('outer')); };
+    log('readyState ' + document.readyState);
+    document.addEventListener('readystatechange', function () { log('readyState ' + document.readyState + ' wildflower=' + !!window.wildflower); });
+    window.addEventListener('load', function () { log('load'); });
+    new MutationObserver(function (records) {
+        records.forEach(function (r) {
+            if (isOuter(r.target) && r.removedNodes.length) log('outer lost ' + r.removedNodes.length + ' node(s)', 'kept=' + r.target.children.length);
+            if (isOuter(r.target) && r.addedNodes.length) log('outer gained ' + r.addedNodes.length + ' node(s)');
+        });
+    }).observe(document.documentElement, { childList: true, subtree: true });
+    var wrap = function (proto, name, test) {
+        var orig = proto[name];
+        proto[name] = function () { if (test(this, arguments)) log(name, stack()); return orig.apply(this, arguments); };
+    };
+    wrap(Node.prototype, 'removeChild', function (self) { return isOuter(self); });
+    wrap(Element.prototype, 'replaceChildren', function (self) { return isOuter(self); });
+    wrap(Element.prototype, 'remove', function (self) { return isOuter(self.parentNode); });
+    wrap(Element.prototype, 'replaceWith', function (self) { return isOuter(self.parentNode); });
+    wrap(Node.prototype, 'appendChild', function (self, a) { return a[0] && isOuter(a[0].parentNode) && a[0].parentNode !== self; });
+    wrap(Node.prototype, 'insertBefore', function (self, a) { return a[0] && isOuter(a[0].parentNode) && a[0].parentNode !== self; });
+    wrap(Range.prototype, 'deleteContents', function (self) { return isOuter(self.commonAncestorContainer); });
+    ['innerHTML', 'textContent'].forEach(function (prop) {
+        var proto = prop === 'innerHTML' ? Element.prototype : Node.prototype;
+        var d = Object.getOwnPropertyDescriptor(proto, prop);
+        Object.defineProperty(proto, prop, { configurable: true, enumerable: d.enumerable, get: d.get,
+            set: function (v) { if (isOuter(this)) log(prop + ' set', stack()); d.set.call(this, v); } });
+    });
+})();
 </script>`
 // Runs right after the server markup, before any list is mounted on either
 // page shape: records the server nodes.
@@ -1006,8 +1042,24 @@ async function loadPage(opts) {
         if (performance.now() - start > 4000) break
         await settle(20)
     }
+    const waited = Math.round(performance.now() - start)
     await settle(150)
     const ctxOf = (h) => win.wildflower.getComponentInstance(h.dataset.componentId).context
+    // A host that had server rows and now has none: print everything the page
+    // recorded, so a failure seen only in CI says what happened.
+    const lost = hosts.some((h, i) => (win.__init[i] || []).length > 0 && kids(h.querySelector('.outer')).length === 0)
+    if (lost) {
+        const state = hosts.map((h, i) => {
+            const o = h.querySelector('.outer')
+            let groups = 'n/a'
+            try { groups = JSON.stringify(ctxOf(h).groups) } catch (e) { groups = 'ctx error: ' + e.message }
+            return { host: i, serverRows: (win.__init[i] || []).length, rowsNow: kids(o).length, ssrPhase: o._ssrPhase,
+                mapArrayInitialized: !!o._mapArrayInitialized, dataSsr: h.getAttribute('data-ssr'), componentId: h.dataset.componentId, groups }
+        })
+        console.warn('[ssr-nested-lists] server rows lost at load:\n' + JSON.stringify({
+            framework: opts.framework, waitedMs: waited, version: win.wildflower && win.wildflower.version,
+            state, trace: win.__trace, warns: win.__canary.warns, errors: win.__canary.errors }, null, 2))
+    }
     return { win, doc, hosts, initial: win.__init, ctxOf }
 }
 
