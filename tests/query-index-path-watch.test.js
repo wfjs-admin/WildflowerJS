@@ -1,6 +1,5 @@
 /**
- * Does an index path on a query store go stale? (review finding Q6)
- *
+ * Does an index path on a query store go stale? *
  * WF-213 warns on watch paths like 'rows.0.name' because an array changed
  * in place leaves such a watcher on the item that was at that position when
  * it was first observed. A query never changes rows in place: every fetch
@@ -82,7 +81,7 @@ suite('index path watcher on a query store', () => {
       wildflower.query('qip-w', { from: async () => [] })
       wildflower.store('qip-plain', { state: { rows: [] } })
       wildflower.getStore('qip-w').subscribe('rows.0.name', () => {})
-      const warned = () => lines.filter((l) => l.includes('[WF WF-213]')).length
+      const warned = () => lines.filter((l) => l.includes('[WF-213]')).length
       const queryHits = warned()
       wildflower.getStore('qip-plain').subscribe('rows.0.name', () => {})
       expect(queryHits).toBe(0)

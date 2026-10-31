@@ -232,7 +232,7 @@ declare namespace WF {
     /** Keys the framework owns, so whatever is left is the author's methods. */
     type ReservedKey =
         | 'state' | 'computed' | 'props' | 'pools' | 'subscribe' | 'watch' | 'rules'
-        | 'types' | 'subscribeTimeout' | 'uses' | 'storageKey' | 'autoSave'
+        | 'types' | 'subscribeTimeout' | 'uses' | 'root' | 'storageKey' | 'autoSave'
         | 'init' | 'beforeInit' | 'destroy' | 'beforeDestroy' | 'onUpdate' | 'beforeUpdate'
         | 'onError' | 'tick' | 'onStoreUpdate' | 'onPropsChange' | 'onRouteChange';
 
@@ -281,6 +281,19 @@ declare namespace WF {
         /** Cross-field form rules; the key is the message. */
         rules?: Record<string, string | RuleConfig>;
         uses?: string[];
+        /**
+         * The component's own side of its root element, each value an
+         * expression in its scope. Merged with the tag's bindings: classes
+         * are a union, the root hides while either side hides it, and an
+         * attribute, style property or directive set on both is the tag's.
+         */
+        root?: {
+            class?: Record<string, string>;
+            attr?: Record<string, string>;
+            style?: Record<string, string>;
+            show?: string;
+            directives?: Record<string, string>;
+        };
         beforeInit?(): void | Promise<void>;
         init?(): void | Promise<void>;
         beforeUpdate?(): void;
@@ -502,6 +515,29 @@ declare namespace WF {
         readonly tier: Tier;
         /** What this build can do; extensions read it to check their requirements. Frozen. */
         readonly features: Readonly<Features>;
+        /**
+         * Development builds only: every coded diagnostic printed, as data,
+         * newest last (the newest 200). Each is also a `wildflower:diagnostic`
+         * event on document.
+         */
+        readonly diagnostics?: {
+            readonly code: string; readonly severity: 'warning' | 'error'; readonly message: string;
+            readonly context: string | null; readonly suggestion: string | null; readonly cause: string | null;
+            readonly docs: string; readonly time: number;
+        }[];
+        /**
+         * Development builds only: print a coded diagnostic in the framework's
+         * format and record it in `diagnostics`. For extensions with their own
+         * codes. Returns the frozen entry.
+         */
+        readonly diagnostic?: (d: {
+            code: string; severity?: 'warning' | 'error'; message?: string; context?: string;
+            suggestion?: string; data?: unknown; cause?: Error | string;
+        }) => {
+            readonly code: string; readonly severity: 'warning' | 'error'; readonly message: string;
+            readonly context: string | null; readonly suggestion: string | null; readonly cause: string | null;
+            readonly docs: string; readonly time: number;
+        };
 
         /**
          * Register a component. `this` inside every method is the component:
@@ -546,6 +582,14 @@ declare namespace WF {
          * a `wildflower:idle` event on document.
          */
         whenIdle(): Promise<void>;
+        /**
+         * Resolves once no component has an init() still to run: scheduled,
+         * waiting on its stores, or running through afterInit and the work an
+         * async init() awaits. Immediately when none is pending.
+         */
+        whenInitialized(): Promise<void>;
+        /** Pool tiers only: flush every drawn pool now, as the frame loop's next flush would. */
+        flushPools?(): void;
         config(options: Partial<ConfigOptions>): Api;
         /** Deep plain-object snapshot of reactive state, for structured clone (IndexedDB, postMessage). */
         toRaw<T>(value: T): T;

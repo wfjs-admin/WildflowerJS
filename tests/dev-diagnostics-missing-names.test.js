@@ -72,7 +72,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode missing-name diagnostics', () => {
 
         const found = errors.filter(e => e.includes("subscribes to store 'mn-ghost-store'"))
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-909]')
+        expect(found[0]).toContain('[WF-909]')
         expect(found[0]).toContain('does not exist')
 
         // Best-effort init: the component still binds and renders.

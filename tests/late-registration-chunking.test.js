@@ -142,7 +142,7 @@ describe('late registration: sync floor, time ceiling, whenIdle()', () => {
         // One wfError() emission is several console.warn lines (message,
         // suggestion, docs URL — and the URL repeats the code), so count the
         // header line only: exactly one warning for the whole registration.
-        const headers = warnings.filter(w => w.startsWith('[WF WF-515]'))
+        const headers = warnings.filter(w => w.startsWith('[WF-515]'))
         expect(headers.length).toBe(1)
         expect(headers[0]).toContain(name)
         expect(warnings.some(w => w.includes('whenIdle'))).toBe(true)

@@ -1,5 +1,5 @@
 /**
- * Reproducer tests for findings from the 2026-04-22 code review (Group 1, safe subset).
+ * Reproducer tests for internal-state defects (group 1, safe subset).
  *
  * Phase 1: unit-style internal-state inspection for H2, H3, H5.
  * These tests do NOT touch scheduler / rAF / pools / sync effects — they
@@ -20,7 +20,7 @@ import {
   whenSettled
 } from './helpers/load-framework.js'
 
-describe.skipIf(isMinifiedBuild())('Code Review 2026-04-22 — Group 1 (phase 1)', () => {
+describe.skipIf(isMinifiedBuild())('Internal-state defects, group 1 (phase 1)', () => {
   let testContainer
   let wildflower
 

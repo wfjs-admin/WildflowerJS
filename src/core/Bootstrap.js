@@ -93,7 +93,7 @@ function _createDevToolsHook(wf) {
             const r = [];
             wf.componentInstances.forEach((i, id) => {
                 if (i.isVirtual) return;
-                const c = {}; try { const d = i.definition; if (d?.computed) for (const k of Object.keys(d.computed)) try { c[k] = i.context[k]; } catch { c[k] = '(error)'; } } catch {}
+                const c = {}; try { const d = i.definition; if (d?.computed) for (const k of Object.keys(d.computed)) try { const v = i.context[k]; c[k] = typeof v === 'function' ? '(per item)' : v; } catch { c[k] = '(error)'; } } catch {}
                 r.push({ id, name: i.name, tag: i.element?.tagName?.toLowerCase() || null, state: ss(i.stateManager), computed: c, props: i.props || {}, stores: i.definition?.stores || [], poolCount: i._pools?.size || 0, parentId: wf.componentParents?.get(id) || null });
             });
             return r;

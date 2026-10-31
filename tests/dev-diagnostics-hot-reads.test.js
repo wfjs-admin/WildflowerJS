@@ -53,7 +53,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode hot-loop facade-read warning (seali
     })
 
     function hotReadWarnings(prop) {
-        return warnings.filter(w => w.includes('[WF WF-216]') && w.includes(`'${prop}'`))
+        return warnings.filter(w => w.includes('[WF-216]') && w.includes(`'${prop}'`))
     }
 
     async function mountComponent(name, def) {

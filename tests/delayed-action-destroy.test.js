@@ -2,7 +2,6 @@
  * WildflowerJS Delayed Action + Destroy Test Suite
  *
  * Tests that delayed action handlers do not fire on destroyed components.
- * Covers issue 2.5 from V1 RC1 Final Code Review.
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
@@ -66,15 +65,6 @@ describe('Delayed Action on Destroyed Component', () => {
 
     wildflower.component('delay-test', {
       state: { count: 0 },
-      events: {
-        actions: {
-          click: {
-            delay: 200,
-            stopPropagation: true,
-            preventDefault: false
-          }
-        }
-      },
       increment() {
         actionCalled = true
         this.state.count++
@@ -83,7 +73,7 @@ describe('Delayed Action on Destroyed Component', () => {
 
     testContainer.innerHTML = `
       <div data-component="delay-test">
-        <button data-action="click:increment">Click</button>
+        <button data-action="click:increment" data-event-delay="200">Click</button>
         <span data-bind="count"></span>
       </div>
     `

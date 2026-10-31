@@ -4,7 +4,8 @@
  * @module
  */
 
-import { handlingSubmitSet, validationCache } from '../core/DomMetadata.js';
+import { validationCache } from '../core/DomMetadata.js';
+import { getContextMethod } from '../state/ContextProxy.js';
 import { pathResolver, WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { parseExpression, getCSPSafeEvaluatorWithArgs, extractIdentifiers } from '../core/CSPExpressionEvaluator.js';
 
@@ -42,9 +43,10 @@ export const FormHandlingMethods = {
     /**
      * Write a data-model input value back to its source (component state, store,
      * or list-item proxy). Relocated from ListItemBinding so data-model write-back
-     * ships in the nano tier; all deps (_getInputValue, _applyMapArrayMutation,
-     * pathResolver, _findListItemAncestor) are core/nano-shipped. The list-item
-     * branch is runtime-inert without list contexts.
+     * ships in the nano tier; its deps (_getInputValue, _applyMapArrayMutation,
+     * pathResolver) are core/nano-shipped, and the row lookup
+     * (_findListItemAncestor, lists only) is gated on __FEATURE_LISTS__. The
+     * list-item branch is runtime-inert without list contexts.
      * @private
      */
     _updateModelValue(context, newValue)
@@ -70,7 +72,7 @@ export const FormHandlingMethods = {
             // propagates through the graph for top-level, computed-source, and
             // nested lists alike; no immutable copy/replace/writeback or manual
             // binding refresh required. Converges on the mapArray mutation path.
-            const rowEl = this._findListItemAncestor(context.element);
+            const rowEl = __FEATURE_LISTS__ ? this._findListItemAncestor(context.element) : null;
             const item = (rowEl && rowEl._itemData) || context._itemData;
             if (item) {
                 this._applyMapArrayMutation(item, context.path, newValue);
@@ -229,46 +231,115 @@ export const FormHandlingMethods = {
     },
 
 /**
-     * Handle form submission events
+     * The component an element belongs to, for the submit dispatcher: the
+     * nearest component above it, or, for content the portal system has moved
+     * out of its component, the component it came from (the moved element
+     * carries data-portaled-from). Whichever boundary is nearer wins, so a
+     * form portaled INTO another component still belongs to its own. An
+     * element that is both (a child component that is the portaled content)
+     * is a component first.
+     *
+     * Last, a form that other code has moved out of every component after it
+     * was bound (a dialog library appending to <body>) belongs to the
+     * component it was bound in: _bindComponentActions leaves that id on the
+     * form.
+     * @param {HTMLElement} el
+     * @returns {{boundary: HTMLElement|null, id: string|null, portal: boolean}|null}
+     * @private
+     */
+    _submitOwner(el)
+    {
+        for (let cur = el; cur && cur.nodeType === 1; cur = cur.parentElement)
+        {
+            if (this._hasAttr(cur, 'component')) return { boundary: cur, id: cur.dataset.componentId || null, portal: false };
+            const from = cur.getAttribute('data-portaled-from');
+            if (from) return { boundary: cur, id: from, portal: true };
+        }
+        return el._wfFormOwner ? { boundary: null, id: el._wfFormOwner, portal: false } : null;
+    },
+    /**
+     * Which of a form's declared actions is its submit action: the one
+     * declared for submit; else a bare name (data-action="save" parses as a
+     * click, and on a form it has always meant submit); else the first.
+     * @param {Array} actions - _parseActions output
+     * @returns {Object|null}
+     * @private
+     */
+    _submitActionOf(actions)
+    {
+        let bare = null;
+        for (let i = 0; i < actions.length; i++)
+        {
+            if (actions[i].eventType === 'submit') return actions[i];
+            if (bare === null && actions[i].eventType === 'click') bare = actions[i];
+        }
+        return bare || actions[0] || null;
+    },
+    /**
+     * Handle form submission events.
+     *
+     * This is the ONLY place a submit reaches an author's handler, whatever
+     * the form is in: a component, a list row (at any depth, or as the row's
+     * own root element), a child component in a row, portaled content, a
+     * slot. It is a capture listener on the document, so it runs first.
+     *
+     * It used to be one of three. Each list had its own submit listener and
+     * every (re)bind of a component's actions attached a direct listener to
+     * each form, and the three each did a different part of the job: one
+     * validated, one built `details`, none chose the action declared for
+     * submit. Where two claimed the same form the handler ran twice; where
+     * only the list's ran there was no validation and, in a nested row, no
+     * input sync.
      * @param {Event} e - The form submission event
      */
     _handleFormSubmit(e)
     {
-        // Check if this form is related to our framework
-        const componentElement = this._getComponentElement(e.target);
-        if (!componentElement) return;
-
         if (e.type !== 'submit')
         {
             return;
         }
 
-        const formElement = e.target.closest('form');
+        const formElement = e.target && e.target.closest ? e.target.closest('form') : null;
         if (!formElement || formElement !== e.target)
         {
             // If the event target isn't the form itself, it might be bubbling from a nested form
             return;
         }
 
-        // Skip forms inside list items - they're handled by delegated submit handler
-        // which provides the proper list context (details.index, details.item, etc.)
-        // Check by walking up parents for _listIndex property (set during list rendering)
-        let el = formElement.parentElement;
-        while (el && el !== componentElement)
+        // Check if this form is related to our framework
+        const owner = this._submitOwner(formElement);
+        if (!owner) return;
+
+        const actionAttr = this._getAttr(formElement, 'action');
+
+        // A form INSIDE a row of one of this component's lists, with no
+        // action, is left alone entirely: not prevented, not synced. (The
+        // walk starts at the form's parent, as it always has, so a form that
+        // is itself the row's root is prevented like any other form.)
+        if (__FEATURE_LISTS__ && !actionAttr)
         {
-            if (typeof el._listIndex === 'number')
+            let el = formElement.parentElement;
+            while (el && el !== owner.boundary)
             {
-                // Form is inside a list item - let delegated handler handle it
-                return;
+                if (typeof el._listIndex === 'number') return;
+                el = el.parentElement;
             }
-            el = el.parentElement;
         }
 
         // Prevent default submission for all forms in our components
         e.preventDefault();
 
+        // A form in a pool row is the pool's: its actions take (item, event),
+        // not a component action's (event, element, details), and the pool's
+        // own listener calls them. Calling the method from here as well ran
+        // it a second time with the wrong arguments.
+        for (let el = formElement; el && el !== owner.boundary; el = el.parentElement)
+        {
+            if (el._poolItem != null) return;
+        }
+
         // Get the component ID
-        const componentId = componentElement.dataset.componentId;
+        const componentId = owner.id;
         if (!componentId)
         {
             return;
@@ -281,55 +352,88 @@ export const FormHandlingMethods = {
             return;
         }
 
+        // A form rendered through data-use-template + data-with binds to the
+        // slot's data, not to component state.
+        const slot = this._slotContextFor ? this._slotContextFor(formElement, instance) : null;
+
+        // What the handler is told about where the form is. Worked out BEFORE
+        // the inputs are synced: the sync can move the row (a sorted or
+        // filtered computed list), and the handler must be told about the row
+        // that was submitted.
+        let detail;
+        if (!slot && __FEATURE_LISTS__)
+        {
+            // The nearest row at or above the form, across component
+            // boundaries: a form in a child component that sits in a parent's
+            // row is told about that row. Content the portal system moved is
+            // not in whatever row its target happens to sit in.
+            const stopAt = owner.portal ? owner.boundary : null;
+            let row = formElement;
+            while (row && row !== stopAt && row._listIndex === undefined) row = row.parentElement;
+            if (row && row !== stopAt && row._itemData !== undefined)
+            {
+                // Built against the component that owns the row's list, which
+                // for a child-in-row form is not the form's own component.
+                const listEl = this._findRowList(row);
+                const listOwnerRef = listEl ? this._submitOwner(listEl) : null;
+                const listOwner = (listOwnerRef && listOwnerRef.id && this.componentInstances.get(listOwnerRef.id)) || instance;
+                detail = this._buildListActionDetail(row, listOwner) || undefined;
+                if (detail)
+                {
+                    // `item` is a getter that looks the row up by position
+                    // each time it is read. Pin it to the row as it is now.
+                    const item = detail.item;
+                    Object.defineProperty(detail, 'item', { value: item, enumerable: true, configurable: true, writable: true });
+                }
+            }
+        }
+
         // Sync all form input values to state before calling the action
-        this._syncFormToState(e.target, instance);
+        if (slot) this._syncSlotFormToData(formElement, instance, slot);
+        else this._syncFormToState(formElement, instance);
 
         // Check if the form has validation and run it
-        if (this._hasAttr(e.target, 'validate-on'))
+        if (this._hasAttr(formElement, 'validate-on'))
         {
-            const triggers = this._getValidationTriggers(e.target);
+            const triggers = this._getValidationTriggers(formElement);
             if (triggers.has('submit'))
             {
-                const isValid = this._validateForm(e.target, instance);
+                const isValid = this._validateForm(formElement, instance);
                 if (!isValid)
                 {
-                    // Block the EventSystem's data-action handler from firing
+                    // Keep the invalid submit from reaching anything else
                     e.stopImmediatePropagation();
                     return; // Stop here if validation fails
                 }
             }
         }
 
-        // This flag will tell our action binding system to skip this action
-        if (!handlingSubmitSet.has(e.target))
-        {
-            handlingSubmitSet.add(e.target);
+        if (!actionAttr) return;
 
-            // Clear flag after execution to allow future submissions
-            setTimeout(() =>
-            {
-                handlingSubmitSet.delete(e.target);
-            }, 100);
+        const action = this._submitActionOf(this._parseActions(actionAttr));
+        const methodName = action && action.methodName;
+        if (!methodName || !getContextMethod(instance.context, methodName)) return;
+
+        if (slot)
+        {
+            detail = { item: instance.stateManager.getValue(slot.dataWithPath), path: slot.dataWithPath, slotContext: true };
+        }
+        const args = action.args;
+        const hasArgs = !!(args && args.length > 0);
+        if (hasArgs)
+        {
+            if (detail === undefined) detail = {};
+            detail.args = args;
         }
 
-        // Check if the form has a data-action attribute
-        const actionAttr = this._getAttr(e.target, 'action');
-        if (actionAttr)
+        try
         {
-            // Parse the action to extract method name (handles "submit:methodName" prefix)
-            const actions = this._parseActions(actionAttr);
-            const methodName = actions[0]?.methodName;
-
-            if (methodName && typeof instance.context[methodName] === 'function')
-            {
-                try
-                {
-                    instance.context[methodName](e, e.target);
-                } catch (error)
-                {
-                    this._handleError(`Error executing form action ${methodName}`, error, instance);
-                }
-            }
+            if (hasArgs) instance.context[methodName](e, formElement, detail, ...args);
+            else if (detail !== undefined) instance.context[methodName](e, formElement, detail);
+            else instance.context[methodName](e, formElement);
+        } catch (error)
+        {
+            this._handleError(`Error executing form action ${methodName}`, error, instance, { actionName: methodName, lifecycle: 'action' });
         }
     },
     /**
@@ -389,6 +493,16 @@ export const FormHandlingMethods = {
         const currentValue = this._getInputValue(e.target, true, _modelRec?.elementMeta, mods);
         if (currentValue === undefined) return; // Skip unchecked radio buttons
 
+        // A select the user has just changed: what it shows now is what it
+        // is to go on showing when its options next change (the value kept
+        // by applyModel would otherwise be the one from before the choice,
+        // since a focused control is not written back to).
+        if (e.target._wfWant !== undefined) {
+            e.target._wfWant = e.target.multiple
+                ? Array.from(e.target.selectedOptions, (o) => o.value)
+                : e.target.value;
+        }
+
         // Resolve the write-back through the model record (element-local OR CM
         // list context; _updateModelValue accepts either).
         if (_modelRec && _modelRec._isModelBinding)
@@ -403,7 +517,7 @@ export const FormHandlingMethods = {
 
         if (listItem)
         {
-            const listElement = this._findDirectParentList(listItem);
+            const listElement = this._findRowList(listItem);
             if (listElement)
             {
                 const componentElement = this._getComponentElement(listElement);
@@ -530,6 +644,26 @@ export const FormHandlingMethods = {
             this._syncInputToState(e.target, instance);
         }
     },
+    /**
+     * Submit-time sync for a form rendered through a slot: its data-model
+     * paths are relative to the slot's data (data-with), so the values go
+     * there, as the slot's own live input handlers write them.
+     * @private
+     */
+    _syncSlotFormToData(formElement, instance, slotContext)
+    {
+        const dataValue = instance.stateManager.getValue(slotContext.dataWithPath);
+        if (!dataValue || typeof dataValue !== 'object') return;
+        const inputElements = formElement.querySelectorAll('input, select, textarea');
+        for (let i = 0; i < inputElements.length; i++)
+        {
+            const modelPath = this._getAttr(inputElements[i], 'model');
+            if (!modelPath) continue;
+            const value = this._getInputValue(inputElements[i]);
+            if (value === undefined) continue; // Skip unchecked radios
+            this._setSlotValue(modelPath, value, dataValue, instance, slotContext);
+        }
+    },
     // Form submission handling for list items
     _syncFormToState(formElement, instance)
     {
@@ -550,7 +684,7 @@ export const FormHandlingMethods = {
             if (listItem)
             {
                 // This is an input within a list item
-                const listElement = this._findDirectParentList(listItem);
+                const listElement = this._findRowList(listItem);
                 if (listElement)
                 {
                     const listPath = this._getAttr(listElement, 'list');
@@ -562,8 +696,19 @@ export const FormHandlingMethods = {
 
                     // List row model write-back: mutate the reactive item proxy
                     // directly (the same proxy the render effect tracks), so the
-                    // set propagates through the graph.
-                    const item = instance.state[listPath]?.[itemIndex];
+                    // set propagates through the graph. state[listPath][index]
+                    // only exists for a top-level list held in component state;
+                    // for a nested row it found nothing, or a top-level list of
+                    // the same name, and for a store or computed list nothing.
+                    // The row's own record first, as the live input path does
+                    // (_updateModelValue): a write to one input can move the
+                    // row within a sorted or filtered list, and the next input
+                    // must still land on the same item.
+                    let item = listItem._itemData;
+                    if (!item) {
+                        const rowList = this._resolveRowListArray(listElement, listPath, instance);
+                        item = rowList && rowList[itemIndex];
+                    }
                     if (item) {
                         this._applyMapArrayMutation(item, modelPath, value);
                     }
@@ -587,41 +732,6 @@ export const FormHandlingMethods = {
         return true;
     },
     /**
-     * Build the full path for a nested list by traversing up through parent lists
-     * For example: teams.1.players when players is nested inside a team
-     * Returns normalized dot notation path (not bracket notation) for pathResolver compatibility
-     * @param {HTMLElement} listElement - The immediate data-list container
-     * @param {HTMLElement} listItem - The list item element
-     * @returns {{ fullPath: string, itemIndex: number }} The full path and item index
-     * @private
-     */
-    _buildNestedListPath(listElement, listItem) {
-        const listPath = this._getAttr(listElement, 'list');
-        const itemIndex = listItem._listIndex;
-
-        // Check for parent list context
-        const parentListElement = listElement.parentElement?.closest(this._attrSelector('list'));
-        if (!parentListElement) {
-            // Not nested - return simple path
-            return { fullPath: listPath, itemIndex };
-        }
-
-        // Find the parent list item that contains this nested list
-        const parentListItem = this._findListItemAncestor(listElement);
-        if (!parentListItem || parentListItem._listIndex === undefined) {
-            return { fullPath: listPath, itemIndex };
-        }
-
-        // Recursively build the parent path
-        const parentResult = this._buildNestedListPath(parentListElement, parentListItem);
-
-        // Combine using dot notation for pathResolver: parentPath.parentIndex.childPath
-        const fullPath = `${parentResult.fullPath}.${parentListItem._listIndex}.${listPath}`;
-
-        return { fullPath, itemIndex };
-    },
-
-    /**
      * Synchronizes a single input element's value to component state
      * @param {HTMLElement} input - The input element
      * @param {Object} instance - The component instance
@@ -639,17 +749,17 @@ export const FormHandlingMethods = {
         const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(input) : null;
         if (listItem)
         {
-            const listElement = this._findDirectParentList(listItem);
+            const listElement = this._findRowList(listItem);
             if (listElement)
             {
-                // Build full path for nested lists (e.g., teams.1.players)
-                const { fullPath: listPath, itemIndex } = this._buildNestedListPath(listElement, listItem);
-
-                // List row model write-back via direct proxy mutation (the same
-                // proxy the render effect tracks; getValue handles nested paths).
-                const listData = instance.stateManager?.getValue(listPath);
-                if (Array.isArray(listData) && listData[itemIndex]) {
-                    this._applyMapArrayMutation(listData[itemIndex], modelPath, value);
+                // The item the row renders (every row carries it, as
+                // _updateModelValue reads it). A list in a row can read a
+                // store or the component (data-list="$store.items",
+                // "settings.options"), so the source is never a path built
+                // through the outer row.
+                const item = listItem._itemData;
+                if (item) {
+                    this._applyMapArrayMutation(item, modelPath, value);
                 }
                 return;
             }
@@ -1231,7 +1341,7 @@ export const FormHandlingMethods = {
         });
 
         // Set initial value from state via property assignment
-        const listItemParent = this._findListItemAncestor(element);
+        const listItemParent = __FEATURE_LISTS__ ? this._findListItemAncestor(element) : null;
         if (listItemParent) {
             return;
         }
@@ -1259,7 +1369,7 @@ export const FormHandlingMethods = {
         // document-level _handleInputChange (capture phase)
 
         // Skip for list items; they get values from item data during rendering
-        const listItemParent = this._findListItemAncestor(element);
+        const listItemParent = __FEATURE_LISTS__ ? this._findListItemAncestor(element) : null;
         if (listItemParent) {
             return;
         }
@@ -1272,120 +1382,6 @@ export const FormHandlingMethods = {
         {
             this._handleError(`Error setting initial value for model: ${path}`, error, instance);
         }
-    },
-
-    // ========================================================================
-    // LIST FORM SUBMISSION DELEGATION
-    // (Moved from EventSystem.js: form-specific event handling)
-    // ========================================================================
-
-    /**
-     * Add submit event delegation for forms inside list items
-     * This enables data-action on form elements within list templates to receive details.index
-     * @param {HTMLElement} listElement - The list container element
-     * @param {Object} instance - The component instance
-     * @param {Object} listContext - The list context
-     * @param {string} path - The list data path
-     * @private
-     */
-    _addListSubmitDelegation(listElement, instance, listContext, path)
-    {
-        if (!__FEATURE_LISTS__) return;
-        listElement.addEventListener('submit', (event) =>
-        {
-            // Find if a form with data-action was submitted
-            const form = event.target;
-            if (form.tagName !== 'FORM') return;
-
-            // Check for data-action attribute on the form
-            // Note: attribute may be stripped by innerHTML optimization
-            // In that case, fall back to context registry lookup
-            let actionAttr = this._getAttr(form, 'action');
-
-            // If no attribute, try the element-local action record (for stripped templates)
-            if (!actionAttr && form._actionContext && form._actionContext.path) {
-                actionAttr = form._actionContext.path;
-            }
-
-            if (!actionAttr) return;
-
-            const closestList = form.closest(this._attrSelector('list'));
-
-            // Only handle submits for THIS list instance
-            if (closestList !== listElement) return;
-
-            // Prevent default form submission
-            event.preventDefault();
-
-            // Check if the form is inside a nested component
-            const closestComponent = form.closest('[data-component-id]');
-            let targetInstance = instance;
-
-            if (closestComponent && closestComponent !== instance.element)
-            {
-                const componentId = closestComponent.dataset.componentId;
-                if (componentId)
-                {
-                    const nestedInstance = this.componentInstances.get(componentId);
-                    if (nestedInstance)
-                    {
-                        targetInstance = nestedInstance;
-                    }
-                }
-            }
-
-            // Sync form data to state before calling action
-            this._syncFormToState(form, targetInstance);
-
-            // Parse the action to get method name
-            const actions = this._parseActions(actionAttr);
-            const methodName = actions[0]?.methodName;
-
-            if (!methodName || typeof targetInstance.context[methodName] !== 'function')
-            {
-                return;
-            }
-
-            // Find the list item and build details
-            const listItem = this._findListItemForAction(form, closestList);
-
-            if (listItem && listItem._listIndex !== undefined && listItem._itemData !== undefined)
-            {
-                // Build the detail off the row's reactive item-proxy + getValue,
-                // same as regular list actions (one-graph absorption); falls
-                // through to the no-detail fallback when the list does not
-                // resolve cleanly.
-                const detail = this._buildListActionDetail(listItem, targetInstance);
-
-                if (detail)
-                {
-                    try
-                    {
-                        targetInstance.context[methodName](event, form, detail);
-                    }
-                    catch (error)
-                    {
-                        this._handleError(
-                            `Error in form action handler '${methodName}'`,
-                            error,
-                            targetInstance,
-                            { actionName: methodName, lifecycle: 'action' }
-                        );
-                    }
-                    return;
-                }
-            }
-
-            // Fallback: call without details if list context not available
-            try
-            {
-                targetInstance.context[methodName](event, form);
-            }
-            catch (error)
-            {
-                this._handleError(`Error executing form action ${methodName}`, error, targetInstance);
-            }
-        });
     }
 
 };

@@ -1,5 +1,5 @@
 /**
- * Plugin lifecycle keys that silently did nothing (review C-10, predates 1.5.3).
+ * Plugin lifecycle keys that silently did nothing.
  *
  * tick: registration lived in the full-state setup path, so a plugin with
  * only tick, with install + tick, or with methods + tick (the lightweight
@@ -57,7 +57,7 @@ describe.skipIf(!hasFeature('plugins'))('plugin tick and setup', () => {
 
         it('warns WF-219 for a setup() function, which nothing calls', () => {
             wf.plugin({ name: 'hasSetup', install() {}, setup() {} })
-            const hits = warnings.filter(w => w.startsWith('[WF WF-219]'))
+            const hits = warnings.filter(w => w.startsWith('[WF-219]'))
             expect(hits.length).toBe(1)
             expect(hits[0]).toContain('setup')
         })

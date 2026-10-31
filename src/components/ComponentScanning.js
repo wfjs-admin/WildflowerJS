@@ -20,20 +20,126 @@ const FALSY_MODIFIER_VALUES = new Set(['false', '0', 'no', 'off']);
 // Non-function definition keys the component factory actually consumes
 // (validateEntityDefinition allowlist — keep in sync with the reads in
 // ComponentScanning/ComponentLifecycle/ComponentRegistry/EntitySystem).
-const COMPONENT_CONTRACT_KEYS = ['state', 'computed', 'watch', 'subscribe', 'subscribeTimeout', 'types', 'events', 'props', 'stores', 'pools', 'rules', 'uses'];
+const COMPONENT_CONTRACT_KEYS = ['state', 'computed', 'watch', 'subscribe', 'subscribeTimeout', 'types', 'props', 'stores', 'pools', 'rules', 'uses', 'root'];
+
+// WF-518: an element with data-component that is also a list or pool
+// container. A component element is only a component, so the list or pool on
+// it never renders the component's own data. The supported shape puts the
+// list one level inside the component. Called from _createComponentCore,
+// which every component init path goes through, once per component name and
+// attribute. Only called inside __DEV__ blocks, so it never runs in production.
+const _warnedComponentContainers = new Set();
+function warnComponentIsContainer(element, componentName, wf) {
+    for (const base of ['list', 'pool']) {
+        if (!wf._hasAttr(element, base)) continue;
+        // A data-query container's data-list is written by the query
+        // transform (data-list="$name.rows"), not by the author.
+        if (base === 'list' && wf._hasAttr(element, 'query')) continue;
+        const guard = componentName + ':' + base;
+        if (_warnedComponentContainers.has(guard)) continue;
+        _warnedComponentContainers.add(guard);
+        // The form the author wrote; data-wf- wins when both are present, as in _getAttr.
+        const attrName = element.hasAttribute(`data-wf-${base}`) ? `data-wf-${base}` : `data-${base}`;
+        const componentAttr = element.hasAttribute('data-wf-component') ? 'data-wf-component' : 'data-component';
+        const value = wf._getAttr(element, base);
+        const tag = element.tagName.toLowerCase();
+        wfError(WF_ERRORS.COMPONENT_IS_CONTAINER, {
+            warn: true,
+            context: `component '${componentName}' has ${attrName}="${value}" on its own element`,
+            suggestion: `Move ${attrName} onto an element inside the component: <div ${componentAttr}="${componentName}"><${tag} ${attrName}="${value}">...</${tag}></div>`
+        });
+    }
+}
 
 const GC_DELAY_MS = 40; // Delay before GC runs (allows DOM to settle)
+
+// Dev-only members, spread into ComponentScanningMethods under __DEV__
+// (absent from production files; every caller is an `if (__DEV__)` call).
+const ComponentScanningDevMethods = {
+    /**
+     * WF-513: data-bind/data-show/data-model/data-action outside every
+     * component never initialize (bindings only process inside a
+     * component) and, until this, never said so. Mirrors _queryOrphanSweep's
+     * shape (WF-963) for the four attributes every tier ships.
+     * @private
+     */
+    _bindingOrphanSweep(root) {
+        // Guard INSIDE the method, not only at the call site. A production
+        // build substitutes __DEV__ with false, so this folds to an
+        // unconditional return and terser drops the rest of the body as
+        // unreachable. Guarding only at the call site leaves the whole body
+        // in the bundle: terser cannot prove a method is unreachable, since
+        // nothing rules out a dynamic this[name] read. Mirrors
+        // _queryOrphanSweep (WF-963).
+        if (!__DEV__) return;
+        if (!root || !root.querySelectorAll) return;
+        for (const base of ['bind', 'show', 'model', 'action']) {
+            const selector = this._attrSelector(base);
+            const els = [];
+            if (root.matches && root.matches(selector)) els.push(root);
+            root.querySelectorAll(selector).forEach((el) => els.push(el));
+            for (const el of els) {
+                if (el._wfBindingOrphanWarned) continue;
+                // data-portaled-from marks content a portal moved out of its
+                // component, which still drives it.
+                if (el.closest(this._attrSelector('component') + ',[data-portaled-from]')) continue;
+                el._wfBindingOrphanWarned = true;
+                const attrName = el.hasAttribute(`data-${base}`) ? `data-${base}` : `data-wf-${base}`;
+                wfError(WF_ERRORS.BINDING_ORPHAN, {
+                    warn: true,
+                    context: `${attrName}="${el.getAttribute(attrName)}" has no component ancestor; bindings only process inside a component, so this element never initializes`,
+                    suggestion: `Wrap it in a component — an empty definition is enough: wildflower.component('shell', {}) + <div data-component="shell">`
+                });
+            }
+        }
+    },
+    /**
+     * WF-514: a presence-only modifier (the framework reads hasAttribute(),
+     * never the value) written as ="false" (or "0"/"no"/"off") is read as
+     * PRESENT and turns the modifier ON — the opposite of what was written,
+     * with no message anywhere near the actual read sites.
+     * @private
+     */
+    _modifierFalsyValueSweep(root) {
+        // See _bindingOrphanSweep: the internal __DEV__ guard is what lets a
+        // production build drop this body rather than ship it unreachable.
+        if (!__DEV__) return;
+        if (!root || !root.querySelectorAll) return;
+        for (const base of PRESENCE_ONLY_MODIFIERS) {
+            const selector = this._attrSelector(base);
+            const els = [];
+            if (root.matches && root.matches(selector)) els.push(root);
+            root.querySelectorAll(selector).forEach((el) => els.push(el));
+            for (const el of els) {
+                const attrName = el.hasAttribute(`data-${base}`) ? `data-${base}` : `data-wf-${base}`;
+                const value = el.getAttribute(attrName);
+                if (value === null || !FALSY_MODIFIER_VALUES.has(value.toLowerCase())) continue;
+                const markerKey = `_wfModifierFalsyWarned_${base}`;
+                if (el[markerKey]) continue;
+                el[markerKey] = true;
+                wfError(WF_ERRORS.MODIFIER_FALSY_VALUE, {
+                    warn: true,
+                    context: `${attrName}="${value}" is still ON — it's a presence-only modifier, so the value isn't read`,
+                    suggestion: `Remove the attribute entirely to turn it off (delete ${attrName}) instead of setting it to "${value}"`
+                });
+            }
+        }
+    },
+};
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const ComponentScanningMethods = {
+    ...(__DEV__ ? ComponentScanningDevMethods : {}),
 _setupDynamicComponentDetection()
     {
         // Only set up once
         if (this._mutationObserver) return;
 
-        this._mutationObserver = new MutationObserver(mutations =>
+        // Kept on the instance so whenInitialized() can run it on the records
+        // still queued (takeRecords()), and count a mount made by markup alone.
+        const onMutations = this._onMutations = mutations =>
         {
             // OPTIMIZATION: Skip processing if we're in batch list cleanup mode
             // The cleanup is already handled by _batchCleanupListItems
@@ -152,7 +258,8 @@ _setupDynamicComponentDetection()
                 // user interactions over cleanup work
                 this._scheduleBackgroundGC();
             }
-        });
+        };
+        this._mutationObserver = new MutationObserver(onMutations);
 
         // Start observing immediately. When the framework loads from <head>,
         // document.body does not exist yet, but documentElement always does and
@@ -247,6 +354,12 @@ _setupDynamicComponentDetection()
             try {
                 newComponents.forEach((element, _index) =>
                 {
+                    // Bindings on its root belong to an already-mounted
+                    // component around it; registered or not, it is that
+                    // component's to read (a false data-render takes it out
+                    // here, before it initializes).
+                    if (element.isConnected) this._claimChildRootBindings(element);
+
                     const componentName = element.dataset.wfComponent || element.dataset.component;
 
                     if (this.componentDefinitions.has(componentName))
@@ -304,75 +417,6 @@ _setupDynamicComponentDetection()
 
         return initializedCount;
     },
-    /**
-     * WF-513: data-bind/data-show/data-model/data-action outside every
-     * component never initialize (bindings only process inside a
-     * component) and, until this, never said so. Mirrors _queryOrphanSweep's
-     * shape (WF-963) for the four attributes every tier ships.
-     * @private
-     */
-    _bindingOrphanSweep(root) {
-        // Guard INSIDE the method, not only at the call site. A production
-        // build substitutes __DEV__ with false, so this folds to an
-        // unconditional return and terser drops the rest of the body as
-        // unreachable. Guarding only at the call site leaves the whole body
-        // in the bundle: terser cannot prove a method is unreachable, since
-        // nothing rules out a dynamic this[name] read. Mirrors
-        // _queryOrphanSweep (WF-963).
-        if (!__DEV__) return;
-        if (!root || !root.querySelectorAll) return;
-        for (const base of ['bind', 'show', 'model', 'action']) {
-            const selector = this._attrSelector(base);
-            const els = [];
-            if (root.matches && root.matches(selector)) els.push(root);
-            root.querySelectorAll(selector).forEach((el) => els.push(el));
-            for (const el of els) {
-                if (el._wfBindingOrphanWarned) continue;
-                // data-portaled-from marks content a portal moved out of its
-                // component, which still drives it.
-                if (el.closest(this._attrSelector('component') + ',[data-portaled-from]')) continue;
-                el._wfBindingOrphanWarned = true;
-                const attrName = el.hasAttribute(`data-${base}`) ? `data-${base}` : `data-wf-${base}`;
-                wfError(WF_ERRORS.BINDING_ORPHAN, {
-                    warn: true,
-                    context: `${attrName}="${el.getAttribute(attrName)}" has no component ancestor; bindings only process inside a component, so this element never initializes`,
-                    suggestion: `Wrap it in a component — an empty definition is enough: wildflower.component('shell', {}) + <div data-component="shell">`
-                });
-            }
-        }
-    },
-    /**
-     * WF-514: a presence-only modifier (the framework reads hasAttribute(),
-     * never the value) written as ="false" (or "0"/"no"/"off") is read as
-     * PRESENT and turns the modifier ON — the opposite of what was written,
-     * with no message anywhere near the actual read sites.
-     * @private
-     */
-    _modifierFalsyValueSweep(root) {
-        // See _bindingOrphanSweep: the internal __DEV__ guard is what lets a
-        // production build drop this body rather than ship it unreachable.
-        if (!__DEV__) return;
-        if (!root || !root.querySelectorAll) return;
-        for (const base of PRESENCE_ONLY_MODIFIERS) {
-            const selector = this._attrSelector(base);
-            const els = [];
-            if (root.matches && root.matches(selector)) els.push(root);
-            root.querySelectorAll(selector).forEach((el) => els.push(el));
-            for (const el of els) {
-                const attrName = el.hasAttribute(`data-${base}`) ? `data-${base}` : `data-wf-${base}`;
-                const value = el.getAttribute(attrName);
-                if (value === null || !FALSY_MODIFIER_VALUES.has(value.toLowerCase())) continue;
-                const markerKey = `_wfModifierFalsyWarned_${base}`;
-                if (el[markerKey]) continue;
-                el[markerKey] = true;
-                wfError(WF_ERRORS.MODIFIER_FALSY_VALUE, {
-                    warn: true,
-                    context: `${attrName}="${value}" is still ON — it's a presence-only modifier, so the value isn't read`,
-                    suggestion: `Remove the attribute entirely to turn it off (delete ${attrName}) instead of setting it to "${value}"`
-                });
-            }
-        }
-    },
     // Public alias for _scanForDynamicComponents with cleaner API
     // @param {string|Element} [scope] - Optional scope to limit scanning (selector string or Element)
     // @returns {number} - Count of newly initialized components
@@ -391,15 +435,21 @@ _setupDynamicComponentDetection()
         // first: an outer section that is false settles it, and the inner
         // conditions (which may name a $query) are not evaluated at all.
         const chain = [];
-        for (let parent = element.parentElement; parent && parent !== this.root; parent = parent.parentElement) {
+        // A data-render on a component's own root is a section of the
+        // component around it (bindings on a root are read where the tag was
+        // written), so a component element's own condition counts too.
+        const start = this._hasAttr(element, 'component') ? element : element.parentElement;
+        for (let parent = start; parent && parent !== this.root; parent = parent.parentElement) {
             if (this._hasAttr(parent, 'render')) chain.push(parent);
         }
         for (let i = chain.length - 1; i >= 0; i--) {
             const parent = chain[i];
             const conditionPath = this._getAttr(parent, 'render');
             if (!conditionPath) continue;
-            const componentElement = this._getComponentElement(parent);
-            if (!componentElement) continue;
+            const componentElement = this._bindingScopeElement(parent);
+            // No component reads it, or it sits on a top-level root, which
+            // never leaves the page: not a section.
+            if (!componentElement || componentElement === parent) continue;
 
             // The owning component is initialized: the same verdict its render
             // effect reaches (_conditionVerdict).
@@ -474,26 +524,8 @@ _setupDynamicComponentDetection()
             element.appendChild(preservedEl);
         });
     },
-    /**
-     * Check if an element has event delegation set up
-     * @param {HTMLElement} element - The element to check
-     * @returns {boolean} - Whether delegation is set up
-     */
-    _hasElementDelegation(element)
-    {
-        return this._delegationState.has(element) &&
-            this._delegationState.get(element).hasEventDelegation === true;
-    },
-    /**
-     * Mark an element as having event delegation
-     * @param {HTMLElement} element - The element to mark
-     */
-    _markElementDelegation(element)
-    {
-        this._delegationState.set(element, {
-            hasEventDelegation: true
-        });
-    },
+    // _hasElementDelegation / _markElementDelegation (lists only) live in
+    // ListSharedMethods.
     /**
      * Register a hook to prevent content updates on specific elements
      * @param {Function} hookFn - Function that receives (element, newValue) and returns boolean
@@ -503,24 +535,7 @@ _setupDynamicComponentDetection()
     {
         this._beforeContentUpdateHooks.push(hookFn);
     },
-    /**
-     * Check if content update should be prevented by external hooks
-     * @param {HTMLElement} element - The element being updated
-     * @param {string} newValue - The new content value
-     * @returns {boolean} - True if update should be prevented
-     * @private
-     */
-    _shouldPreventContentUpdate(element, newValue)
-    {
-        return this._beforeContentUpdateHooks.some(hook => {
-            try {
-                return hook(element, newValue);
-            } catch (error) {
-                this._log('warn', 'Error in beforeContentUpdate hook:', error);
-                return false;
-            }
-        });
-    },
+    // _shouldPreventContentUpdate (SSR only) lives in ssr-list.js.
     // =========================================================================
     // SCAN CONTEXT AND UNIT-OF-WORK METHODS
     // =========================================================================
@@ -721,16 +736,30 @@ _setupDynamicComponentDetection()
             // synchronously so action handlers bound at scan time can run
             // immediately rather than being queued indefinitely by
             // _wrapMethod's action-before-init guard.
+            //
+            // This branch never reaches _initWithStoreWait, so what that
+            // sequence does for an init-bearing component has to be done
+            // here too: the beforeInit and afterInit plugin hooks (a
+            // dynamically mounted component with no init() fires both; an
+            // extension that marks a component live on afterInit, such as
+            // Kinetic's scenes, otherwise never sees a page-load one) and
+            // the tick() registration (without which a page-load component
+            // with tick() and no init() never ticked, before 1.5.1).
+            if (this._triggerHook) {
+                this._triggerHook('component:beforeInit', instance);
+            }
             instance._initReady = true;
             // Pools are set up by now too, so this is the point to decide
             // which setup-time computed errors were real.
             this._checkSetupComputedErrors(instance);
-            // This branch never reaches _initWithStoreWait, where tick()
-            // registration lives for init-bearing components, so register
-            // here too. Without this, a page-load component with tick() and
-            // no init() never ticked (dynamic mounts were unaffected).
             this._registerTickHook(instance);
+            if (this._triggerHook) {
+                this._triggerHook('component:afterInit', instance);
+            }
         }
+
+        // WF-521: a binding on this root that names this component's own value
+        if (__DEV__) this._checkChildRootScope(instance);
 
         // Dispatch component init event for optional module integration (e.g., RouteManager)
         document.dispatchEvent(new CustomEvent('wildflower:componentInit', {
@@ -763,9 +792,12 @@ _setupDynamicComponentDetection()
     _executeDeferredInits(pendingInits) {
         if (pendingInits.length === 0) return;
 
+        // Each is counted toward whenInitialized() until its sequence ends;
+        // one destroyed before the task runs is counted down here.
+        this._initsPending += pendingInits.length;
         setTimeout(() => {
             for (const instance of pendingInits) {
-                if (!this.componentInstances.has(instance.id)) continue;
+                if (!this.componentInstances.has(instance.id)) { this._initDone(); continue; }
                 // Delegate to the shared init sequence used by the dynamic
                 // component path: subscribe-wait (waitForStoreReady) →
                 // beforeInit hook → init() → _initReady + queued-action
@@ -849,9 +881,12 @@ _setupDynamicComponentDetection()
                 this._prepareSingleInstanceForInit(instance, ctx);
             }
 
-            // SSR completion
+            // SSR completion, the last setup step: a subscription to a
+            // computed now takes its baseline when it is made (see
+            // EntityHandle._wireComputedNotifiers).
             for (const instance of ctx.instances) {
                 this._completeSingleSSRIntegration(instance);
+                instance.stateManager._wireComputedNotifiers();
             }
 
             // Update tracking
@@ -994,9 +1029,12 @@ _setupDynamicComponentDetection()
                 this._prepareSingleInstanceForInit(instance, ctx);
             });
 
-            // SSR completion (uses shared unit-of-work method)
+            // SSR completion (uses shared unit-of-work method), the last
+            // setup step: a subscription to a computed now takes its baseline
+            // when it is made (see EntityHandle._wireComputedNotifiers).
             await processWithIdleYield(ctx.instances, (instance) => {
                 this._completeSingleSSRIntegration(instance);
+                instance.stateManager._wireComputedNotifiers();
             });
 
             // Update tracking
@@ -1047,6 +1085,8 @@ _setupDynamicComponentDetection()
         if (__DEV__) warnDefinitionCollisions('Component', componentName, definition);
         // Lifecycle-hook names wired as event handlers (self-guards per name).
         if (__DEV__) warnLifecycleActionNames(element, componentName, this);
+        // A component element that is also a list or pool container (self-guards per name and attribute).
+        if (__DEV__) warnComponentIsContainer(element, componentName, this);
 
         // SSR: Enhance definition if this is an SSR component
         if (__FEATURE_SSR__ && options.ssrEnhance && this.ssrManager) {

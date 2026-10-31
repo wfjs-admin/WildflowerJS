@@ -22,6 +22,177 @@ const _wf214Warned = new Set();
 // WF-235 dedupe: same scheme as WF-214.
 const _wf235Warned = new Set();
 
+// WF-237 dedupe: same scheme as WF-214.
+const _wf237Warned = new Set();
+// Binding attributes whose values are evaluated per row (data-bind and its
+// -class/-style/-attr/-html family, data-show, data-render), with or without
+// the data-wf- prefix.
+const _ROW_EXPR_ATTR = /^data-(?:wf-)?(?:bind|show|render)/;
+
+// WF-237 (dev-only): a list-row binding CALLS an item-level computed, as in
+// data-bind="spent(item) + 1". In a row the name already resolves to that
+// computed's value for the row, so the call throws inside the evaluator and
+// the binding renders nothing, with no other sign. Scans the list's
+// template(s) once, before the first render; one warning per
+// (component, computed).
+// WF-516 dedupe: one warning per (component, method).
+const _wf516Warned = new Set();
+
+/**
+ * How many parameters a function declares. `fn.length` stops at the first
+ * parameter with a default value and never counts a rest parameter, so
+ * `place(item, index = 0, info = {})` and `place(item, ...rest)` both report
+ * 1; the parameter list in the source is counted instead when `length` is
+ * under 2. (Only "does it declare an index" is asked, see _positionReaders.)
+ * @param {Function} fn
+ * @returns {number}
+ */
+function _declaredParams(fn) {
+    if (fn.length >= 2) return fn.length;
+    let src;
+    try { src = Function.prototype.toString.call(fn); } catch (e) { return fn.length; }
+    const open = src.indexOf('(');
+    const arrow = src.indexOf('=>');
+    // `item => ...`: one parameter, and the first "(" belongs to the body.
+    if (open === -1 || (arrow !== -1 && arrow < open)) return fn.length;
+    let depth = 0, commas = 0, seen = false, quote = null, closed = false;
+    for (let i = open + 1; i < src.length; i++) {
+        const ch = src[i];
+        if (quote !== null) {
+            if (ch === '\\') i++;
+            else if (ch === quote) quote = null;
+            continue;
+        }
+        // Comments in the parameter list (an apostrophe in one would
+        // otherwise open a string that runs to the end of the source).
+        if (ch === '/' && src[i + 1] === '/') {
+            const nl = src.indexOf('\n', i);
+            if (nl === -1) break;
+            i = nl;
+            continue;
+        }
+        if (ch === '/' && src[i + 1] === '*') {
+            const end = src.indexOf('*/', i + 2);
+            if (end === -1) break;
+            i = end + 1;
+            continue;
+        }
+        if (ch === '"' || ch === "'" || ch === '`') { quote = ch; seen = true; continue; }
+        if (ch === '(' || ch === '[' || ch === '{') { depth++; seen = true; continue; }
+        if (ch === ')' || ch === ']' || ch === '}') {
+            if (depth === 0) { closed = true; break; }
+            depth--;
+            continue;
+        }
+        if (ch === ',' && depth === 0) { commas++; continue; }
+        if (ch > ' ') seen = true;
+    }
+    // The end of the parameter list was never found (a regex literal in a
+    // default value, source this scan cannot read): say yes. A wrong yes
+    // costs a repaint that changes nothing; a wrong no leaves text stale.
+    if (!closed) return 2;
+    return Math.max(fn.length, seen ? commas + 1 : 0);
+}
+// Definition functions the framework calls itself: never "a method named in
+// a binding" even when a binding happens to use the same word.
+const _LIFECYCLE = new Set(['init', 'beforeInit', 'destroy', 'beforeDestroy', 'onUpdate', 'beforeUpdate',
+    'onError', 'tick', 'onStoreUpdate', 'onPropsChange']);
+const _escapeName = (n) => n.replace(/[$]/g, '\\$');
+
+// WF-517 (dev-only): data-render on a row's ROOT element. Hiding swaps the
+// row for a placeholder the list's bookkeeping does not follow: the row does
+// not come back (or comes back stale), and removing or reordering it while
+// hidden leaves the placeholder behind or shows the row twice. Not currently supported;
+// data-render on an element INSIDE the row is. One warning per (component,
+// list); nested lists' templates are checked through their parent template.
+const _wf517Warned = new Set();
+function _warnRowRootRender(listEl, instance) {
+    const listPath = listEl.getAttribute('data-list') || listEl.getAttribute('data-wf-list') || '';
+    for (const tpl of listEl.querySelectorAll(':scope > template')) {
+        const content = tpl.content;
+        if (!content) continue;
+        const roots = content.children;
+        for (let i = 0; i < roots.length; i++) {
+            const cond = roots[i].getAttribute('data-render') || roots[i].getAttribute('data-wf-render');
+            if (cond === null) continue;
+            const key = ((instance && instance.name) || '?') + ':' + listPath;
+            if (_wf517Warned.has(key)) continue;
+            _wf517Warned.add(key);
+            wfError(WF_ERRORS.ROW_ROOT_RENDER, {
+                warn: true,
+                context: `component "${instance && instance.name}": list "${listPath}" has data-render="${cond}" on its row root <${roots[i].localName}>`,
+                suggestion: `To hide whole rows, put data-show="${cond}" on the row, or bind the list to a computed that filters the array. data-render works on an element inside the row.`
+            });
+        }
+        // Lists nested in this template arrive in rows without their own
+        // <template> (it is extracted with the parent's), so check them here.
+        for (const nested of content.querySelectorAll('[data-list], [data-wf-list]')) {
+            _warnRowRootRender(nested, instance);
+        }
+    }
+}
+
+// Also dev-only, in the same pass: WF-516, a row binding that names a
+// component METHOD (bare or called). Bindings read state and computeds, never
+// methods; outside lists WF-509 says so, inside rows it rendered nothing
+// silently. A name that is state, a computed, or a field of the list's first
+// item is not a mistake and is skipped; string literals are ignored.
+export function warnItemComputedCalls(listEl, instance, data) {
+    _warnRowRootRender(listEl, instance);
+    const sm = instance && instance.stateManager;
+    const origs = sm && sm._originalComputedFunctions;
+    const itemLevel = [];
+    if (origs) origs.forEach((fn, name) => { if (typeof fn === 'function' && fn.length > 0) itemLevel.push(name); });
+    const def = instance && instance.definition;
+    const first = Array.isArray(data) && data.length && data[0] && typeof data[0] === 'object' ? data[0] : null;
+    const methods = [];
+    if (def) {
+        for (const k of Object.keys(def)) {
+            if (typeof def[k] !== 'function' || _LIFECYCLE.has(k)) continue;
+            if ((origs && origs.has(k)) || (instance.state && k in instance.state)) continue;
+            if (first && Object.prototype.hasOwnProperty.call(first, k)) continue;
+            methods.push(k);
+        }
+    }
+    if (!itemLevel.length && !methods.length) return;
+    const call = itemLevel.length ? new RegExp('(?:^|[^\\w$.])(' + itemLevel.map(_escapeName).join('|') + ')\\s*\\(') : null;
+    // With no first row, a bare name may be an item field, so only calls are checked.
+    const named = methods.length && first ? new RegExp('(?:^|[^\\w$.])(' + methods.map(_escapeName).join('|') + ')(?![\\w$])') : null;
+    for (const tpl of listEl.querySelectorAll(':scope > template')) {
+        for (const el of tpl.content.querySelectorAll('*')) {
+            for (const attr of el.attributes) {
+                if (!_ROW_EXPR_ATTR.test(attr.name)) continue;
+                const code = attr.value.replace(/'[^']*'|"[^"]*"|`[^`]*`/g, '""');
+                const m = call && call.exec(code);
+                if (m) {
+                    const key = (instance.name || '?') + ':' + m[1];
+                    if (!_wf237Warned.has(key)) {
+                        _wf237Warned.add(key);
+                        wfError(WF_ERRORS.ITEM_COMPUTED_CALLED, {
+                            warn: true,
+                            context: `component "${instance.name}": ${attr.name}="${attr.value}" calls the item-level computed "${m[1]}"`,
+                            suggestion: `Name it instead: ${attr.name}="${m[1]}". For arithmetic on it, add another item-level computed, e.g. ${m[1]}Plus(item) { return this.${m[1]}(item) + 1; }.`
+                        });
+                    }
+                }
+                // An object's keys ({ open: isOpen }) are class, attribute or style names.
+                const n = named && named.exec(code.replace(/([{,]\s*)[\w$-]+\s*:/g, '$1'));
+                if (n) {
+                    const key = (instance.name || '?') + ':' + n[1];
+                    if (!_wf516Warned.has(key)) {
+                        _wf516Warned.add(key);
+                        wfError(WF_ERRORS.ROW_BINDING_METHOD, {
+                            warn: true,
+                            context: `component "${instance.name}": ${attr.name}="${attr.value}" names the method "${n[1]}"`,
+                            suggestion: `A method can't feed a binding. For a per-row value, declare an item-level computed, computed: { ${n[1]}(item) { ... } }, and bind its name: ${attr.name}="${n[1]}".`
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 // WF-235 (dev-only): an item-level computed (fn.length > 0) returned a
 // thenable. Async computeds live in the entity facade (component/store/plugin
 // scope) — one coordinated request per entity. Item-level computeds run through
@@ -701,7 +872,7 @@ export const ListExpressionMethods = {
      * @param {Array} data - The current list data
      * @param {Object} context - The list context
      */
-    _updateListContextClassBindings(listElement, data, context, instance, startIndex = 0) {
+    _updateListContextClassBindings(listElement, data, context, instance, startIndex = 0, componentState = null) {
         if (!listElement) return;
 
         const listLength = data?.length ?? 0;
@@ -748,29 +919,23 @@ export const ListExpressionMethods = {
                 ? this._rowElements(itemEl)
                 : (itemEl._cachedElementsArray || itemEl._bindingElements);
             if (itemMetadata && itemMetadata.classBindings && cachedElements) {
-                // FAST PATH: Use pre-compiled metadata
-                for (let i = 0; i < itemMetadata.classBindings.length; i++) {
-                    const cb = itemMetadata.classBindings[i];
-                    // Skip bindings that don't use list context variables
-                    if (!cb.usesListContext) continue;
-                    const el = cachedElements[cb.index];
-                    if (!el) continue;
-                    if (isInNestedList(el)) continue;
-                    this._applyCompiledClassBinding(el, item, cb.expression, index, enrichedContext);
-                }
-                // Also handle root element class binding if present
-                if (itemMetadata.rootBindings?.hasBindClass && itemMetadata.rootBindings?.bindClassExpr) {
-                    const rootExpr = itemMetadata.rootBindings.bindClassExpr;
-                    if (this._expressionUsesListContext(rootExpr)) {
-                        this._applyCompiledClassBinding(itemEl, item, rootExpr, index, enrichedContext);
-                    }
-                }
-                // Also handle root element attr binding if present
-                if (itemMetadata.rootBindings?.hasBindAttr && itemMetadata.rootBindings?.bindAttrExpr) {
-                    const rootAttrExpr = itemMetadata.rootBindings.bindAttrExpr;
-                    if (this._expressionUsesListContext(rootAttrExpr)) {
-                        this._processObjectBinding('attr', itemEl, item, rootAttrExpr, index, enrichedContext);
-                    }
+                // A compiled row: its class, style and attribute bindings
+                // that read position, on the row and on its children,
+                // through the evaluators the first paint and a same-key
+                // replace use. (This branch used to re-apply classes and the
+                // row's own attribute only, so a child's attribute and every
+                // style kept the position they were first painted with.)
+                const pos = this._positionReaders(itemMetadata, instance);
+                if (pos !== null && pos.decor) {
+                    // (onComplete builds the component state whenever there
+                    // are decor readers; the plain copy is a last resort.)
+                    const cs = componentState || (componentState = { ...(instance?.state || {}) });
+                    // enrichedContext carries the current length: a class
+                    // that also reads a store goes through the attribute
+                    // resolver, which takes its length from the context.
+                    if (pos.cls) this._applyClassBindingsToRow(itemEl, item, index, listLength, pos.cls, cs, instance, enrichedContext, null, pos.clsComputeds);
+                    if (pos.sty) this._applyStyleBindingsToRow(itemEl, item, index, listLength, pos.sty, cs, instance, enrichedContext);
+                    if (pos.att) this._applyAttrBindingsToRow(itemEl, item, index, listLength, pos.att, cs, instance, enrichedContext);
                 }
             } else {
                 // FALLBACK: Use attributes (for cloneNode path or missing metadata)
@@ -844,9 +1009,114 @@ export const ListExpressionMethods = {
             // bodies and folds in the item-computed conditional pass — one owner,
             // one loop, resolving through the canonical engine path.
             sweepCtx.itemIndex = index;
+            if (itemMetadata) this._positionReaders(itemMetadata, instance);   // stamps the program's records
             this._runAppliersIndexed(cachedElements, item, itemMetadata?._appProgram, sweepCtx, computed);
             this._runRenderContextsIndexed(itemEl._renderContexts, item, sweepCtx, computed);
         }
+    },
+    /**
+     * Which bindings of a compiled row template read the row's position, so
+     * the sweep above re-applies those and nothing else.
+     *
+     * A binding reads position when its expression holds a position token
+     * (_index, _first, _last, _length), or names an item-level computed that
+     * declares its index parameter: `place(item, index, info)`. Declaring it
+     * is what marks the computed: one that takes the item alone and gets at
+     * position some other way (by calling another computed, say) is not
+     * followed, and its text or class is not kept current. A data-show keeps
+     * its wider rule, any computed at all, as before.
+     *
+     * Worked out once per compiled template and kept on it: the applier
+     * program's records get a `_pos` flag, and the class, style and
+     * attribute evaluators that read position are listed, with the names of
+     * the item-level computeds the class evaluators use.
+     * @param {Object} metadata - compiled row template metadata
+     * @param {Object} instance - the list's component
+     * @returns {{any: boolean, decor: boolean, cls: Array|null, sty: Array|null, att: Array|null, clsComputeds: string[]}|null}
+     * @private
+     */
+    _positionReaders(metadata, instance) {
+        if (!metadata) return null;
+        if (metadata._pos !== undefined) return metadata._pos;
+
+        const sm = instance?.stateManager;
+        // Not answerable (and not cached) without the component's computeds.
+        if (!sm) return null;
+        const original = sm._originalComputedFunctions || null;
+        const computed = sm.computed || null;
+        const tokens = this._listContextVars;
+        const takesIndex = (name) => {
+            if (!original || typeof name !== 'string') return false;
+            const fn = original.get(name);
+            return typeof fn === 'function' && _declaredParams(fn) >= 2;
+        };
+        // expr: the expression or path; vars: its identifiers when known.
+        const reads = (expr, vars, computedName, isExpression) => {
+            if (!expr) return false;
+            if (tokens && tokens.has(expr)) return true;                       // a bare token
+            if (isExpression !== false && this._expressionUsesListContext(expr)) return true;
+            if (takesIndex(computedName) || takesIndex(expr)) return true;
+            if (vars) {
+                for (let i = 0; i < vars.length; i++) if (takesIndex(vars[i])) return true;
+            }
+            return false;
+        };
+
+        let any = false;
+        const program = metadata._appProgram;
+        if (program) {
+            for (let i = 0; i < program.length; i++) {
+                const rec = program[i];
+                const spec = rec.spec;
+                let flag = false;
+                if (rec.kind === 'TEXT' || rec.kind === 'HTML') {
+                    flag = reads(spec.path, spec.expressionVars, spec.computedName, !!spec.isExpression);
+                } else if (rec.kind === 'SHOW') {
+                    flag = this._expressionUsesListContext(spec.path)
+                        || !!(computed && this._conditionalRefsComputed(spec, computed));
+                }
+                rec._pos = flag;
+                if (flag) any = true;
+            }
+        }
+        const pick = (evaluators) => {
+            if (!evaluators || evaluators.length === 0) return null;
+            let out = null;
+            for (let i = 0; i < evaluators.length; i++) {
+                const ev = evaluators[i];
+                const expr = ev.expression;
+                if (reads(expr, expr ? this._extractExpressionVars(expr) : null, ev.computedName, true)) {
+                    (out || (out = [])).push(ev);
+                }
+            }
+            return out;
+        };
+        const cls = pick(metadata.classEvaluators);
+        const sty = pick(metadata.styleEvaluators);
+        const att = pick(metadata.attrEvaluators);
+        const decor = !!(cls || sty || att);
+        // The item-level computeds those class evaluators name: the only ones
+        // the class pass has to evaluate for a row (it otherwise evaluates
+        // every item-level computed the component has, once per row).
+        const clsComputeds = [];
+        if (cls && original) {
+            for (let i = 0; i < cls.length; i++) {
+                const expr = cls[i].expression;
+                const vars = expr ? this._extractExpressionVars(expr) : null;
+                if (!vars) continue;
+                for (let v = 0; v < vars.length; v++) {
+                    const fn = original.get(vars[v]);
+                    if (typeof fn === 'function' && fn.length > 0 && clsComputeds.indexOf(vars[v]) === -1) clsComputeds.push(vars[v]);
+                }
+            }
+        }
+        const renders = metadata.renders;
+        if (renders) {
+            for (let i = 0; i < renders.length && !any; i++) {
+                if (reads(renders[i].path, renders[i].expressionVars, renders[i].computedName, true)) any = true;
+            }
+        }
+        return (metadata._pos = { any: any || decor, decor, cls, sty, att, clsComputeds });
     },
     /**
      * Does a compiled show/render binding resolve through an item-level computed?
@@ -963,9 +1233,12 @@ export const ListExpressionMethods = {
             componentState.external = this._getExternalFn(component);
         }
 
-        // Try to get list length from context's data array if not provided directly
-        if (listLength === undefined && Array.isArray(context?.data)) {
-            listLength = context.data.length;
+        // Not provided directly: the list's current length (kept on its
+        // context as the array is read), else the context's data array,
+        // which a list over a computed or a store does not keep current.
+        if (listLength === undefined) {
+            if (typeof context?._length === 'number') listLength = context._length;
+            else if (Array.isArray(context?.data)) listLength = context.data.length;
         }
 
         if (!component) {
@@ -983,7 +1256,9 @@ export const ListExpressionMethods = {
             if (length === undefined) {
                 // Check for _listContext on the list element
                 const listContext = listEl._listContext;
-                if (Array.isArray(listContext?.data)) {
+                if (typeof listContext?._length === 'number') {
+                    length = listContext._length;
+                } else if (Array.isArray(listContext?.data)) {
                     length = listContext.data.length;
                 } else if (listEl) {
                     length = this._getListItems(listEl).length;
@@ -1109,50 +1384,4 @@ export const ListExpressionMethods = {
         }
         return String(result);
     },
-
-    /**
-     * Resolve identifiers referenced in a list-template expression to runtime
-     * values. Writes results into the provided `args` array (pre-allocated by
-     * caller for hot-path zero-allocation use).
-     *
-     * Resolution order: item property → item-level computed (called with the
-     * current item) → undefined. Item-level computeds are computed methods
-     * declared with at least one parameter (`fn.length > 0`); they are NOT
-     * included in `componentState` because they require an item argument.
-     * Without this resolution, expressions like `{ shared: isShared }` and
-     * `isShared ? 'on' : ''` see `isShared` as undefined.
-     *
-     * Caller is responsible for component-state fallback if needed (this helper
-     * intentionally does not touch component state, leaving callers free to
-     * compose with their own state-resolution semantics).
-     *
-     * @param {Array} args  Pre-allocated array to fill (length === vars.length)
-     * @param {string[]} vars  Identifier names referenced in the expression
-     * @param {Object} item  The current list item (the iteration's data)
-     * @param {Object} componentInstance  The component owning the list
-     * @private
-     */
-    _resolveListExprArgs(args, vars, item, componentInstance) {
-        const itemComputeds = componentInstance?.stateManager?.computed;
-        const originals = componentInstance?.stateManager?._originalComputedFunctions;
-        for (let v = 0; v < vars.length; v++) {
-            const name = vars[v];
-            if (item && name in item) {
-                args[v] = item[name];
-            } else if (itemComputeds && itemComputeds[name] && originals && typeof originals.get(name) === 'function') {
-                // Item-level computed: both parameterised fn(item) and bare-form
-                // fn() reading `this.X`. Route through _evaluateComputedInListContext
-                // so each form is invoked with the right shape (the wrapped computed
-                // accessor at itemComputeds[name] always has fn.length === 0, so we
-                // can't distinguish forms via the wrapper).
-                try {
-                    args[v] = this._evaluateComputedInListContext(componentInstance, name, item, undefined, null);
-                } catch (e) {
-                    args[v] = undefined;
-                }
-            } else {
-                args[v] = undefined;
-            }
-        }
-    }
 };

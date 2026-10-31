@@ -61,7 +61,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode definition-contract warnings (A1)',
 
         const found = contractWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-219]')
+        expect(found[0]).toContain('[WF-219]')
         expect(found[0]).toContain("Component 'contract-comp-bad'")
         expect(found[0]).toContain("'items'")
         // The fix hint rides wfError's suggestion line, not the main line.

@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, isMinifiedBuild } from './helpers/load-framework.js'
 
 async function waitForUpdate(ms = 50) {
     await new Promise(resolve => setTimeout(resolve, ms))
@@ -42,14 +42,15 @@ describe('Security: _escapeHTML single quote escaping', () => {
         }
     })
 
-    it('should escape single quotes in _escapeHTML', async () => {
+    // _escapeHTML is a development-build helper (production files omit it).
+    it.skipIf(isMinifiedBuild())('should escape single quotes in _escapeHTML', async () => {
         // Access _escapeHTML directly on the framework prototype
         const escaped = wildflower._escapeHTML("it's a test")
         expect(escaped).toContain('&#39;')
         expect(escaped).not.toContain("'")
     })
 
-    it('should escape all dangerous characters together', async () => {
+    it.skipIf(isMinifiedBuild())('should escape all dangerous characters together', async () => {
         const escaped = wildflower._escapeHTML(`<script>alert('xss' & "more")</script>`)
         expect(escaped).not.toContain('<')
         expect(escaped).not.toContain('>')

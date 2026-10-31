@@ -55,7 +55,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode unresolvable data-prop path warning
     })
 
     function propPathWarnings(path) {
-        return warnings.filter(w => w.includes('[WF WF-507]') && w.includes(`"${path}"`))
+        return warnings.filter(w => w.includes('[WF-507]') && w.includes(`"${path}"`))
     }
 
     async function mountPair(suffix, parentDef, childAttr, childProps) {
@@ -112,7 +112,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode unresolvable data-prop path warning
             'data-prop-title="Just a plain title"')
         await new Promise(r => setTimeout(r, 300))
 
-        expect(warnings.filter(w => w.includes('[WF WF-507]'))).toEqual([])
+        expect(warnings.filter(w => w.includes('[WF-507]'))).toEqual([])
     })
 
     it('stays silent when a declared default absorbs the miss', async () => {

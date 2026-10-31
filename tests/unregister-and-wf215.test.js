@@ -18,7 +18,7 @@ async function waitForUpdate(ms = 60) {
 }
 
 function wf215Calls(spy) {
-    return spy.mock.calls.filter(args => String(args[0]).includes('[WF WF-215]'))
+    return spy.mock.calls.filter(args => String(args[0]).includes('[WF-215]'))
 }
 
 describe('wildflower.unregister + WF-215', () => {

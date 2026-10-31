@@ -70,7 +70,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode replayed-action preventDefault warn
         expect(inst.state.saved).toBe(true)
         const found = replayWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-605]')
+        expect(found[0]).toContain('[WF-605]')
         expect(found[0]).toContain('preventDefault()')
         // The data-event-prevent fix rides wfError's suggestion line.
         expect(warnings.some(w => w.includes('data-event-prevent'))).toBe(true)

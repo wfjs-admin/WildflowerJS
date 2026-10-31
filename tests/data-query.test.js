@@ -585,7 +585,7 @@ suite('data-query engine probe', () => {
         expect(warnings.some(w => w.includes(q) && /sub-second|poll/i.test(w))).toBe(true)
     })
 
-    // Review finding: retry is a
+    // retry is a
     // plain count; every other shape coerced via `| 0` with no diagnostic —
     // `retry: { max: 3 }` (the shape peer libraries use) silently became 0,
     // retry OFF, and the misdeclaration only showed under a network failure.
@@ -1275,7 +1275,7 @@ suite('data-query engine probe', () => {
         await settle()
         // Match the main diagnostic line only: wfError also emits a doc-URL
         // line that contains the code text.
-        const wf950 = () => warnings.filter(w => w.includes('[WF WF-950]')).length
+        const wf950 = () => warnings.filter(w => w.includes('[WF-950]')).length
         expect(wf950()).toBe(0) // engine writes are exempt
 
         const h = wildflower.getQuery(q)
@@ -1460,7 +1460,7 @@ suite('data-query engine probe', () => {
         payload = [{ name: 'no-key' }] // missing the declared key
         await wildflower.getQuery(q).refresh({ params: { page: 2 }, append: true })
         await settle()
-        expect(warnings.filter(w => w.includes('[WF WF-960]')).length).toBe(1)
+        expect(warnings.filter(w => w.includes('[WF-960]')).length).toBe(1)
         expect([...container.querySelectorAll('.row')].map(el => el.textContent)).toEqual(['no-key'])
     })
 
@@ -1489,7 +1489,7 @@ suite('data-query engine probe', () => {
         await wildflower.getQuery(q).refresh({ status: 'open' })
         await settle()
 
-        expect(warnings.filter(w => w.includes('[WF WF-961]')).length).toBe(1)
+        expect(warnings.filter(w => w.includes('[WF-961]')).length).toBe(1)
         // It still refreshes, but the stray key is never sent as a parameter.
         expect(urls.length).toBeGreaterThan(before)
         expect(urls.some(u => u.includes('status=open'))).toBe(false)
@@ -1625,7 +1625,7 @@ suite('data-query engine probe', () => {
         await settle()
         expect(wildflower.getQuery(q).rows.length).toBe(1) // one record, never two
         expect(container.querySelector('.name').textContent).toBe('Grace')
-        expect(warnings.filter(w => w.includes('[WF WF-960]')).length).toBe(1)
+        expect(warnings.filter(w => w.includes('[WF-960]')).length).toBe(1)
     })
 
     it('a focus rung firing over an accumulated store merges end to end', async () => {

@@ -73,14 +73,17 @@ import { getCSPSafeMergedContextEvaluator } from '../core/CSPExpressionEvaluator
 import { _EXPR_FOOTGUN_RE } from '../core/ExpressionEvaluator.js';
 import { ListNestedMethods } from './ListNestedManager.js';
 import { ListItemBindingMethods } from './ListItemBinding.js';
-import { ListExpressionMethods } from './ListExpressionEval.js';
+import { ListExpressionMethods, warnItemComputedCalls } from './ListExpressionEval.js';
 import { ListEventDelegationMethods } from '../events/EventSystem.js';
+import { ListSharedMethods } from './ListSharedMethods.js';
+import { TemplateLookupMethods } from './TemplateSystem.js';
 import { needsComponentInitSet, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
 import { SSRListMethods } from './ssr-list.js';
 import { DIRECT_WRITERS } from '../state/bindingConstants.js';
-import { applyAttrObj, applyStyleProp, applyStyleObj, applyClass } from '../core/BindingWriters.js';
+import { applyAttrObj, applyStyleProp, applyStyleObj, applyClass, reapplySelectValue } from '../core/BindingWriters.js';
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
-import { __wf_str, __wf_txt, HAS_MOVE_BEFORE, wfYield } from '../core/wfUtils.js';
+import { getContextMethod } from '../state/ContextProxy.js';
+import { __wf_str, __wf_txt, HAS_MOVE_BEFORE, wfYield, listTemplateId } from '../core/wfUtils.js';
 import { getRowCompileMode, getTextEmitters, applyRowText, shadowCompareRow,
     createListSinkDispatcher, applyRowTextUpdate, applyRowTextByPath, getPureTextSpec } from './RowCompiler.js';
 
@@ -98,10 +101,44 @@ const SHARED_TEXT_WRITER = (target, node) => {
     return true;
 };
 
+// Dev-only members, spread into ListRendererMethods under __DEV__ (absent from
+// production files). Nothing in the framework calls these; tests do.
+const ListRendererDevMethods = {
+    /**
+     * Escape HTML special characters to prevent XSS.
+     * Retained as a standalone HTML-escape utility (the create path now writes
+     * textContent directly and needs no escaping); still covered by tests.
+     * @param {*} val - Value to escape
+     * @returns {string} Escaped string safe for HTML insertion
+     */
+    // PERF: Pre-compiled regex and lookup map for single-pass HTML escaping
+    _escapeHTMLReplaceRegex: /[&<>"']/g,  // Global for replace()
+    _escapeHTMLMap: { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' },
+
+    _escapeHTML(val) {
+        if (val == null) return '';
+        // PERF: Numbers can't contain &<>"', so skip String() and regex entirely
+        if (typeof val === 'number') return '' + val;
+        const str = typeof val === 'string' ? val : String(val);
+        // PERF: charCodeAt loop beats regex for short strings (no engine startup cost)
+        // &=38, "=34, '=39, <=60, >=62
+        for (let i = 0, len = str.length; i < len; i++) {
+            const c = str.charCodeAt(i);
+            if (c === 38 || c === 34 || c === 39 || c === 60 || c === 62) {
+                return str.replace(this._escapeHTMLReplaceRegex, c => this._escapeHTMLMap[c]);
+            }
+        }
+        return str;
+    },
+};
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const ListRendererMethods = {
+    ...(__DEV__ ? ListRendererDevMethods : {}),
+    ...ListSharedMethods,
+    ...TemplateLookupMethods,
     ...ListNestedMethods,
     ...ListItemBindingMethods,
     ...ListExpressionMethods,
@@ -261,7 +298,7 @@ export const ListRendererMethods = {
         const sm = instance && instance.stateManager;
         if (!sm) return [];
         const normalizedPath = (path.includes('$') && this._normalizeStoreShorthands)
-            ? this._normalizeStoreShorthands(path) : path;
+            ? this._normalizeStoreShorthands(path) : this._listPathBare(path);
         const result = normalizedPath.includes('external(')
             ? this._evaluateExternalListPath(normalizedPath, instance)
             : sm.getValue(normalizedPath);
@@ -335,8 +372,15 @@ export const ListRendererMethods = {
             }
 
             // Only register if it's not already registered
-            if (!instance._listContexts.has(path)) {
+            const registeredCtx = instance._listContexts.get(path);
+            if (!registeredCtx) {
                 instance._listContexts.set(path, context);
+            } else if (registeredCtx !== context && !context.parent && !registeredCtx.parent) {
+                // A second top-level list over the path rides along as a peer
+                // of the registered one (see below); re-processing puts it
+                // back if it was dropped while its element was detached.
+                const peers = registeredCtx._wfPeers || (registeredCtx._wfPeers = []);
+                if (peers.indexOf(context) === -1) peers.push(context);
             }
         }
         // Check if this is a nested list in a rendered item
@@ -396,8 +440,19 @@ export const ListRendererMethods = {
         }
         // Otherwise check component's contexts or create a new one
         if (!context) {
-            if (instance._listContexts && instance._listContexts.has(path)) {
-                context = instance._listContexts.get(path);
+            // Another live list over the same path in this component keeps
+            // the registered context; this list gets its own (unregistered)
+            // one, so each context's element is its own list.
+            const registered = instance._listContexts && instance._listContexts.get(path);
+            const prevEl = registered && registered.element;
+            // "Another live list": a different connected element that still
+            // holds the registered context. Not judged by render state, so a
+            // list whose mount is deferred (chunked mounting) or that was
+            // adopted from server-rendered rows counts too.
+            const separate = !!(prevEl && prevEl !== element && prevEl.isConnected
+                && prevEl._listContext === registered);
+            if (registered && !separate) {
+                context = registered;
 
                 // Update element reference if needed
                 if (context.element !== element) {
@@ -411,14 +466,11 @@ export const ListRendererMethods = {
                 // Normalize $store.path shorthand to external() before processing
                 const normalizedPath = path.includes('$') && this._normalizeStoreShorthands
                     ? this._normalizeStoreShorthands(path)
-                    : path;
+                    : this._listPathBare(path);
 
-                // AUTO-DETECT: check if path is a computed property even without prefix
-                const isExplicitComputed = normalizedPath.startsWith('computed:');
-                const computedName = isExplicitComputed
-                    ? normalizedPath.slice(9)
-                    : (instance.stateManager.computed && instance.stateManager.computed[normalizedPath]
-                        ? normalizedPath : null);
+                // A computed by name, with or without the computed: prefix
+                const computedName = instance.stateManager.computed && instance.stateManager.computed[normalizedPath]
+                    ? normalizedPath : null;
 
                 if (computedName) {
                     // PENDING STORE DEPENDENCY: Set list element in tracking context
@@ -447,12 +499,20 @@ export const ListRendererMethods = {
                 }
 
                 // Create new context
-                context = this._createListContext(path, data, instance);
+                context = this._createListContext(path, data, instance, null, undefined, !separate);
 
                 // Set bidirectional references
                 if (context) {
                     context.element = element;
                     element._listContext = context;
+                    // The path's registry entry stays with the first list;
+                    // this one rides along as its peer, so a state change on
+                    // the path reaches both (_handleListStateChange).
+                    if (separate) {
+                        const peers = (registered._wfPeers || []).filter(p => p.element && p.element.isConnected);
+                        peers.push(context);
+                        registered._wfPeers = peers;
+                    }
                 }
 
                 // PENDING STORE DEPENDENCY: If this is a computed list, register the list element
@@ -631,11 +691,32 @@ export const ListRendererMethods = {
             }
         }
 
-        // Clean up custom directives (single pass through all elements)
+        // Clean up custom directives on every element of each row: a directive
+        // can sit on an element with no binding, which _rowElements leaves out.
+        // Rows run their directives as the list's component, which tracks each
+        // such element (_directiveEls), so only those are visited: a row with
+        // none costs nothing. Without that component, every row is walked.
         // Must be synchronous as directives may have cleanup side effects
         if (hasCustomDirectives) {
-            for (const element of allElements) {
-                this._cleanupCustomDirectives(element);
+            const list = items[0].parentElement;
+            const ownerEl = list && this._getComponentElement(list);
+            const owner = ownerEl && this.componentInstances.get(ownerEl.dataset.componentId);
+            if (owner) {
+                if (owner._directiveEls && owner._directiveEls.size) {
+                    const removed = new Set(items);
+                    for (const el of [...owner._directiveEls]) {
+                        for (let up = el; up && up !== list; up = up.parentElement) {
+                            if (removed.has(up)) {
+                                this._cleanupCustomDirectives(el);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (const item of items) {
+                    this._cleanupCustomDirectivesInSubtree(item);
+                }
             }
         }
 
@@ -689,15 +770,15 @@ export const ListRendererMethods = {
             element._mapArrayInitialized = false;
             // Clear template cache to pick up new template
             const listPath = context?.path || this._getAttr(element, 'list');
-            const componentName = instance?.name;
-            const cacheKey = componentName ? `${componentName}:${listPath}` : listPath;
+            const cacheKey = this._listTemplateKey(element, instance, listPath, context);
+            const legacyKey = cacheKey === (instance?.name ? `${instance.name}:${listPath}` : listPath) ? listPath : cacheKey;
             this._templateCache.extracted.delete(cacheKey);
-            this._templateCache.extracted.delete(listPath);
+            this._templateCache.extracted.delete(legacyKey);
             this._templateCache.compiled.delete(cacheKey);
-            this._templateCache.compiled.delete(listPath);
+            this._templateCache.compiled.delete(legacyKey);
             if (this._templateCache.templateNames) {
                 this._templateCache.templateNames.delete(cacheKey);
-                this._templateCache.templateNames.delete(listPath);
+                this._templateCache.templateNames.delete(legacyKey);
             }
             // Clear existing items to force full re-render
             // Restore stored template(s) so _renderListWithMapArray can re-extract
@@ -717,6 +798,9 @@ export const ListRendererMethods = {
         }
 
         if (!element._mapArrayInitialized) {
+            // WF-237 / WF-516 (dev): a row binding that calls an item-level
+            // computed, or names a method.
+            if (__DEV__ && instance) warnItemComputedCalls(element, instance, data);
             // Initialize mapArray rendering
             // Once initialized, mapArray handles all updates automatically via Effects
             this._renderListWithMapArray(element, data, context, instance);
@@ -729,6 +813,51 @@ export const ListRendererMethods = {
         element._previousDataLength = data.length;
     },
     // NOTE: Context-mode rendering code was removed - mapArray is the only list rendering path.
+
+    /**
+     * The template cache key for a list element, computed once per element
+     * (before its template is extracted) and kept on it.
+     *
+     * - A top-level list: `component:path` plus a hash of its own template
+     *   markup (listTemplateId). The key follows the CONTENT, so two lists
+     *   over one path with different templates never share an entry, lists
+     *   with the same template share one compile, and nothing depends on
+     *   render order, document order, or the element being a clone (the hash
+     *   is also kept in a data-wftpl attribute, which a clone taken after
+     *   the template was extracted still carries).
+     * - A nested list (its context has a parent list): `parentKey>path|id`,
+     *   matching _processNestedTemplates, where id is the nested list's own
+     *   template id. Every row's copy reads the same id from its attribute,
+     *   so the rows share one template; two nested lists over one path in a
+     *   row, and a nested path named like a top-level list, stay apart.
+     * - A nested list whose parent key is unknown: `nested:component:path|id`,
+     *   the fallback _processNestedTemplates also registers.
+     * @private
+     */
+    _listTemplateKey(element, instance, listPath, context = null) {
+        const name = instance?.name;
+        const base = name ? `${name}:${listPath}` : listPath;
+        if (!element) return base;
+        const own = element._wfTplKey;
+        if (own !== undefined) return own;
+        let key;
+        const parentCtx = context && context.parent;
+        if (parentCtx) {
+            const pk = parentCtx.element && parentCtx.element._wfTplKey;
+            // The nested list's own template id. Its data-wftpl attribute was
+            // written on the parent template's copy of this element
+            // (_processNestedTemplates, or the init pass), so every row reads
+            // it back without hashing; an element that still carries its own
+            // template and no attribute is hashed.
+            const kept = element.getAttribute('data-wftpl');
+            const nid = kept ? '|' + kept : listTemplateId(element);
+            key = pk ? `${pk}>${listPath}${nid}` : `nested:${base}${nid}`;
+        } else {
+            key = base + listTemplateId(element);
+        }
+        element._wfTplKey = key;
+        return key;
+    },
 
     /**
      * MAPARRAY RENDERING
@@ -753,6 +882,27 @@ export const ListRendererMethods = {
             if (__DEV__) console.error('[WildflowerJS] stateManager.mapArray not available - list rendering requires a component with stateManager');
             return;
         }
+        // A static dispatcher reused by this mount: renew the liveness tag its
+        // last dispose released (see wrappedDispose), so its stamps count as a
+        // live list again.
+        const _reused = element._wfListSinkDispatcher;
+        if (_reused && !_reused.computedRows && _reused.tag && _reused.tag.disposed && sm.listTag) {
+            _reused.tag = sm.listTag(element);
+            // A NEW sink function for the new life: stamps the previous
+            // mount left on items (possibly items this list no longer
+            // renders) keep the old function and its released tag, so they
+            // stay dead instead of coming back with the renewed one.
+            const impl = _reused._sinkImpl || (_reused._sinkImpl = _reused.sink);
+            _reused.sink = (rawItem, key) => impl(rawItem, key);
+            _reused.sink._wfList = _reused.tag;
+        }
+
+        // The template key, taken before anything touches the template and
+        // before the SSR path returns, so a hydrated list (and the nested
+        // lists that derive their key from it) is keyed too.
+        const listPath = context?.path || this._getAttr(element, 'list');
+        const componentName = instance?.name;
+        const cacheKey = this._listTemplateKey(element, instance, listPath, context);
 
         // === SSR HYDRATION CHECK ===
         // If element is in SSR protected phase, adopt existing DOM items instead of creating new ones
@@ -776,17 +926,18 @@ export const ListRendererMethods = {
 
 
         // Get template from cache
-        const listPath = context?.path || this._getAttr(element, 'list');
-        const componentName = instance?.name;
-        const cacheKey = componentName ? `${componentName}:${listPath}` : listPath;
+        // Entries cached under the bare path are a fallback for the plain
+        // `component:path` key only (a list with no template of its own); a
+        // content-keyed or nested key never reads another list's entry.
+        const legacyKey = cacheKey === (componentName ? `${componentName}:${listPath}` : listPath) ? listPath : cacheKey;
 
         let cachedContent = this._templateCache.extracted.get(cacheKey) ||
-                            this._templateCache.extracted.get(listPath);
+                            this._templateCache.extracted.get(legacyKey);
 
         // Fallback: Check _templateCache.lists for nested templates cached by _processNestedTemplates
         if (!cachedContent) {
             const listsCache = this._templateCache.lists.get(cacheKey) ||
-                               this._templateCache.lists.get(listPath);
+                               this._templateCache.lists.get(legacyKey);
             if (listsCache) {
                 // Extract and cache the content from the lists cache
                 const extractedContent = this._extractTemplateContent(listsCache);
@@ -814,7 +965,7 @@ export const ListRendererMethods = {
             if (template) {
                 // === CRITICAL: Process nested templates to register relationships ===
                 // This enables _processNestedListsForItem to find and render nested lists
-                this._processNestedTemplates(template, listPath, componentName, instance);
+                this._processNestedTemplates(template, listPath, componentName, instance, cacheKey);
 
                 // Extract template content and cache it
                 // Use cacheKey (includes componentName) for proper isolation between components
@@ -848,7 +999,7 @@ export const ListRendererMethods = {
         // This ensures the name is set even when using cached templates with new DOM elements
         if (!element._usedTemplateName && this._templateCache.templateNames) {
             const cachedTemplateName = this._templateCache.templateNames.get(cacheKey) ||
-                                       this._templateCache.templateNames.get(listPath);
+                                       this._templateCache.templateNames.get(legacyKey);
             if (cachedTemplateName) {
                 element._usedTemplateName = cachedTemplateName;
             }
@@ -857,11 +1008,11 @@ export const ListRendererMethods = {
         // Use the cached content we already have (or re-fetch if needed)
         let templateContent = cachedContent ||
                                 this._templateCache.extracted.get(cacheKey) ||
-                                this._templateCache.extracted.get(listPath);
+                                this._templateCache.extracted.get(legacyKey);
 
         // Get compiled metadata for class bindings
         let compiledMetadata = this._templateCache.compiled.get(cacheKey) ||
-                                 this._templateCache.compiled.get(listPath);
+                                 this._templateCache.compiled.get(legacyKey);
 
         // === POLYMORPHIC TEMPLATES (data-template-key) ===
         // When data-template-key is present, index all <template data-type="X"> children
@@ -883,7 +1034,7 @@ export const ListRendererMethods = {
                 const extractedContent = this._extractTemplateContent(tmpl);
 
                 // Process nested templates for each variant
-                this._processNestedTemplates(tmpl, listPath, componentName, instance);
+                this._processNestedTemplates(tmpl, listPath, componentName, instance, cacheKey);
 
                 // Compile metadata for this template variant
                 const variantMeta = this._compileTemplate(tmpl, `${cacheKey}:poly:${typeValue || '__default__'}`);
@@ -967,15 +1118,41 @@ export const ListRendererMethods = {
         // above, which need the stray children as evidence.
         // SSR takeover: rows hydrated by _trySSRHydrationForMapArray are NOT
         // stale — mapFn below reuses them by key, so the sweep must spare
-        // them. Anything left in the map after init (keys gone from the data)
-        // is removed right after the mapArray call.
+        // them. Anything left in the map after the first pass (keys gone
+        // from the data) is removed when that pass completes.
         let ssrAdoptedSweepSkip = null;
+        // The takeover's first pass places each row after the row placed
+        // before it (onInsert); a server row already there is not moved, since
+        // moving a node blurs the focus inside it.
+        let ssrPlace = null;
         if (__FEATURE_SSR__ && element._ssrAdoptedByKey && element._ssrAdoptedByKey.size) {
             ssrAdoptedSweepSkip = new Set(element._ssrAdoptedByKey.values());
+            if (!isPolymorphic) ssrPlace = { last: null };
         }
-        for (let child = element.firstElementChild, next; child; child = next) {
-            next = child.nextElementSibling;
-            if (child.tagName !== 'TEMPLATE' && !(ssrAdoptedSweepSkip && ssrAdoptedSweepSkip.has(child))) child.remove();
+        // Adopted elements whose keys are gone from the data were not reused
+        // by mapFn: remove them (their nested lists with them, as on a client
+        // row's removal) and drop the map so later renders never consult it.
+        const ssrDropLeftovers = __FEATURE_SSR__ ? () => {
+            if (!element._ssrAdoptedByKey) return;
+            element._ssrAdoptedByKey.forEach((el) => {
+                if (el && el.parentNode === element) {
+                    this._disposeNestedListsInItem(el, instance);
+                    el.remove();
+                }
+            });
+            element._ssrAdoptedByKey = null;
+        } : null;
+        // The sweep takes the whitespace around the template too (the
+        // markup's indentation). An empty render empties the container, so
+        // text left here would be there until the list was once empty and
+        // never after, which moves an inline container's first row. ASCII
+        // whitespace only, so a &nbsp; stays; a server-rendered container
+        // keeps its text, as its rows stay where the server put them.
+        for (let child = element.firstChild, next; child; child = next) {
+            next = child.nextSibling;
+            if (child.nodeType === 1
+                ? child.tagName !== 'TEMPLATE' && !(ssrAdoptedSweepSkip && ssrAdoptedSweepSkip.has(child))
+                : child.nodeType === 3 && !ssrAdoptedSweepSkip && !/[^ \t\n\r\f]/.test(child.nodeValue)) child.remove();
         }
 
         // Disable innerHTML fast path when text bindings reference implicit computed properties.
@@ -1043,8 +1220,45 @@ export const ListRendererMethods = {
         // A nested list whose path is a $store / $query shorthand reads a
         // shared source, not a field of its row: it resolves like a top-level
         // list (normalize, external(), query observation) while keeping its
-        // row context for bindings, events, and teardown.
-        const isSharedSourceNested = isNestedList && listPath.includes('$');
+        // row context for bindings, events, and teardown. So does a dotted path
+        // whose head the component declares (data-list="menu.items" or
+        // "settings.options" in a row). _processNestedListsForItem mounts it
+        // by the same test, which never looks at row data.
+        const isSharedSourceNested = isNestedList && this._rowListReadsComponent(instance, listPath);
+        // Whether this list's rows are a select's options (see onComplete).
+        const isOptionHost = element.localName === 'select' || element.localName === 'optgroup';
+
+        // Create the child components of a row that has just been inserted.
+        //
+        // A nested list renders while the row it sits in is being built,
+        // before that row is in any parent: a component created then finds
+        // no parent component above it, so `this.parent` was null and every
+        // prop undefined. Such rows are left to the outer row instead: it is
+        // flagged, and its own insert step creates every component under it,
+        // outermost first, once it is in place. (A nested list that gains a
+        // row later, in a row already in place, creates them here as before.)
+        const initRowComponents = (el) => {
+            needsComponentInitSet.delete(el);
+            if (isNestedList) {
+                let outer = element;
+                while (outer && outer._listIndex === undefined) outer = outer.parentElement;
+                // Not in its list yet: no parent, or still in the fragment
+                // it was cloned into (a row's parent is otherwise always its
+                // list container, an element).
+                const outerParent = outer ? outer.parentNode : undefined;
+                if (outer && (outerParent === null || outerParent.nodeType === 11)) {
+                    needsComponentInitSet.add(outer);
+                    return;
+                }
+            }
+            try {
+                sm.untrack(() => {
+                    self._initializeNestedComponentsInItem(el);
+                });
+            } catch (e) {
+                if (__DEV__) console.warn('[WF] Error initializing component in list item:', e.message);
+            }
+        };
 
         // Cached $-shorthand normalization of listPath (see arrayFn). Normalizing
         // also stamps a query as observed (_queryTouchByShorthand), and a list
@@ -1073,30 +1287,24 @@ export const ListRendererMethods = {
                 // Use _parentItemProxy to access nested data reactively
                 // This creates a dependency so mapArray re-runs when nested data changes
                 if (context._parentItemProxy && context._childPath) {
-                    let v = context._parentItemProxy[context._childPath];
-                    // Fallback: implicit item-level computed evaluation when the
-                    // child path isn't a raw field on the parent item but IS a
-                    // defined computed on the component. Mirrors data-bind's
-                    // resolution for symmetry across binding types.
-                    if (v === undefined &&
-                        !context._childPath.includes('.') &&
-                        sm?.computed?.[context._childPath]) {
-                        const parentIndex = context._parentIndex ?? -1;
-                        try {
-                            v = self._evaluateComputedInListContext(
-                                instance, context._childPath,
-                                context._parentItemProxy, parentIndex, context
-                            );
-                        } catch (e) { /* return undefined below */ }
-                    }
-                    return v;
+                    // The field (or dotted path) read through the item proxy,
+                    // else an item-level computed of that name: the same
+                    // resolution _processNestedListsForItem mounted it with.
+                    const v = self._rowListValue(context._parentItemProxy, context._childPath,
+                        instance, context._parentIndex ?? -1, context);
+                    // Only an array is a list. Anything else the item holds
+                    // under this name (a placeholder object, a count, a
+                    // string) is an empty list until an array is assigned:
+                    // handed to the reconciler it rendered a row per
+                    // character, or left the list unable to render again.
+                    return Array.isArray(v) ? v : undefined;
                 }
                 // Fallback to context.data for non-mapArray nested lists
                 return context.data || data;
             }
 
             // Handle different path types for top-level lists
-            let normalizedPath = listPath;
+            let normalizedPath = self._listPathBare(listPath);
             if (listPath.includes('$') && self._normalizeStoreShorthands) {
                 if (normalizedListPath === null || element.isConnected) {
                     normalizedListPath = self._normalizeStoreShorthands(listPath);
@@ -1104,15 +1312,10 @@ export const ListRendererMethods = {
                 normalizedPath = normalizedListPath;
             }
 
-            // Determine computed property name:
-            // 1. Explicit computed: prefix (e.g., "computed:cards")
-            // 2. Auto-detect: path matches a computed property name (e.g., "cards")
-            // Both paths are treated identically; computed properties just work
-            // regardless of whether the prefix is used.
-            const isExplicitComputed = normalizedPath.startsWith('computed:');
-            const computedName = isExplicitComputed
-                ? normalizedPath.slice(9)
-                : (sm.computed && sm.computed[normalizedPath] ? normalizedPath : null);
+            // A computed by name, with or without the computed: prefix (the
+            // prefix is stripped above, so computed:menu.items reads through
+            // getValue below exactly as menu.items does).
+            const computedName = sm.computed && sm.computed[normalizedPath] ? normalizedPath : null;
 
             if (computedName) {
                 // Computed property: use evaluateComputed with tracking context
@@ -1320,6 +1523,21 @@ export const ListRendererMethods = {
             if (effectMeta.rootBindings?._deps) {
                 for (const d of effectMeta.rootBindings._deps) consumeDep(d);
             }
+            // Store fields the row names directly ($store.field): read each
+            // one here so the list's shared-deps effect follows it. The
+            // entity is looked up once per template and kept while it is
+            // still registered; a miss (not registered yet, or a plugin)
+            // takes the full resolver each time.
+            const ext = effectMeta._extReads;
+            if (ext && instance) {
+                for (let i = 0; i < ext.length; i++) {
+                    const e = ext[i];
+                    let t = e[2];
+                    if (!t || self.componentInstances.get(t.id) !== t) t = e[2] = self._externalFindTarget(e[0]) || null;
+                    if (!t) { self._resolveExternalValue(e[0], e[1], instance.id); continue; }
+                    try { self._externalResolveTargetValue(t, e[1]); } catch (err) { /* read only for tracking */ }
+                }
+            }
         };
 
         // Computed/external templates (fast-touch classification bails: computed
@@ -1359,14 +1577,7 @@ export const ListRendererMethods = {
             // dynamic readers the static classifier can't see). Without the
             // upgrade every per-frame write re-pays the full per-write
             // onStateChange dispatch the sink's fall-through triggers.
-            let _safe = false;
-            if (compiledMetadata) {
-                _safe = compiledMetadata._reactiveGraphStyleSafe;
-                if (_safe === undefined) {
-                    _safe = self._computeReactiveGraphRetireSafe(sm, instance);
-                    compiledMetadata._reactiveGraphStyleSafe = _safe;
-                }
-            }
+            const _safe = compiledMetadata ? self._retireSafe(sm, instance) : false;
             // Applies the one targeted DOM write; returns the written element,
             // or null when the leaf can't be handled (unresolvable/custom/multi
             // target) and the caller must fall through to the full-row apply.
@@ -1450,23 +1661,28 @@ export const ListRendererMethods = {
                 frame: null,
                 sink: null,
                 owner: null, // { keys, sink } record for the uniform (fast-touch) registration
+                // This list's liveness tag, carried by its sink and owner: when
+                // another list renders the same items the graph joins the two
+                // stamps while both are live, and replaces a disposed one.
+                tag: sm.listTag ? sm.listTag(element) : null,
                 stampLeaf: () => { /* runtime stamps only (frame.stamp) */ },
                 // Both slots live on the same node (dual-stamp): the pure-leaf
                 // fast path may have upgraded a stamped leaf to a suppressing
-                // direct writer.
-                clearLeaf: (proxy, prop) => { sm.clearDirectWriter(proxy, prop); sm.clearListSink(proxy, prop); },
+                // direct writer. Clears pass this list's sink/owner so a list
+                // sharing the item keeps its own stamp.
+                clearLeaf: (proxy, prop) => { sm.clearDirectWriter(proxy, prop); sm.clearListSink(proxy, prop, dispatcher.sink); },
                 clearRowStamps: (raw) => {
                     const u = dispatcher.uniformStamps;
                     if (u) {
-                        if (sm.setListOwner) sm.setListOwner(raw, null);
+                        if (sm.setListOwner) sm.setListOwner(raw, null, dispatcher.owner || undefined);
                         // Direct-writer upgrades (and any pre-owner per-prop sink)
                         // live on nodes; both clears are no-ops for a leaf that
                         // never materialized one.
-                        for (let i = 0; i < u.length; i++) { sm.clearDirectWriter(raw, u[i]); sm.setListSink(raw, u[i], null); }
+                        for (let i = 0; i < u.length; i++) { sm.clearDirectWriter(raw, u[i]); sm.setListSink(raw, u[i], null, dispatcher.sink); }
                     }
                     const set = rawStamps.get(raw);
                     if (set) {
-                        for (const k of set) { sm.clearDirectWriter(raw, k); sm.setListSink(raw, k, null); }
+                        for (const k of set) { sm.clearDirectWriter(raw, k); sm.setListSink(raw, k, null, dispatcher.sink); }
                         rawStamps.delete(raw);
                     }
                 },
@@ -1489,7 +1705,7 @@ export const ListRendererMethods = {
                             // prop): the graph routes writes to owned keys through
                             // the sink itself (see core setListOwner).
                             sm.setListOwner(raw, dispatcher.owner
-                                || (dispatcher.owner = { keys: u, sink: dispatcher.sink }));
+                                || (dispatcher.owner = { keys: u, sink: dispatcher.sink, _wfList: dispatcher.tag }));
                         } else {
                             for (let i = 0; i < u.length; i++) sm.setListSink(raw, u[i], dispatcher.sink);
                         }
@@ -1566,6 +1782,7 @@ export const ListRendererMethods = {
                 // tracked rebind: one evaluation per update, no separate walk.
                 sm.runInListFrame(dispatcher.listEffect, dispatcher.frame, () => applyRowFull(rowEl, rowProxy));
             };
+            dispatcher.sink._wfList = dispatcher.tag;
             // The ONE stable per-list effect. Its first run is empty (edges
             // accumulate from frame walks, and STABLE effects never retrack, so
             // those edges survive every wake). A wake means a SHARED dep
@@ -1585,6 +1802,7 @@ export const ListRendererMethods = {
                 try { dispatcher.listEffect(); } catch (e) { /* already disposed */ }
                 for (const raw of rawStamps.keys()) dispatcher.clearRowStamps(raw);
                 rows.clear();
+                if (sm.releaseListTag) sm.releaseListTag(dispatcher.tag);
             };
             element._wfListSinkDispatcher = dispatcher;
             return dispatcher;
@@ -1914,13 +2132,11 @@ export const ListRendererMethods = {
                     return;
                 }
                 dispatcher = createListSinkDispatcher(spec, applyRow, Array.from(leafKinds.keys()), (r) => self._rowElements(r));
+                // Liveness tag (see the computed dispatcher above).
+                dispatcher.tag = sm.listTag ? sm.listTag(element) : null;
                 dispatcher.leafKinds = leafKinds;
                 dispatcher.ownedProps = new Set(leafKinds.keys());
-                let _safe = compiledMetadata._reactiveGraphStyleSafe;
-                if (_safe === undefined) {
-                    _safe = self._computeReactiveGraphRetireSafe(sm, instance);
-                    compiledMetadata._reactiveGraphStyleSafe = _safe;
-                }
+                const _safe = self._retireSafe(sm, instance);
                 // A suppressing direct writer is stamped where the
                 // retire-safe gate allows. Kind-pure style/attr targets must all
                 // resolve to ONE non-custom element or the leaf falls back to
@@ -1964,6 +2180,7 @@ export const ListRendererMethods = {
                         }
                     }
                 };
+                dispatcher.sink._wfList = dispatcher.tag;
                 dispatcher.stampLeaf = (proxy, rowEl, prop) => {
                     const entry = leafKinds.get(prop);
                     if (!entry) return;
@@ -1985,9 +2202,10 @@ export const ListRendererMethods = {
                     }
                 };
                 dispatcher.clearLeaf = (proxy, prop) => {
-                    // Both slots live on the same node (dual-stamp).
+                    // Both slots live on the same node (dual-stamp). Passing
+                    // this list's sink keeps another list's stamp on a shared item.
                     sm.clearDirectWriter(proxy, prop);
-                    sm.clearListSink(proxy, prop);
+                    sm.clearListSink(proxy, prop, dispatcher.sink);
                 };
                 element._wfListSinkDispatcher = dispatcher;
             }
@@ -2124,8 +2342,14 @@ export const ListRendererMethods = {
                 }
             }
 
-            // Store context references (same as context rendering)
-            itemEl._listContext = context;
+            // Store context references (same as context rendering). `_rowList`
+            // is the list this element is a ROW of, and is what the framework
+            // reads. `_listContext` on a container is the list it RENDERS. A
+            // row whose root is itself a nested list carries both, so the two
+            // cannot share one property. An ordinary row keeps `_listContext`
+            // as well, as the documented alias for the list it belongs to.
+            itemEl._rowList = context;
+            if (!hasChildLists || !this._hasAttr(itemEl, 'list')) itemEl._listContext = context;
             itemEl._listIndex = index;
             itemEl._itemData = itemProxy;
 
@@ -2239,9 +2463,23 @@ export const ListRendererMethods = {
             return { element: insertEl, disposeEffect: null };
         };
 
+        // The list's current length, kept on its context as the array is
+        // read (the start of every reconcile, before any row is made or
+        // repainted). An item-level computed's `info` argument reads it. Its
+        // other source, context.data, is refreshed only by a render from
+        // outside, so for a list over a computed or a store `info.length`
+        // and `info.last` stayed at the first render's values.
+        const trackedArrayFn = context
+            ? () => {
+                const arr = arrayFn();
+                context._length = Array.isArray(arr) ? arr.length : 0;
+                return arr;
+            }
+            : arrayFn;
+
         // Set up mapArray with callbacks
         const disposeMapArray = sm.mapArray(
-            arrayFn,
+            trackedArrayFn,
             mapFn,
             {
                 key: keyProp,
@@ -2377,8 +2615,11 @@ export const ListRendererMethods = {
 
                         const itemKey = itemProxy[keyProp] !== undefined ? itemProxy[keyProp] : i;
 
-                        // Attach metadata
-                        row._listContext = context;
+                        // Attach metadata (see the per-item path: _rowList is
+                        // the row's list; _listContext is kept on an ordinary
+                        // row as the documented alias).
+                        row._rowList = context;
+                        if (!hasChildLists || !self._hasAttr(row, 'list')) row._listContext = context;
                         row._listIndex = i;
                         row._itemData = itemProxy;
 
@@ -2485,7 +2726,7 @@ export const ListRendererMethods = {
                                 };
                                 for (let mi = 0; mi < methodNames.length; mi++) {
                                     const methodName = methodNames[mi];
-                                    if (typeof instance.context[methodName] !== 'function') continue;
+                                    if (!getContextMethod(instance.context, methodName)) continue;
                                     self._setupOutsideClickHandler(actionEl, instance, methodName, rowCtx);
                                 }
                             }
@@ -2531,37 +2772,25 @@ export const ListRendererMethods = {
                     // Initialize nested components after all items are in DOM
                     for (let i = 0; i < elements.length; i++) {
                         const el = elements[i];
-                        if (needsComponentInitSet.has(el)) {
-                            needsComponentInitSet.delete(el);
-                            try {
-                                sm.untrack(() => {
-                                    self._initializeNestedComponentsInItem(el);
-                                });
-                            } catch (e) {
-                                if (__DEV__) console.warn('[WF] Error initializing component in list item:', e.message);
-                            }
-                        }
+                        if (needsComponentInitSet.has(el)) initRowComponents(el);
                     }
                 },
                 onInsert: (el, idx) => {
                     if (!el) return;
-                    if (idx >= element.children.length) {
+                    if (__FEATURE_SSR__ && ssrPlace) {
+                        const last = ssrPlace.last;
+                        if (el.parentNode !== element || (last && !(last.compareDocumentPosition(el) & 4))) {
+                            element.insertBefore(el, last ? last.nextSibling : element.firstChild);
+                        }
+                        ssrPlace.last = el;
+                    } else if (idx >= element.children.length) {
                         element.appendChild(el);
                     } else {
                         element.insertBefore(el, element.children[idx]);
                     }
 
                     // === INTEGRATION: Initialize nested components after DOM insertion ===
-                    if (needsComponentInitSet.has(el)) {
-                        needsComponentInitSet.delete(el);
-                        try {
-                            sm.untrack(() => {
-                                self._initializeNestedComponentsInItem(el);
-                            });
-                        } catch (e) {
-                            if (__DEV__) console.warn('[WF] Error initializing component in list item:', e.message);
-                        }
-                    }
+                    if (needsComponentInitSet.has(el)) initRowComponents(el);
                 },
                 onRemove: (el, key) => {
                     if (!el) return;
@@ -2574,8 +2803,8 @@ export const ListRendererMethods = {
                     // _listContexts entries. Gated on this list actually having
                     // child lists so the common (flat-row) remove hot path skips
                     // the subtree walk entirely. MUST run before
-                    // _cleanupContextsInSubtree, which deletes el._listContext on
-                    // descendants; the prune keys off that reference.
+                    // _cleanupContextsInSubtree, which deletes _listContext on
+                    // the row and its descendants; the prune keys off that reference.
                     if (hasChildLists) {
                         self._disposeNestedListsInItem(el, instance);
                     }
@@ -2888,7 +3117,7 @@ export const ListRendererMethods = {
                     // Update nested list contexts with the new parent proxy
                     const childListPaths = self._listRelationships.get(context.path) || new Set();
                     childListPaths.forEach(childPath => {
-                        const nestedListElements = itemEl.querySelectorAll(self._attrSelector('list', childPath));
+                        const nestedListElements = self._nestedListsOfRow(itemEl, childPath, self._attrSelector('list', childPath));
                         nestedListElements.forEach(nestedListEl => {
                             const childContext = nestedListEl._listContext;
                             if (childContext) {
@@ -2896,28 +3125,43 @@ export const ListRendererMethods = {
                                 childContext._parentItemProxy = newItemProxy;
                                 childContext._parentIndex = index;
 
-                                // Get the new nested data from the new proxy
-                                const nestedData = newItemProxy[childPath];
+                                // A shared source ($store.path, or a dotted path
+                                // the component declares) is not a field of the
+                                // item: nothing to refresh.
+                                if (self._rowListReadsComponent(instance, childPath)) return;
 
-                                // Refresh the nested list against the new parent item.
-                                if (Array.isArray(nestedData)) {
-                                    // The nested mapArray's arrayFn reads its data live
-                                    // through childContext._parentItemProxy[childPath],
-                                    // which we just repointed to newItemProxy above. So
-                                    // refreshing the existing nested reconcile effect
-                                    // re-diffs the new array against the preserved prev
-                                    // (reusing/moving keyed children) instead of disposing
-                                    // and rebuilding the whole nested subtree (which
-                                    // re-created every nested row on each parent update).
-                                    if (nestedListEl._mapArrayInitialized && nestedListEl._refreshMapArray) {
-                                        nestedListEl._refreshMapArray();
-                                    } else {
-                                        self._renderList(nestedListEl, nestedData, childContext, instance);
-                                    }
+                                // Refresh the nested list against the new parent
+                                // item, whatever the new item holds: an object
+                                // without the array empties the list, and the
+                                // refresh is what makes the nested effect read
+                                // the NEW item, so an array assigned to it later
+                                // renders. (Refreshing only when the new item had
+                                // an array kept the old rows and left the effect
+                                // listening to the object that was replaced.)
+                                //
+                                // The nested mapArray's arrayFn reads its data live
+                                // through childContext._parentItemProxy[childPath],
+                                // which we just repointed to newItemProxy above. So
+                                // refreshing the existing nested reconcile effect
+                                // re-diffs the new array against the preserved prev
+                                // (reusing/moving keyed children) instead of disposing
+                                // and rebuilding the whole nested subtree (which
+                                // re-created every nested row on each parent update).
+                                if (nestedListEl._mapArrayInitialized && nestedListEl._refreshMapArray) {
+                                    nestedListEl._refreshMapArray();
+                                } else {
+                                    const nestedData = self._rowListValue(newItemProxy, childPath, instance, index, childContext);
+                                    self._renderList(nestedListEl, Array.isArray(nestedData) ? nestedData : [], childContext, instance);
                                 }
                             }
                         });
                     });
+
+                    // Child components in the row keep their elements: point
+                    // their props at the new item.
+                    if (hasNestedComponents) {
+                        self._updateNestedComponentPropsInItem(itemEl, newItemProxy, listPath);
+                    }
 
                     // Rebind the element with the new proxy. This is the row's
                     // sole binding application on a same-key replace (per-row
@@ -2959,6 +3203,13 @@ export const ListRendererMethods = {
                 // Called after all operations complete to update class bindings that use list context variables
                 // (_first, _last, _index, _length) which change when list length changes
                 onComplete: (newArray, oldLength, newLength) => {
+                    // The takeover's leftover server rows go before the
+                    // position pass below, which reads the rows in the DOM;
+                    // later inserts are placed by index.
+                    if (__FEATURE_SSR__) {
+                        ssrDropLeftovers();
+                        ssrPlace = null;
+                    }
                     // Re-apply the per-row bindings whose value moves when list
                     // positions shift: class/attr/text/show/render that read the
                     // position frame (usesListContextVariables), PLUS show/render
@@ -2967,22 +3218,41 @@ export const ListRendererMethods = {
                     // literal _last token). Both cases run through the one sweep now —
                     // the applier engine's FILTER_INDEX pass covers the computed
                     // conditional, so the former separate re-eval pass is gone.
-                    if (compiledMetadata?.usesListContextVariables
-                        || self._listHasComputedConditional(compiledMetadata, instance)) {
-                        self._updateListContextClassBindings(element, newArray, context, instance);
+                    //
+                    // What "reads position" means is worked out once per
+                    // compiled template (_positionReaders): a position token
+                    // in any binding, or a binding that names an item-level
+                    // computed declaring its index parameter.
+                    let any = false, decor = false;
+                    if (isPolymorphic && compiledMetaByType) {
+                        for (const meta of compiledMetaByType.values()) {
+                            const p = self._positionReaders(meta, instance);
+                            if (p !== null && p.any) any = true;
+                            if (p !== null && p.decor) decor = true;
+                            if (meta.usesListContextVariables || self._listHasComputedConditional(meta, instance)) any = true;
+                        }
                     }
+                    const pos = self._positionReaders(compiledMetadata, instance);
+                    if (pos !== null) { if (pos.any) any = true; if (pos.decor) decor = true; }
+                    if (any
+                        || compiledMetadata?.usesListContextVariables
+                        || self._listHasComputedConditional(compiledMetadata, instance)) {
+                        // Class, style and attribute bindings are re-applied
+                        // by the engines the first paint uses, which take the
+                        // component's state as one object.
+                        const componentState = decor ? sm.untrack(() => buildComponentState()) : null;
+                        self._updateListContextClassBindings(element, newArray, context, instance, 0, componentState);
+                    }
+                    // The rows are a select's options: show its value again.
+                    if (isOptionHost) reapplySelectValue(element);
                 }
             }
         );
 
-        // SSR takeover cleanup: adopted elements whose keys are gone from the
-        // data were not reused by mapFn — remove them and drop the map so
-        // later renders never consult it.
-        if (__FEATURE_SSR__ && element._ssrAdoptedByKey) {
-            element._ssrAdoptedByKey.forEach((el) => {
-                if (el && el.parentNode === element) el.remove();
-            });
-            element._ssrAdoptedByKey = null;
+        // SSR takeover cleanup (normally already done by onComplete).
+        if (__FEATURE_SSR__) {
+            ssrDropLeftovers();
+            ssrPlace = null;
         }
 
         // Store dispose function and mark as initialized
@@ -3177,6 +3447,16 @@ export const ListRendererMethods = {
             if (_cd && _cd.computedRows) {
                 try { _cd.dispose(); } catch (e) { /* ignore */ }
                 element._wfListSinkDispatcher = null;
+            } else if (_cd) {
+                // A static dispatcher persists for reuse. Its tag is released
+                // now and renewed when a re-render reuses it; the stamps it
+                // leaves on items are not walked here (O(rows) on every
+                // teardown): a sink whose tag is released is dropped by the
+                // graph on the next write to its leaf (notifyNode), so it
+                // cannot hide another list's stamp. Rows re-register when a
+                // re-render reuses the dispatcher.
+                _cd.rows.clear();
+                if (sm.releaseListTag) sm.releaseListTag(_cd.tag);
             }
             baseDisposeMapArray();
             if (registeredCleanup && instance && instance._mapArrayCleanups) {
@@ -3232,33 +3512,6 @@ export const ListRendererMethods = {
         }
 
         return listsByComponent;
-    },
-
-    /**
-     * Escape HTML special characters to prevent XSS.
-     * Retained as a standalone HTML-escape utility (the create path now writes
-     * textContent directly and needs no escaping); still covered by tests.
-     * @param {*} val - Value to escape
-     * @returns {string} Escaped string safe for HTML insertion
-     */
-    // PERF: Pre-compiled regex and lookup map for single-pass HTML escaping
-    _escapeHTMLReplaceRegex: /[&<>"']/g,  // Global for replace()
-    _escapeHTMLMap: { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' },
-
-    _escapeHTML(val) {
-        if (val == null) return '';
-        // PERF: Numbers can't contain &<>"', so skip String() and regex entirely
-        if (typeof val === 'number') return '' + val;
-        const str = typeof val === 'string' ? val : String(val);
-        // PERF: charCodeAt loop beats regex for short strings (no engine startup cost)
-        // &=38, "=34, '=39, <=60, >=62
-        for (let i = 0, len = str.length; i < len; i++) {
-            const c = str.charCodeAt(i);
-            if (c === 38 || c === 34 || c === 39 || c === 60 || c === 62) {
-                return str.replace(this._escapeHTMLReplaceRegex, c => this._escapeHTMLMap[c]);
-            }
-        }
-        return str;
     },
 
     /**
@@ -3617,7 +3870,7 @@ export const ListRendererMethods = {
      * @param {Array} classEvaluators - Pre-compiled class evaluator objects
      * @param {Object} componentState - Component state object
      */
-    _applyClassBindingsToRow(row, item, index, dataLen, classEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
+    _applyClassBindingsToRow(row, item, index, dataLen, classEvaluators, componentState, instance, listContext, prebuiltMergedCtx, computedNames) {
         // The row's binding-element array, fetched on the first non-root
         // evaluator (a root-only template never builds one here).
         let elements;
@@ -3662,7 +3915,22 @@ export const ListRendererMethods = {
         }
         const originalComputeds = needsMergedCtx ? instance?.stateManager?._originalComputedFunctions : null;
         let itemComputedValues = null;
-        if (originalComputeds) {
+        if (originalComputeds && computedNames) {
+            // The caller knows which item-level computeds these evaluators
+            // name (the position sweep, which runs for every row on every
+            // structural change): evaluate those and no others.
+            for (let i = 0; i < computedNames.length; i++) {
+                const key = computedNames[i];
+                if (!itemComputedValues) itemComputedValues = {};
+                try {
+                    itemComputedValues[key] = this._evaluateComputedInListContext(
+                        instance, key, item, index, listContext
+                    );
+                } catch (e) {
+                    itemComputedValues[key] = undefined;
+                }
+            }
+        } else if (originalComputeds) {
             for (const [key, fn] of originalComputeds) {
                 if (typeof fn === 'function' && fn.length > 0) {
                     if (!itemComputedValues) itemComputedValues = {};
@@ -3747,8 +4015,8 @@ export const ListRendererMethods = {
                         // lazy proxy instead of the {...item, ...componentState} spread.
                         // The proxy spread triggers ownKeys + a GET for every item
                         // property (V8); on a same-key replace that is ~9% of update
-                        // time for a class that never changes. Mirrors the lazy ctx
-                        // already used by _applyStyleBindingsToRow/_applyAttrBindingsToRow.
+                        // time for a class that never changes. The same builder
+                        // _applyStyleBindingsToRow/_applyAttrBindingsToRow use.
                         // Prefer an eager mergedCtx if one was already built above (it
                         // carries the seeded item-level computed values).
                         let ctx = mergedCtx;
@@ -3832,7 +4100,9 @@ export const ListRendererMethods = {
     // {...item, ...componentState} spread and without eagerly evaluating every
     // computed; each is resolved on access. Not Object.keys-safe (no ownKeys
     // trap), so it is used only where the consumer reads named properties.
-    _buildClassMergedCtxLazy(item, componentState, instance, index, dataLen) {
+    // The one lazy row context for all three decor appliers: class passes no
+    // listContext (its computeds evaluate with none), style and attr pass theirs.
+    _buildClassMergedCtxLazy(item, componentState, instance, index, dataLen, listContext = null) {
         const _idx = index, _len = dataLen;
         const origComputeds = instance?.stateManager?._originalComputedFunctions;
         const self = this;
@@ -3843,21 +4113,24 @@ export const ListRendererMethods = {
                 if (prop === '_first') return _idx === 0;
                 if (prop === '_last') return _idx === _len - 1;
                 // Item field first (CL-18 / documented contract: read item[prop], fall
-                // back to a same-name computed only when the field is undefined). Mirrors
-                // the style/attr lazy ctx builders and data-bind text. Previously the
-                // componentState branch shadowed a same-name item field, silently
-                // diverging data-bind-class from every other binding kind.
+                // back to a same-name computed only when the field is undefined). Matches
+                // data-bind text. Previously the componentState branch shadowed a
+                // same-name item field, silently diverging data-bind-class from every
+                // other binding kind.
                 const val = target[prop];
                 if (val !== undefined) return val;
                 // Computed whose name is not provided by a (defined) item field. This
                 // keeps computed-over-componentState precedence intact for names with no
                 // item field. Use _evaluateComputedInListContext so dependency tracking
-                // sees the reads (direct fn.call bypasses tracking).
+                // sees the reads (direct fn.call bypasses tracking). Both parameterized
+                // fn(item) and bare-form fn() reading `this.X` route through it: the
+                // componentState value of a bare-form computed is the component-level
+                // one, stale for a row.
                 if (origComputeds) {
                     const fn = origComputeds.get(prop);
                     if (fn && typeof fn === 'function') {
                         try {
-                            return self._evaluateComputedInListContext(instance, prop, item, _idx, null);
+                            return self._evaluateComputedInListContext(instance, prop, item, _idx, listContext);
                         } catch (e) { return undefined; }
                     }
                 }
@@ -3909,38 +4182,7 @@ export const ListRendererMethods = {
         // PERF: Reusable lazy proxy; avoids spreading item + componentState per evaluator.
         // Destructuring `const {x, y} = ctx` only calls GET for needed properties (no ownKeys).
         // V8 proxy spread ({...proxy}) triggers ownKeys + ALL property GETs; extremely slow.
-        let lazyCtx = prebuiltMergedCtx || null;
-        if (!lazyCtx) {
-            const _idx = index, _len = dataLen;
-            // Item-level computeds (both parameterized fn(item) and bare-form fn()
-            // using `this.X`) need per-item evaluation. componentState resolves
-            // bare-form at the component level, which produces a stale (often
-            // wrong) value because `this.X` reads off the component context.
-            // Always route through _evaluateComputedInListContext when the name
-            // is a registered computed.
-            const origComputeds = instance?.stateManager?._originalComputedFunctions;
-            const self = this;
-            lazyCtx = new Proxy(item, {
-                get(target, prop) {
-                    if (prop === '_index') return _idx;
-                    if (prop === '_length') return _len;
-                    if (prop === '_first') return _idx === 0;
-                    if (prop === '_last') return _idx === _len - 1;
-                    const val = target[prop];
-                    if (val !== undefined) return val;
-                    if (origComputeds) {
-                        const fn = origComputeds.get(prop);
-                        if (fn && typeof fn === 'function') {
-                            try {
-                                return self._evaluateComputedInListContext(instance, prop, item, _idx, listContext);
-                            } catch (e) { return undefined; }
-                        }
-                    }
-                    if (componentState && prop in componentState) return componentState[prop];
-                    return undefined;
-                }
-            });
-        }
+        const lazyCtx = prebuiltMergedCtx || this._buildClassMergedCtxLazy(item, componentState, instance, index, dataLen, listContext);
         for (const evaluator of styleEvaluators) {
             let targetEl;
             if (evaluator.isRoot) { targetEl = row; }
@@ -4036,36 +4278,8 @@ export const ListRendererMethods = {
      */
     _applyAttrBindingsToRow(row, item, index, dataLen, attrEvaluators, componentState, instance, listContext, prebuiltMergedCtx) {
         let elements; // the row's binding-element array, fetched on the first non-root evaluator
-        // PERF: Same lazy proxy pattern as _applyStyleBindingsToRow
-        let lazyCtx = prebuiltMergedCtx || null;
-        if (!lazyCtx) {
-            const _idx = index, _len = dataLen;
-            const origComputeds = instance?.stateManager?._originalComputedFunctions;
-            const self = this;
-            lazyCtx = new Proxy(item, {
-                get(target, prop) {
-                    if (prop === '_index') return _idx;
-                    if (prop === '_length') return _len;
-                    if (prop === '_first') return _idx === 0;
-                    if (prop === '_last') return _idx === _len - 1;
-                    const val = target[prop];
-                    if (val !== undefined) return val;
-                    if (origComputeds) {
-                        const fn = origComputeds.get(prop);
-                        // Match _applyStyleBindingsToRow: route both parameterized
-                        // and bare-form item-level computeds through list-context
-                        // evaluation so `this.X` resolves to item state.
-                        if (fn && typeof fn === 'function') {
-                            try {
-                                return self._evaluateComputedInListContext(instance, prop, item, _idx, listContext);
-                            } catch (e) { return undefined; }
-                        }
-                    }
-                    if (componentState && prop in componentState) return componentState[prop];
-                    return undefined;
-                }
-            });
-        }
+        // PERF: the same lazy proxy as _applyStyleBindingsToRow
+        const lazyCtx = prebuiltMergedCtx || this._buildClassMergedCtxLazy(item, componentState, instance, index, dataLen, listContext);
         for (const evaluator of attrEvaluators) {
             let targetEl;
             if (evaluator.isRoot) { targetEl = row; }
@@ -4315,6 +4529,37 @@ export const ListRendererMethods = {
             }
             rbm._deps = rootDeps;
         }
+
+        // Store fields read by name, as [entity, path, cached target] entries
+        // (one per distinct pair): `$k.time` and `external('k', 'time')` in
+        // any row binding. No binding descriptor above reads them
+        // (`external` is just an identifier there).
+        let ext = null;
+        const seen = new Set();
+        const addExt = (s) => {
+            if (!s || typeof s !== 'string') return;
+            if (s.indexOf('$') !== -1 && this._normalizeStoreShorthands) s = this._normalizeStoreShorthands(s);
+            if (s.indexOf('external(') === -1) return;
+            const re = /external\(\s*(['"])([^'"]+)\1\s*,\s*(['"])([^'"]+)\3\s*\)/g;
+            let m;
+            while ((m = re.exec(s)) !== null) {
+                const key = m[2] + ' ' + m[4];
+                if (seen.has(key)) continue;
+                seen.add(key);
+                (ext || (ext = [])).push([m[2], m[4], null]);
+            }
+        };
+        for (const arr of [metadata.bindings, metadata.htmlBindings, metadata.shows, metadata.renders]) {
+            if (arr) for (const b of arr) addExt(b.path);
+        }
+        for (const arr of [metadata.classBindings, metadata.styleBindings, metadata.attrBindings]) {
+            if (arr) for (const b of arr) addExt(b.expression);
+        }
+        if (rbm) {
+            addExt(rbm.bindPath); addExt(rbm.showPath);
+            addExt(rbm.bindClassExpr); addExt(rbm.bindStyleExpr); addExt(rbm.bindAttrExpr);
+        }
+        metadata._extReads = ext;
     },
 
     /**
@@ -4464,27 +4709,77 @@ export const ListRendererMethods = {
     },
 
     /**
-     * Retire-safety gate for ALL direct-writer kinds (text/style/attr). A direct
-     * writer suppresses BOTH the graph observer wake and the per-write
-     * onStateChange dispatch (notifyNode DIRECT_HANDLED), so stamping is only
-     * sound when nothing besides the row's own binding can read the leaf:
+     * The retire-safety verdict for one component instance, computed once and
+     * kept on the instance. (It was cached on the template metadata, which
+     * every instance of the component type shares: an instance with a
+     * subscriber inherited "nothing is listening" from one without.)
+     *
+     * A component that passes has its change dispatch marked quiet, which is
+     * what lets a direct-writer write skip the dispatch. The skip is decided
+     * at write time by the entity that OWNS the written object (the tree's
+     * set trap reads the owner's flag), so an item owned by a store, or by
+     * any entity that did not pass, still dispatches whoever renders it.
+     * @private
+     */
+    _retireSafe(sm, instance) {
+        if (!instance) return this._computeReactiveGraphRetireSafe(sm, instance);
+        let safe = instance._wfRetireSafe;
+        if (safe === undefined) {
+            safe = this._computeReactiveGraphRetireSafe(sm, instance);
+            instance._wfRetireSafe = safe;
+            if (safe && sm && sm.setDispatchQuiet) sm.setDispatchQuiet(true);
+        }
+        return safe;
+    },
+
+    /**
+     * Retire-safety gate for ALL direct-writer kinds (text/style/attr), for
+     * the RENDERING component. A direct writer suppresses the graph observer
+     * wake and, when the owning entity is quiet, the per-write onStateChange
+     * dispatch (notifyNode DIRECT_HANDLED), so stamping is only sound when
+     * nothing besides the row's own binding can read the leaf:
      *   - no component computeds (an aggregate over item fields forms real graph
      *     edges the writer would starve);
-     *   - no watchers and no imperative subscriptions (both ride the suppressed
+     *   - no watchers and no imperative subscriptions (both ride the
      *     onStateChange dispatch);
      *   - no autoSave persistence (also rides the dispatch).
      * The template-static gates (_reactiveGraphPureText / _fastTouch) cannot see
      * any of these; they only prove no OTHER TEMPLATE BINDING reads the field.
-     * Constant per component; callers cache it on metadata._reactiveGraphStyleSafe.
+     * Callers use _retireSafe, which caches the verdict per INSTANCE.
      * @private
      */
     _computeReactiveGraphRetireSafe(sm, instance) {
         const _oc = instance?.stateManager?._originalComputedFunctions;
-        return Object.keys((sm && sm.computed) || {}).length === 0
+        if (!(Object.keys((sm && sm.computed) || {}).length === 0
             && (!_oc || _oc.size === 0)
             && !(instance && instance._watcherHandlers && instance._watcherHandlers.size > 0)
             && !(sm && sm._subscriptions && sm._subscriptions.size > 0)
-            && !(sm && sm.autoSave && sm.storageKey);
+            && !(sm && sm.autoSave && sm.storageKey))) return false;
+        // Everything else the component branch of _handleEntityStateChange
+        // drives. Each of these was skipped for item edits before 1.5.5
+        // (the checks above were the whole gate). Consumers that can appear
+        // after the list mounted go through _markDispatchBusy instead.
+        if (!instance) return true;
+        if (instance._wfDispatchBusy) return false;
+        const def = instance.definition;
+        // onUpdate / beforeUpdate on the component.
+        if (def && (typeof def.onUpdate === 'function' || typeof def.beforeUpdate === 'function')) return false;
+        // wildflower.hook('component:beforeUpdate' | 'component:afterUpdate').
+        const hooks = this._hooks;
+        if (hooks) {
+            const b = hooks.get('component:beforeUpdate'), a = hooks.get('component:afterUpdate');
+            if ((b && b.length > 0) || (a && a.length > 0)) return false;
+        }
+        // Child components: their props are refreshed from this dispatch.
+        if (instance.children && instance.children.length > 0) return false;
+        // Other components reading this one ($name.path, external()).
+        const ext = this._externalDependencies && this._externalDependencies.get(instance.id);
+        if (ext && ext.size > 0) return false;
+        const deps = this._entityDependents && this._entityDependents.get(instance.id);
+        if (deps && deps.size > 0) return false;
+        // Custom directives: their update() runs from this dispatch.
+        if (this._customDirectives && this._customDirectives.size > 0) return false;
+        return true;
     },
 
     // Style analog of _stampDirectText, for one CSS property of a pure
@@ -4776,6 +5071,8 @@ export const ListRendererMethods = {
 
         // Custom directives (e.g. data-directive="highlight")
         if (this._processCustomDirectives && this._customDirectives && this._customDirectives.size > 0) {
+            // The row's own tag is the list's, also when the row is a child
+            // component's root (a root's tag is read where it was written).
             this._processCustomDirectives(itemEl, instance);
             // Built once per directive set and prefix mode (the string depends
             // on both: data-X and data-wf-X, or data-wf-X alone).
@@ -4790,9 +5087,18 @@ export const ListRendererMethods = {
             if (this._customDirectivesSelector) {
                 const descendants = itemEl.querySelectorAll(this._customDirectivesSelector);
                 for (const descendant of descendants) {
-                    if (!this._hasAttr(descendant, 'component')) {
-                        this._processCustomDirectives(descendant, instance);
-                    }
+                    // Inside a component in the row is that component's. The
+                    // root of one is the list's when no other component in
+                    // the row wrote its tag (asked of the row itself, since
+                    // a new row is not in the page yet).
+                    const comp = this._getComponentElement(descendant);
+                    if (itemEl.contains(comp) && (comp !== descendant || itemEl.contains(this._getComponentElement(descendant.parentElement)))) continue;
+                    // An element in a nested list's row is that row's: the
+                    // nested list was rendered just above and ran its rows'
+                    // directives itself. Running them from here as well
+                    // called init a second time on each.
+                    if (hasChildLists && this._findListItemAncestor(descendant) !== itemEl) continue;
+                    this._processCustomDirectives(descendant, instance);
                 }
             }
         }
@@ -4859,11 +5165,22 @@ export const ListRendererMethods = {
         // Watch for changes via the reactive state proxy's watcher system
         instance._watcherHandlers = instance._watcherHandlers || new Map();
         const self = this;
+        // Watchers are kept one per path, and the component's own `watch` was
+        // registered first: a watch on the key property is kept and called
+        // after the swap (setting this one over it meant it was never
+        // called).
+        const ownWatch = instance._watcherHandlers.get(templateKeyProp);
         const watchHandler = function(newVal) {
             const newType = String(newVal ?? '');
-            self._swapPolymorphicTemplate(instance, newType);
+            try {
+                self._swapPolymorphicTemplate(instance, newType);
+            } finally {
+                if (ownWatch) ownWatch.apply(this, arguments);
+            }
         };
         instance._watcherHandlers.set(templateKeyProp, watchHandler);
+        // A watcher rides the change dispatch.
+        this._markDispatchBusy(instance);
         // The template key may be a computed; this watcher rides its
         // `computed:NAME` pulse, so install that computed's notifier (lazy by
         // default; harmless if templateKeyProp is plain state). Record the bare
@@ -5106,6 +5423,14 @@ export const ListRendererMethods = {
             const listPath = this._getAttr(listElement, 'list');
             if (!listPath) return;
 
+            // A server-rendered list inside another list of this component is
+            // mounted from its row when the outer list hydrates; a context made
+            // here would have no parent and read a top-level path.
+            if (__FEATURE_SSR__ && listElement._ssrPhase) {
+                const outer = listElement.parentElement && listElement.parentElement.closest(this._attrSelector('list'));
+                if (outer && instance.element.contains(outer)) return;
+            }
+
             // Skip if context already exists for this list
             if (listElement._listContext || instance._listContexts.has(listPath)) {
                 return;
@@ -5117,11 +5442,9 @@ export const ListRendererMethods = {
             // Normalize $store.path shorthand to external() before processing
             const normalizedPath = listPath.includes('$') && this._normalizeStoreShorthands
                 ? this._normalizeStoreShorthands(listPath)
-                : listPath;
+                : this._listPathBare(listPath);
 
-            if (normalizedPath.startsWith('computed:')) {
-                data = instance.stateManager.evaluateComputed(normalizedPath.slice(9));
-            } else if (normalizedPath.includes('external(')) {
+            if (normalizedPath.includes('external(')) {
                 // Handle external() expressions for store data
                 if (this._getExternalFn) {
                     try {
@@ -5181,9 +5504,12 @@ export const ListRendererMethods = {
 
         // computed:-sourced lists are mapArray-backed and react through their
         // own structural effect; a computed: notification has no list context
-        // to update on this path.
+        // to update on this path, except a server-rendered list over the
+        // computed that mapArray does not own yet.
         if (path.startsWith('computed:')) {
-            return false;
+            return __FEATURE_SSR__ && this._contextSystemInitialized
+                ? this._ssrNoteComputedWrite(instance, path.slice(9))
+                : false;
         }
 
         // Check for context system usage
@@ -5200,8 +5526,10 @@ export const ListRendererMethods = {
         // Check component's contexts
         if (instance._listContexts && instance._listContexts.size > 0)
         {
-            // Check each context for potential impact
-            instance._listContexts.forEach((context, contextPath) =>
+            // Check each context for potential impact. A second list over the
+            // same path keeps its own context as a peer of the registered one
+            // (see _processList); it takes the same update.
+            const visit = (context, contextPath) =>
             {
                 // Direct list data update
                 if (contextPath === path)
@@ -5238,9 +5566,11 @@ export const ListRendererMethods = {
                     // - splice operations
                     // - item-level changes (e.g., "0", "10" - numeric indices)
                     // - ALSO handle property changes within items (e.g., "0.label", "1.name") for direct mutations
+                    const itemWrite = /^\d+\./.test(subPath);
                     if (subPath === 'length' || subPath === 'splice' || subPath.startsWith('splice.') ||
-                        subPath.match(/^\d+$/) || subPath.match(/^\d+\./))
+                        subPath.match(/^\d+$/) || itemWrite)
                     {
+                        if (__FEATURE_SSR__ && itemWrite) this._ssrNoteItemWrite(context, instanceId);
                         const fullContextPath = context.getFullPath();
                         const dotNotationPath = fullContextPath.replace(/\[(\d+)]/g, '.$1');
 
@@ -5260,6 +5590,19 @@ export const ListRendererMethods = {
                         // Either way, mark context as affected so it gets processed
                         contextsAffected = true;
                         affectedContexts.add(context);
+                    }
+                }
+            };
+            instance._listContexts.forEach((context, contextPath) =>
+            {
+                visit(context, contextPath);
+                const peers = context._wfPeers;
+                if (peers) {
+                    // Peers whose list left the DOM are dropped here.
+                    for (let i = peers.length - 1; i >= 0; i--) {
+                        const el = peers[i].element;
+                        if (!el || !el.isConnected) peers.splice(i, 1);
+                        else visit(peers[i], contextPath);
                     }
                 }
             });

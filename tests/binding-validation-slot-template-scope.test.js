@@ -11,7 +11,7 @@
  *
  * Found on /docs/configurable-templates, where the working `server-monitor` demo
  * drew:
- *   [WF WF-509] data-bind-class expression "healthy ? 'alert-success' :
+ *   [WF-509] data-bind-class expression "healthy ? 'alert-success' :
  *   'alert-danger'" references undefined state property "healthy" in component
  *   "server-monitor" Available properties: server
  *

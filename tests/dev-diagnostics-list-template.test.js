@@ -68,7 +68,7 @@ describe.skipIf(isMinifiedBuild() || !hasFeature('lists'))('Dev-mode list-templa
 
         const found = templateWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-401]')
+        expect(found[0]).toContain('[WF-401]')
         expect(found[0]).toContain('direct children')
         expect(found[0]).toContain('<template>')
         expect(found[0]).toContain("data-list=\"rows\"")
@@ -84,7 +84,7 @@ describe.skipIf(isMinifiedBuild() || !hasFeature('lists'))('Dev-mode list-templa
 
         const found = templateWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-401]')
+        expect(found[0]).toContain('[WF-401]')
         expect(found[0]).toContain('resolved no template')
         expect(found[0]).toContain('inherited templates')
     })
@@ -107,7 +107,7 @@ describe.skipIf(isMinifiedBuild() || !hasFeature('lists'))('Dev-mode list-templa
 
         const found = templateWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-401]')
+        expect(found[0]).toContain('[WF-401]')
         expect(found[0]).toContain('<svg> subtree')
         expect(found[0]).toContain('parser')
     })

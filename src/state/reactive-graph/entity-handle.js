@@ -16,6 +16,8 @@ import {
   refresh as mRefresh, setDirectWriter as mSetDirectWriter,
   setListSink as mSetListSink,
   setListOwner as mSetListOwner,
+  listTag as mListTag,
+  releaseListTag as mReleaseListTag,
   runInListFrame as mRunInListFrame,
   toRaw as mToRaw, runEffect as mRunEffect,
   isTreeModelled,
@@ -25,6 +27,7 @@ import {
   __setDevHotReadReporter as mSetDevHotReadReporter,
   COMPUTED_MISS,
   F_REENTERED,
+  F_PULL,
 } from './core.js';
 // The two codes by name, not the WF_ERRORS table: a headless bundle of this
 // facade (the thread extension's worker half) must not carry every code.
@@ -51,6 +54,13 @@ if (__DEV__) {
 }
 
 const NO_VALUE = Symbol('no-value');
+
+// A computed's current value as a notifier baseline: the facade read, so an
+// errored computed is undefined (as the notifier reports it), and untracked,
+// so a subscription made inside an effect or a computed links nothing to it.
+function readBaseline(h, name) {
+  return mUntrack(() => h.evaluateComputed(name));
+}
 
 // Sentinel VALUE for a computed whose body threw. An errored computed caches
 // this sentinel as the node's value and returns undefined to readers (never
@@ -139,6 +149,15 @@ class EntityHandle {
     this._observedComputeds = new Set();
     this._observeAllComputeds = false;
     this._notifierInstalled = new Set();
+    // Set by _wireComputedNotifiers, which the framework calls once it has
+    // finished setting the entity up. Until then a computed is not
+    // evaluated just to take a notifier's baseline (see
+    // _installComputedNotifier). A handle never wired keeps the first-run
+    // baseline.
+    this._notifiersWired = false;
+    // name -> baseline for each notifier scheduled but not yet created
+    // (NO_VALUE until taken). Created with the first notifier.
+    this._notifierBaselines = null;
     // Circular-dependency detection (state-manager surface). the core has no
     // re-entrancy guard: a true computed cycle would recurse to a stack
     // overflow, so the addComputed wrapper tracks the active evaluation chain
@@ -182,7 +201,10 @@ class EntityHandle {
     // through to normal state resolution.
     const computedResolver = (key) =>
       this._getters[key] ? this.evaluateComputed(key) : COMPUTED_MISS;
-    this._state = reactiveTree(this._raw, (path, nv, ov) => {
+    // The tree's change dispatch. `_wfQuiet` (false by default) is read by the
+    // tree's set trap after a direct writer handled a write: only a quiet
+    // entity's dispatch may be skipped. See setDispatchQuiet.
+    const notify = (path, nv, ov) => {
       this.onStateChange(path, nv, ov);
       // __HEADLESS__ (build define, true only for a bundle of the graph with no
       // framework around it) folds the facade's framework-only surface:
@@ -220,9 +242,23 @@ class EntityHandle {
         const fullInstance = this._wf.componentInstances && this._wf.componentInstances.get(this.component.id);
         if (fullInstance) this._wf._checkTypeMatch(fullInstance, path, nv);
       }
-    }, computedResolver);
+    };
+    notify._wfQuiet = false;
+    this._notify = notify;
+    this._state = reactiveTree(this._raw, notify, computedResolver);
     if (!__HEADLESS__ && this.storageKey) this._loadFromStorage();
     return this._state;
+  }
+
+  // Whether a write a list row's direct writer handled may also skip this
+  // entity's change dispatch (watchers, subscribers, autoSave, the notices to
+  // components subscribed to a store all ride it). Off by default, so a store
+  // or plugin always dispatches. The list renderer turns it on for a component
+  // that has nothing riding its dispatch (_retireSafe); anything that later
+  // adds a subscriber or watcher turns it off again. The direct writers stay:
+  // they keep doing the DOM write, and the dispatch simply resumes.
+  setDispatchQuiet(quiet) {
+    if (this._notify) this._notify._wfQuiet = quiet === true;
   }
 
   // Hydrate state from localStorage over the initial state. Called in
@@ -424,47 +460,26 @@ class EntityHandle {
           err.isCircularDependency = true;
           throw err;
         }
-        // Async computed fast branches (v1.5). Placed AFTER the cycle guard (a
+        // Async computed fast branch (v1.5). Placed AFTER the cycle guard (a
         // cycle throw wins over any pending async state) and BEFORE the
         // eval-stack / tracking-context bookkeeping, which exists only for runs
-        // that invoke user code — these branches never do.
-        if (asyncCtl !== null && asyncCtl.state !== 0) {
-          if (asyncCtl.relaunch) {
-            // A KNOWN input-value change (the props refresh path)
-            // arrived while a request was in flight or settled-unconsumed.
-            // The in-flight/settled value was computed from superseded
-            // inputs: discard it and fall through to re-run the body against
-            // the new values. The new run's generation bump discards any
-            // continuation still in flight (last call wins). Checked BEFORE
-            // the consume branch on purpose: a settled-but-unconsumed result
-            // must not beat the newer input.
-            asyncCtl.relaunch = false;
-            asyncCtl.forced = false;
-            asyncCtl.state = 0;
-            asyncCtl.value = undefined;
-          } else if (asyncCtl.state === 2) {
-            // A settled result is waiting: consume it exactly once, WITHOUT
-            // re-invoking the body (resolution must not re-fire the request).
-            // Fast-forward the edge-reuse cursor so runNode's post-run trim
-            // keeps every edge the launch run tracked (body deps + cell) — a
-            // later real-dependency change must still wake this computed.
-            const settled = asyncCtl.value;
-            asyncCtl.state = 0;
-            asyncCtl.value = undefined;
-            selfNode._depIndex = selfNode.sources.length;
-            return settled;
-          } else if (asyncCtl.forced) {
-            // state === 1: a request is in flight. A recompute forced from
-            // OUTSIDE the graph (scheduleComputedEvaluation store nudges,
-            // computedCache clears — flagged by _invalidate) must not re-fire
-            // the body: hold the previous value. A recompute from a real
-            // dependency change falls through and re-runs the body (last
-            // call wins; the new run bumps the generation, so the superseded
-            // continuation discards on resolve).
-            asyncCtl.forced = false;
-            selfNode._depIndex = selfNode.sources.length;
-            return selfNode.value;
-          }
+        // that invoke user code — this branch never does.
+        if (asyncCtl !== null && asyncCtl.state === 2) {
+          // A settled result is being delivered (_settleAsyncRun reads the
+          // computed right after the cell bump): take it WITHOUT re-invoking
+          // the body (resolution must not re-fire the request). Fast-forward
+          // the edge-reuse cursor so runNode's post-run trim keeps every edge
+          // the launch run tracked (body deps + cell) — a later
+          // real-dependency change must still wake this computed. A run
+          // while a request is in flight (state 1) falls through and re-runs
+          // the body: the node only runs then on a real input change (a nudge
+          // leaves it as the graph has it, see _invalidate), and the new
+          // run's generation bump discards the superseded continuation.
+          const settled = asyncCtl.value;
+          asyncCtl.state = 0;
+          asyncCtl.value = undefined;
+          selfNode._depIndex = selfNode.sources.length;
+          return settled;
         }
         // The framework's computed wrapper (ComponentLifecycle._setupComputedProperties)
         // handles the error (onError / logging) and then RE-THROWS so the state
@@ -522,8 +537,6 @@ class EntityHandle {
               asyncCtl.gen++;
               asyncCtl.state = 0;
               asyncCtl.value = undefined;
-              asyncCtl.forced = false;
-              asyncCtl.relaunch = false;
             }
             return COMPUTED_ERROR;
           }
@@ -552,8 +565,6 @@ class EntityHandle {
             asyncCtl.gen++;
             asyncCtl.state = 0;
             asyncCtl.value = undefined;
-            asyncCtl.forced = false;
-            asyncCtl.relaunch = false;
           }
           return COMPUTED_ERROR;
         } finally {
@@ -598,13 +609,32 @@ class EntityHandle {
   // re-evaluate. Deferring the notifier's first eval by one microtask lands it
   // after the entity is wired (whoever reads first: the promotion pass, a
   // binding, or this notifier).
+  //
+  // The first run compares against a baseline taken when the subscription is
+  // made, so a change made between this call and the microtask is reported
+  // instead of becoming the recorded value. On a wired entity the baseline is
+  // read now; for a subscription made while the entity is still being set up,
+  // it is read when the setup ends (_wireComputedNotifiers). With neither,
+  // the first run records the value, as on a handle the framework never
+  // wires.
   _installComputedNotifier(name) {
     if (this._notifierInstalled.has(name)) return;
     const getter = this._getters[name];
     if (!getter) return; // computed not registered yet; _ensureComputedNotifier retries on addComputed
     this._notifierInstalled.add(name);
-    let lastNotified = NO_VALUE;
+    const baselines = this._notifierBaselines || (this._notifierBaselines = new Map());
+    let baseline = NO_VALUE;
+    if (this._notifiersWired) {
+      baseline = readBaseline(this, name);
+      // A computed with no sources re-runs on every read and cannot push a
+      // change, so a later read would differ from this one with nothing
+      // changed: its first run records the value instead.
+      if (getter.__node && getter.__node.sources.length === 0) baseline = NO_VALUE;
+    }
+    baselines.set(name, baseline);
     queueMicrotask(() => {
+      let lastNotified = baselines.get(name);
+      baselines.delete(name);
       // The entity may have been destroyed between this notifier's scheduling
       // and the microtask draining (same-tick mount/unmount, a destroy inside
       // init). Installing now would create an effect the destroy sweep has
@@ -648,16 +678,34 @@ class EntityHandle {
     for (const k in this._getters) this._installComputedNotifier(k);
   }
 
+  // The framework calls this once, when it has finished setting the entity
+  // up (a store after its init() and first evaluation, a plugin after its
+  // setup, a component at the end of its mount). From here a subscription to
+  // a computed takes its baseline at once; the ones made during the setup
+  // take theirs now, so a change made after the setup is reported and one
+  // made during it is not.
+  _wireComputedNotifiers() {
+    if (this._notifiersWired) return;
+    this._notifiersWired = true;
+    const baselines = this._notifierBaselines;
+    if (baselines === null || this._destroyed) return;
+    baselines.forEach((v, name) => {
+      if (v === NO_VALUE) baselines.set(name, readBaseline(this, name));
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Async computeds (v1.5): a computed may return a thenable. The graph never
   // learns async exists — each async computed owns a hidden reactive cell that
   // the launch run reads (forming a normal graph edge) and the continuation
   // bumps (a normal source write), so resolution wakes the computed exactly
-  // like any dependency change. The wrapper's fast branches then consume the
-  // settled value WITHOUT re-invoking the body. Per-computed state machine:
+  // like any dependency change. The continuation then reads the computed at
+  // once, and the wrapper's fast branch hands it the settled value WITHOUT
+  // re-invoking the body. Per-computed state machine:
   //   state 0 (idle)      — no async activity; the body runs normally
   //   state 1 (in flight) — a request is running; reads serve the previous value
-  //   state 2 (settled)   — a result waits; the next evaluation returns it once
+  //   state 2 (settled)   — only inside the continuation: the result is being
+  //                         delivered to the evaluation it makes right away
   // gen is the generation counter: every completed body run bumps it, and a
   // continuation whose captured generation no longer matches discards silently
   // (last call wins). A rejection settles as COMPUTED_ERROR — readers see
@@ -667,7 +715,7 @@ class EntityHandle {
 
   _createAsyncComputed(name) {
     if (this._asyncComputeds === null) this._asyncComputeds = new Map();
-    const ctl = { state: 0, gen: 0, value: undefined, forced: false, relaunch: false, cell: mReactive({ n: 0 }) };
+    const ctl = { state: 0, gen: 0, value: undefined, cell: mReactive({ n: 0 }) };
     this._asyncComputeds.set(name, ctl);
     return ctl;
   }
@@ -684,8 +732,6 @@ class EntityHandle {
     }
     ctl.state = 1;
     ctl.value = undefined;
-    ctl.forced = false;
-    ctl.relaunch = false;
     // Read the cell UNDER THIS EVALUATION (runNode has this node as the active
     // observer): the edge-reuse cursor appends/reuses the cell edge after the
     // body's own deps, and this is the edge the continuation bumps.
@@ -696,46 +742,48 @@ class EntityHandle {
     // the continuation inside runNode, and the DIRTY its cell bump sets would
     // be wiped by updateIfNecessary's trailing CLEAN. Native promises pass
     // through by identity.
-    // Staleness gate shared by both continuation arms: if the
-    // node is DIRTY at settle time, a REAL dependency changed after this run
-    // launched (the graph marks direct observers DIRTY on a leaf write; a
-    // mere nudge flags itself via ctl.forced, and a props change via
-    // ctl.relaunch — relaunch IS a real change, so it discards too). The
-    // settled value was computed from superseded inputs: discard it and let
-    // the already-scheduled re-evaluation run the body against the new
-    // values. Without this, the consume branch served the stale result and
-    // the change was lost until the dependency moved AGAIN. (A node at CHECK
-    // is a maybe — an upstream computed may re-settle to the same value —
-    // and is deliberately not treated as stale; that window matches the
-    // pre-fix behavior.)
-    const staleAtSettle = () =>
-      node.color === 2 /* DIRTY */ && (!ctl.forced || ctl.relaunch);
+    // Gate shared by both continuation arms: does this result still answer
+    // the computed's current inputs?
+    //  - A newer body run bumped the generation: discard silently.
+    //  - CHECK: an input that reaches this computed through another computed
+    //    was written while the request ran. Read the computed to find out:
+    //    a real change re-runs the body, whose new request supersedes this
+    //    one (generation bump); no change leaves the node CLEAN.
+    //  - DIRTY: a direct input changed after the launch (a nudge from outside
+    //    the graph leaves an in-flight node CLEAN, see _invalidate). Discard;
+    //    the next read re-runs the body against the new values.
+    const settles = () => {
+      if (ctl.gen !== gen || self._destroyed) return false;
+      if (node.color === 1 /* CHECK */) {
+        self.evaluateComputed(name);
+        if (ctl.gen !== gen) return false;
+      }
+      if (node.color === 2 /* DIRTY */) { ctl.state = 0; ctl.value = undefined; return false; }
+      return true;
+    };
+    // Deliver: the cell bump dirties the computed through the normal graph
+    // (its observers are marked), and the read right after takes the result,
+    // so the node is CLEAN again holding it. Left DIRTY until some later read,
+    // the node would absorb the mark of an input write in between, and that
+    // read would serve this result for the new input.
+    const deliver = (value) => {
+      ctl.state = 2;
+      ctl.value = value;
+      ctl.cell.n++;
+      self.evaluateComputed(name);
+    };
     Promise.resolve(v).then(
-      (result) => {
-        if (ctl.gen !== gen || self._destroyed) return; // superseded: discard silently
-        if (staleAtSettle()) { ctl.state = 0; ctl.value = undefined; return; }
-        ctl.state = 2;
-        ctl.value = result;
-        ctl.cell.n++; // dirties the computed through the normal graph
-      },
+      (result) => { if (settles()) deliver(result); },
       (err) => {
-        if (ctl.gen !== gen || self._destroyed) return;
         // A rejection for superseded inputs is discarded like a superseded
-        // run's: the re-run in flight owns the outcome now.
-        if (staleAtSettle()) { ctl.state = 0; ctl.value = undefined; return; }
-        ctl.state = 2;
-        ctl.value = COMPUTED_ERROR;
-        // Visible on the node until the consuming run returns (the core then
-        // resets it, exactly as it does after a recovered sync error).
-        node.error = err;
-        // Cell bump BEFORE the report: the report runs the
-        // user's onError synchronously, and with the node still CLEAN and
-        // node.error set, reading this same computed from inside the
-        // handler re-threw the original error out of the evaluation. Dirty
-        // first, and a read inside the handler consumes the errored state
-        // and yields undefined like any other read of a failed computed.
-        ctl.cell.n++;
-        self._reportAsyncComputedError(name, err);
+        // run's: the re-run in flight owns the outcome now. Delivered BEFORE
+        // the report: the report runs the user's onError synchronously, and
+        // a read of this computed inside the handler yields undefined like
+        // any other read of a failed computed.
+        if (settles()) {
+          deliver(COMPUTED_ERROR);
+          self._reportAsyncComputedError(name, err);
+        }
       }
     );
     // Serve the previous value while in flight (undefined on first load).
@@ -776,7 +824,12 @@ class EntityHandle {
     // Consequence: source-less computeds get METHOD semantics (fresh on every
     // pull read, no push), which matches the `_` non-reactive mental model.
     // Computeds WITH sources are untouched: cached until a dep wakes them.
+    // F_PULL keeps the "no push" half: a re-run that stays source-less does not
+    // wake the computed's readers (see core.js). Only a clean node's re-run is
+    // a pure pull; one already invalidated by hand (a prop change, a late
+    // store) has a real change for its readers, as before.
     if (node && node.sources.length === 0) {
+      if (node.color === 0) node.flags |= F_PULL; // CLEAN
       node.color = 2; // DIRTY: force re-eval on the read below
     }
     // A method called from inside here must run NOW and hand its value back,
@@ -842,26 +895,26 @@ class EntityHandle {
     // Force a recompute on next read by rebinding the getter's node to dirty.
     const node = this._getters[name] && this._getters[name].__node;
     if (node) {
-      // Async computeds: a forced invalidation while a request is in flight
-      // must not re-fire the body (scheduleComputedEvaluation fires for every
-      // computed on any subscribed store change; re-launching the request per
-      // nudge would storm the endpoint). Flag the force ONLY when the node is
-      // currently CLEAN — if the graph already marked it, a real dependency
-      // changed and the body SHOULD re-run (last call wins). The wrapper's
-      // in-flight branch consumes the flag and holds the previous value.
+      // Async computeds: a forced invalidation (a nudge from outside the
+      // graph: scheduleComputedEvaluation, a computedCache clear) while a
+      // request is in flight must not re-fire the body; re-launching the
+      // request per nudge would storm the endpoint. Leave the node as the
+      // graph has it: CLEAN, a read serves the previous value; CHECK (an
+      // input that reaches it through another computed was written), the
+      // read re-runs the body only if that computed's value changed. Either
+      // way a real input write still marks the node, so it re-runs the body
+      // (last call wins). A DIRTY node had a direct input change, and the
+      // body SHOULD re-run.
       //
-      // `changed` is the stronger claim: the CALLER verified an
-      // input value actually changed (the props refresh path — props have no
-      // graph edge, so this flag is their only wake channel). That is a real
-      // dependency change, not a nudge: flag a RELAUNCH so the wrapper
-      // re-runs the body instead of holding, superseding the in-flight
-      // continuation via the new run's generation bump.
-      if (this._asyncComputeds !== null && (changed || node.color === 0)) {
+      // `changed` is the stronger claim: the CALLER verified an input value
+      // actually changed (the props refresh path — props have no graph edge,
+      // so this flag is their only wake channel). That is a real dependency
+      // change, not a nudge: mark the node, and the next read re-runs the
+      // body, superseding the in-flight continuation via the new run's
+      // generation bump.
+      if (!changed && node.color !== 2 && this._asyncComputeds !== null) {
         const ctl = this._asyncComputeds.get(name);
-        if (ctl !== undefined && ctl.state !== 0) {
-          if (changed) ctl.relaunch = true;
-          else if (node.color === 0 && ctl.state === 1) ctl.forced = true;
-        }
+        if (ctl !== undefined && ctl.state === 1) return;
       }
       node.color = 2 /* DIRTY */;
     }
@@ -893,6 +946,25 @@ class EntityHandle {
   // read genuinely re-evaluates; the re-eval only wakes observers on a real
   // value change (Object.is), so over-invalidation is bounded.
   scheduleComputedEvaluation(name) { this._invalidate(name); return this.evaluateComputed(name); }
+
+  // Re-evaluate each computed something observes (its change notifier for a
+  // watch: or a subscribe(), a binding, a computed on another entity), or only
+  // `name` when given. For use right after an invalidation that no read
+  // follows (the late-entity paths): invalidating marks the node DIRTY but not
+  // its observers, so nothing would read it again, and every later mark of
+  // the already-DIRTY node would be a no-op. The read re-runs it, re-links its
+  // sources (an entity that just registered), and on a changed value wakes
+  // its observers.
+  _reevaluateObserved(name) {
+    if (name !== undefined) {
+      const g = this._getters[name];
+      if (g && g.__node.observers.length !== 0) this.evaluateComputed(name);
+      return;
+    }
+    for (const k in this._getters) {
+      if (this._getters[k].__node.observers.length !== 0) this.evaluateComputed(k);
+    }
+  }
 
   createEffect(fn, options = {}) {
     const opts = { sync: !!options.sync, stable: !!options.stable };
@@ -1013,22 +1085,37 @@ class EntityHandle {
   // notifyNode, after which the normal wake still fires (no suppression), so any
   // computed/watcher reading the same leaf stays correct. Pass null to clear
   // (same-key replace, remove, clear).
-  setListSink(itemProxy, key, sinkFn) {
+  // `own` (on a clear): the caller's sink, so a clear removes only that list's
+  // stamp when two lists share the item (see core setListSink).
+  setListSink(itemProxy, key, sinkFn, own) {
     if (!__FEATURE_LISTS__) return;
-    mSetListSink(itemProxy, key, sinkFn);
+    mSetListSink(itemProxy, key, sinkFn, own);
   }
 
-  clearListSink(itemProxy, key) {
+  clearListSink(itemProxy, key, own) {
     if (!__FEATURE_LISTS__) return;
-    mSetListSink(itemProxy, key, null);
+    mSetListSink(itemProxy, key, null, own);
   }
 
   // Uniform-stamp registration: one owner record `{ keys, sink }` per row
   // item in place of a node per stamped prop (see core setListOwner). Pass
-  // null to release the item (remove, same-key replace).
-  setListOwner(itemProxy, owner) {
+  // null to release the item (remove, same-key replace), with `own` so only
+  // this list's owner is released.
+  setListOwner(itemProxy, owner, own) {
     if (!__FEATURE_LISTS__) return;
-    mSetListOwner(itemProxy, owner);
+    mSetListOwner(itemProxy, owner, own);
+  }
+
+  // A list's liveness tag for its stamps: a stamp from a released (disposed)
+  // list is replaced, never joined (see core listTag).
+  listTag(el) {
+    if (!__FEATURE_LISTS__) return null;
+    return mListTag(el);
+  }
+
+  releaseListTag(tag) {
+    if (!__FEATURE_LISTS__) return;
+    mReleaseListTag(tag);
   }
 
   // Run `fn` under a list tracking frame (hybrid one-sink, computed/external

@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding: an async
+ * An async
  * computed must never let a settled result beat a NEWER input.
  *
  * Three reproduced shapes, all fixed together:
@@ -9,7 +9,8 @@
  *    the result is consumed used to be eaten by the consume branch — the
  *    body never re-ran and the stale value pinned until the dep moved again.
  *    Fix: the continuation discards when the node is DIRTY at settle time
- *    (a forced nudge flags itself via ctl.forced and still installs).
+ *    (a nudge from outside the graph leaves an in-flight node unmarked, so
+ *    DIRTY means a real input change).
  *  - R3b: a throwing re-run never bumped the generation, so the superseded
  *    request PARKED its result (its cell edge was trimmed by the throwing
  *    run, so nothing woke), and the next genuine dependency change consumed
@@ -19,8 +20,8 @@
  *    have no graph edge; the forced flag was their only wake channel), so
  *    the request was never relaunched — contradicting the docs' "a change
  *    to any dependency relaunches the request". Fix: the change-gated props
- *    refresh flags a RELAUNCH, which re-runs the body and supersedes the
- *    in-flight continuation.
+ *    refresh marks the node as changed, so the evaluation re-runs the body
+ *    and supersedes the in-flight continuation.
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
@@ -188,7 +189,7 @@ describe('Async computeds: in-flight staleness discipline', () => {
             'the relaunched request resolves against the new prop').toBe('ada-2')
     })
 
-    // Review finding: the rejection continuation used to report to onError
+    // The rejection continuation must not report to onError
     // BEFORE bumping the cell, so during the handler the node was CLEAN
     // with node.error set — and reading the same computed from inside
     // onError re-threw the original error out of the evaluation. The cell
@@ -220,7 +221,7 @@ describe('Async computeds: in-flight staleness discipline', () => {
         expect(observed, 'the handler can read the errored computed safely').toBe('undefined')
     })
 
-    // Review finding, pinned as the CONTRACT (docs state it now): a rejection
+    // Pinned as the CONTRACT (the docs state it): a rejection
     // landing for a request a newer run superseded is discarded silently —
     // the newer run owns the outcome, and a failure of a request nobody is
     // waiting on is not an application error.

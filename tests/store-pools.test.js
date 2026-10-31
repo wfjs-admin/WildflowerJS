@@ -364,7 +364,7 @@ describeIfPools('store pools', () => {
       wildflower.store(name, { storageKey: 'wf-test-' + name, state: { score: 0 }, pools: { enemies: {} } })
     })
     try { localStorage.removeItem('wf-test-' + name) } catch (e) { /* storage unavailable */ }
-    const found = lines.filter((l) => l.includes('[WF WF-911]'))
+    const found = lines.filter((l) => l.includes('[WF-911]'))
     expect(found.length).toBe(1)
     expect(found[0]).toContain(name)
     const quiet = storeName('unsaved')

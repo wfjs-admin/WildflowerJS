@@ -10,6 +10,8 @@ import { wfError, WF_ERRORS } from '../core/wfUtils.js';
 // may contain hyphens (component names do), and a dotted path is required — so
 // "$5.00" and "Price: $5.00" are correctly NOT store shorthands and stay literals.
 const PROP_STORE_SHORTHAND_RE = /^\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.]+)$/;
+// A value that could be a state path; anything else in data-prop-* is text.
+const PROP_PATH_RE = /^[a-zA-Z_$][a-zA-Z0-9_$.]*$/;
 
 // Dev-only once-per-(component:prop:path) guard for WF-507.
 const _warnedPropPaths = new Set();
@@ -77,10 +79,55 @@ function _splitRespectingQuotes(str) {
     return parts;
 }
 
+// Dev-only members, spread into PropsSystemMethods under __DEV__ (absent from
+// production files; every caller is inside an `if (__DEV__ ...)` block).
+const PropsSystemDevMethods = {
+    // Dev-only (WF-507): can `path` resolve against the parent right now?
+    // Mirrors _resolvePropsValue's lookup order as EXISTENCE checks. Unknown
+    // stateManager shapes report resolvable, so the warning can only under-fire.
+    _devPropPathResolvable(parent, path)
+    {
+        const sm = parent.stateManager;
+        if (!sm || !sm._raw) return true;
+        if (path.startsWith('state.')) return _propPathExists(sm._raw, path.slice(6));
+        let p = path;
+        let computedOnly = false;
+        if (p.startsWith('computed:')) { p = p.slice(9); computedOnly = true; }
+        const dot = p.indexOf('.');
+        const head = dot > 0 ? p.slice(0, dot) : p;
+        if (sm._getters && sm._getters[head]) return true;
+        if (computedOnly) return false;
+        if (_propPathExists(sm._raw, p)) return true;
+        const ctx = parent.context;
+        if (ctx && typeof ctx[p] === 'function') return true;
+        if (parent.definition && typeof parent.definition[p] === 'function') return true;
+        return false;
+    },
+
+    // Dev-only (WF-507): parent-side names for the did-you-mean suggestion.
+    _devPropPathCandidates(parent)
+    {
+        const out = [];
+        const sm = parent.stateManager;
+        if (sm && sm._raw) out.push(...Object.keys(sm._raw));
+        if (sm && sm._getters) out.push(...Object.keys(sm._getters));
+        const def = parent.definition;
+        if (def)
+        {
+            for (const k of Object.keys(def))
+            {
+                if (typeof def[k] === 'function' && k !== 'init' && k !== 'destroy') out.push(k);
+            }
+        }
+        return out;
+    },
+};
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const PropsSystemMethods = {
+    ...(__DEV__ ? PropsSystemDevMethods : {}),
     /**
      * Refresh a component's bindings after its props changed. props.* DOM bindings
      * repaint via the component render effect; here we invalidate every computed so
@@ -96,10 +143,11 @@ export const PropsSystemMethods = {
             sm.getComputedPropertyNames().forEach(propName => {
                 // `true` = an input VALUE is known to have changed (both
                 // callers of this method are change-gated). For an async
-                // computed with a request in flight this flags a RELAUNCH
-                // instead of a forced hold — props have no graph edge, so
-                // this is their only wake channel, and absorbing it lost
-                // the change for the whole flight.
+                // computed with a request in flight this marks the node, so
+                // the evaluation below re-runs the body and relaunches,
+                // where a plain nudge would hold the value — props have no
+                // graph edge, so this is their only wake channel, and
+                // absorbing it lost the change for the whole flight.
                 sm._invalidateCachedComputed?.(propName, true);
                 sm.scheduleComputedEvaluation(propName);
             });
@@ -279,7 +327,7 @@ export const PropsSystemMethods = {
      */
     _getListItemData(element, parentInstance)
     {
-        const listItem = element ? this._findListItemAncestor(element) : null;
+        const listItem = __FEATURE_LISTS__ && element ? this._findListItemAncestor(element) : null;
         if (!listItem) return undefined;
 
         // Fast path: mapArray mode stores reactive proxy directly on the element
@@ -320,10 +368,13 @@ export const PropsSystemMethods = {
             return literal;
         }
 
-        // For non-literal values, we need a parent instance to resolve from
+        // For non-literal values, we need a parent instance to resolve from.
+        // Without one, text that could not be a state name is the text
+        // itself, as it is with a parent (below), so a component with no
+        // component around it takes data-prop-title="Custom Title" too.
         if (!parentInstance)
         {
-            return undefined;
+            return valuePath !== '.' && !PROP_PATH_RE.test(valuePath) ? valuePath : undefined;
         }
 
         // Handle list item context - "." means the current list item
@@ -444,7 +495,7 @@ export const PropsSystemMethods = {
             // isn't a valid JS identifier, treat it as a string literal.
             // This allows: data-prop-title="Custom Title" (literal)
             // While preserving: data-prop-title="cardTitle" (state path)
-            if (resolvedValue === undefined && !/^[a-zA-Z_$][a-zA-Z0-9_$.]*$/.test(valuePath)) {
+            if (resolvedValue === undefined && !PROP_PATH_RE.test(valuePath)) {
                 return valuePath;
             }
 
@@ -656,46 +707,6 @@ export const PropsSystemMethods = {
                 }
             }, settleMs);
         }
-    },
-
-    // Dev-only (WF-507): can `path` resolve against the parent right now?
-    // Mirrors _resolvePropsValue's lookup order as EXISTENCE checks. Unknown
-    // stateManager shapes report resolvable, so the warning can only under-fire.
-    _devPropPathResolvable(parent, path)
-    {
-        const sm = parent.stateManager;
-        if (!sm || !sm._raw) return true;
-        if (path.startsWith('state.')) return _propPathExists(sm._raw, path.slice(6));
-        let p = path;
-        let computedOnly = false;
-        if (p.startsWith('computed:')) { p = p.slice(9); computedOnly = true; }
-        const dot = p.indexOf('.');
-        const head = dot > 0 ? p.slice(0, dot) : p;
-        if (sm._getters && sm._getters[head]) return true;
-        if (computedOnly) return false;
-        if (_propPathExists(sm._raw, p)) return true;
-        const ctx = parent.context;
-        if (ctx && typeof ctx[p] === 'function') return true;
-        if (parent.definition && typeof parent.definition[p] === 'function') return true;
-        return false;
-    },
-
-    // Dev-only (WF-507): parent-side names for the did-you-mean suggestion.
-    _devPropPathCandidates(parent)
-    {
-        const out = [];
-        const sm = parent.stateManager;
-        if (sm && sm._raw) out.push(...Object.keys(sm._raw));
-        if (sm && sm._getters) out.push(...Object.keys(sm._getters));
-        const def = parent.definition;
-        if (def)
-        {
-            for (const k of Object.keys(def))
-            {
-                if (typeof def[k] === 'function' && k !== 'init' && k !== 'destroy') out.push(k);
-            }
-        }
-        return out;
     },
     /**
      * Validate props against their definitions

@@ -5,6 +5,8 @@
  */
 
 import { pathResolver } from '../core/wfUtils.js';
+import { getContextMethod } from '../state/ContextProxy.js';
+import { applyModel } from '../core/BindingWriters.js';
 import {
     actionBoundElements, modelBoundElements,
     portalMetaCache, listItemContextCache, portalListItemContextCache,
@@ -33,7 +35,7 @@ export const PortalSystemMethods = {
         }
 
         // Find list item ancestor
-        const listItem = this._findListItemAncestor(element);
+        const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(element) : null;
         if (!listItem) return null;
 
         const index = listItem._listIndex;
@@ -44,7 +46,7 @@ export const PortalSystemMethods = {
 
         if (!listContext) {
             // Try to get from list item element
-            listContext = listItem._listContext;
+            listContext = listItem._rowList;
 
             // Fall back to instance's _listContexts map
             if (!listContext && instance._listContexts) {
@@ -700,7 +702,7 @@ export const PortalSystemMethods = {
 
             // Update the element
             if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
-                element.value = value ?? '';
+                applyModel(element, value);
             } else {
                 element.textContent = value ?? '';
             }
@@ -763,9 +765,26 @@ export const PortalSystemMethods = {
         // Parse actions (can have multiple space-separated actions)
         const actionDefs = this._parseActions(actionAttr);
 
+        // A form's submit is dispatched in one place for every form, portaled
+        // or not (FormHandling._handleFormSubmit finds this form's component
+        // through data-portaled-from). Binding it here as well ran it twice,
+        // and a bare data-action="save", which parses as a click, ran on
+        // every click inside the form. So on a form the submit and the bare
+        // (click) actions are left to the dispatcher; its other actions
+        // (keydown:, ...) are bound below as before.
+        const isForm = actionEl.tagName === 'FORM';
+        // An outside action runs on clicks everywhere except its element: it
+        // goes in the outside-click registry, not on the element.
+        const outside = this._hasAttr(actionEl, 'event-outside');
+
         actionDefs.forEach(({ eventType, methodName, args: actionArgs }) => {
+            if (isForm && (eventType === 'submit' || eventType === 'click')) return;
             // Skip if the action method doesn't exist
-            if (!methodName || typeof instance.context[methodName] !== 'function') {
+            if (!methodName || !getContextMethod(instance.context, methodName)) {
+                return;
+            }
+            if (outside) {
+                this._setupOutsideClickHandler(actionEl, instance, methodName);
                 return;
             }
 
@@ -846,7 +865,7 @@ export const PortalSystemMethods = {
             } else if (modelEl.type === 'radio') {
                 modelEl.checked = modelEl.value === initialValue;
             } else {
-                modelEl.value = initialValue ?? '';
+                applyModel(modelEl, initialValue);
             }
         }
 

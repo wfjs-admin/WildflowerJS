@@ -99,10 +99,48 @@ function _toRawWalk(value, seen) {
     return out;
 }
 
+// Dev-only members, spread into EntitySystemMethods under __DEV__ (absent from
+// production files). Nothing in the framework calls these; tests do.
+const EntitySystemDevMethods = {
+    /**
+     * Check if an expression uses a specific path
+     * @param {string} expression - The binding expression
+     * @param {string} path - The state path to check
+     * @returns {boolean} - Whether the expression uses the path
+     * @private
+     */
+    _expressionUsesPath(expression, path)
+    {
+        // Strip computed: prefix so "computed:storeValue" matches "storeValue" in expressions
+        const effectivePath = path.startsWith('computed:') ? path.slice(9) : path;
+
+        // Handle simple case - direct word match
+        const wordBoundaryRegex = new RegExp(`\\b${effectivePath}\\b`);
+        if (wordBoundaryRegex.test(expression))
+        {
+            return true;
+        }
+
+        // For nested properties, check the parent path
+        if (effectivePath.includes('.'))
+        {
+            const basePath = effectivePath.split('.')[0];
+            const basePathRegex = new RegExp(`\\b${basePath}\\b`);
+            if (basePathRegex.test(expression))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    },
+};
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const EntitySystemMethods = {
+    ...(__DEV__ ? EntitySystemDevMethods : {}),
 /**
      * Resolve an external value from another component (used by binding expression evaluation)
      * @param {string} componentNameOrId - Name or ID of the target component
@@ -159,70 +197,17 @@ export const EntitySystemMethods = {
         }
         return target;
     },
+    // _externalPluginGet and _registerPluginDependent (plugins only) live in
+    // PluginSystemMethods.
     /**
-     * Shared plugin-state resolution for external(). Returns null when the
-     * name doesn't resolve to a plugin; otherwise { value } where value is
-     * the GET result (argc 2) or undefined (plugins don't support external
-     * writes or 1-arg context handles). Call sites gate on
-     * __FEATURE_PLUGINS__; the body is gated too so plugin-free builds strip
-     * it entirely.
-     * @private
-     */
-    _externalPluginGet(entityNameOrId, path, argc, callerId) {
-        if (!__FEATURE_PLUGINS__) return null;
-        if (!this._pluginStates) return null;
-        let pluginName = entityNameOrId;
-        // Handle both "plugin:name" and direct "name" format
-        if (pluginName.startsWith('plugin:')) {
-            pluginName = pluginName.slice(7);
-        }
-        const pluginContext = this._pluginStates.get(pluginName);
-        if (!pluginContext || !pluginContext.state) return null;
-
-        // Register the caller as depending on this plugin
-        if (callerId) {
-            this._registerPluginDependent(pluginName, callerId);
-        }
-
-        if (argc === 2) {
-            try {
-                if (path.startsWith('computed:')) {
-                    const computedName = path.slice(9);
-                    return { value: pluginContext._stateManager?.evaluateComputed(computedName) ??
-                                    pluginContext[computedName] };
-                }
-                let value = pathResolver.get(pluginContext.state, path);
-                if (value === undefined && !path.includes('.') && pluginContext[path] !== undefined) {
-                    // A bare path naming a computed, e.g. data-bind="$plugin.total",
-                    // which _normalizeStoreShorthands turns into external('plugin',
-                    // 'total') WITHOUT a computed: prefix; misses the state lookup
-                    // above because ReactiveGraph's reactiveTree state holds only real
-                    // state (computed names are not state keys). The ContextProxy
-                    // resolves computed names, so read the value through it.
-                    value = pluginContext[path];
-                }
-                return { value };
-            } catch (error) {
-                return { value: path.startsWith('computed:') ? 0 : null };
-            }
-        }
-        return { value: undefined };
-    },
-    /**
-     * Shared value resolution against a target entity: computed (dotted or
-     * plain) vs regular state path. No try/catch: each caller keeps its own
-     * fallback semantics.
+     * Shared value resolution against a target entity. getValue covers state
+     * paths and computed ones, plain or dotted; the computed: prefix is
+     * optional, so computed:a.b reads exactly what a.b does. No try/catch:
+     * each caller keeps its own fallback semantics.
      * @private
      */
     _externalResolveTargetValue(targetEntity, path) {
-        if (path.startsWith('computed:')) {
-            const computedPath = path.slice(9);
-            if (computedPath.includes('.')) {
-                return targetEntity.stateManager._resolveComputedPath(computedPath);
-            }
-            return targetEntity.stateManager.evaluateComputed(computedPath);
-        }
-        return targetEntity.stateManager.getValue(path);
+        return targetEntity.stateManager.getValue(path.startsWith('computed:') ? path.slice(9) : path);
     },
     /**
      * Shared SET path for external(): write, mark for update, schedule.
@@ -274,7 +259,12 @@ export const EntitySystemMethods = {
      * @param {string} path - The state path being depended on
      * @private
      */
+    // _markDispatchBusy / _markAllDispatchBusy live in ListSharedMethods: the
+    // mark only matters to a list's quiet dispatch, so callers outside the
+    // list code are gated on __FEATURE_LISTS__.
     _registerExternalDependency(sourceComponentId, targetComponentId, path) {
+        // The target's dispatch is what re-renders the dependent.
+        if (__FEATURE_LISTS__) this._markDispatchBusy(this.componentInstances.get(targetComponentId));
         // Key by target entity id: any state change on the target notifies all
         // external dependents. Path-level granularity is deliberately not
         // tracked: a per-path index would always be a subset of this one
@@ -286,19 +276,6 @@ export const EntitySystemMethods = {
             this._externalDependencies.set(targetComponentId, dependents);
         }
         dependents.add(sourceComponentId);
-    },
-    /**
-     * Register a component as depending on a plugin's state
-     * When the plugin's state changes, the dependent component should be updated
-     * @param {string} pluginName - Name of the plugin
-     * @param {string} componentId - ID of the component that depends on this plugin
-     * @private
-     */
-    _registerPluginDependent(pluginName, componentId) {
-        // Use unified _entityDependents (formerly _pluginDependents)
-        // Plugin names are prefixed with 'plugin:' to distinguish from components/stores
-        const entityKey = `plugin:${pluginName}`;
-        this._registerEntityDependent(entityKey, componentId);
     },
     /**
      * Get all component IDs that depend on a given plugin
@@ -325,6 +302,7 @@ export const EntitySystemMethods = {
         // Invalidate cached "no notify targets" flag on the entity instance
         const instance = this.componentInstances.get(entityId);
         if (instance) instance._hasNotifyTargets = true;
+        if (__FEATURE_LISTS__) this._markDispatchBusy(instance);
         // Track whether this entity has any DOM component dependents.
         // Stores without DOM dependents can skip onStateChange in SET traps.
         const depInstance = this.componentInstances.get(componentId);
@@ -1102,7 +1080,7 @@ export const EntitySystemMethods = {
             else stateManager._ensureComputedNotifier(path.startsWith('computed:') ? path.slice(9) : path);
         }
 
-        // RG-5 (review 2026-07-02, decided): subscribing to a list item
+        // RG-5: subscribing to a list item
         // by numeric index is an anti-pattern. Reactivity is identity-based, so
         // the index in an onStateChange path reflects the item's position when
         // FIRST observed; after a splice/reorder the subscription misfires or
@@ -1174,6 +1152,10 @@ export const EntitySystemMethods = {
                 }
             };
         }
+
+        // A subscriber rides the change dispatch: from here on it runs for
+        // every write, direct-writer leaves included (see setDispatchQuiet).
+        if (stateManager.setDispatchQuiet) stateManager.setDispatchQuiet(false);
 
         // Store subscription info
         stateManager._subscriptions.set(subscriptionId, {
@@ -1384,39 +1366,16 @@ export const EntitySystemMethods = {
         // Update custom directives (only when plugin system is available)
         if (this._customDirectives && this._customDirectives.size > 0 && instance.element) {
             this._updateCustomDirectivesInSubtree(instance.element, instance, path);
-        }
-    },
-    /**
-     * Check if an expression uses a specific path
-     * @param {string} expression - The binding expression
-     * @param {string} path - The state path to check
-     * @returns {boolean} - Whether the expression uses the path
-     * @private
-     */
-    _expressionUsesPath(expression, path)
-    {
-        // Strip computed: prefix so "computed:storeValue" matches "storeValue" in expressions
-        const effectivePath = path.startsWith('computed:') ? path.slice(9) : path;
-
-        // Handle simple case - direct word match
-        const wordBoundaryRegex = new RegExp(`\\b${effectivePath}\\b`);
-        if (wordBoundaryRegex.test(expression))
-        {
-            return true;
-        }
-
-        // For nested properties, check the parent path
-        if (effectivePath.includes('.'))
-        {
-            const basePath = effectivePath.split('.')[0];
-            const basePathRegex = new RegExp(`\\b${basePath}\\b`);
-            if (basePathRegex.test(expression))
-            {
-                return true;
+            // Content the component's portals moved is still its own.
+            const portals = this._activePortals && this._activePortals.get(instance.id);
+            if (portals) {
+                for (const record of portals) {
+                    for (const el of record.content) {
+                        this._updateCustomDirectivesInSubtree(el, instance, path);
+                    }
+                }
             }
         }
-
-        return false;
     },
     /**
      * Execute watchers for a specific path

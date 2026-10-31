@@ -28,7 +28,7 @@ describe('DevTools hook v1.2 surface', () => {
     it('Phase 0 contract: version/schemaVersion/dev ship in all builds; getters are dev-only', () => {
         const h = hook()
         expect(h, 'global hook should exist in every build').toBeTruthy()
-        expect(h.version).toBe('1.5.4')
+        expect(h.version).toBe('1.5.5')
         // wildflower.version is the same build-time string (from package.json).
         expect(wildflower.version).toBe(h.version)
         expect(h.schemaVersion).toBe(1)
@@ -110,7 +110,7 @@ describe('DevTools hook v1.2 surface', () => {
         }
     })
 
-    // Review finding: hasTo must be true for the DECLARATIVE forms too. The
+    // hasTo must be true for the DECLARATIVE forms too. The
     // headline v1.5 declaration is a URL string or an operation map, and
     // `typeof to === 'function'` reported "no write transport" for both.
     it('getQueries reports hasTo for the declarative to: forms', async () => {

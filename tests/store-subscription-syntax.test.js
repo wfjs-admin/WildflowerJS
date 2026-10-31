@@ -681,8 +681,8 @@ describe('Store Subscription Syntax', () => {
 
             await waitForUpdate(100)
 
-            // Should have logged WF-501 warning. The wfError helper now
-            // emits the code with a leading "WF " prefix (e.g. "[WF WF-501]")
+            // Should have logged WF-501 warning. The wfError helper
+            // emits the code in brackets (e.g. "[WF-501]")
             // and the doc URL on a subsequent line, so we match the bare
             // code substring across any of the warnSpy calls.
             const calls = warnSpy.mock.calls.map(c => c.join(' '))

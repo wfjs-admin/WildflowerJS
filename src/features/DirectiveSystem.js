@@ -48,6 +48,9 @@ export const DirectiveSystemMethods = {
         // Invalidate cached selector so it gets rebuilt with the new directive
         this._customDirectivesSelector = null;
 
+        // A directive's update() is driven from each component's change dispatch.
+        if (__FEATURE_LISTS__ && this._markAllDispatchBusy) this._markAllDispatchBusy();
+
         return this;
     },
     /**
@@ -69,26 +72,54 @@ export const DirectiveSystemMethods = {
             if (!directive) continue;
             if (this._wfTwinWins(element, attr.name)) continue;
 
-            const value = attr.value;
-            const context = this._buildDirectiveContext(element, value, component);
-
-            // Store context for updates and cleanup
-            if (!this._directiveContexts.has(element)) {
-                this._directiveContexts.set(element, new Map());
+            this._initDirective(element, directiveName, directive, attr.value, component);
+        }
+    },
+    /**
+     * The directives a component's root: block names ({ tooltip: 'label' }),
+     * on its root element and in its own scope. A directive the tag carries
+     * as well is the tag's: whoever wrote the tag keeps it (WF-520).
+     * @private
+     */
+    _processRootDirectives(component)
+    {
+        const block = component.definition && component.definition.root;
+        const names = block && block.directives;
+        if (!names || typeof names !== 'object') return;
+        const element = component.element;
+        for (const directiveName in names) {
+            const directive = this._customDirectives.get(directiveName);
+            const value = names[directiveName];
+            if (!directive || typeof value !== 'string') continue;
+            if (this._hasAttr(element, directiveName)) {
+                if (__DEV__) this._warnRootConflict(component, 'directive', directiveName);
+                continue;
             }
-            this._directiveContexts.get(element).set(directiveName, {
-                value,
-                context,
-                lastResolvedValue: context.resolvedValue
-            });
+            this._initDirective(element, directiveName, directive, value, component);
+        }
+    },
+    /** One directive on one element: its context, kept for updates and cleanup, then init. @private */
+    _initDirective(element, directiveName, directive, value, component)
+    {
+        const context = this._buildDirectiveContext(element, value, component);
 
-            // Call init
-            if (directive.init) {
-                try {
-                    directive.init(element, value, context);
-                } catch (error) {
-                    if (__DEV__) console.error(`[WF] Directive "${directiveName}" init error:`, error);
-                }
+        if (!this._directiveContexts.has(element)) {
+            this._directiveContexts.set(element, new Map());
+        }
+        this._directiveContexts.get(element).set(directiveName, {
+            value,
+            context,
+            lastResolvedValue: context.resolvedValue
+        });
+        // Every element a component runs a directive on, so its teardown
+        // reaches one that has left its subtree (a child root left behind).
+        if (component) (component._directiveEls || (component._directiveEls = new Set())).add(element);
+
+        if (directive.init) {
+            try {
+                directive.init(element, value, context);
+            } catch (error) {
+                if (__DEV__) console.error(`[WF] Directive "${directiveName}" init error:`, error);
             }
         }
     },
@@ -108,7 +139,7 @@ export const DirectiveSystemMethods = {
         };
 
         // Check if inside a list
-        const listItemElement = this._findListItemAncestor(element);
+        const listItemElement = __FEATURE_LISTS__ ? this._findListItemAncestor(element) : null;
         if (listItemElement) {
             context.listIndex = listItemElement._listIndex;
             // Try to get the list item data
@@ -145,6 +176,9 @@ export const DirectiveSystemMethods = {
         for (const [directiveName, data] of elementDirectives) {
             const directive = this._customDirectives.get(directiveName);
             if (!directive?.update) continue;
+            // A root carries the directives of two components: those its tag
+            // gave the component around it, and its own root: block's.
+            if (data.context.component !== component) continue;
 
             // Check if this directive's value path is affected
             if (changedPath && !this._isDirectivePathAffected(data.value, changedPath)) continue;
@@ -180,12 +214,16 @@ export const DirectiveSystemMethods = {
      * Cleanup custom directives on an element
      * @private
      */
-    _cleanupCustomDirectives(element)
+    _cleanupCustomDirectives(element, only)
     {
         const elementDirectives = this._directiveContexts.get(element);
         if (!elementDirectives) return;
 
         for (const [directiveName, data] of elementDirectives) {
+            const owner = data.context.component;
+            if (only && owner !== only) continue;
+            elementDirectives.delete(directiveName);
+            if (owner && owner._directiveEls) owner._directiveEls.delete(element);
             const directive = this._customDirectives.get(directiveName);
             if (!directive?.destroy) continue;
 
@@ -196,31 +234,73 @@ export const DirectiveSystemMethods = {
             }
         }
 
-        this._directiveContexts.delete(element);
+        if (elementDirectives.size === 0) this._directiveContexts.delete(element);
     },
     /**
      * Apply a callback to every element in a subtree (root + all descendants).
-     * Shared traversal for process/update/cleanup directive operations.
+     * Shared traversal for process/update/cleanup directive operations. Given
+     * the component, only the elements whose directives it reads: its own,
+     * and the roots of the components directly inside it, whose tags it wrote
+     * (the rule bindings follow, _bindingScopeElement). A nested component's
+     * inside is that component's, and its own root is its owner's unless it
+     * is top-level; an update still visits it for its root: block. Cleanup
+     * passes no component and reaches every element.
      * @private
      */
-    _forEachDirectiveElement(rootElement, callback) {
+    _forEachDirectiveElement(rootElement, callback, component, updating) {
         if (this._customDirectives.size === 0) return;
-        callback(rootElement);
-        const allElements = rootElement.querySelectorAll('*');
-        for (const element of allElements) {
+        const own = component && component.element;
+        // Document order: a skipped element's descendants follow it.
+        let skip;
+        for (const element of [rootElement, ...rootElement.querySelectorAll('*')]) {
+            if (skip && skip.contains(element)) continue;
+            skip = null;
+            if (own) {
+                // Content another component's portal moved here is that component's.
+                const from = element !== rootElement && element.getAttribute('data-portaled-from');
+                if (from && from !== own.dataset.componentId) {
+                    skip = element;
+                    continue;
+                }
+                if (this._hasAttr(element, 'component')) {
+                    if (element !== own) skip = element;
+                    if (!(updating && element === own) && this._bindingScopeElement(element) !== own) continue;
+                }
+            }
             callback(element);
         }
     },
     /** @private */
     _processCustomDirectivesInSubtree(rootElement, component) {
-        this._forEachDirectiveElement(rootElement, el => this._processCustomDirectives(el, component));
+        this._forEachDirectiveElement(rootElement, el => {
+            // A child's root another arrival path already gave this component
+            // (_claimChildRootBindings, a section's insertion) keeps it.
+            if (!this._directiveOwner(el, component)) this._processCustomDirectives(el, component);
+        }, component);
+        if (component && rootElement === component.element) this._processRootDirectives(component);
+    },
+    /** Whether `component` already runs a directive on `el`. @private */
+    _directiveOwner(el, component) {
+        const entries = this._directiveContexts.get(el);
+        if (entries) for (const data of entries.values()) if (data.context.component === component) return true;
+        return false;
     },
     /** @private */
     _updateCustomDirectivesInSubtree(rootElement, component, changedPath) {
-        this._forEachDirectiveElement(rootElement, el => this._updateCustomDirectives(el, component, changedPath));
+        this._forEachDirectiveElement(rootElement, el => this._updateCustomDirectives(el, component, changedPath), component, true);
     },
-    /** @private */
-    _cleanupCustomDirectivesInSubtree(rootElement) {
-        this._forEachDirectiveElement(rootElement, el => this._cleanupCustomDirectives(el));
+    /**
+     * A destroyed component's root still in the page keeps the directives
+     * its tag gave the component around it, as its bindings do: they are
+     * that component's, destroyed when it goes or the element leaves.
+     * @private
+     */
+    _cleanupCustomDirectivesInSubtree(rootElement, component) {
+        const only = component && rootElement.isConnected ? component : null;
+        this._forEachDirectiveElement(rootElement, el => this._cleanupCustomDirectives(el, el === rootElement ? only : null));
+        // A destroyed component's directives wherever they are now.
+        if (component && component._directiveEls) {
+            for (const el of component._directiveEls) this._cleanupCustomDirectives(el, component);
+        }
     }
 };

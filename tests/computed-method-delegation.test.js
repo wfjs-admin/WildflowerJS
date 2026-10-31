@@ -17,7 +17,7 @@
  * during first paint. The CONTROL tests pin the behavior that must survive
  * any fix: lifecycle hooks and post-init calls already work, and genuine
  * actions fired before init must still queue and replay (that half is also
- * covered by async-lifecycle.test.js and code-review-2026-04-28).
+ * covered by async-lifecycle.test.js and reactive-engine-concerns.test.js).
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
@@ -171,7 +171,7 @@ describe('a method called during first render', () => {
     // ---- CONTROLS: behavior that already works and must keep working ----
 
     it('V6 cross-instance: another component\'s computed cannot bypass MY pre-init queue', async () => {
-        // Review finding: COMPUTED_EVAL was one global depth counter, so while
+        // COMPUTED_EVAL is one global depth counter, so while
         // ANY computed evaluated, EVERY component's pre-init queue was
         // lifted — a computed on A reaching a method on not-yet-initialized
         // B ran the method early (side effects fired before B's init-set

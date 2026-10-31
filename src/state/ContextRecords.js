@@ -1,5 +1,6 @@
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { boundActionsCache } from '../core/DomMetadata.js';
+import { getContextMethod } from './ContextProxy.js';
 
 // Attribute prefix helpers
 const _isStrict = () => window.wildflower?.options?.useWfPrefixOnly;
@@ -109,6 +110,7 @@ class RenderRecord
     _insertRenderElement()
     {
         if (!this.placeholder || !this.templateClone) return;
+        if (!this.placeholder.parentNode) return this._dropRecord();
 
         // Clone the template (templateClone set by _processDataRenderElement in wildflowerJS.js)
         const newElement = this.templateClone.cloneNode(true);
@@ -125,8 +127,19 @@ class RenderRecord
 
         const wildflower = this._wf;
         if (wildflower) {
-            // Scan for nested components first (uses correct initialization path)
-            wildflower.scan(newElement);
+            // The component's effect is rebuilt over the whole component
+            // below. An empty pending list tells the scan's claim of a child
+            // root in the section to add to it instead of rebuilding first.
+            const owner = this._parentIndex === undefined && this.componentInstance;
+            if (owner && !owner._effectMeta) owner._effectMeta = [];
+
+            // Scan for nested components first (uses correct initialization
+            // path). scan() looks below its scope, so a section that is itself
+            // a child component's root (a data-render the parent wrote on the
+            // child's tag) is scanned from its parent; that also clears the id
+            // the clone carries from the generation that left with the section.
+            wildflower.scan(this._parentIndex === undefined && _cmHasAttr(newElement, 'component')
+                ? newElement.parentNode : newElement);
 
             const instance = this.componentInstance;
             const componentLevel = !!instance && this._parentIndex === undefined;
@@ -270,10 +283,32 @@ class RenderRecord
             }
         }
 
+        // The cleanup above ran either way (nested lists disposed, nested
+        // components destroyed); a section other code already took out of
+        // the page has nowhere to leave a placeholder.
+        if (!this.element.parentNode) return this._dropRecord();
+
         // Insert placeholder and remove element
         this.element.parentNode.insertBefore(placeholder, this.element);
         this.element.parentNode.removeChild(this.element);
         this.element = null;
+    }
+
+    /**
+     * Other code took the section (or its placeholder) out of the page, so
+     * there is nowhere to remove it from or put it back. Retire the record:
+     * throwing here would stop the component's render effect part-way, and
+     * every binding after this one would stop updating. The record leaves
+     * the component's sections and its effect entry is hidden.
+     * @private
+     */
+    _dropRecord()
+    {
+        this.element = this.placeholder = this.templateClone = null;
+        const instance = this.componentInstance;
+        if (!instance || this._parentIndex !== undefined) return;
+        if (instance._renderContexts) instance._renderContexts = instance._renderContexts.filter(ctx => ctx !== this);
+        if (this._wf) this._wf._hideMetas(instance, meta => meta.context === this);
     }
 
     /** Process bindings/actions/conditionals in newly inserted render element. @private */
@@ -385,8 +420,26 @@ class RenderRecord
         // submit handler.
         if (el.tagName === 'FORM') return;
 
+        // An outside action runs on clicks everywhere EXCEPT its element, so
+        // a listener on the element is the wrong thing: it goes in the
+        // outside-click registry, as the component's binder does. The
+        // registry drops an entry once its element leaves the document, so
+        // this runs on every insertion (before the duplicate guard below).
+        const outside = _cmHasAttr(el, 'event-outside');
+        // In a list row the handler is told which row, as it is for an
+        // outside action the row's own builder registers.
+        let outsideRow = null;
+        if (__FEATURE_LISTS__ && outside) {
+            const row = wildflower._findListItemAncestor(el);
+            if (row && row._rowList) outsideRow = { item: row._itemData, index: row._listIndex, listContext: row._rowList };
+        }
+
         for (const {methodName, eventType} of actionDefs) {
-            if (methodName && typeof instance.context[methodName] === 'function') {
+            if (methodName && getContextMethod(instance.context, methodName)) {
+                if (outside) {
+                    wildflower._setupOutsideClickHandler(el, instance, methodName, outsideRow);
+                    continue;
+                }
                 // GUARD: Prevent duplicate event binding (same guard used by EventSystem._bindComponentActions)
                 let elBoundActions = boundActionsCache.get(el);
                 if (!elBoundActions) {
@@ -454,8 +507,10 @@ class RenderRecord
             wildflower._withdrawPortalsInSubtree(this.element, this.componentInstance);
         }
 
-        // Find and destroy nested components
-        const nestedComponents = this.element.querySelectorAll('[data-component-id]');
+        // Find and destroy nested components, and the section's own when it
+        // is a child component's root (a data-render the parent wrote on the
+        // child's tag).
+        const nestedComponents = [this.element, ...this.element.querySelectorAll('[data-component-id]')];
         nestedComponents.forEach(compEl => {
             const compId = compEl.dataset.componentId;
             if (compId && wildflower.hasComponentInstance(compId)) {
@@ -543,13 +598,19 @@ class PortalBindingRecord
     {
         return this.element && document.body.contains(this.element);
     }
+}
 
+// The class writer exists only in tiers with portals: PortalSystem is its one
+// caller. Assigned here rather than declared in the class body so the other
+// tiers drop it.
+if (__FEATURE_PORTALS__)
+{
     /**
      * Update DOM element for class binding context. Lifted verbatim off the old
      * Context class so a non-registered portal record can paint `data-bind-class`.
      * @private
      */
-    _updateClassBindingElement(newValue)
+    PortalBindingRecord.prototype._updateClassBindingElement = function (newValue)
     {
         if (!this.element || !this.isElementAttached()) return;
 
@@ -628,7 +689,7 @@ class PortalBindingRecord
 
         // Track what we added (even empty string to indicate we've processed this)
         this._previousClass = newValue || '';
-    }
+    };
 }
 
 
@@ -697,8 +758,9 @@ export class ContextRecords
      * `element._actionContext`. The dispatcher (_handleActionWithContext) reads
      * only .data/.path/.componentInstance/.element; nothing calls a method on it.
      * List-item detail comes from the row element (rowEl._itemData/_listIndex),
-     * not the .parent/_parentIndex linkage, so those are kept only for the
-     * form-submit routing gate (EventSystem `.parent.type === 'list'`).
+     * not the .parent/_parentIndex linkage. (The form-submit routing gate that
+     * read `.parent.type === 'list'` is gone: submits are dispatched by
+     * FormHandling._handleFormSubmit, which makes no record.)
      */
     createActionContext(path, componentInstance, element, method, eventType = 'click', parent = null, parentIndex = null) {
         if (!parent && element) {
@@ -714,7 +776,13 @@ export class ContextRecords
             data: {
                 method,
                 event: eventType || 'click',
-                options: {}
+                // null until someone gives the record its options: the
+                // component's binder does, when it makes one; for every other
+                // record the dispatcher works them out on first use
+                // (EventSystem._actionOptions). An empty object here read as
+                // "has options, all off", and the modifiers on a list row's
+                // action were never looked at.
+                options: null
             }
         };
 
@@ -745,7 +813,7 @@ export class ContextRecords
         if (!listItem) return null;
 
         // Find the DIRECT parent list using framework helper
-        const listElement = this._wf._findDirectParentList(listItem);
+        const listElement = this._wf._findRowList(listItem);
         if (listElement && listElement._listContext) {
             return listElement._listContext;
         }
@@ -763,7 +831,7 @@ export class ContextRecords
         if (!element || !context) return;
 
         // Use JS property-based lookup instead of DOM attribute selector
-        const listItem = this._wf?._findListItemAncestor(element);
+        const listItem = __FEATURE_LISTS__ ? this._wf?._findListItemAncestor(element) : null;
         if (listItem) {
             // _listIndex is the canonical row index, kept current by onMove during
             // list operations (_bindItemIndex was a redundant mirror, now retired).

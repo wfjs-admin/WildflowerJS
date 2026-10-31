@@ -19,7 +19,7 @@ async function waitForUpdate(ms = 60) {
 function wf214Calls(spy) {
     // Count only the main emission line; wfError also prints Suggestion/Docs
     // follow-up lines (the Docs URL contains the code string too).
-    return spy.mock.calls.filter(args => String(args[0]).includes('[WF WF-214]'))
+    return spy.mock.calls.filter(args => String(args[0]).includes('[WF-214]'))
 }
 
 describe('WF-214 item-computed this-miss dev warning', () => {

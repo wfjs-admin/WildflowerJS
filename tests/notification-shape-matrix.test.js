@@ -369,7 +369,7 @@ describe('Notification × subscription-shape matrix', () => {
         it('component pattern: outer computed re-fires when inner becomes dirty (DOM bound)', async () => {
             // Canonical access: outer reads inner via `this.inner` (not
             // `this.computed.inner`) — matches the test pattern proven
-            // working in code-review-2026-04-28-reactive-peer-review.test.js
+            // working in reactive-engine-concerns.test.js
             // (Concern 4 / composed STABLE chains).
             const container = document.createElement('div')
             container.style.position = 'absolute'

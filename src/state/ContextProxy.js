@@ -61,6 +61,46 @@ const FRAMEWORK_PROPERTIES = new Set([
 ]);
 
 /**
+ * Names the framework calls on its own schedule. An item-level computed
+ * with one of these names is not exposed as a callable.
+ */
+const RESERVED_METHOD_NAMES = new Set([
+    'init', 'beforeInit', 'destroy', 'beforeDestroy', 'onUpdate', 'beforeUpdate',
+    'onError', 'tick', 'onStoreUpdate', 'onPropsChange'
+]);
+
+/**
+ * True when `name` is an item-level computed on this context (declared with
+ * an item parameter). The context exposes those as callables, so every
+ * lookup that finds a method by `typeof context[name] === 'function'` checks
+ * this first: an item-level computed is never an action, handler or hook.
+ *
+ * @param {Object} context - Component or store context (proxy or raw)
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isItemComputed(context, name) {
+    const origs = context && context.stateManager && context.stateManager._originalComputedFunctions;
+    if (!origs || typeof name !== 'string') return false;
+    const fn = origs.get(name);
+    return typeof fn === 'function' && fn.length > 0;
+}
+
+/**
+ * The method named `name` on a context, or undefined. Excludes item-level
+ * computeds, which read as functions from component code.
+ *
+ * @param {Object} context
+ * @param {string} name
+ * @returns {Function|undefined}
+ */
+function getContextMethod(context, name) {
+    if (!context) return undefined;
+    const fn = context[name];
+    return typeof fn === 'function' && !isItemComputed(context, name) ? fn : undefined;
+}
+
+/**
  * Create a Proxy-wrapped context that resolves flat property names
  * against computed and state when not found directly on the context.
  *
@@ -92,8 +132,23 @@ function createContextProxy(rawContext, stateManager) {
                 return Reflect.get(target, prop, receiver);
             }
 
+            // Item-level computed (declared with an item parameter): from
+            // component code, `this.name(item, index, info)` is a plain call
+            // of the author's function with this context, so the caller's own
+            // tracking sees every read. Rows evaluate it through their own
+            // path (ListExpressionEval) and never come here. Checked against
+            // the original functions: the wrappers in stateManager.computed
+            // always report zero parameters.
+            // Reserved lifecycle names are never exposed, so `init(item)`
+            // can't be mistaken for the init hook. Item-level computeds are
+            // registered in stateManager.computed too, so state reads never
+            // reach this check.
             // Computed (precedence over state, matching template resolution)
             if (stateManager.computed && stateManager.computed[prop]) {
+                const fn = stateManager._originalComputedFunctions?.get(prop);
+                if (typeof fn === 'function' && fn.length > 0 && !RESERVED_METHOD_NAMES.has(prop)) {
+                    return (...args) => fn.apply(receiver, args);
+                }
                 return stateManager.evaluateComputed(prop);
             }
 
@@ -217,4 +272,4 @@ function warnCollisions(stateManager, entityName, computedDef) {
     }
 }
 
-export { createContextProxy, patchSelfReferences, warnCollisions, FRAMEWORK_PROPERTIES, RAW_TARGET };
+export { createContextProxy, patchSelfReferences, warnCollisions, isItemComputed, getContextMethod, FRAMEWORK_PROPERTIES, RAW_TARGET };

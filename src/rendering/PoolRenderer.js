@@ -10,6 +10,8 @@
 
 import { WF_ERRORS, wfError, __wf_txt, validateEntityDefinition, HAS_MOVE_BEFORE, mergeData } from '../core/wfUtils.js';
 import { reactive as rgReactive, isTracking as rgIsTracking } from '../state/reactive-graph/core.js';
+import { getContextMethod } from '../state/ContextProxy.js';
+import { TemplateLookupMethods } from './TemplateSystem.js';
 
 // Non-function keys the pool entity block actually consumes
 // (validateEntityDefinition allowlist — everything else that isn't a function
@@ -1506,7 +1508,7 @@ class DataPoolHandle extends PoolHandle {
 if (typeof __DEV__ !== 'undefined' && __DEV__) {
     for (const m of ['splice', 'pop', 'indexOf', 'slice']) {
         PoolHandle.prototype[m] = function () {
-            throw new Error(`[WF WF-414] pool.${m}() is not supported: pools use swap-with-last storage, so positions reshuffle on every removal and index-based operations would hit a different entity than intended. Use remove(key) to delete, at(i) for stable DOM-order access, and add/remove for all mutations.`);
+            throw new Error(`[WF-414] pool.${m}() is not supported: pools use swap-with-last storage, so positions reshuffle on every removal and index-based operations would hit a different entity than intended. Use remove(key) to delete, at(i) for stable DOM-order access, and add/remove for all mutations.`);
         };
     }
     PoolHandle.prototype._devAssertItemsConsistency = function () {
@@ -1618,6 +1620,8 @@ function devElsewhereAdvice(other, isPath) {
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const PoolRendererMethods = {
+    // Template lookup shared with the list renderer (TemplateSystem.js).
+    ...TemplateLookupMethods,
 
     /**
      * Set up pool containers for a component instance.
@@ -1874,25 +1878,36 @@ export const PoolRendererMethods = {
             // robust than CSS selector matching. First-match-wins: walk from
             // event.target up to entity root, fire the first data-action found.
             if (compiledMetadata && compiledMetadata.actions && compiledMetadata.actions.length > 0) {
-                // Group actions by event type, build index → method lookup
-                // actionValue format: "method" (default click) or "event:method"
-                const byEvent = new Map(); // eventType → Map<elementIndex, methodName>
+                // Group actions by event type, build index → action lookup.
+                // The attribute is parsed the way it is everywhere else
+                // (_parseActions): "method", "event:method", several of them
+                // separated by spaces, and arguments. Reading it here as one
+                // "event:method" pair made `click:a keydown:b` a click on a
+                // method named "a keydown:b", and `pick(7)` a method named
+                // "pick(7)"; neither exists, so nothing ran.
+                const byEvent = new Map(); // eventType → Map<elementIndex, { methodName, args }>
 
                 for (let i = 0; i < compiledMetadata.actions.length; i++) {
                     const action = compiledMetadata.actions[i];
-                    let eventType = 'click';
-                    const actionStr = action.actionName || action.actionValue;
-                    let method = actionStr;
-
-                    // Parse "event:method" format
-                    const colonIdx = actionStr.indexOf(':');
-                    if (colonIdx !== -1) {
-                        eventType = actionStr.slice(0, colonIdx).trim();
-                        method = actionStr.slice(colonIdx + 1).trim();
+                    const defs = this._parseActions(action.actionName || action.actionValue);
+                    for (let d = 0; d < defs.length; d++) {
+                        if (!defs[d].methodName) continue;
+                        // A bare action parses as a click. On a form it means
+                        // submit, as it does everywhere else; left as a click
+                        // it ran on every click inside the form.
+                        // (Only when the form declares no `submit:` action of
+                        // its own; beside one, a click action is a click.)
+                        let type = defs[d].eventType;
+                        if (action.isForm === true && type === 'click') {
+                            let declaresSubmit = false;
+                            for (let s = 0; s < defs.length; s++) {
+                                if (defs[s].eventType === 'submit') { declaresSubmit = true; break; }
+                            }
+                            if (!declaresSubmit) type = 'submit';
+                        }
+                        if (!byEvent.has(type)) byEvent.set(type, new Map());
+                        byEvent.get(type).set(action.index, defs[d]);
                     }
-
-                    if (!byEvent.has(eventType)) byEvent.set(eventType, new Map());
-                    byEvent.get(eventType).set(action.index, method);
                 }
 
                 // One listener per event type on the container
@@ -1913,19 +1928,25 @@ export const PoolRendererMethods = {
                         while (el && el !== element) {
                             const idx = cachedElements.indexOf(el);
                             if (idx !== -1 && indexMap.has(idx)) {
-                                const method = indexMap.get(idx);
+                                const def = indexMap.get(idx);
+                                const method = def.methodName;
+                                // Declared arguments follow the documented
+                                // (item, event) / entity (event) parameters.
+                                const args = (def.args && def.args.length > 0) ? def.args : null;
                                 // Entity method wins over component method when both exist
                                 const entityFn = item[method];
                                 if (typeof entityFn === 'function') {
                                     // An entity method is not wrapped as a
                                     // component method is: report it here.
                                     try {
-                                        entityFn.call(item, event);
+                                        if (args) entityFn.call(item, event, ...args);
+                                        else entityFn.call(item, event);
                                     } catch (error) {
                                         this._handleError(`Error in pool '${handle.name}' entity method ${method}`, error, instance, { methodName: method, pool: handle.name });
                                     }
-                                } else if (typeof ctx[method] === 'function') {
-                                    ctx[method](item, event);
+                                } else if (getContextMethod(ctx, method)) {
+                                    if (args) ctx[method](item, event, ...args);
+                                    else ctx[method](item, event);
                                 }
                                 return; // First match wins, don't continue walking
                             }
@@ -1968,7 +1989,7 @@ export const PoolRendererMethods = {
         const out = { onAdd: null, onRemove: null, onClear: null, props: null, entityComputed: null, entityMethods: null, entityStateTemplate: null };
         if (!poolDef) return out;
         const ctx = instance.context;
-        const resolve = (hook) => typeof hook === 'string' ? ctx[hook]?.bind(ctx) :
+        const resolve = (hook) => typeof hook === 'string' ? getContextMethod(ctx, hook)?.bind(ctx) :
             typeof hook === 'function' ? hook.bind(ctx) : null;
         const owner = () => instance;
         out.onAdd = guardPoolHook(this, resolve(poolDef.onAdd), owner, 'onAdd');
@@ -2052,6 +2073,36 @@ export const PoolRendererMethods = {
     },
 
     /**
+     * Flush every drawn pool now, synchronously: the flush the frame loop
+     * would run on its next frame, without the ticks. For code that moves
+     * time itself, where no animation frame comes (a renderer seeking frame
+     * by frame). A forced flush ignores data-pool-fps and counts as this
+     * frame's flush. A throw goes to the owner's onError and counts toward
+     * stopping the pool, as in the loop. Passive and data-only pools are
+     * skipped, as in the loop. The loop body is repeated here, not shared,
+     * so the per-frame path gains no call.
+     * @returns {undefined}
+     * @public
+     */
+    flushPools() {
+        const handles = this._activePoolHandles;
+        if (!handles) return;
+        const now = performance.now();
+        for (let i = 0; i < handles.length; i++) {
+            const h = handles[i];
+            if (h.size > 0) {
+                h._lastFlushTime = -Infinity;
+                try {
+                    h._flush(now);
+                    if (h._flushErrors) h._flushErrors = 0;
+                } catch (error) {
+                    if (this._flushThrew(h, error)) { handles.splice(i, 1); i--; }
+                }
+            }
+        }
+    },
+
+    /**
      * Start the shared rAF rendering loop for all active pools.
      * @private
      */
@@ -2077,11 +2128,15 @@ export const PoolRendererMethods = {
         // Tick components BEFORE pool flush (physics updates entities, flush writes to DOM)
         const tickables = this._tickableInstances;
         if (tickables && tickables.length > 0) {
-            if (!this._lastTickTime) {
+            // `== null`: a clock may start at 0, and a frame at now = 0 still
+            // sets the reference time. A clock that moves backward (a seek)
+            // ticks with dt 0.
+            if (this._lastTickTime == null) {
                 this._lastTickTime = now;
             } else {
                 let dt = now - this._lastTickTime;
                 if (dt > 250) dt = 250; // clamp
+                else if (dt < 0) dt = 0;
                 this._lastTickTime = now;
                 for (let i = 0; i < tickables.length; i++) {
                     const t = tickables[i];

@@ -178,7 +178,7 @@ describe.skipIf(isMinifiedBuild())('Reactive-graph correctness (go-live)', () =>
     expect(remaining).toBe(0)
   })
 
-  // RG-1 (review 2026-07-02): the pure-single-text direct-writer retirement
+  // RG-1: the pure-single-text direct-writer retirement
   // suppresses the graph wake AND the onStateChange dispatch (DIRECT_HANDLED).
   // A component computed that reads the same item leaves through the graph
   // (an aggregate) must therefore block the retirement; otherwise it goes

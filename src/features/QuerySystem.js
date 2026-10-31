@@ -555,7 +555,180 @@ function observeElement(controller, el) {
 const QUERY_CONFIG_KEYS = ['from', 'key', 'refresh', 'params', 'initial', 'stream', 'deleted', 'retry',
     'to', 'persist', 'select', 'create', 'headers', 'body', 'confirmation'];
 
+// Dev-only members, spread into QuerySystemMethods under __DEV__ (absent from
+// production files; every caller is inside an `if (__DEV__ ...)` block).
+const QuerySystemDevMethods = {
+    /**
+     * data-expect declaration parser (dev-only; §4b scope: field presence
+     * and primitive type, nothing else). "id:number, name:string, active"
+     * → [['id','number'],['name','string'],['active',null]]. A token that
+     * is not `field` or `field:string|number|boolean` is ignored with a
+     * WF-962 warn — the declaration never grows a vocabulary.
+     */
+    _parseQueryExpect(spec, name) {
+        if (!__DEV__) return null;
+        const out = [];
+        for (const tok of String(spec).split(',')) {
+            const t = tok.trim();
+            if (!t) continue;
+            const m = t.match(/^([a-zA-Z_$][\w$]*)(?::(string|number|boolean))?$/);
+            if (!m) {
+                wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
+                    warn: true,
+                    context: `Query "${name}": data-expect token "${t}" is not "field" or "field:string|number|boolean"; token ignored`,
+                    suggestion: 'data-expect declares shape only — presence and primitive type. Validation, coercion, and refinement belong in a wrapper around the source'
+                });
+                continue;
+            }
+            out.push([m[1], m[2] || null]);
+        }
+        return out.length > 0 ? out : null;
+    },
+
+    /**
+     * Shape-drift check at the choke point (dev-only). Missing = the field
+     * is absent from a row; drift = present, non-null, wrong primitive
+     * typeof. Null is a data condition, not drift. One warn per query per
+     * field per kind, forever — polls and streams must not flood the
+     * console with the same fact.
+     */
+    _queryExpectCheck(controller, rows, source) {
+        if (!__DEV__) return;
+        const warned = controller._expectWarned || (controller._expectWarned = new Set());
+        const src = source || 'unknown';
+        for (const [field, type] of controller.expect) {
+            for (const row of rows) {
+                if (row == null || typeof row !== 'object') continue;
+                if (!(field in row)) {
+                    if (!warned.has(field + ':missing')) {
+                        warned.add(field + ':missing');
+                        wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
+                            warn: true,
+                            context: `Query "${controller.name}": declared field "${field}" is missing from incoming rows (source: ${src})`,
+                            suggestion: `Fix the source's response mapping, or remove "${field}" from data-expect if the source no longer ships it`
+                        });
+                    }
+                    break;
+                }
+                const v = row[field];
+                if (type && v != null && typeof v !== type) {
+                    if (!warned.has(field + ':type')) {
+                        warned.add(field + ':type');
+                        wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
+                            warn: true,
+                            context: `Query "${controller.name}": declared field "${field}" expected ${type}, got ${typeof v} (source: ${src})`,
+                            suggestion: src === 'ssr'
+                                ? `SSR-adopted cells parse as strings unless the bound element declares data-type="${type}"`
+                                : `Align the source field type or update the data-expect declaration`
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    },
+
+    /**
+     * WF-963 (§7): a [data-query] element outside any component is a
+     * silent no-op — the transform runs during component binding, so
+     * nothing ever processes it. Dev-only post-scan sweep, no standing
+     * observer. The predicate is structural (presence of a component
+     * ATTRIBUTE on an ancestor), so a component whose async init has not
+     * finished yet never false-positives.
+     */
+    _queryOrphanSweep(root) {
+        if (!__DEV__) return;
+        if (!root || !root.querySelectorAll) return;
+        const els = [];
+        const querySel = this._attrSelector('query');
+        if (root.matches && root.matches(querySel)) els.push(root);
+        root.querySelectorAll(querySel).forEach((el) => els.push(el));
+        for (const el of els) {
+            if (el._wfQueryBound || el._wfQueryOrphanWarned) continue;
+            if (el.closest(this._attrSelector('component'))) continue;
+            el._wfQueryOrphanWarned = true;
+            const name = this._getAttr(el, 'query') || '(unnamed)';
+            wfError(WF_ERRORS.QUERY_ORPHAN, {
+                warn: true,
+                context: `data-query="${name}" has no component ancestor; queries bind during component binding, so this element renders nothing`,
+                suggestion: `Wrap it in a component — an empty definition is enough: wildflower.component('shell', {}) + <div data-component="shell">`
+            });
+        }
+    },
+
+    /**
+     * WF-986 (bug-history survey ruling #2): declared headers rode a
+     * cross-origin redirect. The platform strips exactly one header on
+     * the hop — Authorization — and forwards the rest, and no framework
+     * code runs between the two requests, so the engine can only notice
+     * the leak, never prevent it. Named once per query through the R15
+     * warnOnce gate (a redirecting endpoint is a standing condition),
+     * for reads and writes alike, superseded responses included — the
+     * request was made either way. The scrub-by-header-name alternative
+     * is the one undici shipped three times (Authorization, then the
+     * Cookie and Proxy-Authorization CVEs) and is wrong by construction:
+     * the list is always missing one.
+     */
+    _queryWarnRedirect(controller, requestUrl, resp, declaredCount) {
+        // Both call sites are already __DEV__-guarded, so this changes no
+        // behaviour — it lets a production build fold the body away instead
+        // of shipping it unreachable. See _queryOrphanSweep.
+        if (!__DEV__) return;
+        if (declaredCount === 0 || !resp || !resp.redirected) return;
+        const from = urlOrigin(requestUrl);
+        const to = urlOrigin(resp.url || '');
+        if (from === to) return;
+        if (!warnOnce(controller, WF_ERRORS.QUERY_REDIRECT_CROSS_ORIGIN)) return;
+        wfError(WF_ERRORS.QUERY_REDIRECT_CROSS_ORIGIN, {
+            warn: true,
+            context: `Query "${controller.name}": the request to ${from} was redirected to ${to}, and the declared headers rode along — the platform strips only Authorization on a cross-origin hop`,
+            suggestion: 'If the redirect is expected, point the URL at its final destination so the request starts where it ends; if it is not, credentials are leaving the origin they were declared for'
+        });
+    },
+
+    /**
+     * WF-993 (survey pass two, Lane F #4): a config({ headers }) key no
+     * request can ever match — the wrong scheme, an explicit port the
+     * request URLs never spell (`:443`), an http key beside https
+     * queries — means the credential never ships, with no trace: the
+     * request is legal, the server just never sees the header. Origins
+     * compare exactly, and the engine must not loosen the match (the
+     * scoping IS the security property); what it can do is notice the
+     * NEAR-miss — same host, different scheme or port — at the first
+     * request that fails it, and name both sides. Once per declared key,
+     * reset when the config object changes. The document's own origin is
+     * excluded as a candidate: a `self` declaration hit by another local
+     * port is a deliberate scope, not a misspelling of the request's
+     * origin. A declared origin whose host no request ever touches stays
+     * silent — there is nothing to compare it against.
+     */
+    _queryHeadersOriginMiss(controller, origin, defaults) {
+        if (!__DEV__) return;
+        const hostOf = (o) => {
+            const i = o.indexOf('//');
+            const h = i >= 0 ? o.slice(i + 2) : o;
+            return h.replace(/:\d+$/, '');
+        };
+        const oh = hostOf(origin);
+        if (!oh) return;
+        const selfOrigin = urlOrigin('');
+        for (const declared of defaults.keys()) {
+            if (declared === selfOrigin || hostOf(declared) !== oh) continue;
+            if (!this._queryHeaderMissWarned) this._queryHeaderMissWarned = new Set();
+            if (this._queryHeaderMissWarned.has(declared)) return;
+            this._queryHeaderMissWarned.add(declared);
+            wfError(WF_ERRORS.QUERY_HEADERS_ORIGIN_MISS, {
+                warn: true,
+                context: `config({ headers }): "${declared}" never matches this request's origin "${origin}" (query "${controller.name}") — same host, but origins compare exactly on scheme, host, and port, so those headers are not sent`,
+                suggestion: `Key the entry by the exact origin the requests use ('${origin}'), or 'self' for the document's own origin`
+            });
+            return;
+        }
+    },
+};
+
 export const QuerySystemMethods = {
+    ...(__DEV__ ? QuerySystemDevMethods : {}),
 
     /**
      * Register a named query. Global, like stores. See DESIGN.md for the
@@ -1231,7 +1404,7 @@ export const QuerySystemMethods = {
             // IS the seed; parse it back into the store before anything
             // renders. An explicit initial: wins over the parse.
             if (el.closest(this._attrSelector('ssr', 'true'))) {
-                this._queryAdoptSSRContent(controller, el, hasTemplate);
+                this._queryAdoptSSRContent(controller, el, hasTemplate, instance);
             }
             if (!hasTemplate) {
                 // RECORD shape: the subtree binds to the single result record
@@ -1387,8 +1560,10 @@ export const QuerySystemMethods = {
      * (the machine truth beats the display text). Without a rendered or
      * seeded key, the first CHANGED result rebuilds the list once instead
      * of patching. An explicit initial: always wins over the whole parse.
+     * Lists nested in a row are parsed into that row (SSRManager
+     * _parseQueryRowLists), as the rows of a data-list are.
      */
-    _queryAdoptSSRContent(controller, el, isList) {
+    _queryAdoptSSRContent(controller, el, isList, instance) {
         const store = this.getStore(controller.name);
         if (!store) return;
         // Rows installed by a persist restore do NOT block adoption: the
@@ -1431,6 +1606,9 @@ export const QuerySystemMethods = {
             const nodes = [];
             if (root.hasAttribute && this._hasAttr(root, 'bind')) nodes.push(root);
             root.querySelectorAll(BIND_SEL).forEach((n) => nodes.push(n));
+            // A row that is itself a list (<tr data-list="cells">): the
+            // bindings inside it belong to its own rows.
+            const rootIsList = root !== el && this._hasAttr(root, 'list');
             for (const n of nodes) {
                 // Boundary guard (mirrors SSRManager's list-parse discipline):
                 // a binding whose nearest list/query container is NOT this
@@ -1438,7 +1616,7 @@ export const QuerySystemMethods = {
                 // row/record.
                 if (n !== root) {
                     const container = n.closest(CONTAINERS);
-                    if (container !== el && container !== root) continue;
+                    if (container !== el && (container !== root || rootIsList)) continue;
                 }
                 const field = this._getAttr(n, 'bind');
                 if (!field || !SIMPLE.test(field)) continue;
@@ -1483,9 +1661,16 @@ export const QuerySystemMethods = {
             // hydration's map in _trySSRHydrationForMapArray).
             const adoptedByKey = new Map();
             const keyProp = controller.key;
+            const keyed = typeof controller.config.key === 'string';
             for (const child of el.children) {
                 if (child.tagName === 'TEMPLATE') continue;
                 const row = readFields(child, {});
+                // A row with no field or seed of its own has no key: a keyed
+                // query does not adopt it.
+                if (keyed && Object.keys(row).length === 0) continue;
+                // Its nested lists are parsed into it (a path its fields or
+                // seed already set keeps that value).
+                if (__FEATURE_SSR__ && this.ssrManager) this.ssrManager._parseQueryRowLists(child, el, row, instance);
                 if (Object.keys(row).length > 0) {
                     rows.push(row);
                     if (row[keyProp] !== undefined) adoptedByKey.set(row[keyProp], child);
@@ -1599,7 +1784,7 @@ export const QuerySystemMethods = {
         }
 
         let mode = patch ? 'patch' : append ? 'append' : (controller.accumulated && gentle ? 'merge' : 'replace');
-        // Scan the WHOLE page (review A2): checking only live[0] let a mixed
+        // Scan the WHOLE page: checking only live[0] let a mixed
         // keyed/unkeyed payload slip the guard — its unkeyed rows entered the
         // accumulation once, then vanished from every later page (the seen
         // set held `undefined` from then on).
@@ -1908,104 +2093,6 @@ export const QuerySystemMethods = {
         if (controller.persistKey && controller.pendingWrites === 0 &&
             (source === 'fetch' || source === 'stream' || reconcile)) {
             this._queryPersistSave(controller, nextRows, source === 'fetch');
-        }
-    },
-
-    /**
-     * data-expect declaration parser (dev-only; §4b scope: field presence
-     * and primitive type, nothing else). "id:number, name:string, active"
-     * → [['id','number'],['name','string'],['active',null]]. A token that
-     * is not `field` or `field:string|number|boolean` is ignored with a
-     * WF-962 warn — the declaration never grows a vocabulary.
-     */
-    _parseQueryExpect(spec, name) {
-        if (!__DEV__) return null;
-        const out = [];
-        for (const tok of String(spec).split(',')) {
-            const t = tok.trim();
-            if (!t) continue;
-            const m = t.match(/^([a-zA-Z_$][\w$]*)(?::(string|number|boolean))?$/);
-            if (!m) {
-                wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
-                    warn: true,
-                    context: `Query "${name}": data-expect token "${t}" is not "field" or "field:string|number|boolean"; token ignored`,
-                    suggestion: 'data-expect declares shape only — presence and primitive type. Validation, coercion, and refinement belong in a wrapper around the source'
-                });
-                continue;
-            }
-            out.push([m[1], m[2] || null]);
-        }
-        return out.length > 0 ? out : null;
-    },
-
-    /**
-     * Shape-drift check at the choke point (dev-only). Missing = the field
-     * is absent from a row; drift = present, non-null, wrong primitive
-     * typeof. Null is a data condition, not drift. One warn per query per
-     * field per kind, forever — polls and streams must not flood the
-     * console with the same fact.
-     */
-    _queryExpectCheck(controller, rows, source) {
-        if (!__DEV__) return;
-        const warned = controller._expectWarned || (controller._expectWarned = new Set());
-        const src = source || 'unknown';
-        for (const [field, type] of controller.expect) {
-            for (const row of rows) {
-                if (row == null || typeof row !== 'object') continue;
-                if (!(field in row)) {
-                    if (!warned.has(field + ':missing')) {
-                        warned.add(field + ':missing');
-                        wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
-                            warn: true,
-                            context: `Query "${controller.name}": declared field "${field}" is missing from incoming rows (source: ${src})`,
-                            suggestion: `Fix the source's response mapping, or remove "${field}" from data-expect if the source no longer ships it`
-                        });
-                    }
-                    break;
-                }
-                const v = row[field];
-                if (type && v != null && typeof v !== type) {
-                    if (!warned.has(field + ':type')) {
-                        warned.add(field + ':type');
-                        wfError(WF_ERRORS.QUERY_EXPECT_DRIFT, {
-                            warn: true,
-                            context: `Query "${controller.name}": declared field "${field}" expected ${type}, got ${typeof v} (source: ${src})`,
-                            suggestion: src === 'ssr'
-                                ? `SSR-adopted cells parse as strings unless the bound element declares data-type="${type}"`
-                                : `Align the source field type or update the data-expect declaration`
-                        });
-                    }
-                    break;
-                }
-            }
-        }
-    },
-
-    /**
-     * WF-963 (§7): a [data-query] element outside any component is a
-     * silent no-op — the transform runs during component binding, so
-     * nothing ever processes it. Dev-only post-scan sweep, no standing
-     * observer. The predicate is structural (presence of a component
-     * ATTRIBUTE on an ancestor), so a component whose async init has not
-     * finished yet never false-positives.
-     */
-    _queryOrphanSweep(root) {
-        if (!__DEV__) return;
-        if (!root || !root.querySelectorAll) return;
-        const els = [];
-        const querySel = this._attrSelector('query');
-        if (root.matches && root.matches(querySel)) els.push(root);
-        root.querySelectorAll(querySel).forEach((el) => els.push(el));
-        for (const el of els) {
-            if (el._wfQueryBound || el._wfQueryOrphanWarned) continue;
-            if (el.closest(this._attrSelector('component'))) continue;
-            el._wfQueryOrphanWarned = true;
-            const name = this._getAttr(el, 'query') || '(unnamed)';
-            wfError(WF_ERRORS.QUERY_ORPHAN, {
-                warn: true,
-                context: `data-query="${name}" has no component ancestor; queries bind during component binding, so this element renders nothing`,
-                suggestion: `Wrap it in a component — an empty definition is enough: wildflower.component('shell', {}) + <div data-component="shell">`
-            });
         }
     },
 
@@ -3246,7 +3333,7 @@ export const QuerySystemMethods = {
                     item = mergeData({}, item, { [controller.deletedField]: true });
                 }
             } else if (__DEV__) {
-                // One mistake, one warning (review A3): the same call would
+                // One mistake, one warning: the same call would
                 // also trip WF-976 below (a tombstone-less delete carries
                 // only the key), and WF-976's include-the-fields advice is
                 // wrong for a delete. This flag suppresses the second warn.
@@ -4176,36 +4263,6 @@ export const QuerySystemMethods = {
     },
 
     /**
-     * WF-986 (bug-history survey ruling #2): declared headers rode a
-     * cross-origin redirect. The platform strips exactly one header on
-     * the hop — Authorization — and forwards the rest, and no framework
-     * code runs between the two requests, so the engine can only notice
-     * the leak, never prevent it. Named once per query through the R15
-     * warnOnce gate (a redirecting endpoint is a standing condition),
-     * for reads and writes alike, superseded responses included — the
-     * request was made either way. The scrub-by-header-name alternative
-     * is the one undici shipped three times (Authorization, then the
-     * Cookie and Proxy-Authorization CVEs) and is wrong by construction:
-     * the list is always missing one.
-     */
-    _queryWarnRedirect(controller, requestUrl, resp, declaredCount) {
-        // Both call sites are already __DEV__-guarded, so this changes no
-        // behaviour — it lets a production build fold the body away instead
-        // of shipping it unreachable. See _queryOrphanSweep.
-        if (!__DEV__) return;
-        if (declaredCount === 0 || !resp || !resp.redirected) return;
-        const from = urlOrigin(requestUrl);
-        const to = urlOrigin(resp.url || '');
-        if (from === to) return;
-        if (!warnOnce(controller, WF_ERRORS.QUERY_REDIRECT_CROSS_ORIGIN)) return;
-        wfError(WF_ERRORS.QUERY_REDIRECT_CROSS_ORIGIN, {
-            warn: true,
-            context: `Query "${controller.name}": the request to ${from} was redirected to ${to}, and the declared headers rode along — the platform strips only Authorization on a cross-origin hop`,
-            suggestion: 'If the redirect is expected, point the URL at its final destination so the request starts where it ends; if it is not, credentials are leaving the origin they were declared for'
-        });
-    },
-
-    /**
      * Record the rows a resolved URL produced, and remember that this URL is
      * what is now on screen. Insertion ordered, so the oldest entry is the
      * first key and re-inserting on a hit refreshes recency.
@@ -4385,46 +4442,6 @@ export const QuerySystemMethods = {
         }
         merge(controller.config.headers);   // the query's own declaration wins
         return out;
-    },
-
-    /**
-     * WF-993 (survey pass two, Lane F #4): a config({ headers }) key no
-     * request can ever match — the wrong scheme, an explicit port the
-     * request URLs never spell (`:443`), an http key beside https
-     * queries — means the credential never ships, with no trace: the
-     * request is legal, the server just never sees the header. Origins
-     * compare exactly, and the engine must not loosen the match (the
-     * scoping IS the security property); what it can do is notice the
-     * NEAR-miss — same host, different scheme or port — at the first
-     * request that fails it, and name both sides. Once per declared key,
-     * reset when the config object changes. The document's own origin is
-     * excluded as a candidate: a `self` declaration hit by another local
-     * port is a deliberate scope, not a misspelling of the request's
-     * origin. A declared origin whose host no request ever touches stays
-     * silent — there is nothing to compare it against.
-     */
-    _queryHeadersOriginMiss(controller, origin, defaults) {
-        if (!__DEV__) return;
-        const hostOf = (o) => {
-            const i = o.indexOf('//');
-            const h = i >= 0 ? o.slice(i + 2) : o;
-            return h.replace(/:\d+$/, '');
-        };
-        const oh = hostOf(origin);
-        if (!oh) return;
-        const selfOrigin = urlOrigin('');
-        for (const declared of defaults.keys()) {
-            if (declared === selfOrigin || hostOf(declared) !== oh) continue;
-            if (!this._queryHeaderMissWarned) this._queryHeaderMissWarned = new Set();
-            if (this._queryHeaderMissWarned.has(declared)) return;
-            this._queryHeaderMissWarned.add(declared);
-            wfError(WF_ERRORS.QUERY_HEADERS_ORIGIN_MISS, {
-                warn: true,
-                context: `config({ headers }): "${declared}" never matches this request's origin "${origin}" (query "${controller.name}") — same host, but origins compare exactly on scheme, host, and port, so those headers are not sent`,
-                suggestion: `Key the entry by the exact origin the requests use ('${origin}'), or 'self' for the document's own origin`
-            });
-            return;
-        }
     },
 
     /**

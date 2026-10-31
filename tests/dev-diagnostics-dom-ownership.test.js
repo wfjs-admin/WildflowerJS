@@ -67,7 +67,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode DOM-ownership diagnostics', () => {
 
         const found = ownershipWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-105]')
+        expect(found[0]).toContain('[WF-105]')
         expect(found[0]).toContain('Manual .text() overwrite on bound node')
     })
 

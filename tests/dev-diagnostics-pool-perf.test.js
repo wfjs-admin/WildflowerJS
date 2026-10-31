@@ -63,10 +63,10 @@ describe.skipIf(isMinifiedBuild() || !hasFeature('pools'))('Dev-mode pool perfor
     // Match only the main diagnostic line — wfError also prints a docs-URL
     // line containing the bare code, which must not inflate the count.
     function shapeWarnings() {
-        return warnings.filter(w => w.includes('[WF WF-410]'))
+        return warnings.filter(w => w.includes('[WF-410]'))
     }
     function budgetWarnings() {
-        return warnings.filter(w => w.includes('[WF WF-411]'))
+        return warnings.filter(w => w.includes('[WF-411]'))
     }
 
     // ------------------------------------------------- row 5: mixed shapes

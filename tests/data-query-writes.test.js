@@ -442,10 +442,9 @@ suite('data-query writes — write(): one option, one method', () => {
         delete wildflower._queryRetryBaseMs
     })
 
-    // 8 — UPDATED after review: every write()/create() failure REJECTS.
-    // This used to pin a synchronous throw, which was the two-rule contract
-    // the review flagged: three declaration mistakes threw before a promise
-    // existed (so .catch never attached) while two data mistakes rejected.
+    // 8 — every write()/create() failure REJECTS. A synchronous throw would
+    // make a two-rule contract: three declaration mistakes throwing before a
+    // promise exists (so .catch never attaches) while two data mistakes reject.
     it('write() with no `to` declared rejects WF-964', async () => {
         const q = uname('q'); const c = uname('c')
         window.fetch = async () => jsonResponse([{ id: 1, title: 'a', done: false }])
@@ -1911,9 +1910,8 @@ suite('data-query writes — write(): one option, one method', () => {
         expect(controller.fieldClaims.size).toBe(0)
     })
 
-    // 44 — review finding C, which testing
-    // WITHDREW. Kept as a characterization: the mechanism below is real, the
-    // defect it was reported as is not, and this pins the difference so the
+    // 44 — a characterization: the mechanism below is real, but it is not a
+    // permanent defect, and this pins the difference so the
     // same conclusion is not re-derived from reading the code again.
     //
     // Test 43 covers both writes REJECTING. This covers the delete SUCCEEDING
@@ -1975,8 +1973,8 @@ suite('data-query writes — write(): one option, one method', () => {
 
         // THE WINDOW. The delete is confirmed and its catch-up fetch has landed
         // omitting the row, but the later write is still unsettled and its
-        // create claim holds the row on screen. This is the state the review
-        // called a permanent ghost; recorded here as what it actually is, a
+        // create claim holds the row on screen. This state looks
+        // like a permanent ghost but is only a
         // window bounded by the second write settling.
         const ghostWhilePending = h.rows.some((r) => r.id === 1)
         expect(ghostWhilePending,
@@ -2094,7 +2092,7 @@ suite('data-query writes — write(): one option, one method', () => {
             .toEqual({ id: 1, title: 'Buy milk', done: true })
     })
 
-    // 49 — review finding. A
+    // 49 — A
     // confirmation carrying the key as an explicit null slipped the
     // keyless guard (which tested `=== undefined` only), rode the
     // tmp-id rename machinery with null as the "corrected" key, and the
@@ -2124,7 +2122,7 @@ suite('data-query writes — write(): one option, one method', () => {
         expect(controller.keyAliases.size, 'no alias registered for a null "rename"').toBe(0)
     })
 
-    // 50 — review finding. RFC 7396's MergePatch is RECURSIVE: when both the
+    // 50 — RFC 7396's MergePatch is RECURSIVE: when both the
     // row's field and the resolved field are plain objects, absent nested
     // members survive too. A shallow merge would reintroduce the exact
     // absence-drops-fields bug one level down. The nested partial comes
@@ -2198,7 +2196,7 @@ suite('data-query writes — write(): one option, one method', () => {
         expect(h.rows[0].title).toBe('Buy milk')
     })
 
-    // 53 — review finding. Naming an operation on a function `to` REJECTS
+    // 53 — Naming an operation on a function `to` REJECTS
     // (it used to throw a bare Error with no WF code, before any promise
     // existed, so the .catch an author attached never ran). The docs have
     // always attributed this case to WF-974; now the code agrees.
@@ -2219,7 +2217,7 @@ suite('data-query writes — write(): one option, one method', () => {
         expect(String(caught)).toMatch(/operation hint/)
     })
 
-    // 54 — review finding, the refactor-typo shape: an undeclared operation
+    // 54 — the refactor-typo shape: an undeclared operation
     // name rejects with the declared list in the message, applies nothing
     // optimistically, and sends nothing.
     it('an undeclared operation name rejects, catchably, touching nothing', async () => {

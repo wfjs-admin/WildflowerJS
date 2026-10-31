@@ -8,7 +8,7 @@
  * keeps receiving applies behind its placeholder, and re-reveal must show
  * values written WHILE hidden (nested revealed-subtree freshness).
  *
- * NMU-B: the reviewer's exact shape — a SHARED store dep read by an item
+ * NMU-B: a SHARED store dep read by an item
  * computed that gates data-render; flipping the store field wakes the parent
  * list's STABLE effect, whose synchronous re-apply flips every row's render
  * off, unmounting ALL child lists inside the stable effect's own run. Then a
@@ -103,7 +103,7 @@ describe('Nested child-list unmount inside a parent apply', () => {
         // subVisible is an item computed reading a SHARED store dep: the store
         // read gives the parent list's stable effect its external edge, so
         // flipping cfg.on drives the flip through the stable effect's own
-        // synchronous full-row re-applies (the reviewer's mid-flush shape).
+        // synchronous full-row re-applies (the mid-flush shape).
         wildflower.component('nmu-b', {
             state: {
                 items: [

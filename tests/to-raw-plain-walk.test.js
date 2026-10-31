@@ -50,7 +50,7 @@ describe('toRaw walks plain data', () => {
       wildflower.toRaw(s.list)
       await wait(30)
     }
-    expect(warnings.filter((w) => w.includes('[WF WF-216]'))).toEqual([])
+    expect(warnings.filter((w) => w.includes('[WF-216]'))).toEqual([])
   })
 
   it('a computed that copies through toRaw does not track what it copied', async () => {

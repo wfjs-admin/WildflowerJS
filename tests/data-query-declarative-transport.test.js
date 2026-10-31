@@ -71,7 +71,7 @@ suite('data-query: declarative transport form', () => {
         container = null
     })
 
-    const warnsWith = (code) => warnings.filter((w) => w.includes('[WF ' + code + ']'))
+    const warnsWith = (code) => warnings.filter((w) => w.includes('[' + code + ']'))
 
     // Records the whole request, not just the URL: a wrong verb, a missing body
     // and an unsent header are all silent failures the URL alone cannot show.

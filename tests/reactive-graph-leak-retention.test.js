@@ -287,7 +287,7 @@ describe.skipIf(isMinifiedBuild())('Reactive-graph retention', () => {
     expect(pulses).toBe(pulsesAtDestroy)
   })
 
-  // RG-2 (review 2026-07-02): the TOP-LEVEL data-list structural effect is a raw
+  // RG-2: the TOP-LEVEL data-list structural effect is a raw
   // core effect stored only on element._disposeMapArray, so it is in no set the
   // destroy sweep iterates. For a list fed (via a computed) from a long-lived
   // store, the store nodes keep observer back-edges to it: after

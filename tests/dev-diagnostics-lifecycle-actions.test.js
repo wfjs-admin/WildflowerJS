@@ -58,7 +58,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode lifecycle-name action warnings (A2)
 
         const found = lifecycleWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-604]')
+        expect(found[0]).toContain('[WF-604]')
         expect(found[0]).toContain("'tick'")
         expect(found[0]).toContain('every animation frame')
     })

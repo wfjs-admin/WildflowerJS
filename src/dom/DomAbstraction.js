@@ -361,7 +361,15 @@ export const DomAbstractionMethods = {
         };
 
 
-        if (hasAttr(element))
+        // A value binding on a nested component's own root is read by the
+        // root's owner (_rootOwnerElement), not by this component: collecting
+        // it here bound a root data-model to this component's state and
+        // validated root bindings against it. This path runs for every
+        // instance whose markup differs from the first one's, which includes
+        // instances that differ only in their root bindings. A top-level root
+        // keeps its own. A list or pool container keeps its existing owner.
+        const container = attribute === 'data-list' || attribute === 'data-pool';
+        if (hasAttr(element) && (container || !this._rootOwnerElement(element)))
         {
             const path = getPath(element);
             safelyAddElement(element, path);
@@ -381,18 +389,19 @@ export const DomAbstractionMethods = {
                 continue; // Skip this entire subtree
             }
 
-            // Skip children of data-list containers in SSR components; SSR list items
-            // exist as real DOM elements before the list renderer runs
-            if (this._hasAttr(current, 'list') && current.closest(this._attrSelector('ssr', 'true')))
-            {
-                continue; // Skip this entire subtree
-            }
-
             // If this element has the attribute we're looking for, collect it
             if (hasAttr(current))
             {
                 const path = getPath(current);
                 safelyAddElement(current, path);
+            }
+
+            // Skip children of data-list containers in SSR components; SSR list items
+            // exist as real DOM elements before the list renderer runs. The
+            // container itself is collected above: it is this component's list.
+            if (this._hasAttr(current, 'list') && current.closest(this._attrSelector('ssr', 'true')))
+            {
+                continue; // Skip this entire subtree
             }
 
             // Add this element's children to the processing queue

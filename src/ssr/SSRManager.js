@@ -321,8 +321,11 @@ export class SSRManager {
         ssrAdoptedElements.add(element);
         this.protectedElements.add(element);
 
-        // Parse state from server-rendered content
-        const parsedState = this._parseSSRState(element);
+        // Parse state from server-rendered content. Rows of lists nested in a
+        // row over a dotted path wait in `deferred` until the definition is
+        // known (enhanceDefinition): such a list may read the component.
+        const deferred = [];
+        const parsedState = this._parseSSRState(element, deferred);
 
         // Protect all lists within this component
         this._protectListsInComponent(element);
@@ -331,6 +334,7 @@ export class SSRManager {
         this.ssrComponents.set(element, {
             phase: SSRPhase.PROTECTED,
             parsedState: parsedState,
+            deferred,
             timestamp: Date.now()
         });
 
@@ -380,6 +384,19 @@ export class SSRManager {
             const declared = originalDefinition.state || {};
             for (const key of Object.keys(parsedState)) {
                 if (key in computedDefs && !(key in declared)) delete parsedState[key];
+            }
+        }
+
+        // A list nested in a row over a dotted path reads the component (or
+        // a $ source) when the AUTHORED definition declares the path's head;
+        // the client applies the same test (_rowListReadsComponent), and
+        // parsed state never counts. Only the other lists' server rows are
+        // fields of their row item.
+        if (ssrData && ssrData.deferred) {
+            for (const d of ssrData.deferred) {
+                if (!d.path.includes('$') && !this.wildflower._declaresListHead(originalDefinition, d.path)) {
+                    pathResolver.set(d.item, d.path, d.rows);
+                }
             }
         }
 
@@ -539,6 +556,10 @@ export class SSRManager {
                 // But framework will handle all future operations normally
             }
         });
+
+        // Lists whose state no longer matched their server rows when they
+        // hydrated are taken over now that every list here is COMPLETE.
+        if (this.wildflower._ssrTakeOverPending) this.wildflower._ssrTakeOverPending(listElements);
     }
 
     /**
@@ -673,11 +694,11 @@ export class SSRManager {
     /**
      * Parse state from SSR DOM content
      */
-    _parseSSRState(element) {
+    _parseSSRState(element, deferred = []) {
         const state = {};
 
         // First, parse lists (they need special handling)
-        this._parseListsIntoState(element, state);
+        this._parseListsIntoState(element, state, deferred);
 
         // Then parse individual bindings that are NOT inside lists
         const bindElements = element.querySelectorAll(this._sel('bind') + ',' + this._sel('model'));
@@ -701,8 +722,11 @@ export class SSRManager {
             if (el.closest(this._sel('query')) || el.closest(this._sel('pool'))) {
                 return;
             }
+            // A binding on a nested component's own root reads the component
+            // around it (_rootOwnerElement), so it is this one's when that is us.
             const owner = el.closest(this._sel('component'));
-            if (owner && owner !== element) {
+            if (owner && owner !== element
+                && !(owner === el && this.wildflower._rootOwnerElement(el) === element)) {
                 return;
             }
 
@@ -743,7 +767,7 @@ export class SSRManager {
     /**
      * Parse lists from SSR DOM into state arrays
      */
-    _parseListsIntoState(element, state) {
+    _parseListsIntoState(element, state, deferred) {
         const listElements = element.querySelectorAll(this._sel('list'));
 
         listElements.forEach(listEl => {
@@ -753,8 +777,61 @@ export class SSRManager {
             if (listEl.parentElement && listEl.parentElement.closest(this._sel('list'))) {
                 return;
             }
-            pathResolver.set(state, this._attr(listEl, 'list'), this._parseListElement(listEl));
+            // A list in the rows of a data-query list (its <template> child
+            // marks the list shape; the element becomes a list at component
+            // init, after this parse) belongs to those rows: the query's
+            // adoption parses it (_parseQueryRowLists).
+            const query = listEl.parentElement && listEl.parentElement.closest(this._sel('query'));
+            if (query && element.contains(query) && query.querySelector(':scope > template')) {
+                return;
+            }
+            pathResolver.set(state, this._listPath(listEl), this._parseListElement(listEl, deferred));
         });
+    }
+
+    /**
+     * Parse the lists in one server row of a data-query list into that row,
+     * as _parseListElement does for the rows of a data-list. Called by the
+     * query's SSR adoption. A list that reads the component (a $ source, or
+     * a dotted path whose head the component declares) is not a field of the
+     * row: it mounts from the component, as in plain server rows
+     * (enhanceDefinition). A path the row's fields or data-seed already set
+     * keeps that value.
+     * @param {HTMLElement} rowEl - the server row
+     * @param {HTMLElement} queryEl - the data-query element
+     * @param {Object} row - the parsed row
+     * @param {Object} instance - the owning component instance, if known
+     */
+    _parseQueryRowLists(rowEl, queryEl, row, instance) {
+        const containers = this._sel('list') + ',' + this._sel('query');
+        const deferred = [];
+        const lists = [...rowEl.querySelectorAll(this._sel('list'))];
+        if (this._attr(rowEl, 'list')) lists.unshift(rowEl);
+        for (const nl of lists) {
+            if (nl !== rowEl) {
+                if (nl.parentElement.closest(containers) !== queryEl) continue;
+                // A list inside a child component in this row is the child's.
+                let inChild = false;
+                for (let cur = nl.parentElement; cur && cur !== rowEl; cur = cur.parentElement) {
+                    if (cur.matches(this._sel('component'))) { inChild = true; break; }
+                }
+                if (inChild) continue;
+            }
+            deferred.push({ item: row, path: this._listPath(nl), rows: this._parseListElement(nl, deferred) });
+        }
+        for (const d of deferred) {
+            if (!this.wildflower._rowListReadsComponent(instance, d.path) && pathResolver.get(d.item, d.path) === undefined) {
+                pathResolver.set(d.item, d.path, d.rows);
+            }
+        }
+    }
+
+    /**
+     * A list element's path without the optional computed: prefix
+     * (computed:menu.items is menu.items).
+     */
+    _listPath(listEl) {
+        return this.wildflower._listPathBare(this._attr(listEl, 'list'));
     }
 
     /**
@@ -764,7 +841,7 @@ export class SSRManager {
      * item loses its nested array and a post-activation re-render of the parent
      * list draws the inner lists empty.
      */
-    _parseListElement(listEl) {
+    _parseListElement(listEl, deferred = []) {
         const listItems = [];
         const template = listEl.querySelector('template');
         const itemElements = Array.from(listEl.children).filter(child =>
@@ -795,10 +872,27 @@ export class SSRManager {
             // First-level nested lists inside this item → recurse into item state.
             const nestedLists = itemEl.querySelectorAll(this._sel('list'));
             nestedLists.forEach(nl => {
-                if (nl.parentElement && nl.parentElement.closest(this._sel('list')) === listEl) {
-                    pathResolver.set(itemState, this._attr(nl, 'list'), this._parseListElement(nl));
+                if (!nl.parentElement || nl.parentElement.closest(this._sel('list')) !== listEl) return;
+                // A list inside a child component in this row is the child's
+                // (the rule _nestedListsOfRow applies), not a field of this item.
+                for (let cur = nl.parentElement; cur; cur = cur.parentElement) {
+                    if (cur.matches(this._sel('component'))) return;
+                    if (cur === itemEl) break;
                 }
+                const path = this._listPath(nl);
+                const rows = this._parseListElement(nl, deferred);
+                // A dotted path may read the component, not the item: that is
+                // settled once the definition is known (enhanceDefinition).
+                if (path.indexOf('.') > 0) deferred.push({ item: itemState, path, rows });
+                else pathResolver.set(itemState, path, rows);
             });
+            // A row that is itself a list (<tr data-list="cells">): its rows are this item's array.
+            const ownList = this._attr(itemEl, 'list') && this._listPath(itemEl);
+            if (ownList) {
+                const rows = this._parseListElement(itemEl, deferred);
+                if (ownList.indexOf('.') > 0) deferred.push({ item: itemState, path: ownList, rows });
+                else pathResolver.set(itemState, ownList, rows);
+            }
 
             // data-seed on the item root: unrendered item fields (ids, flags).
             const itemSeed = this._readSeedAttribute(itemEl);

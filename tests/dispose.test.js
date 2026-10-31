@@ -3,7 +3,6 @@
  *
  * Tests that _dispose() clears the context registry GC interval
  * and releases resources when the framework instance is torn down.
- * Covers issue 2.19 from V1 RC1 Final Code Review.
  */
 
 import { describe, it, expect, beforeAll } from 'vitest'

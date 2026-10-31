@@ -57,7 +57,7 @@ suite('orphan data-query diagnostic (WF-963)', () => {
         container = null
     })
 
-    const wf963 = () => warnings.filter(w => w.includes('[WF WF-963]'))
+    const wf963 = () => warnings.filter(w => w.includes('[WF-963]'))
 
     devIt('an orphan data-query element warns once, naming the query', async () => {
         const q = uname('q')

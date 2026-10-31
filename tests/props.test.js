@@ -2221,6 +2221,27 @@ describe('Props System', () => {
             expect(document.getElementById('lit-title').textContent).toBe('Custom Title');
         });
 
+        it('treats non-identifier values as string literals on a component with no parent component', async () => {
+            wf.component('lit-orphan', {
+                props: { title: { default: 'fallback' }, path: { default: 'fallback' } }
+            });
+
+            container.innerHTML = `
+                <div data-component="lit-orphan" data-prop-title="Custom Title" data-prop-path="cardTitle">
+                    <span id="orphan-title" data-bind="props.title"></span>
+                    <span id="orphan-path" data-bind="props.path"></span>
+                </div>
+            `;
+            wf.scan();
+            await waitForInit();
+            await new Promise(r => setTimeout(r, 100));
+
+            // Text that could not be a state name is the text itself, parent or not;
+            // a valid identifier with nothing to resolve it against keeps the default.
+            expect(document.getElementById('orphan-title').textContent).toBe('Custom Title');
+            expect(document.getElementById('orphan-path').textContent).toBe('fallback');
+        });
+
         it('still resolves valid identifiers from parent state', async () => {
             wf.component('id-parent', { state: { greeting: 'Hello World' } });
             wf.component('id-child', {

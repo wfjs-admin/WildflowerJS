@@ -52,7 +52,7 @@ describe('Cross-field validation rules', () => {
     }
   })
 
-  const warnCount = (code) => warnings.filter(w => w.includes(`[WF ${code}]`)).length
+  const warnCount = (code) => warnings.filter(w => w.includes(`[${code}]`)).length
 
   it('a failing rule blocks submit; the rule name is the message; involved inputs are marked', async () => {
     const c = uname('dates')
@@ -304,7 +304,7 @@ describe('Cross-field validation rules', () => {
     expect(submitted, 'the whole rule is refused, not just the when: gate').toBe(true)
     if (isDev) {
       expect(warnCount('WF-228')).toBeGreaterThanOrEqual(1)
-      expect(warnings.some(w => w.includes('[WF WF-228]') && w.includes('when:'))).toBe(true)
+      expect(warnings.some(w => w.includes('[WF-228]') && w.includes('when:'))).toBe(true)
     }
   })
 
@@ -377,7 +377,7 @@ describe('Cross-field validation rules', () => {
     expect(submitted, 'inert rule never blocks').toBe(true)
     if (isDev) {
       expect(warnCount('WF-228')).toBeGreaterThanOrEqual(1)
-      expect(warnings.some(w => w.includes('[WF WF-228]') && w.includes('ghost'))).toBe(true)
+      expect(warnings.some(w => w.includes('[WF-228]') && w.includes('ghost'))).toBe(true)
     }
   })
 
@@ -449,7 +449,7 @@ describe('Cross-field validation rules', () => {
     expect(submitted, 'a refused rule never blocks; the object form is required for a function check').toBe(true)
     if (isDev) {
       expect(warnCount('WF-228')).toBeGreaterThanOrEqual(1)
-      expect(warnings.some(w => w.includes('[WF WF-228]') && w.includes('no check expression or function'))).toBe(true)
+      expect(warnings.some(w => w.includes('[WF-228]') && w.includes('no check expression or function'))).toBe(true)
     }
   })
 

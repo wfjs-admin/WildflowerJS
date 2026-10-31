@@ -9,12 +9,15 @@ import { getCSPSafeMergedContextEvaluator, getCSPSafeEvaluatorWithArgs } from '.
 import { _EXPR_FOOTGUN_RE } from '../core/ExpressionEvaluator.js';
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { slotDataCache } from '../core/DomMetadata.js';
-import { applyShow, applyText } from '../core/BindingWriters.js';
+import { getContextMethod } from '../state/ContextProxy.js';
+import { applyShow, applyText, applyModel } from '../core/BindingWriters.js';
 
 /**
- * Methods to be mixed into WildflowerJS.prototype
+ * Template lookup used only by the list and pool renderers. Spread into
+ * ListRendererMethods and PoolRendererMethods rather than TemplateSystemMethods,
+ * so a tier with neither (nano) does not ship it.
  */
-export const TemplateSystemMethods = {
+export const TemplateLookupMethods = {
 /**
      * Find template element in a container (HTML5 template only)
      * @private
@@ -119,6 +122,63 @@ export const TemplateSystemMethods = {
         }
         return found;
     },
+    /**
+     * Build elements array from compiled DOM paths
+     * PERF: Uses pre-computed elementPaths array for single-loop resolution
+     * instead of iterating through 7 separate binding type arrays
+     *
+     * Lives here (not in the list-only ListItemBinding.js) because it's pure
+     * DOM-path resolution over compiledMetadata.elementPaths — no list
+     * concepts involved — and PoolRenderer.js calls it directly via
+     * this._framework, so it ships with the pool renderer as well as the
+     * list renderer.
+     * @private
+     */
+    _buildElementsArrayFromMetadata(itemEl, compiledMetadata) {
+        const paths = compiledMetadata.elementPaths;
+
+        // FAST PATH: Use pre-computed elementPaths (7x fewer loop iterations)
+        // Instead of looping through bindings, htmlBindings, models, shows, actions,
+        // classBindings, styleBindings separately with undefined checks,
+        // we just resolve each unique element once
+        if (paths && paths.length > 0) {
+            const allElementsArray = new Array(paths.length);
+            // PERF OPTIMIZATION 2.1: Inline element path resolution to eliminate function call overhead
+            // For 1000 items × 5 bindings = 5000 function calls saved
+            for (let i = 0; i < paths.length; i++) {
+                const path = paths[i];
+                const plen = path ? path.length : 0;
+                if (plen === 0) {
+                    allElementsArray[i] = itemEl;
+                    continue;
+                }
+                // Resolve each child index by element node-pointers
+                // (firstElementChild + nextElementSibling) rather than fetching the live
+                // HTMLCollection (current.children) and indexing it per hop. elementPaths
+                // are element-child indices, and *ElementSibling traverse element-only
+                // nodes, so this is semantically identical to children[idx] (text/comment
+                // nodes excluded the same way) while avoiding the collection wrapper +
+                // index walk on each step (~58% faster per row at create10k).
+                let current = itemEl;
+                for (let p = 0; p < plen; p++) {
+                    let next = current.firstElementChild;
+                    for (let k = path[p]; k > 0 && next; k--) next = next.nextElementSibling;
+                    if (!next) { current = null; break; }
+                    current = next;
+                }
+                allElementsArray[i] = current;
+            }
+            return allElementsArray;
+        }
+
+        return [];
+    },
+};
+
+/**
+ * Methods to be mixed into WildflowerJS.prototype
+ */
+export const TemplateSystemMethods = {
     /**
      * Extract usable content from a template
      * @private
@@ -342,7 +402,7 @@ export const TemplateSystemMethods = {
                 const listPath = this._getAttr(listContainer, 'list');
 
                 if (listComponentInstance && listPath) {
-                    const cacheKey = `${listComponentInstance.name}:${listPath}`;
+                    const cacheKey = listContainer._wfTplKey || `${listComponentInstance.name}:${listPath}`;
                     this._templateCache.lists.delete(cacheKey);
                     this._templateCache.compiled.delete(cacheKey);
                     this._templateCache.extracted.delete(cacheKey);
@@ -661,9 +721,22 @@ export const TemplateSystemMethods = {
             const actionName = this._getAttr(el, 'action');
             if (!actionName) continue;
 
+            // A form's submit is dispatched in one place for every form
+            // (FormHandling._handleFormSubmit), with this slot's details. A
+            // listener here as well ran the handler twice.
+            if (el.tagName === 'FORM') {
+                if (__DEV__) {
+                    const submitAction = this._submitActionOf(this._parseActions(actionName));
+                    if (submitAction && !getContextMethod(instance.context, submitAction.methodName)) {
+                        wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: `Action '${submitAction.methodName}' not found on component '${instance.name}'` });
+                    }
+                }
+                continue;
+            }
+
             // Check if action exists on the using component
-            const actionMethod = instance.context[actionName];
-            if (typeof actionMethod !== 'function') {
+            const actionMethod = getContextMethod(instance.context, actionName);
+            if (!actionMethod) {
                 if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: `Action '${actionName}' not found on component '${instance.name}'` });
                 continue;
             }
@@ -716,7 +789,7 @@ export const TemplateSystemMethods = {
             } else if (el.type === 'radio') {
                 el.checked = el.value === String(value);
             } else {
-                el.value = value ?? '';
+                applyModel(el, value);
             }
 
             // Create two-way binding handler
@@ -818,6 +891,29 @@ export const TemplateSystemMethods = {
 
         // Reactivity is triggered automatically through the proxy
         // The dataValue object is part of the reactive state
+    },
+
+    /**
+     * The slot (data-use-template + data-with) whose rendered content holds
+     * an element, or null. The submit dispatcher uses it: a form in a slot
+     * binds to the slot's data and is told about it.
+     * @param {HTMLElement} el
+     * @param {Object} instance - The component the slot is used in
+     * @returns {Object|null} The slot context
+     * @private
+     */
+    _slotContextFor(el, instance) {
+        const slots = instance && instance._slotContexts;
+        if (!slots || slots.size === 0) return null;
+        for (const slotContext of slots.values()) {
+            const rendered = slotContext.renderedElements
+                || (slotContext.renderedElement ? [slotContext.renderedElement] : null);
+            if (!rendered) continue;
+            for (let i = 0; i < rendered.length; i++) {
+                if (rendered[i] && rendered[i].contains && rendered[i].contains(el)) return slotContext;
+            }
+        }
+        return null;
     },
 
     /**
@@ -1034,8 +1130,14 @@ export const TemplateSystemMethods = {
         }
 
 
-        // Check for nested lists - respects useWfPrefixOnly mode
-        const hasNestedLists = queryRoot.querySelector(this._attrSelector('list')) !== null;
+        // Check for nested lists - respects useWfPrefixOnly mode.
+        // The root itself may be the nested list (a row whose root is a list,
+        // e.g. <tr data-list="cells">); querySelector only searches descendants,
+        // and once that list's own <template> has been lifted out nothing
+        // inside the root says so. Without this the row counts as flat, takes
+        // the stripped bulk path, and loses the root's data-key and data-action.
+        const hasNestedLists = this._hasAttr(queryRoot, 'list')
+            || queryRoot.querySelector(this._attrSelector('list')) !== null;
 
         // Check for nested components - used to determine if _initializeNestedComponentsInItem needs to run
         // CRITICAL: Also check if queryRoot itself is a component (querySelector only searches descendants)
@@ -1268,7 +1370,8 @@ export const TemplateSystemMethods = {
                     elementPath,
                     isInNestedList,
                     isInNestedComponent,
-                    hasEventOutside
+                    hasEventOutside,
+                    isForm: el.tagName === 'FORM'
                 });
             }
 
@@ -1476,7 +1579,9 @@ export const TemplateSystemMethods = {
         const hasExternalClassBindings = metadata.classBindings.some(cb => hasExternalRef(cb.expression));
         const hasRootExternalClassBinding = hasExternalRef(metadata.rootBindings?.bindClassExpr);
 
-        const canUseInnerHTML =
+        // Only the list renderer reads the bulk path's outputs (innerHTMLParts,
+        // textAccessors), so a tier without lists never builds them.
+        const canUseInnerHTML = __FEATURE_LISTS__ &&
             !hasCustomDirectives &&  // Custom directives need lifecycle hooks
             metadata.models.length === 0 &&
             !metadata.hasNestedLists &&
@@ -1529,10 +1634,15 @@ export const TemplateSystemMethods = {
         // CRITICAL: Configurable templates MUST NOT use innerHTML optimization
         // because innerHTML replaces the original <template data-use-template> element,
         // which breaks rescanItemTemplates() functionality
-        metadata.canUseInnerHTML = canUseInnerHTML && !hasExcludedFeatures && !options.isConfigurableTemplate;
+        // Last, and only for a template that passed everything above: every
+        // framework attribute in it must be one the bulk path serves. The
+        // checks above say what a known binding needs; this one says that
+        // nothing else is present (see BULK_UNSERVED_ATTR).
+        metadata.canUseInnerHTML = canUseInnerHTML && !hasExcludedFeatures && !options.isConfigurableTemplate
+            && this._rowTemplateBulkServed(queryRoot);
 
         // Generate innerHTML template if eligible
-        if (metadata.canUseInnerHTML) {
+        if (__FEATURE_LISTS__ && metadata.canUseInnerHTML) {
             // Clone template for modification (don't mutate original)
             const templateClone = queryRoot.cloneNode(true);
 
@@ -1612,7 +1722,9 @@ export const TemplateSystemMethods = {
                 'data-show', 'data-wf-show',
                 'data-render', 'data-wf-render',
                 'data-if', 'data-wf-if',
-                'data-key', 'data-wf-key',
+                // data-key is NOT stripped: on a row element it means nothing
+                // to the framework (a list's key sits on its container), so
+                // one found here is the author's own attribute.
                 // Anti-FOUC marker: must be stripped from the cached
                 // template (and innerHTML parts), not just from the
                 // initial DOM scan. Otherwise rows added later (or moved
@@ -1621,6 +1733,16 @@ export const TemplateSystemMethods = {
                 // forever, defeating data-show on inner elements.
                 'data-cloak', 'data-wf-cloak'
             ];
+
+            // In data-wf- only mode the bare data-* forms are not the
+            // framework's: they belong to whatever library the mode exists to
+            // sit beside (its data-action, its data-bind), and the per-row
+            // path leaves them alone. Strip only what the framework reads.
+            if (this.options.useWfPrefixOnly) {
+                for (let s = attrsToStrip.length - 1; s >= 0; s--) {
+                    if (!attrsToStrip[s].startsWith('data-wf-')) attrsToStrip.splice(s, 1);
+                }
+            }
 
             // Strip from templateClone root element
             for (const attr of attrsToStrip) {
@@ -1833,57 +1955,8 @@ export const TemplateSystemMethods = {
 
         return metadata;
     },
-    /**
-     * Build elements array from compiled DOM paths
-     * PERF: Uses pre-computed elementPaths array for single-loop resolution
-     * instead of iterating through 7 separate binding type arrays
-     *
-     * Lives here (not in the list-only ListItemBinding.js) because it's pure
-     * DOM-path resolution over compiledMetadata.elementPaths — no list
-     * concepts involved — and PoolRenderer.js calls it directly via
-     * this._framework, so it must be present whenever _compileTemplate is,
-     * regardless of whether the list feature is built in.
-     * @private
-     */
-    _buildElementsArrayFromMetadata(itemEl, compiledMetadata) {
-        const paths = compiledMetadata.elementPaths;
-
-        // FAST PATH: Use pre-computed elementPaths (7x fewer loop iterations)
-        // Instead of looping through bindings, htmlBindings, models, shows, actions,
-        // classBindings, styleBindings separately with undefined checks,
-        // we just resolve each unique element once
-        if (paths && paths.length > 0) {
-            const allElementsArray = new Array(paths.length);
-            // PERF OPTIMIZATION 2.1: Inline element path resolution to eliminate function call overhead
-            // For 1000 items × 5 bindings = 5000 function calls saved
-            for (let i = 0; i < paths.length; i++) {
-                const path = paths[i];
-                const plen = path ? path.length : 0;
-                if (plen === 0) {
-                    allElementsArray[i] = itemEl;
-                    continue;
-                }
-                // Resolve each child index by element node-pointers
-                // (firstElementChild + nextElementSibling) rather than fetching the live
-                // HTMLCollection (current.children) and indexing it per hop. elementPaths
-                // are element-child indices, and *ElementSibling traverse element-only
-                // nodes, so this is semantically identical to children[idx] (text/comment
-                // nodes excluded the same way) while avoiding the collection wrapper +
-                // index walk on each step (~58% faster per row at create10k).
-                let current = itemEl;
-                for (let p = 0; p < plen; p++) {
-                    let next = current.firstElementChild;
-                    for (let k = path[p]; k > 0 && next; k--) next = next.nextElementSibling;
-                    if (!next) { current = null; break; }
-                    current = next;
-                }
-                allElementsArray[i] = current;
-            }
-            return allElementsArray;
-        }
-
-        return [];
-    },
+    // _rowTemplateBulkServed (the list bulk path) lives in ListSharedMethods;
+    // _buildElementsArrayFromMetadata (lists and pools) in TemplateLookupMethods.
     /**
      * Quote bare hyphenated object keys so attr expressions are valid JS:
      * { data-item-id: id } → { 'data-item-id': id }
@@ -2057,17 +2130,22 @@ export const TemplateSystemMethods = {
         // List elements need to be collected but their children are NOT processed
         const listElements = element.querySelectorAll(this._attrSelector('list'));
         for (const listEl of listElements) {
-            // Skip lists inside nested components
+            // Skip lists inside nested components, and lists inside another
+            // list. The second kind matters only in server-rendered rows (a
+            // client list removes everything but its template when it first
+            // mounts): such a list is mounted from its row, and its element
+            // path runs through this instance's rows, so a snapshot shared
+            // with another instance must not carry it.
             let parent = listEl.parentElement;
-            let insideNestedComponent = false;
+            let skip = false;
             while (parent && parent !== element) {
-                if (this._hasAttr(parent, 'component')) {
-                    insideNestedComponent = true;
+                if (this._hasAttr(parent, 'component') || this._hasAttr(parent, 'list')) {
+                    skip = true;
                     break;
                 }
                 parent = parent.parentElement;
             }
-            if (!insideNestedComponent) {
+            if (!skip) {
                 const listPath = this._getAttr(listEl, 'list');
                 const keyProp = this._getAttr(listEl, 'key'); // data-key="id" or data-wf-key="id"
                 metadata.lists.push({
@@ -2205,7 +2283,8 @@ export const TemplateSystemMethods = {
                 metadata.actions.push({
                     index: i,
                     actionValue,
-                    elementPath
+                    elementPath,
+                    isForm: el.tagName === 'FORM'
                 });
             }
         }

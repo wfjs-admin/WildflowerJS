@@ -10,6 +10,7 @@
  */
 
 import { listBoundElements } from '../core/DomMetadata.js';
+import { getContextMethod } from '../state/ContextProxy.js';
 import { pathResolver, __wf_str, __wf_txt } from '../core/wfUtils.js';
 import { applyShow, applyClass, applyModel } from '../core/BindingWriters.js';
 
@@ -27,10 +28,74 @@ const _reusableBindCtx = {
     propsData: null
 };
 
+// Dev-only members, spread into ListItemBindingMethods under __DEV__ (absent
+// from production files; the caller is inside an `if (__DEV__)` block).
+const ListItemBindingDevMethods = {
+    /**
+     * Dev-only differential oracle for _collectStandaloneExternalBindings.
+     *
+     * Reproduces the pre-2026-08-24 selector-and-filter collection verbatim
+     * (five whole-subtree queries, per-match parent-chain `isInsideList`) and
+     * asserts the pruning walk retained the same elements in the same order,
+     * per kind. Both run on identical DOM in the same tick, so any divergence
+     * is a real characterization error rather than a timing artifact.
+     *
+     * Emits a console.error rather than throwing: a divergence must be loud and
+     * must fail a test asserting a clean console, but must not take down an app
+     * running a dev build. Stripped entirely from production.
+     * @private
+     */
+    _assertStandaloneCollectorsAgree(el, walked) {
+        const isInsideList = (element) => {
+            let parent = element.parentElement;
+            while (parent && parent !== el) {
+                if (this._getAttr(parent, 'list')) return true;
+                parent = parent.parentElement;
+            }
+            return false;
+        };
+        const legacyFor = (selector, attr) => {
+            const out = [];
+            const found = el.querySelectorAll(selector);
+            for (let i = 0; i < found.length; i++) {
+                const node = found[i];
+                const expr = this._getAttr(node, attr);
+                if (expr && this._hasExternalRefExpr(expr) && !isInsideList(node)) out.push(node);
+            }
+            return out;
+        };
+        const legacy = {
+            attr: legacyFor('[data-bind-attr],[data-wf-bind-attr]', 'bind-attr'),
+            bind: legacyFor('[data-bind],[data-wf-bind]', 'bind'),
+            cls: legacyFor('[data-bind-class],[data-wf-bind-class]', 'bind-class'),
+            style: legacyFor('[data-bind-style],[data-wf-bind-style]', 'bind-style'),
+            html: legacyFor('[data-bind-html],[data-wf-bind-html]', 'bind-html'),
+        };
+        const kinds = ['attr', 'bind', 'cls', 'style', 'html'];
+        for (let k = 0; k < kinds.length; k++) {
+            const kind = kinds[k];
+            const a = walked[kind], b = legacy[kind];
+            let same = a.length === b.length;
+            if (same) {
+                for (let i = 0; i < a.length; i++) {
+                    if (a[i] !== b[i]) { same = false; break; }
+                }
+            }
+            if (!same) {
+                console.error('[WF standalone-external collector divergence] kind=' + kind +
+                    ' walk=' + a.length + ' legacy=' + b.length +
+                    ' — the pruning walk and the legacy selector filter disagree; ' +
+                    'the retained-set characterization is incomplete. Component:', el);
+            }
+        }
+    },
+};
+
 /**
  * Methods to be mixed into ListRendererMethods (and ultimately WildflowerJS.prototype)
  */
 export const ListItemBindingMethods = {
+    ...(__DEV__ ? ListItemBindingDevMethods : {}),
     /**
      * The row's binding-element array, built on first need. A bulk-created
      * row of a plain text template carries none until something reads it
@@ -96,7 +161,12 @@ export const ListItemBindingMethods = {
         ctx.componentState = componentInstance?.state || {};
         ctx.componentInstance = componentInstance;
         ctx.itemIndex = itemIndex;
-        ctx.listLength = listContext?.data?.length || 0;
+        // The list's current length (kept on its context as the array is
+        // read). context.data is not kept current for a list over a computed
+        // or a store, so a field edit repainted `_last` / `_length` in the
+        // edited row from the length at first render.
+        const liveLength = listContext ? listContext._length : undefined;
+        ctx.listLength = liveLength !== undefined ? liveLength : (listContext?.data?.length || 0);
         ctx.listContext = listContext;
         ctx.propsData = componentInstance?._propsData;
 
@@ -164,7 +234,9 @@ export const ListItemBindingMethods = {
                 }
                 const strValue = __wf_str(value);
                 if (spec.isInput) {
-                    if (el.value !== strValue) el.value = strValue;
+                    // The one writer for a control's value (a select keeps
+                    // what it was asked to show for when its options arrive).
+                    applyModel(el, strValue);
                 } else {
                     __wf_txt(el, strValue);
                 }
@@ -172,6 +244,7 @@ export const ListItemBindingMethods = {
             } else if (kind === 'HTML') {
                 const value = this._resolveCompiledBinding(spec, item, ctx);
                 const htmlStr = value == null ? '' : value;
+                el._wfHtmlValue = htmlStr;   // what the element shows (read by the position sweep)
                 el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
             } else if (kind === 'MODEL') {
                 const value = this._getValueFromItem(item, spec.path);
@@ -241,6 +314,7 @@ export const ListItemBindingMethods = {
             if (kind === 'HTML') {
                 const value = this._resolveCompiledBinding(spec, item, ctx);
                 const htmlStr = value == null ? '' : value;
+                el._wfHtmlValue = htmlStr;   // what the element shows (read by the position sweep)
                 el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
             } else if (kind === 'MODEL') {
                 const value = this._getValueFromItem(item, spec.path);
@@ -256,36 +330,44 @@ export const ListItemBindingMethods = {
     /**
      * Applier-program execution engine — positional (FILTER_INDEX) variant (S3).
      * The structural-change counterpart run per row from the onComplete sweep:
-     * repaints TEXT/SHOW records whose value can move when list positions shift.
-     * TEXT matches an expression that reads a position token (_index/_first/_last/
-     * _length); SHOW matches that OR a conditional that resolves through an
-     * item-level computed (which can read the frame internally). The predicate is
-     * the SAME _expressionUsesListContext the attribute sweep used (spec.path IS
-     * the expression string), so the selected set is unchanged; resolve + write go
-     * through the canonical engine path (matching initial bind). RENDER is handled
-     * by _runRenderContextsIndexed; CLASS/ATTR stay on the decor sweep.
+     * repaints the TEXT/HTML/SHOW records whose value can move when list
+     * positions shift. Which records those are is decided once per compiled
+     * template by _positionReaders (the `_pos` flag on each record): a position
+     * token (_index/_first/_last/_length), or an item-level computed that can
+     * read the frame. Resolve + write go through the canonical engine path
+     * (matching initial bind). RENDER is handled by _runRenderContextsIndexed;
+     * CLASS/STYLE/ATTR by the row's evaluators (see the sweep).
      * @private
      */
     _runAppliersIndexed(elements, item, program, ctx, computed) {
         if (!program) return;
         for (let i = 0; i < program.length; i++) {
             const rec = program[i];
+            // Whether the record reads position was worked out once for the
+            // compiled template (_positionReaders): a token, bare or in an
+            // expression, or an item-level computed that declares its index.
+            // (TEXT used to match only a token inside an expression, so a
+            // bare data-bind="_index" and a computed's text were never
+            // repainted, and HTML was not in this pass at all.)
+            if (rec._pos !== true) continue;
             const kind = rec.kind;
-            if (kind !== 'TEXT' && kind !== 'SHOW') continue;
             const spec = rec.spec;
-            const expr = spec.path;
-            let match;
-            if (kind === 'TEXT') {
-                match = this._expressionUsesListContext(expr) && this.isExpression(expr);
-            } else {
-                match = this._expressionUsesListContext(expr)
-                    || (computed && this._conditionalRefsComputed(spec, computed));
-            }
-            if (!match) continue;
             const el = elements[rec.elementIndex];
             if (!el) continue;
 
-            if (kind === 'TEXT') {
+            if (kind === 'HTML') {
+                // Written only when the value moved: every writer of a row's
+                // html records the value it wrote (_wfHtmlValue), so this
+                // compares against what the element shows, whoever painted
+                // it last, and an unchanged row keeps its DOM (and whatever
+                // the user typed into it).
+                const value = this._resolveCompiledBinding(spec, item, ctx);
+                const htmlStr = value == null ? '' : value;
+                if (el._wfHtmlValue !== htmlStr) {
+                    el._wfHtmlValue = htmlStr;
+                    el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
+                }
+            } else if (kind === 'TEXT') {
                 let value;
                 if (spec.isSimplePath) {
                     value = item[spec.path];
@@ -307,7 +389,7 @@ export const ListItemBindingMethods = {
                 }
                 const strValue = __wf_str(value);
                 if (spec.isInput) {
-                    if (el.value !== strValue) el.value = strValue;
+                    applyModel(el, strValue);
                 } else {
                     __wf_txt(el, strValue);
                 }
@@ -363,7 +445,11 @@ export const ListItemBindingMethods = {
                     case '_last': fv = index === listLength - 1; break;
                 }
                 shouldRender = b.negate ? !fv : !!fv;
-            } else if (computed && this._conditionalRefsComputed(b, computed)) {
+            } else if ((computed && this._conditionalRefsComputed(b, computed))
+                // A token inside an expression (data-render="_index > 0"):
+                // resolved like any other expression, against this row's
+                // frame. Only the bare token used to be re-evaluated.
+                || (b.isExpression && this._expressionUsesListContext(b.path))) {
                 const raw = this._resolveCompiledBinding(b, item, ctx);
                 shouldRender = b.negate ? !raw : Boolean(raw);
             } else {
@@ -439,7 +525,7 @@ export const ListItemBindingMethods = {
             componentState: componentInstance?.state || {},
             componentInstance,
             itemIndex,
-            listLength: ctx?.data?.length || 0,
+            listLength: (ctx && ctx._length !== undefined) ? ctx._length : (ctx?.data?.length || 0),
             listContext: ctx,
             propsData: componentInstance?._propsData
         };
@@ -458,7 +544,7 @@ export const ListItemBindingMethods = {
         }
 
         if (isInput) {
-            el.value = value == null ? '' : value;
+            applyModel(el, value);
         } else {
             el.textContent = value == null ? '' : value;
         }
@@ -472,32 +558,10 @@ export const ListItemBindingMethods = {
 
         const value = this._resolveRawBinding(htmlPath, item, scope);
         const htmlStr = value == null ? '' : value;
+        el._wfHtmlValue = htmlStr;
         el.innerHTML = this._sanitizeOrPassHTML(htmlStr);
     },
-    /**
-     * Execute single data-model in fallback mode
-     * @private
-     */
-    _executeFallbackModel(el, item, modelPath) {
-        const value = this._getValueFromItem(item, modelPath);
-
-        if (this._applyCustomElementAdapter(el, value)) {
-            return;
-        }
-
-        applyModel(el, value, el.type);
-    },
-    /**
-     * Execute single data-show in fallback mode
-     * @private
-     */
-    _executeFallbackShow(el, item, showPath, listContext, itemIndex) {
-        const scope = this._buildItemScope(listContext, itemIndex);
-
-        // _resolveRawBinding handles negation and all path types (computed:, $store.path, expressions, etc.)
-        const value = this._resolveRawBinding(showPath, item, scope);
-        applyShow(el, value);
-    },
+    // _executeFallbackModel / _executeFallbackShow (SSR only) live in ssr-list.js.
     /**
      * Bind model and show on root element itself
      * @private
@@ -551,7 +615,7 @@ export const ListItemBindingMethods = {
         const allElements = this._rowElements(itemEl);
 
         // Get the list context
-        const listContext = itemEl._listContext;
+        const listContext = itemEl._rowList;
         const componentInstance = listContext?.componentInstance;
 
         if (!this._contextSystemInitialized || !this._contextRecords || !componentInstance) {
@@ -559,7 +623,7 @@ export const ListItemBindingMethods = {
             return;
         }
 
-        // PERF: Use listContext directly - it's already verified when stored on itemEl._listContext
+        // PERF: Use listContext directly - it's already verified when stored on itemEl._rowList
         // in mapArray's onCreate callback
         let verifiedListContext = listContext;
 
@@ -651,7 +715,7 @@ export const ListItemBindingMethods = {
                 };
                 for (const def of outsideDefs) {
                     if (!def.methodName) continue;
-                    if (typeof componentInstance.context[def.methodName] !== 'function') continue;
+                    if (!getContextMethod(componentInstance.context, def.methodName)) continue;
                     this._setupOutsideClickHandler(actionEl, componentInstance, def.methodName, rowCtx);
                 }
                 continue;
@@ -665,7 +729,7 @@ export const ListItemBindingMethods = {
                 const {methodName, eventType, args: actionArgs} = actionDefs[k];
 
                 // Skip invalid methods
-                if (!methodName || typeof componentInstance.context[methodName] !== 'function') {
+                if (!methodName || !getContextMethod(componentInstance.context, methodName)) {
                     continue;
                 }
 
@@ -760,7 +824,7 @@ export const ListItemBindingMethods = {
                     };
                     for (const def of outsideDefs) {
                         if (!def.methodName) continue;
-                        if (typeof componentInstance.context[def.methodName] !== 'function') continue;
+                        if (!getContextMethod(componentInstance.context, def.methodName)) continue;
                         this._setupOutsideClickHandler(actionEl, componentInstance, def.methodName, rowCtx);
                     }
                     continue;
@@ -773,7 +837,7 @@ export const ListItemBindingMethods = {
                 const actionDefs = action._parsedDefs || (action._parsedDefs = this._parseActions(action.actionName));
 
                 for (const { methodName, eventType, args: actionArgs } of actionDefs) {
-                    if (!methodName || typeof componentInstance.context[methodName] !== 'function') {
+                    if (!methodName || !getContextMethod(componentInstance.context, methodName)) {
                         continue;
                     }
 
@@ -821,6 +885,9 @@ export const ListItemBindingMethods = {
                         if (actionArgs && actionArgs.length > 0) {
                             actionContext.data.actionArgs = actionArgs;
                         }
+                        // The compiled action this record is for (its options
+                        // are shared by every row; EventSystem._actionOptions)
+                        actionContext.data.meta = action;
                         createdContexts.set(actionEl, actionContext);
                     }
                 }
@@ -1206,63 +1273,5 @@ export const ListItemBindingMethods = {
             for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]);
         }
         return buckets;
-    },
-    /**
-     * Dev-only differential oracle for _collectStandaloneExternalBindings.
-     *
-     * Reproduces the pre-2026-08-24 selector-and-filter collection verbatim
-     * (five whole-subtree queries, per-match parent-chain `isInsideList`) and
-     * asserts the pruning walk retained the same elements in the same order,
-     * per kind. Both run on identical DOM in the same tick, so any divergence
-     * is a real characterization error rather than a timing artifact.
-     *
-     * Emits a console.error rather than throwing: a divergence must be loud and
-     * must fail a test asserting a clean console, but must not take down an app
-     * running a dev build. Stripped entirely from production.
-     * @private
-     */
-    _assertStandaloneCollectorsAgree(el, walked) {
-        const isInsideList = (element) => {
-            let parent = element.parentElement;
-            while (parent && parent !== el) {
-                if (this._getAttr(parent, 'list')) return true;
-                parent = parent.parentElement;
-            }
-            return false;
-        };
-        const legacyFor = (selector, attr) => {
-            const out = [];
-            const found = el.querySelectorAll(selector);
-            for (let i = 0; i < found.length; i++) {
-                const node = found[i];
-                const expr = this._getAttr(node, attr);
-                if (expr && this._hasExternalRefExpr(expr) && !isInsideList(node)) out.push(node);
-            }
-            return out;
-        };
-        const legacy = {
-            attr: legacyFor('[data-bind-attr],[data-wf-bind-attr]', 'bind-attr'),
-            bind: legacyFor('[data-bind],[data-wf-bind]', 'bind'),
-            cls: legacyFor('[data-bind-class],[data-wf-bind-class]', 'bind-class'),
-            style: legacyFor('[data-bind-style],[data-wf-bind-style]', 'bind-style'),
-            html: legacyFor('[data-bind-html],[data-wf-bind-html]', 'bind-html'),
-        };
-        const kinds = ['attr', 'bind', 'cls', 'style', 'html'];
-        for (let k = 0; k < kinds.length; k++) {
-            const kind = kinds[k];
-            const a = walked[kind], b = legacy[kind];
-            let same = a.length === b.length;
-            if (same) {
-                for (let i = 0; i < a.length; i++) {
-                    if (a[i] !== b[i]) { same = false; break; }
-                }
-            }
-            if (!same) {
-                console.error('[WF standalone-external collector divergence] kind=' + kind +
-                    ' walk=' + a.length + ' legacy=' + b.length +
-                    ' — the pruning walk and the legacy selector filter disagree; ' +
-                    'the retained-set characterization is incomplete. Component:', el);
-            }
-        }
     },
 };

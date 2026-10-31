@@ -418,6 +418,39 @@ describeIfDirectives('Custom Directives', () => {
 
       expect(destroySpy).toHaveBeenCalledTimes(1)
     })
+
+    it('should call destroy for every row when a list is cleared, on elements with no binding', async () => {
+      const destroySpy = vi.fn()
+
+      wildflower.directive('row-tracker', {
+        init: vi.fn(),
+        destroy: destroySpy
+      })
+
+      wildflower.component('test-clear', {
+        state: {
+          items: [{ id: 1, name: 'a' }, { id: 2, name: 'b' }, { id: 3, name: 'c' }]
+        }
+      })
+
+      testContainer.innerHTML = `
+        <div data-component="test-clear">
+          <ul data-list="items" data-key="id">
+            <template>
+              <li><span data-row-tracker>Item</span> <b data-bind="name"></b></li>
+            </template>
+          </ul>
+        </div>
+      `
+
+      const component = await waitForComponent('[data-component="test-clear"]')
+      await waitForUpdate(100)
+
+      component.state.items = []
+      await waitForUpdate(100)
+
+      expect(destroySpy).toHaveBeenCalledTimes(3)
+    })
   })
 
   describe('Directive Error Handling', () => {

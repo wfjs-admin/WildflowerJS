@@ -239,7 +239,7 @@ suite('query cache persistence (persist:)', () => {
             wildflower.query(q, { from: '/api/x', key: 'id', persist: 5 })
             wildflower.getQuery(q)
             await settle()
-            expect(warnings.filter(w => w.includes('[WF WF-968]')).length).toBe(1)
+            expect(warnings.filter(w => w.includes('[WF-968]')).length).toBe(1)
             expect(readEnvelope(q), 'nothing persisted').toBe(null)
         } finally {
             console.warn = realWarn
@@ -640,7 +640,7 @@ suite('query cache persistence (persist:)', () => {
             await h.refresh()
             await settle(30)
 
-            const hits = warnings.filter(w => w.includes('[WF WF-988]'))
+            const hits = warnings.filter(w => w.includes('[WF-988]'))
             expect(hits.length, 'one diagnostic per clear, not per suppressed save').toBe(1)
             expect(hits[0], 'naming the query').toContain(q)
         } finally {
@@ -705,14 +705,14 @@ suite('query cache persistence (persist:)', () => {
             await settle()
             expect(readEnvelope(q), 'the save itself still lands').toBeTruthy()
 
-            const hits = warnings.filter(w => w.includes('[WF WF-992]'))
+            const hits = warnings.filter(w => w.includes('[WF-992]'))
             expect(hits.length, 'one diagnostic').toBe(1)
             expect(hits[0], 'naming the first offending field').toContain('created')
             expect(hits[0], 'naming its type').toContain('Date')
 
             await h.refresh()
             await settle(30)
-            expect(warnings.filter(w => w.includes('[WF WF-992]')).length,
+            expect(warnings.filter(w => w.includes('[WF-992]')).length,
                 'once per query, not per save').toBe(1)
         } finally {
             console.warn = realWarn
@@ -731,7 +731,7 @@ suite('query cache persistence (persist:)', () => {
             wildflower.getQuery(q)
             await settle()
             expect(readEnvelope(q)).toBeTruthy()
-            expect(warnings.filter(w => w.includes('[WF WF-992]')).length).toBe(0)
+            expect(warnings.filter(w => w.includes('[WF-992]')).length).toBe(0)
         } finally {
             console.warn = realWarn
         }
@@ -761,7 +761,7 @@ suite('query cache persistence (persist:)', () => {
                 Storage.prototype.setItem = origSet
             }
 
-            const hits = warnings.filter(w => w.includes('[WF WF-994]'))
+            const hits = warnings.filter(w => w.includes('[WF-994]'))
             expect(hits.length, 'one diagnostic per query, not per failed save').toBe(1)
             expect(hits[0], 'naming the query').toContain(q)
             expect(localStorage.getItem(keyFor(q)),

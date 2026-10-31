@@ -95,12 +95,6 @@ export const ComponentRegistryMethods = {
             return this;
         }
 
-        // Normalize events configuration
-        if (definition.events)
-        {
-            definition.events = this._normalizeEventsConfig(definition.events);
-        }
-
         // Normalize props definition (convert shorthand to full form)
         if (definition.props)
         {

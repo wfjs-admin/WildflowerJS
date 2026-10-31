@@ -77,7 +77,7 @@ suite('dev diagnostics: data-query on the <template> element itself', () => {
     })
 })
 
-// The production half, pinned on every lane including min (review C-09).
+// The production half, pinned on every lane including min.
 // 1.5.2 took this element down the record-shape path: it activated the query
 // (a fetch) and marked it hasRecord, binding nothing. Now it is skipped in
 // every build, so the mistake has no side effects.

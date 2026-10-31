@@ -7,6 +7,7 @@
  *
  *   1. An item-level computed cannot be called by another computed as an
  *      ordinary function, so a shared predicate has to be duplicated.
+ *      (True until 1.5.5, which made it callable; the test now pins that.)
  *   2. An item-level computed that reads an EXTERNAL store is not
  *      re-evaluated when only that store changes, even with a subscribe.
  *
@@ -103,7 +104,7 @@ describe('item-level computeds and outside state', () => {
         expect(classes(), 'tracking should not require an explicit subscribe').toEqual(['hot', 'hot'])
     })
 
-    it('CANNOT be reached from another computed as a plain function', async () => {
+    it('can be called from another computed as a plain function (1.5.5)', async () => {
         const c = uname('callc')
         let callError = null
         wildflower.component(c, {
@@ -131,12 +132,11 @@ describe('item-level computeds and outside state', () => {
         `
         await settle()
 
-        // Documented behavior, not a wish: computeds are exposed on the
-        // context as VALUES, so `this.isBig` is whatever the computed
-        // evaluates to with no row, and calling it is a TypeError. A
-        // predicate shared between a row binding and a summary count has to
-        // live somewhere both can reach, which is the next test.
-        expect(callError, 'reaching an item-level computed as a function throws').toMatch(/not a function/)
+        // Until 1.5.5 this was a TypeError: the context exposed computeds as
+        // values only. An item-level computed is now callable from component
+        // code with a row.
+        expect(callError).toBeNull()
+        expect(container.querySelector('#cnt').textContent).toBe('1')
     })
 
     it('DIAGNOSTIC: what a computed can see on `this`', async () => {

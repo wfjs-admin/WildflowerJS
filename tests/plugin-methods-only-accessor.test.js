@@ -58,7 +58,7 @@ describe.skipIf(!hasFeature('plugins'))('plugin(): methods-only top-level shape 
         const realWarn = console.warn
         beforeEach(() => { warnings = []; console.warn = (...a) => { warnings.push(a.join(' ')) } })
         afterEach(() => { console.warn = realWarn })
-        const wf109 = () => warnings.filter(w => w.startsWith('[WF WF-109]'))
+        const wf109 = () => warnings.filter(w => w.startsWith('[WF-109]'))
 
         it('stays quiet for an install-only plugin that registers a directive (the documented tooltips shape)', () => {
             wildflower.plugin({ name: 'tooltipsDoc', install(wf) { wf.directive('tooltip-doc', { init() {} }) } })

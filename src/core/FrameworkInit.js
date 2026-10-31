@@ -4,6 +4,7 @@
  * @module
  */
 import { ContextRecords } from '../state/ContextRecords.js';
+import { listTemplateId } from './wfUtils.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -184,6 +185,50 @@ export const FrameworkInitMethods = {
         });
     },
     /**
+     * Resolves once no component has a deferred init() sequence pending:
+     * scheduled, waiting on its subscribed stores (up to subscribeTimeout),
+     * or running through the afterInit hook and the work an async init()
+     * awaits. Resolves immediately when none
+     * is pending. An init scheduled from inside another init() is covered,
+     * since it is counted before the outer one finishes. Separate from
+     * whenIdle(), which covers the scan and chunked late registrations; on
+     * page load, await whenIdle() and then this.
+     *
+     * @returns {Promise<void>}
+     */
+    whenInitialized()
+    {
+        // A component mounted by markup alone is counted when the observer's
+        // callback runs, a microtask after the change; take its records now.
+        const observer = this._mutationObserver;
+        if (observer)
+        {
+            const records = observer.takeRecords();
+            if (records.length) this._onMutations(records);
+        }
+        if (!this._initsPending)
+        {
+            return Promise.resolve();
+        }
+        return new Promise(resolve => {
+            (this._initResolvers || (this._initResolvers = [])).push(resolve);
+        });
+    },
+    /**
+     * One deferred init sequence finished (or was skipped): count it down,
+     * and resolve the whenInitialized() waiters at 0.
+     * @private
+     */
+    _initDone()
+    {
+        if (--this._initsPending === 0 && this._initResolvers)
+        {
+            const resolvers = this._initResolvers;
+            this._initResolvers = null;
+            for (let i = 0; i < resolvers.length; i++) resolvers[i]();
+        }
+    },
+    /**
      * Count a piece of deferred work toward whenIdle(). When the count
      * returns to zero every waiter is resolved and `wildflower:idle` fires.
      * A rejected promise is logged and still counted as finished, so a
@@ -248,7 +293,7 @@ export const FrameworkInitMethods = {
         document.addEventListener('change', boundValidationBlur, true);
     },
 // GLOBAL EVENT BINDING
-    _createListContext(path, data, componentInstance, parentContext = null, itemIndex = undefined)
+    _createListContext(path, data, componentInstance, parentContext = null, itemIndex = undefined, register = true)
     {
         // Ensure the records factory (id generator) is initialized
         this._ensureContextSystem();
@@ -293,7 +338,9 @@ export const FrameworkInitMethods = {
             // For nested lists, create unique key using parent path and item index
             contextKey = `${parentContext.path}[${itemIndex}].${path}`;
         }
-        componentInstance._listContexts.set(contextKey, context);
+        // register=false: a second top-level list over the same path keeps
+        // its own context and leaves the path's entry with the first.
+        if (register) componentInstance._listContexts.set(contextKey, context);
 
         // Ensure parent-child relationship is correctly established
         if (parentContext && context._parentIndex === undefined)
@@ -485,16 +532,9 @@ export const FrameworkInitMethods = {
                         ? wf._normalizeStoreShorthands(this.path)
                         : this.path;
 
-                    if (normalizedPath.startsWith('computed:'))
-                    {
-                        const computedPath = normalizedPath.slice(9);
-
-                        if (computedPath.includes('.')) {
-                            return this.componentInstance.stateManager._resolveComputedPath(computedPath);
-                        } else {
-                            return this.componentInstance.stateManager.evaluateComputed(computedPath);
-                        }
-                    } else if (normalizedPath.includes('external('))
+                    // A computed: path (dotted or not) reads through getValue
+                    // below, without the prefix: computed:a.b reads a.b.
+                    if (normalizedPath.includes('external('))
                     {
                         // Handle external() expressions for store data
                         if (wf && wf._getExternalFn) {
@@ -512,7 +552,8 @@ export const FrameworkInitMethods = {
                         return Array.isArray(this.data) ? this.data : [];
                     } else
                     {
-                        return this.componentInstance.stateManager.getValue(normalizedPath);
+                        return this.componentInstance.stateManager.getValue(
+                            normalizedPath.startsWith('computed:') ? normalizedPath.slice(9) : normalizedPath);
                     }
                 }
             }
@@ -574,6 +615,35 @@ export const FrameworkInitMethods = {
      */
     _initializeTemplates()
     {
+        const listSel = this._attrSelector('list');
+        const compSel = this._attrSelector('component');
+        const listKeyFor = (listEl, fallbackType) => {
+            if (listEl._wfTplKey !== undefined) return listEl._wfTplKey;
+            const listName = this._getAttr(listEl, 'list');
+            const compEl = listEl.closest(compSel);
+            const type = (compEl && this._getAttr(compEl, 'component')) || fallbackType;
+            const parentList = listEl.parentElement && listEl.parentElement.closest(listSel);
+            const key = (parentList && parentList.closest(compSel) === compEl)
+                ? `${listKeyFor(parentList)}>${listName}${listTemplateId(listEl)}`
+                : (type ? `${type}:${listName}` : listName) + listTemplateId(listEl);
+            listEl._wfTplKey = key;
+            return key;
+        };
+        // Give every nested list inside a template its own template id
+        // (data-wftpl), before the content is extracted: the rows cloned from
+        // it then carry the id and never hash (see _listTemplateKey). Each
+        // level is stamped before the levels inside it.
+        const stampNested = (tpl) => {
+            const content = tpl.content;
+            if (!content) return;
+            content.querySelectorAll(listSel).forEach(nested => {
+                listTemplateId(nested);
+                const kids = nested.children;
+                for (let i = 0; i < kids.length; i++) {
+                    if (kids[i].localName === 'template') stampNested(kids[i]);
+                }
+            });
+        };
         // Find all HTML5 template elements
         this.root.querySelectorAll('template').forEach(template =>
         {
@@ -601,17 +671,22 @@ export const FrameworkInitMethods = {
             // For list templates, compile and cache for performance
             // SKIP: Configurable template references (data-use-template) - these are resolved dynamically
             // when the component instance exists and should not be cached as empty templates
+            // Only the list renderer reads these caches, so a tier without
+            // lists skips the compile and keying.
             const isConfigurableTemplateRef = this._hasAttr(template, 'use-template');
-            if (isList && listElement && !isConfigurableTemplateRef)
+            if (__FEATURE_LISTS__ && isList && listElement && !isConfigurableTemplateRef)
             {
                 const listName = this._getAttr(listElement, 'list');
 
                 // COMPILE TEMPLATE: Extract binding metadata at initialization
-                // Use composite key: componentType:listName to avoid collisions between different components
-                const componentElement = template.closest(this._attrSelector('component'));
-                const actualComponentType = (componentElement && this._getAttr(componentElement, 'component')) || componentType;
-
-                const compilationKey = actualComponentType ? `${actualComponentType}:${listName}` : listName;
+                // The same key the list renderer derives (_listTemplateKey):
+                // `component:path` plus a hash of the list's template markup
+                // for a top-level list, `parentKey>path` for a list inside
+                // another list's rows (server-rendered rows carry those in
+                // the light DOM). Kept on the element; a polymorphic list's
+                // several templates share its one key.
+                const compilationKey = listKeyFor(listElement, componentType);
+                stampNested(template);
 
                 // Store reference using composite key (no need to clone - HTML5 templates stay in DOM)
                 this._templateCache.lists.set(compilationKey, template);

@@ -245,6 +245,12 @@ const configs = [
     // public API only; built here like Threads for the defines and the pinned
     // terser. Filter: `node scripts/build-rollup.cjs three.wf`.
     ...extensionConfigs('three'),
+
+    // KINETIC EXTENSION (packages/kinetic): time-driven scenes for
+    // HyperFrames. Page-only, public API only; built here like three for the
+    // defines and the pinned terser. Private until first release. Filter:
+    // `node scripts/build-rollup.cjs kinetic.wf`.
+    ...extensionConfigs('kinetic'),
 ];
 
 // An extension package's two files, <name>.wf.js and <name>.wf.min.js, from

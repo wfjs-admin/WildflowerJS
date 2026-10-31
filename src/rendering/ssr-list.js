@@ -13,12 +13,87 @@
  * (_bindWithCompiledMetadata, the fallback executors, class/style/attr
  * processors). Those serve the non-SSR hot path and must stay in
  * ListItemBinding/ListRenderer; do not move shared symbols across this
- * import fence.
+ * import fence. The exceptions are the members only SSR code calls, which
+ * live here: _executeFallbackModel, _executeFallbackShow and
+ * _shouldPreventContentUpdate.
  */
 
-import { ssrAdoptedElements, ssrStateChangedElements } from '../core/DomMetadata.js';
+import { ssrAdoptedElements, ssrStateChangedElements, ssrItemWriteMarks, ssrTakeoverAtActivation } from '../core/DomMetadata.js';
+import { applyShow, applyModel } from '../core/BindingWriters.js';
 
 export const SSRListMethods = {
+    /**
+     * An item-level write (`rows.0.x`, `groups.1.cells.length`) reached an
+     * adopted list that mapArray does not own yet. Its fingerprint records
+     * nested arrays and objects only by length or type, so the write may not
+     * move it; the mark makes _ssrListDiff render the list.
+     * @private
+     */
+    _ssrNoteItemWrite(context, instanceId) {
+        const el = context && context.element;
+        if (!el || el._mapArrayInitialized || !el._ssrAdoptedByKey) return;
+        ssrItemWriteMarks.add(el);
+        // Batch mode: the handler queues nothing, and applyBatch only processes
+        // the components its proxy snapshot recorded, which leaves out
+        // item-level writes. Enrol the component so _applyBatchToLists
+        // processes its lists.
+        if (this._batchMode) (this._batchChangedComponents || (this._batchChangedComponents = new Set())).add(instanceId);
+    },
+
+    /**
+     * A computed changed (`computed:NAME`). An adopted list over it that
+     * mapArray does not own yet has no other change signal: the writes that
+     * move the computed are to other paths. Mark it so the render takes it
+     * over, which hands it to mapArray, and from then on it follows the
+     * computed. Its notifier was armed at hydration.
+     * @returns {boolean} whether a list was marked
+     * @private
+     */
+    _ssrNoteComputedWrite(instance, name) {
+        let hit = false;
+        // A second list over the same path is a peer of the registered
+        // context (as in _handleListStateChange).
+        const visit = (context) => {
+            const el = context.element;
+            if (!el || !el.isConnected || el._mapArrayInitialized || !el._ssrAdoptedByKey) return;
+            ssrItemWriteMarks.add(el);
+            if (!this._batchMode) this._contextsToUpdate.add(context);
+            hit = true;
+        };
+        instance._listContexts.forEach((context, contextPath) => {
+            if (this._listPathBare(contextPath).split('.')[0] !== name) return;
+            visit(context);
+            if (context._wfPeers) context._wfPeers.forEach(visit);
+        });
+        if (hit) {
+            // Batch mode: applyBatch processes the enrolled component's lists
+            // (as for _ssrNoteItemWrite).
+            if (this._batchMode) (this._batchChangedComponents || (this._batchChangedComponents = new Set())).add(instance.id);
+            else this._scheduleRender();
+        }
+        return hit;
+    },
+
+    /**
+     * Called by SSR activation once every list of a component is COMPLETE:
+     * take over the lists whose hydration found state and server rows of
+     * different lengths, so a write made before activation is painted now
+     * instead of at the next change.
+     * @private
+     */
+    _ssrTakeOverPending(listElements) {
+        listElements.forEach(el => {
+            if (!ssrTakeoverAtActivation.has(el)) return;
+            ssrTakeoverAtActivation.delete(el);
+            if (!el.isConnected || el._mapArrayInitialized) return;
+            const owner = el.closest(this._attrSelector('component'));
+            const inst = owner && this.componentInstances.get(owner.dataset.componentId);
+            if (!inst) return;
+            ssrItemWriteMarks.add(el);
+            this._processList({ element: el, path: el._listContext ? el._listContext.path : this._getAttr(el, 'list'), componentId: inst.id }, inst, false);
+        });
+    },
+
     /**
      * Collect list contexts that need DOM updates at the top of _render
      * (binding contexts are handled by effects). Consumed by
@@ -90,6 +165,15 @@ export const SSRListMethods = {
      * @private
      */
     _ssrListDiff(element, path, instance, context, data, forceUpdate) {
+        // An item-level write reached this adopted list: render it. Once the
+        // list is COMPLETE that is the takeover, which reuses the adopted rows
+        // and remounts the nested lists. While it is protected it re-hydrates.
+        if (ssrItemWriteMarks.has(element)) {
+            ssrItemWriteMarks.delete(element);
+            forceUpdate = true;                  // skips replace-all and sparse
+            element._lastDataFingerprint = null; // the first-render branch sets needsRender
+        }
+
         // Store the data for future comparisons
         const previousData = element._previousData;
         const hasPreviousData = previousData && Array.isArray(previousData) && Array.isArray(data);
@@ -245,7 +329,7 @@ export const SSRListMethods = {
                         const compiledMetadata = itemEl._compiledMetadata;
                         if (compiledMetadata && itemEl._cachedElementsArray) {
                             // FAST PATH: Use cached element references and execute functions
-                            const listContext = itemEl._listContext || context;
+                            const listContext = itemEl._rowList || context;
                             this._bindWithCompiledMetadata(itemEl, item, compiledMetadata, listContext, index, context);
                             // Decorative bindings (class/style/attr) go through the shared
                             // evaluator pass, the sole list-path owner since the executors
@@ -276,12 +360,15 @@ export const SSRListMethods = {
                         if (propsToUpdate.size === 0) return;
 
                         propsToUpdate.forEach(prop => {
-                            // Find bindings for this property AND nested properties
+                            // Find bindings for this property AND nested properties.
+                            // querySelectorAll leaves out the row's root, so a
+                            // binding there (<li data-bind="title">) is index -1.
                             const allBindings = itemEl.querySelectorAll(this._attrSelector('bind'));
+                            const rootBound = this._hasAttr(itemEl, 'bind');
 
                             // Iterate NodeList directly instead of Array.from().filter() to avoid allocations
-                            for (let bi = 0; bi < allBindings.length; bi++) {
-                                const bindingEl = allBindings[bi];
+                            for (let bi = rootBound ? -1 : 0; bi < allBindings.length; bi++) {
+                                const bindingEl = bi < 0 ? itemEl : allBindings[bi];
                                 const bindPath = this._getAttr(bindingEl, 'bind');
 
                                 // Filter: skip bindings that don't match this prop (unless wildcard)
@@ -448,7 +535,9 @@ export const SSRListMethods = {
         const len = data.length;
         if (len === 0) return 'length:0';
 
-        const _id = (item) => {
+        // `nested` is false for a value inside a row's nested array or object:
+        // its own nested values contribute only the cheap marker.
+        const _id = (item, nested = true) => {
             if (item == null) return 'null';
             if (typeof item !== 'object') return String(item);
             // Value-inclusive token. SSR-hydrated lists are not mapArray-backed:
@@ -459,17 +548,30 @@ export const SSRListMethods = {
             // while component-level computeds (which track the value directly)
             // still update. Identity (id/key) is kept as a prefix so structural
             // add/remove/reorder is still detected; scalar property values are
-            // appended so a value change moves the fingerprint. Nested
-            // objects/arrays contribute a cheap type+length marker (deep nested
-            // mutations remain out of scope for this lightweight hash).
+            // appended so a value change moves the fingerprint. A nested
+            // array or object contributes a cheap type+length marker, and for
+            // a row also the scalar values of its first 8 nested items (the
+            // rows of a nested list) or of the object: a $store or $query
+            // source that changes only there has no other signal. A row with
+            // no nested values gets the same token as before.
             let t = item.id !== undefined ? 'i:' + item.id + '|'
                   : item.key !== undefined ? 'k:' + item.key + '|' : '';
             const keys = Object.keys(item);
             for (let j = 0; j < keys.length; j++) {
                 const v = item[keys[j]];
-                t += keys[j] + ':' + (v !== null && typeof v === 'object'
-                    ? (Array.isArray(v) ? 'a' + v.length : 'o')
-                    : v) + ';';
+                if (v === null || typeof v !== 'object') {
+                    t += keys[j] + ':' + v + ';';
+                } else if (Array.isArray(v)) {
+                    t += keys[j] + ':a' + v.length;
+                    if (nested) {
+                        t += '[';
+                        for (let m = 0; m < v.length && m < 8; m++) t += _id(v[m], false) + ',';
+                        t += ']';
+                    }
+                    t += ';';
+                } else {
+                    t += keys[j] + ':' + (nested ? '{' + _id(v, false) + '}' : 'o') + ';';
+                }
             }
             return t;
         };
@@ -541,16 +643,65 @@ export const SSRListMethods = {
         // Track item elements for cleanup
         const itemElements = new Map();
 
+        // Which server row holds which item. By position, unless the list
+        // declares data-key and its server rows carry their keys (a data-seed
+        // field or a bound field): then by key, so a source in another order
+        // than the server's (a computed, a sorted store) pairs each row with
+        // its own item. A row with no key, or whose key no item has, is left
+        // unpaired; the takeover removes it.
+        const pairs = [];
+        const ssr = this.ssrManager;
+        let byKey = null;
+        if (ssr && this._getAttr(element, 'key')) {
+            const bindSel = this._attrSelector('bind');
+            const listSel = this._attrSelector('list');
+            for (const row of ssrItems) {
+                const seed = ssr._readSeedAttribute(row);
+                let k = seed ? seed[keyProp] : undefined;
+                if (k === undefined) {
+                    const fields = row.querySelectorAll(bindSel);
+                    for (let j = -1; j < fields.length; j++) {
+                        const f = j < 0 ? row : fields[j];
+                        if (this._getAttr(f, 'bind') === keyProp && f.closest(listSel) === element) {
+                            k = ssr._parseValueFromElement(f);
+                            break;
+                        }
+                    }
+                }
+                if (k === undefined) continue;
+                if (!byKey) byKey = new Map();
+                if (!byKey.has(String(k))) byKey.set(String(k), row);
+            }
+        }
+        if (byKey) {
+            for (let i = 0; i < data.length; i++) {
+                const k = data[i] != null ? data[i][keyProp] : undefined;
+                const row = k !== undefined ? byKey.get(String(k)) : undefined;
+                if (row) {
+                    byKey.delete(String(k));
+                    pairs.push([row, i]);
+                }
+            }
+        } else {
+            for (let i = 0; i < Math.min(ssrItems.length, data.length); i++) pairs.push([ssrItems[i], i]);
+        }
+
+        // State that no longer matches the server rows (an init() push or
+        // splice before activation, keyed rows in another order) is painted
+        // by a takeover at activation.
+        let mismatch = ssrItems.length !== data.length || pairs.length !== data.length;
+        for (let j = 0; !mismatch && j < pairs.length; j++) mismatch = pairs[j][0] !== ssrItems[j];
+
         // Bind data to existing SSR items
-        for (let i = 0; i < Math.min(ssrItems.length, data.length); i++) {
-            const itemEl = ssrItems[i];
+        for (const [itemEl, i] of pairs) {
             const item = data[i];
 
             // Wrap item in proxy if not already (for reactivity tracking)
             const itemProxy = sm.wrapInProxy ? sm.wrapInProxy(item) : item;
 
             // Set metadata (same as context rendering)
-            itemEl._listContext = context;
+            itemEl._rowList = context;
+            if (!this._hasAttr(itemEl, 'list')) itemEl._listContext = context;
             itemEl._listIndex = i;
             itemEl._itemData = itemProxy;
 
@@ -577,6 +728,53 @@ export const SSRListMethods = {
             itemElements.set(itemKey, itemEl);
         }
 
+        // The takeover is of the top-level list: it remounts the nested lists
+        // from their rows. It is for plain state arrays only. When this list
+        // or any list above it reads a shared source ($store, $query, or the
+        // long form external(...)) or a computed (by name, or as the head of
+        // a dotted path such as menu.items), nothing is taken over: such rows
+        // can lag the server markup until the source loads, and a takeover
+        // would blank them.
+        if (mismatch) {
+            let root = null;
+            for (let c = context; c; c = (c.parent && c.parent.type === 'list') ? c.parent : null) {
+                const p = String(c.path);
+                const csm = (c.componentInstance || instance)?.stateManager;
+                if (p.indexOf('$') !== -1 || p.indexOf('external(') !== -1 || p.startsWith('computed:') ||
+                    (csm && csm.computed && csm.computed[p.split('.')[0]])) {
+                    root = null;
+                    break;
+                }
+                root = c;
+            }
+            if (root && root.element) ssrTakeoverAtActivation.add(root.element);
+        }
+
+        // A keyed server row no item claimed (its key is not in the data, or
+        // its text is formatted unlike the key) is bound to nothing, whatever
+        // the source: with data present, the list is taken over at
+        // activation, which removes such rows and renders the unmatched items.
+        if (byKey && pairs.length < ssrItems.length && data.length > 0) {
+            let top = context;
+            while (top && top.parent && top.parent.type === 'list') top = top.parent;
+            ssrTakeoverAtActivation.add(top && top.element ? top.element : element);
+        }
+
+        // A top-level list over a component computed (data-list="shown",
+        // "computed:shown", "menu.items" under a computed menu) changes only
+        // through the computed, which no write path names. With rows to adopt
+        // it is taken over at activation: mapArray then follows the computed,
+        // and each row its item. With none yet (the computed's data has not
+        // loaded) the server rows stay, and the computed's first change takes
+        // the list over (_ssrNoteComputedWrite).
+        if (context && !(context.parent && context.parent.type === 'list')) {
+            const head = this._listPathBare(String(context.path)).split('.')[0];
+            if (sm.computed && sm.computed[head]) {
+                if (data.length > 0) ssrTakeoverAtActivation.add(element);
+                else if (sm._ensureComputedNotifier) sm._ensureComputedNotifier(head);
+            }
+        }
+
         // Mark list as having completed initial render
         element._initialRenderDone = true;
         element._previousData = [...data];
@@ -595,6 +793,24 @@ export const SSRListMethods = {
 
         // Set up event delegation on the container element
         this._ensureListEventDelegation(element, instance, listPath);
+
+        // Nested lists in the adopted rows hydrate from their row, the way a
+        // client row mounts them (_applyListItemIntegrations): a child context,
+        // the row's item proxy, and each list's own adoption map. Each nested
+        // list hydrates through this function, so deeper levels follow.
+        // _listRelationships is keyed by bare path across components, so it
+        // can name child paths for a list whose rows hold no list at all: one
+        // query decides for every row (a row that is itself a list is a
+        // descendant of the container too; template content is not).
+        const childPaths = context && this._listRelationships && this._listRelationships.get(context.path);
+        if (childPaths && childPaths.size && this._contextSystemInitialized &&
+            element.querySelector(this._attrSelector('list'))) {
+            const rsm = instance && instance.stateManager;
+            for (const [row, i] of pairs) {
+                const item = row._itemData;
+                this._processNestedListsForItem(row, (rsm && rsm.reactive) ? rsm.reactive(item) : item, i, context, instance);
+            }
+        }
 
         return true; // SSR handled
     },
@@ -651,7 +867,7 @@ export const SSRListMethods = {
         this._bindRootElementData(itemEl, item, ds, itemIndex, context);
 
         // OPTIMIZATION: Use pre-computed metadata if provided (avoids per-item string concat + Map lookup)
-        const listContext = itemEl._listContext;
+        const listContext = itemEl._rowList;
         const compiledMetadata = precomputedMetadata !== null ? precomputedMetadata : this._getCompiledMetadata(listContext);
 
         let allElements;
@@ -741,10 +957,16 @@ export const SSRListMethods = {
         if (!listPath) return null;
 
         const componentName = listContext?.componentInstance?.name;
-        const compilationKey = componentName ? `${componentName}:${listPath}` : listPath;
+        const baseKey = componentName ? `${componentName}:${listPath}` : listPath;
+        // The list element's own template key (derived here when hydration
+        // reached the list before the renderer keyed it).
+        const el = listContext.element;
+        const compilationKey = el
+            ? this._listTemplateKey(el, listContext.componentInstance, listPath, listContext)
+            : baseKey;
 
         return this._templateCache.compiled.get(compilationKey) ||
-               this._templateCache.compiled.get(listPath);
+               (compilationKey === baseKey ? this._templateCache.compiled.get(listPath) : undefined);
     },
 
     /**
@@ -880,5 +1102,47 @@ export const SSRListMethods = {
         }
 
         return allElements;
+    },
+    /**
+     * Execute single data-model in fallback mode
+     * @private
+     */
+    _executeFallbackModel(el, item, modelPath) {
+        const value = this._getValueFromItem(item, modelPath);
+
+        if (this._applyCustomElementAdapter(el, value)) {
+            return;
+        }
+
+        applyModel(el, value, el.type);
+    },
+    /**
+     * Execute single data-show in fallback mode
+     * @private
+     */
+    _executeFallbackShow(el, item, showPath, listContext, itemIndex) {
+        const scope = this._buildItemScope(listContext, itemIndex);
+
+        // _resolveRawBinding handles negation and all path types (computed:, $store.path, expressions, etc.)
+        const value = this._resolveRawBinding(showPath, item, scope);
+        applyShow(el, value);
+    },
+    /**
+     * Check if content update should be prevented by external hooks
+     * @param {HTMLElement} element - The element being updated
+     * @param {string} newValue - The new content value
+     * @returns {boolean} - True if update should be prevented
+     * @private
+     */
+    _shouldPreventContentUpdate(element, newValue)
+    {
+        return this._beforeContentUpdateHooks.some(hook => {
+            try {
+                return hook(element, newValue);
+            } catch (error) {
+                this._log('warn', 'Error in beforeContentUpdate hook:', error);
+                return false;
+            }
+        });
     },
 };

@@ -61,7 +61,7 @@ suite('data-expect shape-drift warn (WF-962)', () => {
     // The bracketed prefix appears exactly once per wfError call (the
     // trailing "↳ Docs:" line also contains the bare code, so a bare
     // filter double-counts).
-    const wf962 = () => warnings.filter(w => w.includes('[WF WF-962]'))
+    const wf962 = () => warnings.filter(w => w.includes('[WF-962]'))
 
     function mountList(qname, cname, expectSpec) {
         container.innerHTML = `

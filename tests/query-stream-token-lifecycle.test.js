@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * Review finding: stream URLs
+ * Stream URLs
  * resolve :tokens exactly as reads do, and the stream FOLLOWS THE READS.
  *
  * Before the fix, the sse rung handed the literal URL to EventSource —
@@ -319,7 +319,7 @@ suite('data-query: stream URL token lifecycle', () => {
     // to from. Composes with the readyState-2 revival fix above — each
     // fetch reopens the dead stream, so the count must survive cycles.
 
-    const count989 = (warnings) => warnings.filter(w => w.includes('[WF WF-989]')).length
+    const count989 = (warnings) => warnings.filter(w => w.includes('[WF-989]')).length
 
     itDev('WF-989: two dead cycles with zero messages on the from URL name the mistake once', async () => {
         const q = uname('q'); const c = uname('c')

@@ -290,13 +290,13 @@ suite('data-query freshness window (fresh:N rung token)', () => {
             // wfError emits two console.warn lines (message + docs link, both
             // carrying the code string); match the bracketed prefix so one
             // diagnostic counts once.
-            const bogus = warnings.filter(w => w.includes('[WF WF-967]'))
+            const bogus = warnings.filter(w => w.includes('[WF-967]'))
             expect(bogus.length, "'poll:15' matches no rung; it warns").toBe(1)
             expect(bogus[0]).toContain('poll:15')
 
             warnings.length = 0
             wildflower.query(uname('q'), { from: '/api/x.json', refresh: ['once', 15, 'focus', 'reconnect', 'etag:30', 'fresh:10'] })
-            expect(warnings.filter(w => w.includes('[WF WF-967]')).length, 'every valid token is silent').toBe(0)
+            expect(warnings.filter(w => w.includes('[WF-967]')).length, 'every valid token is silent').toBe(0)
         } finally {
             console.warn = realWarn
         }

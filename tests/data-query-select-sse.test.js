@@ -1,7 +1,6 @@
 /**
  * @vitest-environment browser
  *
- * Review finding:
  * `select:` must apply to EVERY read delivery, stream included. It used
  * to run only on the fetch path (_querySelect had one call site), so a
  * shared envelope ingested raw on every SSE push — the whole list

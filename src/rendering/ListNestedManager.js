@@ -8,6 +8,40 @@
  * @module
  */
 
+import { listTemplateId, wfError, WF_ERRORS } from '../core/wfUtils.js';
+
+// WF-519 (dev-only): a dotted data-list path inside a row whose route and
+// first row disagree. The route is the declaration's (_rowListReadsComponent);
+// the first row seen shows what the author may have meant. Once per
+// (component, path).
+const _wf519Seen = __DEV__ ? new Set() : null;
+function _warnRowListRoute(fw, instance, path, item, readsComponent) {
+    if (path.includes('$') || !instance) return;
+    const p = fw._listPathBare(path);
+    const dot = p.indexOf('.');
+    if (dot < 0) return;
+    const key = instance.name + ':' + path;
+    if (_wf519Seen.has(key)) return;
+    _wf519Seen.add(key);
+    const head = p.slice(0, dot);
+    // Raw read: a dev check must not add a dependency.
+    const raw = item && instance.stateManager.toRaw(item);
+    const has = raw != null && typeof raw === 'object' && raw[head] !== undefined;
+    if (readsComponent && has) {
+        wfError(WF_ERRORS.ROW_LIST_PATH, {
+            warn: true,
+            context: `component "${instance.name}": data-list="${path}" inside a row reads the component's "${head}"; the row item's "${head}" is not read`,
+            suggestion: `To render the row item's field, rename it or the component's "${head}".`
+        });
+    } else if (!readsComponent && !has && !instance.stateManager.computed?.[head]) {
+        wfError(WF_ERRORS.ROW_LIST_PATH, {
+            warn: true,
+            context: `component "${instance.name}": data-list="${path}" inside a row reads the row item, and the first row has no "${head}", so it renders nothing there`,
+            suggestion: `To render the component's ${p} in every row, declare "${head}" in the component's state: block.`
+        });
+    }
+}
+
 /**
  * Methods to be mixed into ListRendererMethods (and ultimately WildflowerJS.prototype)
  */
@@ -84,8 +118,9 @@ export const ListNestedMethods = {
         if (!itemEl || !itemEl.querySelectorAll) return;
         const listContexts = instance && instance._listContexts;
         const nestedListEls = itemEl.querySelectorAll('[data-list], [data-wf-list]');
-        for (let i = 0; i < nestedListEls.length; i++) {
-            const nested = nestedListEls[i];
+        // The row itself, when its root element is a nested list (i === -1).
+        for (let i = this._hasAttr(itemEl, 'list') ? -1 : 0; i < nestedListEls.length; i++) {
+            const nested = i === -1 ? itemEl : nestedListEls[i];
             if (nested._mapArrayInitialized && nested._disposeMapArray) {
                 try { nested._disposeMapArray(); } catch (e) { /* already gone */ }
                 nested._mapArrayInitialized = false;
@@ -93,7 +128,11 @@ export const ListNestedMethods = {
             }
             const childContext = nested._listContext;
             if (childContext) {
-                if (listContexts && childContext._wfListContextKey) {
+                // Only this context's own entry: two lists over the same path
+                // produce the same `path[i].child` key for their rows' nested
+                // lists, and the entry may belong to the other list's row.
+                if (listContexts && childContext._wfListContextKey
+                    && listContexts.get(childContext._wfListContextKey) === childContext) {
                     listContexts.delete(childContext._wfListContextKey);
                 }
                 // Also unlink from the parent list context's children Map, which
@@ -110,60 +149,76 @@ export const ListNestedMethods = {
         }
     },
     /**
-     * Update props for nested components within a list item when the item shifts position
-     * This is called during optimized single-removal to update data-prop-X="." bindings
-     * @param {HTMLElement} itemEl - The list item element
-     * @param {Object} newItemData - The new item data at this position
+     * Re-resolve the props of the child components inside a row whose item
+     * was replaced by another object with the same key (the row element is
+     * kept, so the components are too). Without it a `data-prop-x="."` prop
+     * went on pointing at the old object until something edited the new one.
+     *
+     * Each child re-resolves its own props against its own place
+     * (_updateComponentProps), so a component in a nested row further in is
+     * asked too and finds nothing changed. The full follow-up runs for those
+     * that did change: props-dependent computeds, the child's render effect,
+     * onPropsChange.
+     * @param {HTMLElement} itemEl - The list row (already carrying the new item)
+     * @param {Object} newItemData - The row's new item
+     * @param {string} listPath - The list's path, for onPropsChange
      * @private
      */
-    _updateNestedComponentPropsInItem(itemEl, newItemData) {
-        // Collect all component elements - both the item itself (if it's a component)
-        // and any nested components within it
-        const componentElements = [];
+    _updateNestedComponentPropsInItem(itemEl, newItemData, listPath) {
+        const nested = itemEl.querySelectorAll('[data-component-id]');
+        const self = itemEl.dataset.componentId;
+        if (nested.length === 0 && !self) return;
 
-        // Check if the item element itself is a component
-        if (itemEl.dataset.componentId) {
-            componentElements.push(itemEl);
+        const propsChangeInfo = { parentPath: listPath, newValue: newItemData, oldValue: undefined };
+        if (self) {
+            const inst = this.componentInstances.get(self);
+            if (inst && inst._propPaths) this._refreshChildProps(inst, propsChangeInfo);
         }
-
-        // Also find nested components within the item
-        const nestedComponents = itemEl.querySelectorAll('[data-component-id]');
-        nestedComponents.forEach(el => componentElements.push(el));
-
-        if (componentElements.length === 0) return;
-
-        componentElements.forEach(componentEl => {
-            const componentId = componentEl.dataset.componentId;
-            if (!componentId) return;
-
-            const instance = this.componentInstances.get(componentId);
-            if (!instance || !instance._propPaths || !instance._propsData) return;
-
-            let propsChanged = false;
-
-            // Update any props that use "." path (current list item)
-            for (const [propName, pathInfo] of Object.entries(instance._propPaths)) {
-                if (pathInfo.path === '.') {
-                    const oldValue = instance._propsData[propName];
-                    if (oldValue !== newItemData) {
-                        instance._propsData[propName] = newItemData;
-                        propsChanged = true;
-                    }
-                }
-            }
-
-            // If props changed, update all binding contexts that use props.* paths
-            if (propsChanged && this._contextSystemInitialized && this._contextRecords) {
-                this._updatePropsBindingsForComponent(instance);
-            }
-        });
+        for (let i = 0; i < nested.length; i++) {
+            const inst = this.componentInstances.get(nested[i].dataset.componentId);
+            if (inst && inst._propPaths) this._refreshChildProps(inst, propsChangeInfo);
+        }
     },
     /**
-     * Update all binding contexts that use props.* paths for a component
-     * Called after props have been updated to refresh the DOM
-     * @param {Object} instance - Component instance
+     * The nested lists of one row for one child path: the matching
+     * descendants, and the row itself when its root element is that list. A
+     * table forces the second shape: a <tr> may only hold cells, so a row of
+     * cells has no wrapper to put the inner list on.
+     *
+     * A list inside a child component in the row is the child's, not the
+     * row's (the rule _processNestedTemplates applies to the template). The
+     * search is by attribute, so without the check a child component's own
+     * list named like one of the parent's nested lists was mounted by the
+     * parent, with the parent's data.
+     * @param {HTMLElement} itemEl - the row
+     * @param {string} childPath - the nested list's declared path
+     * @param {string} selector - the attribute selector for that path
+     * @returns {NodeList|HTMLElement[]}
      * @private
      */
+    _nestedListsOfRow(itemEl, childPath, selector) {
+        const found = itemEl.querySelectorAll(selector);
+        const rowIsList = this._getAttr(itemEl, 'list') === childPath;
+        let kept = null;
+        for (let i = 0; i < found.length; i++) {
+            // Anything from the list element up to the row that is a component.
+            let inChild = false;
+            for (let cur = found[i]; cur; cur = cur.parentElement) {
+                if (this._hasAttr(cur, 'component')) { inChild = true; break; }
+                if (cur === itemEl) break;
+            }
+            if (inChild) {
+                if (kept === null) { kept = []; for (let k = 0; k < i; k++) kept.push(found[k]); }
+            } else if (kept !== null) {
+                kept.push(found[i]);
+            }
+        }
+        if (!rowIsList) return kept === null ? found : kept;
+        const all = [itemEl];
+        const rest = kept === null ? found : kept;
+        for (let i = 0; i < rest.length; i++) all.push(rest[i]);
+        return all;
+    },
     /**
      * Process nested lists within a parent list item
      * @private
@@ -179,9 +234,12 @@ export const ListNestedMethods = {
             // made every `data-wf-list` inside a row invisible and the nested
             // list simply never rendered. No warning, because nothing was
             // looking for it.
-            const nestedListElements = itemEl.querySelectorAll(this._attrSelector('list', escapedPath));
+            const nestedListElements = this._nestedListsOfRow(itemEl, childPath, this._attrSelector('list', escapedPath));
 
+            // Decided by the declaration, once for every row of this list.
+            const readsComponent = this._rowListReadsComponent(instance, childPath);
             nestedListElements.forEach(nestedListEl => {
+                if (__DEV__) _warnRowListRoute(this, instance, childPath, item, readsComponent);
                 let nestedData;
                 if (childPath.charCodeAt(0) === 36 /* $ */) {
                     // $store.path / $query.rows: a shared source, not a field
@@ -192,30 +250,37 @@ export const ListNestedMethods = {
                     nestedData = this._normalizeStoreShorthands
                         ? this._evaluateExternalListPath(this._normalizeStoreShorthands(childPath), instance)
                         : [];
-                    if (!Array.isArray(nestedData)) nestedData = [];
-                } else {
-                    nestedData = item[childPath];
-                }
-
-                // Fallback: implicit item-level computed evaluation when the
-                // path isn't a raw field on the item. Mirrors data-bind's
-                // resolution so item-level computeds work as nested-list
-                // sources, not just as data-bind values.
-                if (nestedData === undefined &&
-                    !childPath.includes('.') &&
-                    instance?.stateManager?.computed?.[childPath]) {
-                    try {
-                        nestedData = this._evaluateComputedInListContext(
-                            instance, childPath, item, index, context
-                        );
-                    } catch (e) {
-                        if (typeof __DEV__ !== 'undefined' && __DEV__) {
-                            console.error(`Error evaluating nested list computed "${childPath}":`, e);
-                        }
+                } else if (readsComponent) {
+                    // A dotted path whose head the component declares
+                    // (data-list="menu.items", "settings.options") reads the
+                    // component. It mounts like a shared source and reads live
+                    // like a top-level list (_renderListWithMapArray applies
+                    // the same test).
+                    nestedData = instance.stateManager.getValue(this._listPathBare(childPath));
+                    // Server rows of such a list are not adopted: it mounts
+                    // fresh (the mount sweep removes them), so it follows the
+                    // component like a client row. An adopted copy was keyed
+                    // under the row and never woke on a component write.
+                    if (__FEATURE_SSR__ && nestedListEl._ssrPhase) {
+                        nestedListEl._ssrPhase = null;
+                        // Activation only releases lists still protected.
+                        if (this.ssrManager) this.ssrManager.protectedLists.delete(nestedListEl);
                     }
+                } else {
+                    // A field of the row item, or an item-level computed when
+                    // the item has no such field. Mirrors data-bind's
+                    // resolution, and the nested arrayFn reads it the same way.
+                    nestedData = this._rowListValue(item, childPath, instance, index, context);
                 }
 
-                if (Array.isArray(nestedData)) {
+                // Mount whatever the source holds. An item with no array yet
+                // (a field filled in later, a row replaced by an object
+                // without it) gets an empty list: the nested list's own effect
+                // reads the field through the item, so the rows appear when
+                // the array does. Mounting only when the array was already
+                // there left nothing to wake, and the list never rendered.
+                if (!Array.isArray(nestedData)) nestedData = [];
+                {
                     // CRITICAL: Check if nested list already has a context and update its _parentIndex
                     // This ensures model bindings inside the nested list use the correct parent index
                     // after parent list reordering
@@ -297,9 +362,11 @@ export const ListNestedMethods = {
      * @param {string} parentPath - The parent list's data path
      * @param {string|null} [componentName=null] - The component name for context
      * @param {Object|null} [instance=null] - Component instance for external template lookup
+     * @param {string|null} [parentKey=null] - The parent list's template cache key
+     *   (see _listTemplateKey); child keys are `parentKey>childPath`
      * @private
      */
-    _processNestedTemplates(parentTemplate, parentPath, componentName = null, instance = null)
+    _processNestedTemplates(parentTemplate, parentPath, componentName = null, instance = null, parentKey = null)
     {
         // For HTML5 templates, search inside the content, not the template element itself
         const searchContainer = parentTemplate.tagName === 'TEMPLATE' && parentTemplate.content
@@ -329,22 +396,43 @@ export const ListNestedMethods = {
                 return;
             }
 
+            // The nested list's own template id, taken (and written to its
+            // data-wftpl attribute) before the template is resolved and
+            // removed. The attribute sits on the list element inside the
+            // parent template, so every row's copy carries it.
+            const nid = listTemplateId(nestedList);
+
             // Find the template within this nested list
             // Pass instance to enable data-use-template lookups for nested external templates
             const childTemplate = this._findTemplate(nestedList, instance);
             if (!childTemplate) return;
 
-            // Store the child template using composite key to avoid collisions
-            const cacheKey = componentName ? `${componentName}:${childPath}` : childPath;
+            // Store the child template under its parent's key and its own id
+            // (`parentKey>childPath|id`), so two parents over the same child
+            // path, two nested lists over one child path in the same row, or a
+            // child path named like a top-level list, each keep their own
+            // template. Also under `nested:component:childPath|id`, a namespace
+            // only a nested list whose parent key is unknown reads (see
+            // _listTemplateKey); a top-level list never does.
+            const baseKey = componentName ? `${componentName}:${childPath}` : childPath;
+            const childKey = parentKey ? `${parentKey}>${childPath}${nid}` : `nested:${baseKey}${nid}`;
+            // The copy kept here is what this nested list's rows are cloned
+            // from, and it is taken before the recursion below reaches the
+            // lists one level further in. Give those their ids first, so the
+            // rows carry them and never hash. (The recursion computes the
+            // same ids: nothing inside those lists has been touched yet.)
+            const inner = (childTemplate.content || childTemplate).querySelectorAll(this._attrSelector('list'));
+            for (let i = 0; i < inner.length; i++) listTemplateId(inner[i]);
             const cachedChildTemplate = childTemplate.cloneNode(true);
-            this._templateCache.lists.set(cacheKey, cachedChildTemplate);
+            this._templateCache.lists.set(childKey, cachedChildTemplate);
+            if (parentKey) this._templateCache.lists.set(`nested:${baseKey}${nid}`, cachedChildTemplate);
 
 
             // Store parent-child relationship
             this._registerListRelationships([{parentPath, childPath}]);
 
             // Recursively process deeper nesting
-            this._processNestedTemplates(childTemplate, childPath, componentName, instance);
+            this._processNestedTemplates(childTemplate, childPath, componentName, instance, childKey);
             // Remove template from DOM if it's an element (not a DocumentFragment)
             if (childTemplate.nodeType !== Node.DOCUMENT_FRAGMENT_NODE && childTemplate.remove) {
                 childTemplate.remove();

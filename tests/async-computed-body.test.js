@@ -1,7 +1,7 @@
 /**
  * @vitest-environment browser
  *
- * The async-BODY tier (review coverage finding):
+ * The async-BODY tier:
  * before this file, no test in the suite defined a real `async` function
  * computed — every fixture returned a hand-built Promise from a synchronous
  * body, the one authoring shape where the documented post-`await` tracking

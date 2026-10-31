@@ -202,8 +202,7 @@ suite('data-query: params on internal refetch, ETag keying, keyless write', () =
         `
     }
 
-    // Adversarial review finding A, found by two
-    // lenses independently. `key` defaults to 'id' and llms.txt documents that,
+    // `key` defaults to 'id' and llms.txt documents that,
     // and the read path uses the default throughout. The write path instead
     // asks whether `key:` was TEXTUALLY declared, so a list query that omits it
     // is keyed for reading and keyless for writing. Shape is DOM-determined;
@@ -364,13 +363,13 @@ suite('data-query: params on internal refetch, ETag keying, keyless write', () =
         })
     })
 
-    // Adversarial review finding D. The ETag
+    // The ETag
     // header is read and stored before resp.json() is called, so a body that
     // fails to parse still leaves its validator behind. Nothing applied that
     // response, but the validator now vouches for it: the next conditional
     // request sends it, a 304 marks the query fresh, and with persist on those
     // stale rows are written to localStorage as confirmed truth, which is the
-    // only failure in this review that outlives the tab.
+    // only failure of this kind that outlives the tab.
     describe('an ETag only vouches for a response that was applied', () => {
         it('a body that fails to parse does not leave its validator behind', async () => {
             const q = uname('et'); const c = uname('etc')
@@ -419,7 +418,7 @@ suite('data-query: params on internal refetch, ETag keying, keyless write', () =
         })
     })
 
-    // Adversarial review finding B. Three guards
+    // Three guards
     // handle a write's resolved value: `result == null` invalidates, and two
     // more both require `typeof result === 'object'`. A PRIMITIVE fails both
     // and reaches _queryIngest, where an unkeyed single payload with reconcile

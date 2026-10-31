@@ -24,7 +24,7 @@ describe.skipIf(!hasFeature('query') || isMinifiedBuild())('WF-942: unknown quer
     capture()
     const name = 'qUnknown' + (++n)
     wf.query(name, { from: () => [], pools: { a: {} } })
-    const found = warnings.filter((w) => w.includes('[WF WF-942]'))
+    const found = warnings.filter((w) => w.includes('[WF-942]'))
     expect(found.length).toBe(1)
     expect(found[0]).toContain(`"${name}"`)
     expect(found[0]).toContain('pools')

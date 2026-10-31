@@ -65,7 +65,7 @@ describe('data-bind-class shape warning', () => {
         expect(btn.classList.contains('btn')).toBe(true)  // static class preserved
 
         // The WF-505 warning is now emitted via wfError; output starts with
-        // `[WF WF-505] Class binding shape mismatch...`. Assert on the code
+        // `[WF-505] Class binding shape mismatch...`. Assert on the code
         // rather than the prose so future wording tweaks don't break this.
         const allWarns = warnSpy.mock.calls.map(c => c.join(' '))
         const codeWarn = allWarns.find(s => s.includes('WF-505'))

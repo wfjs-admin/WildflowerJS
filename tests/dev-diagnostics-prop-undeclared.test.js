@@ -52,7 +52,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode undeclared prop attribute warning (
     })
 
     function undeclaredWarnings(key) {
-        return warnings.filter(w => w.includes('[WF WF-508]') && w.includes(`'${key}'`))
+        return warnings.filter(w => w.includes('[WF-508]') && w.includes(`'${key}'`))
     }
 
     async function mount(suffix, childDef, childAttrs) {
@@ -118,7 +118,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode undeclared prop attribute warning (
             { props: { title: { type: String }, count: { type: Number, default: 0 } }, state: { label: 'x' } },
             'data-prop-title="cardTitle" data-prop-count="2"')
 
-        expect(warnings.filter(w => w.includes('[WF WF-508]'))).toEqual([])
+        expect(warnings.filter(w => w.includes('[WF-508]'))).toEqual([])
     })
 
     // ------------------------------------------ shape 2: no props block
@@ -139,6 +139,6 @@ describe.skipIf(isMinifiedBuild())('Dev-mode undeclared prop attribute warning (
             { state: { label: 'x' } },
             '')
 
-        expect(warnings.filter(w => w.includes('[WF WF-508]'))).toEqual([])
+        expect(warnings.filter(w => w.includes('[WF-508]'))).toEqual([])
     })
 })

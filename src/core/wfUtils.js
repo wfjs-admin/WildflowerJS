@@ -62,7 +62,7 @@
  *     context: 'my-component',
  *     suggestion: 'Check component registration'
  * });
- * // Output: [WF WF-102] Component instance not found: my-component
+ * // Output: [WF-102] Component instance not found: my-component
  * //         ↳ Suggestion: Check component registration
  * ```
  *
@@ -186,11 +186,11 @@ export const wfYield = (() => {
  *   ─────  ──────────────────────────  ──────────────  ─────────────────────
  *   000s   core, initialization        001-003         004-099
  *   100s   components                  101-108         109-199
- *   200s   state, computed, watch      201-236         237-299
+ *   200s   state, computed, watch      201-238         239-299
  *   300s   context                     301-304         305-399
  *   400s   templates, lists            401-418         419-499
- *   500s   bindings, forms             501-512         513-599
- *   600s   actions, events             601-606         607-699
+ *   500s   bindings, forms             501-521         522-599
+ *   600s   actions, events             601-607         608-699
  *   700s   routing                     701-712         713-799
  *   800s   SSR                         801-802         803-899
  *   900s   stores    901-911           queries 940-942,950-999  912-939 (shared), 943-949
@@ -212,14 +212,55 @@ export const wfYield = (() => {
  */
 // The two codes the reactive graph's facade (entity-handle.js) raises, hoisted
 // out of the table so a headless bundle of the graph (the thread extension's
-// worker half) imports these two definitions and not the whole registry: the
-// table is one object literal, so any import of it ships every code. The
-// entries below point at these same objects; the ledger check reads codes
-// textually and sees them either way.
+// worker half) imports these two definitions and not the whole registry: any
+// import of the table ships every code in it. The entries below point at
+// these same objects; the ledger check reads codes textually and sees them
+// either way.
 export const WF_ERR_CIRCULAR_DEPENDENCY = { code: 'WF-202', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Circular dependency detected' }) };
 export const WF_ERR_HOT_LOOP_FACADE_READS = { code: 'WF-216', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A state property is read thousands of times per frame through the reactive facade (sustained hot loop)' }) };
 
-export const WF_ERRORS = {
+// The table is two objects. WF_ERRORS_PROD holds the entries production code
+// raises; WF_ERRORS_DEV_ONLY holds the rest, which only __DEV__-folded
+// diagnostics raise, and a production build drops it. WF_ERRORS (and so
+// window.WF_ERRORS, see wfGlobals.js) is the full table in development builds
+// and WF_ERRORS_PROD alone in production. A wfError call that moves out of a
+// __DEV__ block takes its entry with it into WF_ERRORS_PROD:
+// scripts/check-wf-errors-prod.cjs (npm run check:wf-errors, Step 1c of
+// build-and-test.cjs) fails when a production bundle references a key its
+// table does not carry.
+const WF_ERRORS_PROD = {
+    // Component lifecycle (100-199)
+    DOM_OWNERSHIP: { code: 'WF-105', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Manual DOM write on a node the engine keeps current' }) },
+
+    // State/reactivity (200-299)
+    CIRCULAR_DEPENDENCY: WF_ERR_CIRCULAR_DEPENDENCY,
+
+    // Action/event errors (600-699)
+    EMIT_NO_INSTANCE: { code: 'WF-603', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component instance not found' }) },
+
+    // Router errors (700-799)
+    ROUTE_ALIAS_ERROR: { code: 'WF-702', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Target route not found for alias' }) },
+    ROUTE_GUARD_ERROR: { code: 'WF-703', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route guard' }) },
+    ROUTE_NAVIGATION_ERROR: { code: 'WF-704', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Navigation queue exceeded retry limit' }) },
+    NAMED_ROUTE_NOT_FOUND: { code: 'WF-705', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Named route not found' }) },
+    ROUTE_HANDLER_ERROR: { code: 'WF-709', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route handler' }) },
+    ROUTE_COMPONENT_ERROR: { code: 'WF-710', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading route component' }) },
+    ROUTE_SCROLL_ERROR: { code: 'WF-711', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in scroll behavior' }) },
+    ROUTE_HOOK_ERROR: { code: 'WF-712', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route lifecycle hook' }) },
+
+    // Store errors (900-999)
+    STORE_NAME_INVALID: { code: 'WF-901', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store component name must be a string' }) },
+    STORE_DEF_INVALID: { code: 'WF-902', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store component definition must be an object' }) },
+    STORE_INIT_ERROR: { code: 'WF-903', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in store init hook' }) },
+    STORE_CREATE_ERROR: { code: 'WF-904', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error creating store component' }) },
+    STORE_DEFAULT_ERROR: { code: 'WF-907', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create default app-store' }) },
+
+    // Query diagnostics (the query block of the store century; see the
+    // comment above the query entries in WF_ERRORS_DEV_ONLY)
+    QUERY_TO_INVALID: { code: 'WF-964', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() needs a `to` function declared on the query' }) },
+};
+
+const WF_ERRORS_DEV_ONLY = {
     // Core/initialization (001-099)
     ROOT_NOT_FOUND: { code: 'WF-001', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Root element not found' }) },
     CONFIG_INVALID: { code: 'WF-002', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid configuration value' }) },
@@ -230,7 +271,6 @@ export const WF_ERRORS = {
     COMPONENT_NOT_FOUND: { code: 'WF-102', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Component instance not found' }) },
     COMPONENT_CONTEXT_MISSING: { code: 'WF-103', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Component context not available' }) },
     PARENT_HANDLER_ERROR: { code: 'WF-104', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in parent event handler' }) },
-    DOM_OWNERSHIP: { code: 'WF-105', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Manual DOM write on a node the engine keeps current' }) },
     DESTROY_RESURRECT: { code: 'WF-106', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'destroy() called with the component element still in the document' }) },
     PROVIDER_MISSING: { code: 'WF-107', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A declared provider was never provided' }) },
     REGISTRATION_OVERWRITTEN: { code: 'WF-108', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A directive or plugin registration was overwritten' }) },
@@ -238,7 +278,6 @@ export const WF_ERRORS = {
 
     // State/reactivity (200-299)
     COMPUTED_EVAL_ERROR: { code: 'WF-201', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error evaluating computed property' }) },
-    CIRCULAR_DEPENDENCY: WF_ERR_CIRCULAR_DEPENDENCY,
     STATE_SET_ERROR: { code: 'WF-203', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error setting state value' }) },
     STATE_DELETE_ERROR: { code: 'WF-204', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error deleting state value' }) },
     STATE_LOAD_ERROR: { code: 'WF-205', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading state from storage' }) },
@@ -267,6 +306,9 @@ export const WF_ERRORS = {
     RULE_VERDICT_INVALID: { code: 'WF-234', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Validation rule check returned something that is not a verdict; rule skipped' }) },
     ITEM_COMPUTED_ASYNC: { code: 'WF-235', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Item-level list computed returned a Promise; async computeds are component/store/plugin-level only' }) },
     STATE_UNDERSCORE_KEY: { code: 'WF-236', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'An underscore key in state is not reachable as this._name (underscore names are raw instance fields)' }) },
+    ITEM_COMPUTED_CALLED: { code: 'WF-237', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A list-row binding calls an item-level computed; in a row the name is already that computed\'s value, so the call renders nothing' }) },
+    // Printed by the reactive graph itself (core.js imports nothing); listed for the registry.
+    FLUSH_LOOP_BREAKER: { code: 'WF-238', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Reactive updates did not settle: one flush ran a million updates, so it stopped' }) },
 
     // Context system (300-399)
     CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
@@ -314,41 +356,34 @@ export const WF_ERRORS = {
     BINDING_ORPHAN: { code: 'WF-513', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A binding attribute has no component ancestor, so it never initializes' }) },
     MODIFIER_FALSY_VALUE: { code: 'WF-514', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A presence-only modifier carries a falsy-looking value; presence alone turns it on' }) },
     LATE_INIT_CHUNKED: { code: 'WF-515', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component registered after the page-load scan matched more elements than fit its synchronous budget; the rest are initializing in chunks' }) },
+    ROW_BINDING_METHOD: { code: 'WF-516', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A list-row binding names a component method; bindings read state and computeds, so it renders nothing' }) },
+    ROW_ROOT_RENDER: { code: 'WF-517', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-render on a list row\'s root element is not currently supported: a list tracks each row by that element, and data-render removes it' }) },
+    COMPONENT_IS_CONTAINER: { code: 'WF-518', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component element cannot also be a list or pool container' }) },
+    ROW_LIST_PATH: { code: 'WF-519', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A dotted data-list path inside a list row reads the component when the component declares its first segment, and the row item otherwise' }) },
+    ROOT_BLOCK_CONFLICT: { code: 'WF-520', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component\'s tag and its root: block set the same attribute, style property or directive; the tag\'s value is used' }) },
+    ROOT_BINDING_CHILD_SCOPE: { code: 'WF-521', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A binding on a nested component\'s root element reads the component around it, and names a value only the nested component has' }) },
 
     // Action/event errors (600-699)
     ACTION_HANDLER_ERROR: { code: 'WF-601', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in action handler' }) },
     METHOD_ERROR: { code: 'WF-602', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in component method' }) },
-    EMIT_NO_INSTANCE: { code: 'WF-603', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component instance not found' }) },
     LIFECYCLE_NAME_ACTION: { code: 'WF-604', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-action targets a reserved lifecycle name' }) },
     REPLAY_STALE_EVENT: { code: 'WF-605', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Stale event API called in an action replayed after init' }) },
     ACTION_STORE_SHORTHAND: { code: 'WF-606', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: '$entity.path cannot name an action handler' }) },
+    ROW_ACTION_CAPTURE: { code: 'WF-607', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-event-capture has no effect on this action: it is dispatched by a listener it shares (a list\'s, for an action in a list row), which runs after the capture phase' }) },
 
     // Router errors (700-799)
     ROUTE_NOT_FOUND: { code: 'WF-701', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Route not found' }) },
-    ROUTE_ALIAS_ERROR: { code: 'WF-702', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Target route not found for alias' }) },
-    ROUTE_GUARD_ERROR: { code: 'WF-703', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route guard' }) },
-    ROUTE_NAVIGATION_ERROR: { code: 'WF-704', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Navigation queue exceeded retry limit' }) },
-    NAMED_ROUTE_NOT_FOUND: { code: 'WF-705', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Named route not found' }) },
     ROUTE_CONFIG_INVALID: { code: 'WF-706', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid route configuration' }) },
     ROUTE_ALREADY_INIT: { code: 'WF-707', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Router already initialized' }) },
     ROUTE_NO_MATCH: { code: 'WF-708', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'No route matched for path' }) },
-    ROUTE_HANDLER_ERROR: { code: 'WF-709', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route handler' }) },
-    ROUTE_COMPONENT_ERROR: { code: 'WF-710', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading route component' }) },
-    ROUTE_SCROLL_ERROR: { code: 'WF-711', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in scroll behavior' }) },
-    ROUTE_HOOK_ERROR: { code: 'WF-712', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route lifecycle hook' }) },
 
     // SSR errors (800-899)
     SSR_ACTIVATION_ERROR: { code: 'WF-801', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error during SSR activation' }) },
     SSR_HYDRATION_ERROR: { code: 'WF-802', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error during hydration' }) },
 
     // Store errors (900-999)
-    STORE_NAME_INVALID: { code: 'WF-901', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store component name must be a string' }) },
-    STORE_DEF_INVALID: { code: 'WF-902', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store component definition must be an object' }) },
-    STORE_INIT_ERROR: { code: 'WF-903', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in store init hook' }) },
-    STORE_CREATE_ERROR: { code: 'WF-904', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error creating store component' }) },
     STORE_EXTERNAL_ERROR: { code: 'WF-905', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in external() accessing store' }) },
     STORE_SUBSCRIPTION_ERROR: { code: 'WF-906', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in store subscription callback' }) },
-    STORE_DEFAULT_ERROR: { code: 'WF-907', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create default app-store' }) },
     STORE_REENTRANT_WRITE: { code: 'WF-908', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store path written from inside its own change notification' }) },
     STORE_NEVER_REGISTERED: { code: 'WF-909', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A subscribed or watched store never registered' }) },
     STORE_WAIT_TIMEOUT: { code: 'WF-910', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Timed out waiting for a subscribed store to become ready' }) },
@@ -377,7 +412,6 @@ export const WF_ERRORS = {
     QUERY_REFRESH_SHAPE: { code: 'WF-961', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'refresh() received unexpected options; request parameters belong inside params' }) },
     QUERY_EXPECT_DRIFT: { code: 'WF-962', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Incoming rows drifted from the data-expect declaration' }) },
     QUERY_ORPHAN: { code: 'WF-963', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-query element has no component ancestor, so nothing will ever process it' }) },
-    QUERY_TO_INVALID: { code: 'WF-964', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() needs a `to` function declared on the query' }) },
     QUERY_WRITE_KEYLESS_RESULT: { code: 'WF-965', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() resolved with an object lacking the query key; treated as resolve-with-nothing (the query invalidates)' }) },
     FACADE_IN_RAW: { code: 'WF-966', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A container written to reactive state holds facade-wrapped elements; unwrap with wildflower.toRaw before writing' }) },
     QUERY_RUNG_UNKNOWN: { code: 'WF-967', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Unrecognized refresh rung token; token ignored' }) },
@@ -435,6 +469,8 @@ export const WF_ERRORS = {
     // Render-effect path resolution failures
     EFFECT_PATH: { code: 'WF-EFFECT', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving path in render effect' }) }
 };
+
+export const WF_ERRORS = (typeof __DEV__ !== 'undefined' && __DEV__) ? { ...WF_ERRORS_PROD, ...WF_ERRORS_DEV_ONLY } : WF_ERRORS_PROD;
 
 /**
  * Marker for query-engine writes to query-owned stores. The engine bumps
@@ -495,6 +531,64 @@ function errorDocUrl(code) {
 }
 
 /**
+ * Development builds keep each coded diagnostic as data as well as printing
+ * it, so code that checks a page (a test, a dev overlay, an agent) can read
+ * what the console shows: `wildflower.diagnostics` is this array (the newest
+ * DIAGNOSTIC_LIMIT, cleared with `length = 0`), and each entry is also
+ * dispatched as a `wildflower:diagnostic` event on document. Null in
+ * production builds.
+ */
+export const diagnosticLog = (typeof __DEV__ !== 'undefined' && __DEV__) ? [] : null;
+const DIAGNOSTIC_LIMIT = 200;
+
+/**
+ * Print a coded diagnostic and record it (development builds only). Both
+ * wfError and the public wildflower.diagnostic() come through here, so the
+ * framework's lines and an extension's lines have one format:
+ * `[CODE] message: context`, then the Suggestion, Data, Caused-by and Docs
+ * lines. The docs link is always derived from the code. Returns the frozen
+ * entry pushed to wildflower.diagnostics.
+ *
+ * @param {Object} d
+ * @param {string} d.code - 'WF-505', 'KN-141'; the code carries its prefix
+ * @param {string} [d.severity='warning'] - 'warning' (console.warn) or 'error' (console.error)
+ * @param {string} [d.message]
+ * @param {string} [d.context]
+ * @param {string} [d.suggestion]
+ * @param {*} [d.data]
+ * @param {Error|string} [d.cause]
+ * @returns {Object} the frozen entry
+ */
+export function reportDiagnostic(d) {
+    const { code, message, context, suggestion, data, cause } = d || {};
+    const severity = d && d.severity === 'error' ? 'error' : 'warning';
+    const docs = errorDocUrl(code);
+    const line = '[' + code + ']' + (message ? ' ' + message : '') + (context ? ': ' + context : '');
+    if (severity === 'error') console.error(line); else console.warn(line);
+    if (suggestion) console.warn(`  ↳ Suggestion: ${suggestion}`);
+    if (data) console.warn(`  ↳ Data:`, data);
+    if (cause) console.warn(`  ↳ Caused by:`, cause.message || cause);
+    console.warn(`  ↳ Docs: ${docs}`);
+
+    const entry = Object.freeze({
+        code,
+        severity,
+        message: message || '',
+        context: context || null,
+        suggestion: suggestion || null,
+        cause: cause ? String(cause.message || cause) : null,
+        docs,
+        time: Date.now()
+    });
+    diagnosticLog.push(entry);
+    if (diagnosticLog.length > DIAGNOSTIC_LIMIT) diagnosticLog.shift();
+    if (typeof document !== 'undefined' && typeof CustomEvent === 'function') {
+        document.dispatchEvent(new CustomEvent('wildflower:diagnostic', { detail: entry }));
+    }
+    return entry;
+}
+
+/**
  * Log an error with structured error code, context, and suggestions.
  *
  * In production builds (__DEV__ = false), outputs compact error with code + doc link.
@@ -514,25 +608,24 @@ function errorDocUrl(code) {
  */
 export function wfError(errorDef, options = {}) {
     const { context, suggestion, cause, data, warn } = options;
-    const log = warn ? console.warn.bind(console) : console.error.bind(console);
+
+    // Page code reusing window.WF_ERRORS with a key this file leaves out
+    // (production files carry only the entries they raise) gets a line, not a throw.
+    if (!errorDef) {
+        (warn ? console.warn : console.error).call(console, '[WF]', context || '');
+        if (cause) console.error(cause);
+        return;
+    }
 
     if (typeof __DEV__ !== 'undefined' && __DEV__) {
-        // Development: full context output, including the doc URL so the
-        // canonical reference is one click away even when the inline
-        // message/suggestion already explain the issue.
-        log(`[WF ${errorDef.code}] ${errorDef.message}${context ? `: ${context}` : ''}`);
-
-        if (suggestion) {
-            console.warn(`  ↳ Suggestion: ${suggestion}`);
-        }
-        if (data) {
-            console.warn(`  ↳ Data:`, data);
-        }
-        if (cause) {
-            console.warn(`  ↳ Caused by:`, cause.message || cause);
-        }
-        console.warn(`  ↳ Docs: ${errorDocUrl(errorDef.code)}`);
+        reportDiagnostic({
+            code: errorDef.code,
+            severity: warn ? 'warning' : 'error',
+            message: errorDef.message,
+            context, suggestion, data, cause
+        });
     } else {
+        const log = warn ? console.warn.bind(console) : console.error.bind(console);
         // Production: compact error code + doc link. A `cause` is the
         // exception the framework caught from the author's own code (an
         // init(), a store definition), and that reaches the console in every
@@ -895,6 +988,85 @@ export function mergeData(target) {
     }
     return target;
 }
+
+/**
+ * A list element's template identity: '|' plus a short hash of its own
+ * template markup, or '' when it carries no template. The list template cache
+ * key is `component:path` plus this, so two lists over one path with
+ * different templates never share an entry, and the key does not depend on
+ * which list rendered first, document order, or the element being a clone
+ * (a data-render re-insert, a second instance). Read it BEFORE extraction:
+ * extraction removes nested templates and rewrites data-query elements in
+ * place. Hashes every direct <template> child (a polymorphic list has
+ * several).
+ *
+ * Remembered across clones: a list's <template> is removed from the element
+ * once extracted, and a data-render block re-inserts a cloneNode copy of its
+ * content. A copy taken after the lists inside rendered has rows but no
+ * template, and no expando survives a clone, so the hash is also written to a
+ * data-wftpl attribute (not `data-wf-tpl`: `data-wf-X` is the alias form of
+ * `data-X`, and a custom directive named `tpl` would then fire on every
+ * list), which a clone carries; an element with no template
+ * child reads it back. Last, the first descendant template (how _findTemplate
+ * resolves a template that is not a direct child).
+ */
+export function listTemplateId(listEl) {
+    let h = 0x811c9dc5, len = 0, found = false;
+    const add = (tpl) => {
+        const s = tpl.outerHTML;
+        found = true;
+        len += s.length;
+        for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 0x01000193);
+        }
+    };
+    const kids = listEl.children;
+    for (let i = 0; i < kids.length; i++) {
+        if (kids[i].localName === 'template') add(kids[i]);
+    }
+    if (!found) {
+        const kept = listEl.getAttribute('data-wftpl');
+        if (kept) return '|' + kept;
+        const t = listEl.querySelector('template');
+        if (t) add(t);
+    }
+    if (!found) return '';
+    const id = (h >>> 0).toString(36) + '.' + len.toString(36);
+    listEl.setAttribute('data-wftpl', id);
+    return '|' + id;
+}
+
+/**
+ * Framework attributes the BULK ROW PATH does not serve, by base name (no
+ * data- / data-wf- prefix). A row template carrying any of them is built by
+ * the per-row path.
+ *
+ * Ten or more rows created at once are cloned from a stripped copy of the
+ * template and bound from compiled metadata. That is only right when every
+ * framework attribute in the template is one the path is known to handle. The
+ * rule used to be a list of exclusions checked against the compiled metadata,
+ * so an attribute nobody had listed took the stripped path by default (a
+ * <form data-action> in a row worked at nine rows and was dead at ten).
+ *
+ * At run time this is still a list of names, and a name that is not on it is
+ * served. What keeps it complete is scripts/check-attr-vocabulary.cjs: every
+ * attribute name the source reads through the prefix helpers must be either
+ * here or on the served line below, or the test run fails. So an attribute
+ * added to the framework has to be placed deliberately; when in doubt it goes
+ * here, the slower path that handles everything. (The script sees helper
+ * calls with a literal name. An attribute read any other way is not checked.)
+ *
+ * Served by the bulk path (the script reads this line):
+ * @bulk-served: bind bind-class action key cloak no-router type event-capture event-debounce event-delay event-if event-once event-outside event-passive event-prevent event-self event-stop event-throttle event-key-*
+ *
+ * `event-outside` is wired per row when the rows are built (onBulkCreate).
+ * `type` is a common styling hook, and the framework reads it only when it
+ * adopts server-rendered rows, which this path never builds. Two served names
+ * are not served on particular elements, `action` on a <form> and `bind` on a
+ * form control: TemplateSystem._rowTemplateBulkServed has those.
+ */
+export const BULK_UNSERVED_ATTR = /^(?:bind-(?:attr|html|style)|model(?:-(?:event|lazy|number|trim))?|pool(?:-(?:cull|cull-props|fps|sort|static))?|prop-.+|props|list|show|render|component|portal|query|transition|with|slot(?:-container)?|use-template|item-template|template-(?:key|fallback)|validate(?:-(?:on|message))?|error-(?:fallback|for)|expect|external|seed|ssr|storage-key|auto-save)$/;
 
 /**
  * `target[key] = value` for a copy, keeping a `__proto__` key as the own data

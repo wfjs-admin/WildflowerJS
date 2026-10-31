@@ -28,6 +28,11 @@ import { __wf_str, __wf_txt, wfError, WF_ERRORS } from './wfUtils.js';
  * @param {boolean} visible
  */
 export function applyShow(element, visible) {
+    // The verdict of the data-show on the tag, kept for a component's root:
+    // block (_wfRootShow), which can hide the root as well: the root is
+    // hidden while either side hides it, whichever side ran first.
+    if (element._wfTagShow !== visible) element._wfTagShow = visible;
+    if (element._wfRootShow !== undefined) visible = visible && element._wfRootShow;
     const display = visible ? '' : 'none';
     if (element.style.display !== display) {
         element.style.display = display;
@@ -71,9 +76,38 @@ export function applyModel(element, value, kind) {
     } else if (kind === 'select-multiple') {
         const values = Array.isArray(value) ? value.map(String) : [];
         for (const opt of element.options) opt.selected = values.includes(opt.value);
+        element._wfWant = values;
     } else {
         const strValue = value == null ? '' : String(value);
         if (element.value !== strValue) element.value = strValue;
+        // A select can only show a value it has an option for. What it was
+        // asked to show is kept, so it can be shown when the options arrive
+        // or change (reapplySelectValue).
+        if (element.localName === 'select') element._wfWant = strValue;
+    }
+}
+
+/**
+ * Show a select's value again after its options changed.
+ *
+ * A select whose options are rendered by a list is given its value before the
+ * options exist, and the browser picks the first option when they arrive; the
+ * same happens whenever the selected option is removed and comes back. The
+ * list calls this when the rows of a <select> or an <optgroup> change. A
+ * value with no option selects nothing, as it does for a select with fixed
+ * options.
+ *
+ * @param {Element} listElement - the list container (a select or an optgroup)
+ */
+export function reapplySelectValue(listElement) {
+    const select = listElement.localName === 'select' ? listElement : listElement.parentElement;
+    if (!select || select.localName !== 'select') return;
+    const want = select._wfWant;
+    if (want === undefined) return;
+    if (typeof want === 'string') {
+        if (select.value !== want) select.value = want;
+    } else {
+        for (const opt of select.options) opt.selected = want.includes(opt.value);
     }
 }
 
@@ -133,21 +167,7 @@ export function applyAttrObj(element, object, helpers) {
                 continue;
             }
 
-            const sanitized = sanitize ? sanitize(prop, value) : value;
-            const isBooleanAttr = BOOLEAN_HTML_ATTRS.has(prop.toLowerCase());
-
-            if (sanitized === null || sanitized === undefined) {
-                if (element.hasAttribute(prop)) element.removeAttribute(prop);
-            } else if (sanitized === false && isBooleanAttr) {
-                if (element.hasAttribute(prop)) element.removeAttribute(prop);
-            } else if (sanitized === true && isBooleanAttr) {
-                if (element.getAttribute(prop) !== '') element.setAttribute(prop, '');
-            } else {
-                const strValue = String(sanitized);
-                if (element.getAttribute(prop) !== strValue) {
-                    element.setAttribute(prop, strValue);
-                }
-            }
+            applyAttrValue(element, prop, sanitize ? sanitize(prop, value) : value);
         } catch (e) {
             // Invalid attribute name/value - skip silently
         }
@@ -158,6 +178,26 @@ export function applyAttrObj(element, object, helpers) {
         element._boundAttrProps = new Set();
     }
     Object.keys(object).forEach(prop => element._boundAttrProps.add(prop));
+}
+
+/**
+ * Apply one resolved (already sanitized) attribute value, with the
+ * applyAttrObj semantics above. Throws on an invalid attribute name.
+ *
+ * @param {Element} element
+ * @param {string} prop
+ * @param {*} value
+ */
+export function applyAttrValue(element, prop, value) {
+    const isBooleanAttr = BOOLEAN_HTML_ATTRS.has(prop.toLowerCase());
+    if (value == null || (value === false && isBooleanAttr)) {
+        if (element.hasAttribute(prop)) element.removeAttribute(prop);
+    } else if (value === true && isBooleanAttr) {
+        if (element.getAttribute(prop) !== '') element.setAttribute(prop, '');
+    } else {
+        const strValue = String(value);
+        if (element.getAttribute(prop) !== strValue) element.setAttribute(prop, strValue);
+    }
 }
 
 /**
@@ -316,10 +356,12 @@ export function applyClass(element, value) {
     const next = new Set();
     for (let i = 0; i < names.length; i++) next.add(names[i]);
 
-    // Remove previously-bound classes that dropped out; preserve all non-bound classes.
+    // Remove previously-bound classes that dropped out; preserve all non-bound
+    // classes, and those a component's root: block holds on (_wfRootOn).
     if (prev) {
+        const held = element._wfRootOn;
         for (const cls of prev) {
-            if (!next.has(cls)) element.classList.remove(cls);
+            if (!next.has(cls) && !(held && held.has(cls))) element.classList.remove(cls);
         }
     }
     for (const cls of next) element.classList.add(cls);

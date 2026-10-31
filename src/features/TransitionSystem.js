@@ -35,7 +35,10 @@ export const TransitionSystemMethods = {
         if (element._transitionTarget === undefined) {
             element._transitionTarget = isVisible;
             if (context.mode !== 'render') {
-                element.style.display = isVisible ? '' : 'none';
+                // The tag's verdict, kept for a component's root: block,
+                // which hides the root as well while it says so.
+                element._wfTagShow = isVisible;
+                element.style.display = isVisible && element._wfRootShow !== false ? '' : 'none';
             } else {
                 context._updateConditionalElement(isVisible);
             }
@@ -120,9 +123,11 @@ export const TransitionSystemMethods = {
         // Step 1: Add enter class (sets initial state like opacity:0, transform, etc.)
         element.classList.add(enterClass);
 
-        // Step 2: Make element visible (for data-show)
+        // Step 2: Make element visible (for data-show), unless a component's
+        // root: block hides this root (its show is not transitioned)
         if (context.mode !== 'render') {
-            element.style.display = '';
+            element._wfTagShow = true;
+            if (element._wfRootShow !== false) element.style.display = '';
         }
 
         // Step 3: Force reflow to ensure the initial state is rendered

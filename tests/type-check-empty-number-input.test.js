@@ -60,4 +60,36 @@ describe.skipIf(isMinifiedBuild())('type check: an emptied number field', () => 
     await new Promise((r) => setTimeout(r, 20))
     expect(mismatches().length).toBe(1)
   })
+
+  // The mirror case: a field that STARTS empty ('') is an empty field, not a
+  // declared string, and a number input bound to it writes a Number.
+  async function mountEmpty() {
+    let ctx = null
+    window.wildflower.component('tc-starts-empty', { state: { amount: '' }, init() { ctx = this } })
+    host.innerHTML = '<div data-component="tc-starts-empty"><input id="tc-amount" type="number" data-model="amount" data-model-number></div>'
+    if (window.wildflower._setupDynamicComponentDetection) window.wildflower._setupDynamicComponentDetection()
+    await waitForCompleteRender()
+    await new Promise((r) => setTimeout(r, 30))
+    return ctx
+  }
+  const amountMismatches = () => warnings.filter((w) => w.includes('Type mismatch') && w.includes('"amount"'))
+
+  it('a field that starts as \'\' accepts a number from a number input, silently', async () => {
+    const ctx = await mountEmpty()
+    const input = document.getElementById('tc-amount')
+    input.value = '300'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(ctx.amount).toBe(300)
+    ctx.amount = ''
+    await new Promise((r) => setTimeout(r, 20))
+    expect(amountMismatches()).toEqual([])
+  })
+
+  it('a field that starts as \'\' still reports an array written to it', async () => {
+    const ctx = await mountEmpty()
+    ctx.amount = [1, 2]
+    await new Promise((r) => setTimeout(r, 20))
+    expect(amountMismatches().length).toBe(1)
+  })
 })

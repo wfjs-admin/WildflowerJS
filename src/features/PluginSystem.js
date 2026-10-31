@@ -8,7 +8,7 @@
 
 import { createStateManager } from '../state/createStateManager.js';
 import { createContextProxy, patchSelfReferences, warnCollisions } from '../state/ContextProxy.js';
-import { validateEntityDefinition, warnDefinitionCollisions, wfError, WF_ERRORS } from '../core/wfUtils.js';
+import { validateEntityDefinition, warnDefinitionCollisions, wfError, WF_ERRORS, pathResolver } from '../core/wfUtils.js';
 
 // Non-function definition keys the plugin factory actually consumes
 // (validateEntityDefinition allowlist — note plugins DO have a 'methods'
@@ -78,6 +78,71 @@ function hasTopLevelPluginMethods(metadata) {
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const PluginSystemMethods = {
+    // From EntitySystem: external() reads of plugin state, called only under
+    // __FEATURE_PLUGINS__.
+
+    /**
+     * Shared plugin-state resolution for external(). Returns null when the
+     * name doesn't resolve to a plugin; otherwise { value } where value is
+     * the GET result (argc 2) or undefined (plugins don't support external
+     * writes or 1-arg context handles). Call sites gate on
+     * __FEATURE_PLUGINS__; the body is gated too so plugin-free builds strip
+     * it entirely.
+     * @private
+     */
+    _externalPluginGet(entityNameOrId, path, argc, callerId) {
+        if (!__FEATURE_PLUGINS__) return null;
+        if (!this._pluginStates) return null;
+        let pluginName = entityNameOrId;
+        // Handle both "plugin:name" and direct "name" format
+        if (pluginName.startsWith('plugin:')) {
+            pluginName = pluginName.slice(7);
+        }
+        const pluginContext = this._pluginStates.get(pluginName);
+        if (!pluginContext || !pluginContext.state) return null;
+
+        // Register the caller as depending on this plugin
+        if (callerId) {
+            this._registerPluginDependent(pluginName, callerId);
+        }
+
+        if (argc === 2) {
+            try {
+                if (path.startsWith('computed:')) {
+                    const computedName = path.slice(9);
+                    return { value: pluginContext._stateManager?.evaluateComputed(computedName) ??
+                                    pluginContext[computedName] };
+                }
+                let value = pathResolver.get(pluginContext.state, path);
+                if (value === undefined && !path.includes('.') && pluginContext[path] !== undefined) {
+                    // A bare path naming a computed, e.g. data-bind="$plugin.total",
+                    // which _normalizeStoreShorthands turns into external('plugin',
+                    // 'total') WITHOUT a computed: prefix; misses the state lookup
+                    // above because ReactiveGraph's reactiveTree state holds only real
+                    // state (computed names are not state keys). The ContextProxy
+                    // resolves computed names, so read the value through it.
+                    value = pluginContext[path];
+                }
+                return { value };
+            } catch (error) {
+                return { value: path.startsWith('computed:') ? 0 : null };
+            }
+        }
+        return { value: undefined };
+    },
+    /**
+     * Register a component as depending on a plugin's state
+     * When the plugin's state changes, the dependent component should be updated
+     * @param {string} pluginName - Name of the plugin
+     * @param {string} componentId - ID of the component that depends on this plugin
+     * @private
+     */
+    _registerPluginDependent(pluginName, componentId) {
+        // Use unified _entityDependents (formerly _pluginDependents)
+        // Plugin names are prefixed with 'plugin:' to distinguish from components/stores
+        const entityKey = `plugin:${pluginName}`;
+        this._registerEntityDependent(entityKey, componentId);
+    },
 /**
      * Register a plugin with the framework
      * @param {Function|Object} plugin - Plugin function or object with install method
@@ -413,6 +478,10 @@ export const PluginSystemMethods = {
         // Store in the plugin states map
         this._pluginStates.set(name, context);
         this._createPluginAccessor(name);
+
+        // Set up: a subscription to a computed now takes its baseline when
+        // it is made (see EntityHandle._wireComputedNotifiers).
+        stateManager._wireComputedNotifiers();
     },
     /**
      * Set up a lightweight plugin (methods only, no state manager)

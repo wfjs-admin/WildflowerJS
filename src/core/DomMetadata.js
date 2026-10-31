@@ -29,11 +29,14 @@ export const ssrAdoptedElements = new WeakSet();
 /** SSR list elements whose state has changed (allows re-rendering) */
 export const ssrStateChangedElements = new WeakSet();
 
+/** Adopted SSR lists that received an item-level write since their last render */
+export const ssrItemWriteMarks = new WeakSet();
+
+/** Top-level SSR lists to take over at activation: state no longer matches the server rows */
+export const ssrTakeoverAtActivation = new WeakSet();
+
 /** SSR elements with action binding enabled during protection */
 export const ssrAllowActionsElements = new WeakSet();
-
-/** Form elements currently handling a submit (prevents double-fire) */
-export const handlingSubmitSet = new WeakSet();
 
 // ═══════════════════════════════════════════════════════════════
 // Group B: Cached metadata (WeakMaps)

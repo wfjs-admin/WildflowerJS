@@ -140,4 +140,42 @@ describe('Zero-source computed cache', () => {
         expect(ctx.doubled).toBe(10);
         expect(evals).toBeGreaterThan(after);
     });
+
+    // A read-forced re-run is a pull, so it must not push. Before the fix, each
+    // re-run returned a new object, woke the reader's effect, and two lists plus
+    // a binding on one list's host kept waking each other until the flush loop
+    // breaker tripped (found by a Kinetic showreel, reproduced without Kinetic).
+    it('a source-less computed returning a new object does not wake its readers on each read', async () => {
+        const errors = [];
+        const origError = console.error;
+        console.error = (...a) => { errors.push(a.join(' ')); };
+        try {
+            wf.component('zs-object', {
+                state: { t: 0 },
+                computed: {
+                    offsets() { return { 0: 0, 1: 1, 2: 2 }; },
+                    rows() { return [0, 1].map((i) => ({ key: i, text: String(this.t + this.offsets[i]) })); },
+                    hostStyle() { return { opacity: String((this.t + this.offsets[2]) / 10) }; },
+                    word() { return [{ key: 'w', text: String(this.t - this.offsets[1]) }]; },
+                },
+            });
+            container.innerHTML = '<div data-component="zs-object">'
+                + '<div id="zs-rows" data-bind-style="hostStyle" data-list="rows" data-key="key"><template><i data-bind="text"></i></template></div>'
+                + '<p id="zs-word" data-list="word" data-key="key"><template><span data-bind="text"></span></template></p>'
+                + '</div>';
+            wf.scan();
+            await waitForInit();
+            const ctx = ctxOf('zs-object');
+            for (let n = 1; n <= 3; n++) {
+                ctx.t = n;
+                await new Promise((r) => setTimeout(r, 20));
+            }
+            expect(errors.filter((e) => /loop breaker|WF-238/.test(e))).toEqual([]);
+            expect(container.querySelector('#zs-rows').textContent).toBe('34');
+            expect(container.querySelector('#zs-rows').style.opacity).toBe('0.5');
+            expect(container.querySelector('#zs-word').textContent).toBe('2');
+        } finally {
+            console.error = origError;
+        }
+    });
 });

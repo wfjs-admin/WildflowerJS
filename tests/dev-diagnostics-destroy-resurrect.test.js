@@ -61,7 +61,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode destroy/auto-resurrect warning (A6)
 
         const found = resurrectWarnings()
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-106]')
+        expect(found[0]).toContain('[WF-106]')
         // The teardown fix rides wfError's suggestion line.
         expect(warnings.some(w => w.includes('element.remove()'))).toBe(true)
     })

@@ -4,10 +4,11 @@
  * @module
  */
 
-import { listBoundElements, ssrAdoptedElements } from '../core/DomMetadata.js';
+import { listBoundElements } from '../core/DomMetadata.js';
 import { WF_ERRORS, wfError, mergeData } from '../core/wfUtils.js';
+import { getContextMethod } from '../state/ContextProxy.js';
 import { recording as __tlOn, timelineNoteFrame as __tlFrame } from '../state/TimelineRecorder.js';
-import { applyShow, applyAttrObj, applyStyleObj, applyText, applyModel, applyClass } from '../core/BindingWriters.js';
+import { applyShow, applyAttrObj, applyAttrValue, applyStyleObj, applyStyleProp, applyText, applyModel, applyClass } from '../core/BindingWriters.js';
 
 /** Blocklisted attributes for data-bind-attr security (O(1) lookup, no per-call allocation).
  *  Relocated from ListExpressionEval so data-bind-attr sanitization ships in the nano
@@ -25,10 +26,839 @@ const _LIST_BLOCKED_ATTRS = new Set([
     'data-wf-bind-attr', 'data-wf-model', 'data-wf-key'
 ]);
 
+/** The value bindings a component's root can carry for its owner (_rootOwnerElement),
+ *  under either prefix. A precheck: in wf-prefix-only mode a bare attribute matches
+ *  too, and the mode-aware reads after it find nothing to do. */
+const _ROOT_BINDINGS_SELECTOR = ['show', 'render', 'bind', 'bind-html', 'bind-class', 'bind-style', 'bind-attr', 'model']
+    .map(name => `[data-${name}],[data-wf-${name}]`).join(',');
+
+/** A root: block compiled to effect entries, once per definition (_createRootEffect). */
+const _rootSpecs = new WeakMap();
+
+/** Whether an effect entry or a section record is the one for `root`. */
+const _entryIsFor = (entry, root) => entry.element === root || (!!entry.context && entry.context.element === root);
+
+// Dev-only members, spread into RenderingCoreMethods under __DEV__ (absent
+// from production files). Every caller outside this object is inside an
+// `if (__DEV__ ...)` block or a `__DEV__ ?` expression.
+const RenderingCoreDevMethods = {
+    // #region FEATURE_BINDING_VALIDATION
+    // ==========================================
+    // RUNTIME BINDING VALIDATION (Debug Mode Only)
+    // ==========================================
+
+    /**
+     * Validate all bindings for a component against its state properties
+     * Warns in debug mode when bindings reference undefined state properties
+     * @param {Object} instance - The component instance
+     * @private
+     */
+    _validateComponentBindings(instance) {
+        if (!__DEV__) return; // compile-time: bodies in this region are stripped from prod builds
+        if (!this.debug) return;
+
+        const { state, name: componentName, id: componentId, element: componentElement } = instance;
+        const stateKeys = Object.keys(state);
+
+        // Include computed property names; they're valid binding targets
+        if (instance.stateManager && instance.stateManager.computed) {
+            const computedKeys = Object.keys(instance.stateManager.computed);
+            for (const key of computedKeys) {
+                if (!stateKeys.includes(key)) stateKeys.push(key);
+            }
+        }
+
+        // Collect all binding paths from domElements (registered bindings)
+        const bindingCollections = [
+            { collection: this.domElements.bindings, pathKey: 'path', type: 'data-bind' },
+            { collection: this.domElements.models, pathKey: 'path', type: 'data-model' },
+            { collection: this.domElements.conditionals, pathKey: 'path', type: 'data-show' },
+            { collection: this.domElements.htmlBindings, pathKey: 'path', type: 'data-bind-html' },
+            { collection: this.domElements.lists, pathKey: 'path', type: 'data-list' }
+        ];
+
+        for (const { collection, pathKey, type } of bindingCollections) {
+            if (!collection) continue;
+
+            for (const binding of collection) {
+                if (binding.componentId !== componentId) continue;
+                // Inside a record-shape query subtree a bare path reads the
+                // row (data-model excepted), so component state cannot judge
+                // it. WF-997 names a field neither scope carries, once the row
+                // has arrived.
+                if (__FEATURE_QUERY__ && type !== 'data-model' && binding.element && binding.element._wfRecordQuery) continue;
+
+                const path = binding[pathKey];
+                if (!path) continue;
+
+                this._validateBindingPath(path, stateKeys, componentName, type, state);
+            }
+        }
+
+        // The root: block reads the component's own scope. Directive values
+        // are not checked, here as on a tag (a directive may take a literal).
+        const block = instance.definition && instance.definition.root;
+        if (block && typeof block === 'object') {
+            if (typeof block.show === 'string') this._validateBindingPath(block.show, stateKeys, componentName, 'root: show', state);
+            for (const key of ['class', 'attr', 'style']) {
+                const group = block[key];
+                if (group && typeof group === 'object') for (const name in group) {
+                    if (typeof group[name] === 'string') this._validateBindingPath(group[name], stateKeys, componentName, `root: ${key}.${name}`, state);
+                }
+            }
+        }
+
+        // Scan component DOM for data-render and data-bind-class attributes
+        // These are not stored in global domElements, so we scan directly
+        // IMPORTANT: Skip elements inside nested data-component scopes; those
+        // belong to child components and will be validated when those initialize
+        if (componentElement) {
+            const isOwnedByThisComponent = (el) => {
+                // Slot templates (data-use-template + data-with) are expanded
+                // against the object named by data-with, so their bindings
+                // resolve in THAT scope, not this component's state. Validating
+                // them here reported valid bindings as undefined (WF-509 false
+                // positive). Every runtime binding processor already skips these
+                // via the same closest() guard — see the call sites around
+                // _processBindingElements / _processClassBindingElements.
+                if (el.closest('[data-use-template-rendered]')) return false;
+                // Same for children of a <template>: only reachable when the
+                // template sits inside <svg> (parsed as an inert element with
+                // live children); they belong to the pool, not to state.
+                if (el.closest('template')) return false;
+
+                let parent = el.parentElement;
+                while (parent && parent !== componentElement) {
+                    if (this._hasAttr(parent, 'component')) return false;
+                    parent = parent.parentElement;
+                }
+                return true;
+            };
+
+            // Validate data-render bindings
+            const renderElements = componentElement.querySelectorAll(this._attrSelector('render'));
+            renderElements.forEach(el => {
+                if (!isOwnedByThisComponent(el)) return;
+                const path = this._getAttr(el, 'render');
+                if (path) {
+                    this._validateBindingPath(path, stateKeys, componentName, 'data-render', state);
+                }
+            });
+
+            // Validate data-bind-class expressions
+            const classBindingElements = componentElement.querySelectorAll(this._attrSelector('bind-class'));
+            classBindingElements.forEach(el => {
+                if (!isOwnedByThisComponent(el)) return;
+                if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
+                const expression = this._getAttr(el, 'bind-class');
+                if (expression) {
+                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-class');
+                }
+            });
+
+            // Validate data-bind-style expressions
+            const styleBindingElements = componentElement.querySelectorAll(this._attrSelector('bind-style'));
+            styleBindingElements.forEach(el => {
+                if (!isOwnedByThisComponent(el)) return;
+                if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
+                const expression = this._getAttr(el, 'bind-style');
+                if (expression) {
+                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-style');
+                }
+            });
+
+            // Validate data-action method references. Unlike the value
+            // bindings above, an action on a component's root is that
+            // component's own handler (_bindComponentActions binds it there),
+            // so the root's action is checked here and a child root's is left
+            // to the child.
+            const actionElements = componentElement.querySelectorAll(this._attrSelector('action'));
+            const checkAction = (el) => {
+                const actionAttr = this._getAttr(el, 'action');
+                if (actionAttr) {
+                    this._validateActionMethods(actionAttr, instance, componentName);
+                }
+            };
+            if (this._hasAttr(componentElement, 'action')) checkAction(componentElement);
+            actionElements.forEach(el => {
+                if (!isOwnedByThisComponent(el)) return;
+                if (this._hasAttr(el, 'component')) return;
+                checkAction(el);
+            });
+        }
+    },
+    /**
+     * Validate a single binding path against available state properties
+     * @param {string} path - The binding path (e.g., "user.name", "count", "!isActive")
+     * @param {Array<string>} stateKeys - Available state property names
+     * @param {string} componentName - Name of the component for error messages
+     * @param {string} bindingType - Type of binding (data-bind, data-model, etc.)
+     * @private
+     */
+    _validateBindingPath(path, stateKeys, componentName, bindingType, state) {
+        if (!__DEV__) return;
+        // Skip validation for special paths
+        if (!path || typeof path !== 'string') return;
+
+        // Skip computed: prefixed paths (these are computed properties)
+        if (path.startsWith('computed:')) return;
+
+        // Skip props. prefixed paths (these resolve via component props, not state)
+        if (path.startsWith('props.') || path.startsWith('props:')) return;
+
+        // Skip external() expressions (cross-component references)
+        if (path.includes('external(')) return;
+
+        // Skip $entity.path shorthand (normalized to external() at bind time)
+        if (path.includes('$')) return;
+
+        // Parse type hint from path (e.g., "price:number" -> path="price", typeHint="number")
+        let typeHint = null;
+        let actualPath = path;
+        const typeHintMatch = path.match(/^([^:]+):(\w+)$/);
+        if (typeHintMatch) {
+            actualPath = typeHintMatch[1];
+            typeHint = typeHintMatch[2];
+        }
+
+        // If the path contains expression operators, it's not a simple property
+        // reference: delegate to the expression-variable validator so each
+        // identifier in the expression is checked individually. Without this,
+        // `data-show="activePattern === 'intro'"` would be treated as a single
+        // property name `"activePattern === 'intro'"` and always report
+        // "undefined state property".
+        // Valid simple-path characters: word chars, dots (nested), and leading `!`.
+        // Anything else (spaces, `=`, `&`, `|`, `?`, `>`, `<`, `+`, `*`, `(`, etc.)
+        // means the attribute holds an expression.
+        if (!/^!?[\w.]+$/.test(actualPath)) {
+            this._validateExpressionVariables(actualPath, stateKeys, componentName, bindingType);
+            return;
+        }
+
+        // Skip list context variables
+        const listContextVars = ['_index', '_length', '_first', '_last', '_item'];
+        const cleanPath = actualPath.replace(/^!/, ''); // Remove negation prefix
+        const pathParts = cleanPath.split('.');
+        const rootVar = pathParts[0];
+
+        if (listContextVars.includes(rootVar)) return;
+
+        // Skip store-alias data-model paths ("storeName.field"): FormHandling
+        // routes these writes to the named store's state, not this component's
+        // (mirrored on the read side in _executeComponentBindingsForEffect),
+        // so the root legitimately has no matching component state key. Scoped
+        // to REGISTERED stores only — an unregistered root still warns, which
+        // is what actually catches typos and genuine component-state mistakes.
+        if (bindingType === 'data-model' && pathParts.length > 1
+            && this.storeManager?.getStoreComponentByName(rootVar)) {
+            return;
+        }
+
+        // Check if root property exists in state
+        if (!stateKeys.includes(rootVar)) {
+            // Find similar property names for typo suggestions
+            const suggestions = this._findSimilarPropertyNames(rootVar, stateKeys);
+            let message = `${bindingType}="${actualPath}" references undefined state property "${rootVar}" in component "${componentName}"`;
+
+            if (suggestions.length > 0) {
+                message += `. Did you mean: ${suggestions.join(', ')}?`;
+            }
+
+            message += ` Available properties: ${stateKeys.join(', ')}`;
+            if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
+            return;
+        }
+
+        // Check nested path if state object is provided and path has multiple parts
+        let finalValue = state ? state[rootVar] : undefined;
+        if (state && pathParts.length > 1) {
+            let currentObj = state[rootVar];
+            for (let i = 1; i < pathParts.length; i++) {
+                const part = pathParts[i];
+                if (currentObj === null || currentObj === undefined) {
+                    // Parent is null/undefined, can't validate further
+                    finalValue = undefined;
+                    break;
+                }
+                if (typeof currentObj !== 'object') {
+                    // Parent is not an object, can't have nested properties
+                    finalValue = undefined;
+                    break;
+                }
+                if (!(part in currentObj)) {
+                    // Nested property doesn't exist - find similar property names
+                    const availableProps = Object.keys(currentObj);
+                    const suggestions = this._findSimilarPropertyNames(part, availableProps);
+                    const parentPath = pathParts.slice(0, i).join('.');
+                    let message = `${bindingType}="${actualPath}" references undefined property "${part}" on "${parentPath}" in component "${componentName}"`;
+
+                    if (suggestions.length > 0) {
+                        message += `. Did you mean: ${suggestions.join(', ')}?`;
+                    }
+
+                    message += ` Available properties: ${availableProps.join(', ')}`;
+                    if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
+                    return;
+                }
+                currentObj = currentObj[part];
+                finalValue = currentObj;
+            }
+        }
+
+        // Validate type hint against actual value
+        if (typeHint && finalValue !== undefined) {
+            const actualType = this._inferTypeFromValue(finalValue);
+            if (actualType !== typeHint && actualType !== 'any') {
+                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, {
+                    warn: true,
+                    context: `Type hint mismatch in component "${componentName}": ` +
+                        `${bindingType}="${path}" expects ${typeHint} but property "${actualPath}" has type ${actualType}. ` +
+                        `Value: ${JSON.stringify(finalValue)}`
+                });
+            }
+        }
+    },
+    /**
+     * Validate variables in an expression (like data-bind-class expressions)
+     * @param {string} expression - The expression to validate
+     * @param {Array<string>} stateKeys - Available state property names
+     * @param {string} componentName - Name of the component for error messages
+     * @param {string} bindingType - Type of binding
+     * @private
+     */
+    _validateExpressionVariables(expression, stateKeys, componentName, bindingType) {
+        if (!__DEV__) return;
+        // Skip $entity.path shorthand (normalized to external() at bind time)
+        if (expression && expression.includes('$')) return;
+
+        // Strip computed: prefix before validation; it's a runtime hint, not a variable
+        const cleanExpression = expression.replace(/\bcomputed:/g, '');
+
+        // Remove string literals before extracting identifiers; words inside
+        // quotes ('priority-option high') are not variable references
+        const noStrings = cleanExpression.replace(/'[^']*'|"[^"]*"/g, '');
+
+        // Extract variable names: only ROOT identifiers, not property accesses.
+        // `(?<!\.)` lookbehind excludes identifiers preceded by a dot so that
+        // `events.length` produces `['events']` not `['events', 'length']`.
+        // Without this, built-in props like .length/.includes/.toLowerCase()
+        // appear as "undefined state property": noisy false positives.
+        const propertyRegex = /(?<!\.)\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+        const matches = noStrings.match(propertyRegex);
+
+        if (!matches) return;
+
+        // Reserved words and keywords to skip
+        const reserved = new Set([
+            'true', 'false', 'null', 'undefined', 'NaN', 'Infinity',
+            'if', 'else', 'return', 'typeof', 'instanceof', 'new', 'this',
+            'external', 'Math', 'Date', 'String', 'Number', 'Boolean', 'Array', 'Object',
+            'function', 'var', 'let', 'const', 'for', 'while',
+            // List context variables
+            '_index', '_length', '_first', '_last', '_item'
+        ]);
+
+        const checkedVars = new Set();
+
+        for (const varName of matches) {
+            // Skip reserved words, already checked vars, and string literals
+            if (reserved.has(varName) || checkedVars.has(varName)) continue;
+            checkedVars.add(varName);
+
+            // Check if this variable exists in state
+            if (!stateKeys.includes(varName)) {
+                const suggestions = this._findSimilarPropertyNames(varName, stateKeys);
+                let message = `${bindingType} expression "${expression}" references undefined state property "${varName}" in component "${componentName}"`;
+
+                if (suggestions.length > 0) {
+                    message += `. Did you mean: ${suggestions.join(', ')}?`;
+                }
+
+                message += ` Available properties: ${stateKeys.join(', ')}`;
+                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
+            }
+        }
+    },
+    /**
+     * Validate variables in an object-form-capable binding expression
+     * (data-bind-style and data-bind-class). Object form is
+     * { key: stateVar, ... } where the KEY is a CSS property or class NAME,
+     * not a variable — only VALUE-side identifiers are validated. Unquoted
+     * class keys ({ active: isTab1 }) previously hit the generic expression
+     * validator and were flagged as undefined state properties (AI-surface
+     * eval finding F3, 2026-07-16); quoted keys never tripped it because
+     * string-stripping removes them first.
+     * @param {string} expression - The expression (e.g., "{ color: textColor }")
+     * @param {Array<string>} stateKeys - Available state property names
+     * @param {string} componentName - Name of the component for error messages
+     * @param {Object} state - The component state object
+     * @param {string} bindingType - 'data-bind-style' or 'data-bind-class'
+     * @private
+     */
+    _validateObjectFormExpression(expression, stateKeys, componentName, state, bindingType) {
+        if (!__DEV__) return;
+        const trimmed = expression.trim();
+
+        // Object syntax: { key: stateVar, ... }
+        if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+            const inner = trimmed.slice(1, -1).trim();
+            if (!inner) return;
+
+            // Split on commas (respecting nested structures)
+            const pairs = inner.split(',');
+            for (const pair of pairs) {
+                const colonIdx = pair.indexOf(':');
+                if (colonIdx === -1) continue;
+
+                // Only validate the VALUE side (after the colon); the KEY side is a name
+                const valuePart = pair.substring(colonIdx + 1).trim();
+                if (!valuePart) continue;
+
+                // The value might be a simple identifier or an expression
+                this._validateExpressionVariables(valuePart, stateKeys, componentName, bindingType, state);
+            }
+            return;
+        }
+
+        // Non-object syntax: treat as expression (bare property name or expression)
+        this._validateExpressionVariables(expression, stateKeys, componentName, bindingType, state);
+    },
+    /**
+     * Validate action method references against available component methods
+     * @param {string} actionAttr - The data-action attribute value (e.g., "click:save", "increment", "save('draft')")
+     * @param {Object} instance - The component instance
+     * @param {string} componentName - Name of the component for error messages
+     * @private
+     */
+    _validateActionMethods(actionAttr, instance, componentName) {
+        if (!__DEV__) return;
+        // Parse action definitions using the framework's parser if available
+        const actionDefs = typeof this._parseActions === 'function'
+            ? this._parseActions(actionAttr)
+            : this._parseActionDefsSimple(actionAttr);
+
+        const context = instance.context;
+        if (!context) return;
+
+        // Collect available method names for suggestions
+        const methodNames = Object.keys(context).filter(k => typeof context[k] === 'function');
+
+        for (const { methodName } of actionDefs) {
+            if (!methodName) continue;
+
+            if (!getContextMethod(context, methodName)) {
+                // $entity.path in data-action: the generic "undefined method"
+                // message below sends the author hunting for a typo among their
+                // own methods, when the real issue is that $ is a read accessor
+                // for external state and doesn't name action handlers. Same
+                // anchored shape as ExpressionEvaluator's STORE_SHORTHAND_REGEX.
+                const dollar = /^\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.]+)$/.exec(methodName);
+                if (dollar) {
+                    wfError(WF_ERRORS.ACTION_STORE_SHORTHAND, {
+                        warn: true,
+                        context: `data-action="${methodName}" in component "${componentName}". ` +
+                            `$entity.path is a read accessor for external state and cannot name an action handler; ` +
+                            `actions are methods on this component. To delegate to another entity's method, define one: ` +
+                            // Wrapper named for the method being invoked (LAST path
+                            // segment): $foo.util.bump -> bump() { ...util.bump(); }
+                            `${dollar[2].split('.').pop()}() { this.getStore('${dollar[1]}').${dollar[2]}(); }`
+                    });
+                    continue;
+                }
+                const suggestions = this._findSimilarPropertyNames(methodName, methodNames);
+                let message = `data-action references undefined method "${methodName}" in component "${componentName}"`;
+
+                if (suggestions.length > 0) {
+                    message += `. Did you mean: ${suggestions.join(', ')}?`;
+                }
+
+                message += ` Available methods: ${methodNames.join(', ')}`;
+                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
+            }
+        }
+    },
+    /**
+     * Simple fallback parser for action definitions when _parseActions is not available
+     * @param {string} actionAttr - The data-action attribute value
+     * @returns {Array<{eventType: string, methodName: string}>}
+     * @private
+     */
+    _parseActionDefsSimple(actionAttr) {
+        if (!__DEV__) return [];
+        const results = [];
+        const parts = actionAttr.trim().split(/\s+/);
+
+        for (const part of parts) {
+            let methodPart = part;
+            const parenStart = part.indexOf('(');
+            const colonIdx = part.indexOf(':');
+
+            // Handle event:method format (colon before any parenthesis)
+            if (colonIdx !== -1 && (parenStart === -1 || colonIdx < parenStart)) {
+                methodPart = part.substring(colonIdx + 1);
+            }
+
+            // Strip argument list: method(args) -> method
+            const parenIdx = methodPart.indexOf('(');
+            if (parenIdx !== -1) {
+                methodPart = methodPart.substring(0, parenIdx);
+            }
+
+            results.push({ eventType: 'click', methodName: methodPart });
+        }
+
+        return results;
+    },
+    /**
+     * Find property names similar to the given name (for typo suggestions)
+     * Uses Levenshtein distance for fuzzy matching
+     * @param {string} name - The property name to find matches for
+     * @param {Array<string>} candidates - Available property names
+     * @returns {Array<string>} - Similar property names
+     * @private
+     */
+    _findSimilarPropertyNames(name, candidates) {
+        if (!__DEV__) return [];
+        const maxDistance = Math.max(2, Math.floor(name.length / 3));
+        const lowerName = name.toLowerCase();
+        const similar = [];
+
+        for (const candidate of candidates) {
+            // Guard on the raw strings, NOT on distance > 0. Comparison is
+            // case-insensitive, so a pure case slip ("selectedid" written for
+            // "selectedId") scores 0 — excluding zero-distance matches dropped
+            // the single most common typo class, leaving the WF-509 warning with
+            // no suggestion at all on exactly the case the author can fix fastest.
+            if (candidate === name) continue;
+            const distance = this._levenshteinDistance(lowerName, candidate.toLowerCase());
+            if (distance <= maxDistance) {
+                similar.push({ candidate, distance });
+            }
+        }
+
+        // Nearest first. Unsorted, candidates arrive in declaration order and the
+        // 3-item cut can discard a distance-1 match in favour of a distance-3 one
+        // that happened to be declared earlier. Sort is stable, so equal-distance
+        // candidates keep declaration order.
+        similar.sort((a, b) => a.distance - b.distance);
+        return similar.slice(0, 3).map(entry => entry.candidate); // Top 3 suggestions
+    },
+    /**
+     * Calculate Levenshtein distance between two strings
+     * @param {string} a - First string
+     * @param {string} b - Second string
+     * @returns {number} - Edit distance
+     * @private
+     */
+    _levenshteinDistance(a, b) {
+        if (!__DEV__) return 0;
+        if (a.length === 0) return b.length;
+        if (b.length === 0) return a.length;
+
+        const matrix = [];
+
+        // Initialize matrix
+        for (let i = 0; i <= b.length; i++) {
+            matrix[i] = [i];
+        }
+        for (let j = 0; j <= a.length; j++) {
+            matrix[0][j] = j;
+        }
+
+        // Fill matrix
+        for (let i = 1; i <= b.length; i++) {
+            for (let j = 1; j <= a.length; j++) {
+                if (b.charAt(i - 1) === a.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1, // substitution
+                        matrix[i][j - 1] + 1,     // insertion
+                        matrix[i - 1][j] + 1      // deletion
+                    );
+                }
+            }
+        }
+
+        return matrix[b.length][a.length];
+    },
+    // ==========================================
+    // Type inference
+    // ==========================================
+
+    /**
+     * Infer types from initial state values
+     * Creates a type map for all top-level state properties
+     * @param {Object} state - The component's initial state object
+     * @returns {Object} - Map of property names to inferred type strings
+     * @private
+     */
+    _inferTypesFromState(state) {
+        if (!__DEV__) return {};
+        if (!state || typeof state !== 'object') {
+            return {};
+        }
+
+        const types = {};
+
+        for (const key of Object.keys(state)) {
+            // A property that starts as '' is an empty field rather than a
+            // declared string: a number input bound to it writes a Number.
+            types[key] = state[key] === '' ? 'empty-field' : this._inferTypeFromValue(state[key]);
+        }
+
+        return types;
+    },
+    /**
+     * Infer the type of a single value
+     * @param {*} value - The value to infer the type of
+     * @returns {string} - The inferred type ('string', 'number', 'boolean', 'array', 'object', 'function', 'any')
+     * @private
+     */
+    _inferTypeFromValue(value) {
+        if (!__DEV__) return 'any';
+        if (value === null || value === undefined) {
+            return 'any'; // Can't infer type from null/undefined
+        }
+
+        if (Array.isArray(value)) {
+            return 'array';
+        }
+
+        const jsType = typeof value;
+
+        switch (jsType) {
+            case 'string':
+                return 'string';
+            case 'number':
+                return 'number';
+            case 'boolean':
+                return 'boolean';
+            case 'object':
+                return 'object';
+            case 'function':
+                return 'function';
+            default:
+                return 'any';
+        }
+    },
+    // ==========================================
+    // Runtime type checking
+    // ==========================================
+
+    /**
+     * Check if a value matches the expected type for a property
+     * Emits a console warning if there's a type mismatch
+     * @param {Object} component - The component instance
+     * @param {string} prop - The property name being set
+     * @param {*} value - The new value being assigned
+     * @returns {boolean} - True if types match or no type defined, false if mismatch
+     * @private
+     */
+    _checkTypeMatch(component, prop, value) {
+        if (!__DEV__) return true;
+        // Only check in debug mode
+        if (!this.debug && !this.options?.debug) {
+            return true;
+        }
+
+        // Get expected type from component's type map
+        const expectedType = component?._types?.[prop];
+
+        // No type defined or 'any' type - skip checking
+        if (!expectedType || expectedType === 'any') {
+            return true;
+        }
+
+        // An emptied number field: a type="number" input bound with data-model
+        // writes '' (kept so validation can see the field is empty), which is
+        // a legitimate value for a number property, not a mismatch.
+        if (expectedType === 'number' && value === '') {
+            return true;
+        }
+        // The mirror case: a field that started as '' (an empty field) takes
+        // text or a number, whichever its input writes.
+        if (expectedType === 'empty-field' && (typeof value === 'string' || typeof value === 'number')) {
+            return true;
+        }
+
+        // Get actual type of the new value
+        const actualType = this._inferTypeFromValue(value);
+
+        // Check if types match
+        if (actualType !== expectedType) {
+            // Allow null/undefined for any type (they become 'any')
+            if (actualType === 'any') {
+                return true;
+            }
+
+            if (__DEV__) console.warn(
+                `[WF] Type mismatch in component "${component.name}": ` +
+                `Property "${prop}" expects ${expectedType === 'empty-field' ? 'string or number' : expectedType} but received ${actualType}. ` +
+                `Value: ${JSON.stringify(value)}`
+            );
+            return false;
+        }
+
+        return true;
+    },
+    // #endregion FEATURE_BINDING_VALIDATION
+
+    /**
+     * WF-997: a binding inside a record-shape query subtree naming something
+     * neither the row nor the component provides. Scope-merge makes almost
+     * everything resolve, so what is left is a genuine authoring miss (a typo,
+     * or a field the endpoint does not return) that renders empty in silence.
+     *
+     * Only runs once per element, only in dev, and only once a row exists, so
+     * "still loading" is never mistaken for "misspelled". Precision matters
+     * more than coverage here: firing on correct code is the WF-975/976 shape
+     * this project ruled against. Identifiers preceded by a dot (member access
+     * like .toLocaleDateString) and followed by a colon (object-literal keys
+     * like {href: ...}) are skipped, string literals are stripped first, and
+     * known globals are excluded. Anything ambiguous is left alone.
+     * @private
+     */
+    _warnRecordFieldMisses(element, path, scopeState) {
+        if (!path || typeof path !== 'string') return;
+        // Strip string literals, then $name.path store shorthands. A shorthand
+        // resolves through external() and names an entity, not a scope field,
+        // so scanning it reports the query's own name as a missing field. Entity
+        // names may contain hyphens, which would also split into fragments.
+        const stripped = path
+            .replace(/'[^']*'|"[^"]*"|`[^`]*`/g, '')
+            .replace(/\$[A-Za-z_][\w-]*(?:\.[\w.]+)*/g, '');
+        const GLOBALS = this._recordDiagGlobals || (this._recordDiagGlobals = new Set([
+            'true', 'false', 'null', 'undefined', 'NaN', 'Infinity', 'typeof',
+            'instanceof', 'new', 'this', 'in', 'void', 'delete',
+            'Math', 'Date', 'String', 'Number', 'Boolean', 'Array', 'Object',
+            'JSON', 'RegExp', 'Map', 'Set', 'Intl', 'parseInt', 'parseFloat',
+            'isNaN', 'isFinite', 'encodeURIComponent', 'decodeURIComponent',
+            'external', 'computed'
+        ]));
+        const missing = [];
+        const re = /(^|[^.\w$'"`])([A-Za-z_$][\w$]*)\s*(:?)/g;
+        let m;
+        while ((m = re.exec(stripped)) !== null) {
+            const name = m[2];
+            if (m[3] === ':') continue;            // object-literal key
+            if (GLOBALS.has(name)) continue;
+            if (name in scopeState) continue;
+            if (missing.indexOf(name) === -1) missing.push(name);
+        }
+        if (missing.length === 0) return;
+        wfError(WF_ERRORS.QUERY_RECORD_FIELD_MISSING, {
+            warn: true,
+            context: `Query "${element._wfRecordQuery}": the binding "${path}" names ${missing.map((n) => `"${n}"`).join(', ')}, which the row and the component both lack; it renders empty`,
+            suggestion: 'Check the spelling against the row the endpoint returns. A field the server only sometimes sends needs a fallback in the expression'
+        });
+    },
+
+    /**
+     * WF-520, once per component and name: the tag and the component's root:
+     * block both set an attribute, a style property or a directive. The tag's
+     * is the one used.
+     * @private
+     */
+    _warnRootConflict(instance, kind, name) {
+        const seen = this._rootConflictWarned || (this._rootConflictWarned = new Set());
+        const key = instance.name + '|' + kind + '|' + name;
+        if (seen.has(key)) return;
+        seen.add(key);
+        wfError(WF_ERRORS.ROOT_BLOCK_CONFLICT, {
+            warn: true,
+            context: `Component '${instance.name}': the ${kind} "${name}" is set both on its tag and in its root: block; the tag's value is used`,
+            suggestion: 'Set it in one place: on the tag for the markup around the component to control it, or in root: for the component itself'
+        });
+    },
+
+    /**
+     * WF-521: the bindings on a nested component's root are read by its owner
+     * (_rootOwnerElement), so a name there that only the nested component has
+     * reads nothing. Warns once per (component, attribute) when a name the
+     * tag reads is the child's (state, computed, prop or method) and not the
+     * owner's. A top-level root, an owner not registered yet (its bindings
+     * are inert; _adoptPendingChildren checks again), and a root that a row,
+     * pool or slot reads are skipped. Called as the child initializes, on
+     * every init path, and when an owner adopts children that came first.
+     * @private
+     */
+    _checkChildRootScope(instance) {
+        const el = instance.element;
+        if (!el || !this._carriesRootBindings(el)) return;
+        const ownerEl = this._rootOwnerElement(el);
+        const ownerId = ownerEl && ownerEl.dataset.componentId;
+        const owner = ownerId && this.componentInstances.get(ownerId);
+        if (!owner || !this._isOwnedBindingElement(el, ownerEl)) return;
+        const pool = el.parentElement.closest(this._attrSelector('pool'));
+        if (pool && ownerEl.contains(pool)) return;
+        const warned = this._childRootScopeWarned || (this._childRootScopeWarned = new Set());
+        let mine = null, theirs = null;
+        for (const attr of _ROOT_BINDING_ATTRS) {
+            const expr = this._getAttr(el, attr);
+            if (!expr) continue;
+            const key = instance.name + '|' + attr;
+            if (warned.has(key)) continue;
+            if (!mine) { mine = _scopeNameSet(instance); theirs = _scopeNameSet(owner); }
+            const hit = _rootReadNames(expr).find(id => mine.has(id) && !theirs.has(id));
+            if (!hit) continue;
+            warned.add(key);
+            const written = (el.hasAttribute('data-wf-' + attr) ? 'data-wf-' : 'data-') + attr;
+            wfError(WF_ERRORS.ROOT_BINDING_CHILD_SCOPE, {
+                warn: true,
+                context: `${written}="${expr}" on the root of '${instance.name}' is read by '${owner.name}', the component around it, which has no '${hit}'; '${hit}' belongs to '${instance.name}'`,
+                suggestion: `Move the binding onto an element inside '${instance.name}', or declare its side of its root in its definition: root: { style: { background: '${hit}' } } (class, attr, show and directives likewise)`
+            });
+        }
+    },
+};
+
+/** The value bindings a nested component's root carries for its owner (WF-521). */
+const _ROOT_BINDING_ATTRS = ['show', 'render', 'bind', 'bind-html', 'bind-class', 'bind-style', 'bind-attr', 'model'];
+
+/** Every name a component's own scope answers to: state, computed, props, methods (WF-521). */
+function _scopeNameSet(instance) {
+    const names = new Set(Object.keys(instance.state || {}));
+    const computed = instance.stateManager && instance.stateManager.computed;
+    if (computed) for (const k of Object.keys(computed)) names.add(k);
+    const def = instance.definition || {};
+    const props = def.props;
+    if (Array.isArray(props)) for (const k of props) names.add(k);
+    else if (props && typeof props === 'object') for (const k of Object.keys(props)) names.add(k);
+    for (const k of Object.keys(def)) if (typeof def[k] === 'function') names.add(k);
+    return names;
+}
+
+/**
+ * The names an expression reads from its scope (WF-521): not the words in a
+ * string literal, not a member after a dot (cfg.bg), not a $store path, and
+ * not an object-literal key ({ background: bg } reads bg only).
+ */
+const _ID_RE = /[A-Za-z_$][\w$]*/g;
+const _STRING_RE = /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+function _rootReadNames(expr) {
+    const src = expr.replace(_STRING_RE, "''");
+    const out = [];
+    for (const m of src.matchAll(_ID_RE)) {
+        const id = m[0];
+        if (id[0] === '$' || /\d/.test(src[m.index - 1] || '')) continue;   // a store path, or a number's tail (1e5)
+        let i = m.index - 1;
+        while (i >= 0 && /\s/.test(src[i])) i--;
+        const before = i >= 0 ? src[i] : '';
+        if (before === '.') continue;   // a member: cfg.bg
+        let j = m.index + id.length;
+        while (j < src.length && /\s/.test(src[j])) j++;
+        if (src[j] === ':' && (before === '{' || before === ',' || before === '')) continue;   // an object key
+        out.push(id);
+    }
+    return out;
+}
+
 /**
  * Methods to be mixed into WildflowerJS.prototype
  */
 export const RenderingCoreMethods = {
+    ...(__DEV__ ? RenderingCoreDevMethods : {}),
     // -------------------------------------------------------------------------
     // Conditional subsystem (data-show / data-render) + external() resolver.
     // Relocated here from ListRenderer so they ship in the nano tier: data-show
@@ -38,39 +868,7 @@ export const RenderingCoreMethods = {
     // the render record (_updateConditionalElement) already live in nano-shipped
     // modules, so this makes the whole conditional path list-independent.
     // -------------------------------------------------------------------------
-    /**
-     * True when `el` sits under a component-level data-render element whose
-     * condition evaluates false right now. Component init runs the query
-     * transform, the binding pass, and early list mounting before the
-     * conditional pass removes such a section, so callers use this to avoid
-     * observing, mounting, or fetching for a subtree that is about to leave;
-     * insertion binds the section's clone when it appears. Row-level
-     * data-render (inside a list row) is item-scoped and is not evaluated.
-     * @param {HTMLElement} el - The element to test
-     * @param {HTMLElement} rootEl - The component element (walk stops here)
-     * @param {Object} instance - Component instance
-     * @returns {boolean}
-     * @private
-     */
-    _insideHiddenRender(el, rootEl, instance) {
-        const listSelector = this._attrSelector('list');
-        // Collect the chain, then evaluate it outermost first: once an outer
-        // section is false the inner conditions are not evaluated at all (an
-        // inner condition naming a $query would otherwise touch and activate
-        // it for a section that is about to leave).
-        const chain = [];
-        for (let cur = el; cur && cur !== rootEl; cur = cur.parentElement) {
-            if (this._hasAttr(cur, 'render')) chain.push(cur);
-        }
-        for (let i = chain.length - 1; i >= 0; i--) {
-            const cur = chain[i];
-            const container = cur.parentElement ? cur.parentElement.closest(listSelector) : null;
-            if (container && rootEl.contains(container)) continue; // row-level: item-scoped
-            const path = this._getAttr(cur, 'render');
-            if (path && !this._conditionVerdict(path, instance, cur)) return true;
-        }
-        return false;
-    },
+    // _insideHiddenRender (lists, and QuerySystem in full) lives in ListSharedMethods.
 
     /**
      * Mark the render-effect metadata of every binding inside `root`, a
@@ -90,27 +888,36 @@ export const RenderingCoreMethods = {
         // subtree (ListRenderer.mountList), while a list detached by hand
         // carries no mark and mounts as it always did.
         root._wfRenderHidden = true;
-        const lists = [instance._effectMeta, instance._renderMeta];
-        for (const metas of lists) {
-            if (!metas) continue;
-            for (const meta of metas) {
-                if (meta._hidden) continue;
-                if (meta.type === 'render') {
-                    // The removed section's OWN record stays live: its
-                    // placeholder is what brings the section back. A nested
-                    // section's record (element or placeholder inside the
-                    // removed subtree) is re-created at insertion; until then
-                    // evaluating it would only move nodes nobody sees and touch
-                    // any query its condition names.
-                    const ctx = meta.context;
-                    const node = ctx && (ctx.element || ctx.placeholder);
-                    if (node && node !== root && root.contains(node)) meta._hidden = true;
-                    continue;
-                }
-                if (!meta.element) continue;
-                if (root === meta.element || root.contains(meta.element)) meta._hidden = true;
+        this._hideMetas(instance, (meta) => {
+            if (meta.type === 'render') {
+                // The removed section's OWN record stays live: its
+                // placeholder is what brings the section back. A nested
+                // section's record (element or placeholder inside the
+                // removed subtree) is re-created at insertion; until then
+                // evaluating it would only move nodes nobody sees and touch
+                // any query its condition names.
+                const ctx = meta.context;
+                const node = ctx && (ctx.element || ctx.placeholder);
+                return !!node && node !== root && root.contains(node);
             }
+            return !!meta.element && (root === meta.element || root.contains(meta.element));
+        });
+    },
+
+    /**
+     * Mark the render-effect entries `test` picks, in both the pending list
+     * (instance._effectMeta) and the live one the effect iterates
+     * (instance._renderMeta), so the effect skips them. Nothing is removed
+     * here, since an effect run may be iterating the list.
+     * @returns {boolean} Whether any entry was marked
+     * @private
+     */
+    _hideMetas(instance, test) {
+        let found = false;
+        for (const metas of [instance._effectMeta, instance._renderMeta]) {
+            if (metas) for (const meta of metas) if (!meta._hidden && test(meta)) found = meta._hidden = true;
         }
+        return found;
     },
 
     /**
@@ -129,37 +936,39 @@ export const RenderingCoreMethods = {
         // Find all conditional elements (both data-show and data-render) - support both prefixes
         // IMPORTANT: Exclude elements inside <template> elements (they belong to list templates)
         // and elements inside data-list containers (they're handled by _bindListItemConditionals)
-        const allConditionalElements = element.querySelectorAll(`${this._attrSelector('show')}, ${this._attrSelector('render')}`);
+        const allConditionalElements = Array.from(element.querySelectorAll(`${this._attrSelector('show')}, ${this._attrSelector('render')}`));
+        // A top-level root's own data-show reads this component: nothing
+        // around it wrote the tag. (Its data-render is not a section, since a
+        // component cannot take its own root out of the page; see the mode
+        // choice below.)
+        if (this._hasAttr(element, 'show') && this._isUnownedRoot(element)) {
+            allConditionalElements.unshift(element);
+        }
 
-        const conditionalElements = Array.from(allConditionalElements)
+        const conditionalElements = allConditionalElements
             .filter(el =>
             {
-                const closestComponent = this._getComponentElement(el);
-                if (closestComponent !== element) {
-                    return false;
-                }
-
-                // Also exclude elements inside uninitialized child components
-                // (components with data-component but no data-component-id yet)
-                const uninitializedParent = el.closest(this._attrSelector('component'));
-                if (uninitializedParent && uninitializedParent !== element && !uninitializedParent.dataset.componentId) {
-                    return false;
-                }
-
-                // Exclude elements inside <template> elements (list templates)
-                if (el.closest('template')) {
-                    return false;
-                }
-
-                // Exclude elements rendered by data-use-template (they have their own binding system)
-                if (el.closest('[data-use-template-rendered]')) {
+                // This component's own elements, and the roots of the
+                // components directly inside it, whose tags it wrote. Also
+                // excludes elements inside a nested component (registered or
+                // not), a <template>, or data-use-template content.
+                if (!this._isOwnedBindingElement(el, element)) {
                     return false;
                 }
 
                 // Exclude elements INSIDE data-list containers (handled by list item binding)
-                // But DO process the list container itself if it has data-show
+                // But DO process the list container itself if it has data-show.
+                // A list element is its own closest list, so for one the
+                // question is asked of its parent: a top-level container has
+                // no list above it and is processed here; a row whose root is
+                // itself a nested list (<tr data-list="cells">), or a nested
+                // container inside a row, belongs to the row. This runs again
+                // with rendered rows present on a template-key swap.
                 const closestList = el.closest(this._attrSelector('list'));
-                if (closestList && closestList !== el && closestList.closest(this._attrSelector('component')) === element) {
+                const owningList = closestList === el
+                    ? (el.parentElement ? el.parentElement.closest(this._attrSelector('list')) : null)
+                    : closestList;
+                if (owningList && owningList.closest(this._attrSelector('component')) === element) {
                     return false;
                 }
 
@@ -175,8 +984,9 @@ export const RenderingCoreMethods = {
             // touch any query they name) for a section nobody sees, and
             // insertion re-creates them from the section's clone anyway.
             if (!conditionalElement.isConnected) return;
-            // Determine mode: 'show' or 'render' (support both prefixes)
-            const isRenderMode = this._hasAttr(conditionalElement, 'render');
+            // Determine mode: 'show' or 'render' (support both prefixes). The
+            // component's own root is only ever here for its data-show.
+            const isRenderMode = conditionalElement !== element && this._hasAttr(conditionalElement, 'render');
             const condPath = isRenderMode
                 ? this._getAttr(conditionalElement, 'render')
                 : this._getAttr(conditionalElement, 'show');
@@ -228,6 +1038,12 @@ export const RenderingCoreMethods = {
         // Strip data-cloak from template so re-insertions don't inherit it
         templateClone.removeAttribute('data-cloak');
         templateClone.removeAttribute('data-wf-cloak');
+        // And the ids of components already initialized in the section (a
+        // component registered before the one that owns the section): an
+        // insertion is a new generation, and an id whose instance has not
+        // been collected yet would make the scan skip the copy for good.
+        templateClone.removeAttribute('data-component-id');
+        templateClone.querySelectorAll('[data-component-id]').forEach(el => el.removeAttribute('data-component-id'));
 
         // Create the render record (plain object, not registered; the render
         // effect holds it directly via its type:'render' meta).
@@ -523,7 +1339,7 @@ export const RenderingCoreMethods = {
             const listItemElement = this._findListItemAncestor(activeElement);
             if (listItemElement)
             {
-                const listElement = this._findDirectParentList(listItemElement);
+                const listElement = this._findRowList(listItemElement);
                 if (listElement)
                 {
                     activeInfo = {
@@ -711,7 +1527,14 @@ export const RenderingCoreMethods = {
                 // the existing text node's .data to '' in place. Invisible on a list rendered from
                 // state (the renderer repaints the correct value straight after) and fatal on rows that
                 // arrived pre-rendered, where the emptied text IS the content: the server's own markup.
-                const listAncestor = el.closest(this._attrSelector('list'));
+                let listAncestor = el.closest(this._attrSelector('list'));
+                // A select whose options are a list is its own nearest list,
+                // but its data-bind is its value, not a row's binding: it
+                // belongs to whatever the select itself sits in. (Skipped as
+                // "inside a list", it was never bound at all.)
+                if (listAncestor === el && el.tagName === 'SELECT') {
+                    listAncestor = el.parentElement ? el.parentElement.closest(this._attrSelector('list')) : null;
+                }
                 if (listAncestor && listAncestor.closest(this._attrSelector('component')) === element) {
                     return false;
                 }
@@ -719,8 +1542,9 @@ export const RenderingCoreMethods = {
                 if (el.closest('[data-use-template-rendered]')) {
                     return false;
                 }
-                const closestComponent = this._getComponentElement(el);
-                return closestComponent === element;
+                // This component's own elements, and the roots of the
+                // components directly inside it (_isOwnedBindingElement).
+                return this._isOwnedBindingElement(el, element);
             });
 
 
@@ -757,7 +1581,7 @@ export const RenderingCoreMethods = {
         const listItem = __FEATURE_LISTS__ ? this._findListItemAncestor(bindingElement) : null;
 
         if (listItem) {
-            const listElement = this._findDirectParentList(listItem);
+            const listElement = this._findRowList(listItem);
             if (listElement && listElement._listContext) {
                 const itemIndex = listItem._listIndex;
                 // In-list per-binding CM context removed (probe: 0 hits; in-list
@@ -1066,24 +1890,65 @@ export const RenderingCoreMethods = {
      */
     _querySelfAndDescendants(element, selector) {
         const results = Array.from(element.querySelectorAll(selector));
-        if (element.matches(selector)) {
-            // Only include root if no parent component/list owns this element's bindings.
-            // Both attribute halves must be prefix-aware: a parent declared after this
-            // child has no data-component-id yet, so its data-wf-component attribute is
-            // the only thing that identifies it as the owner (plain-page canary
-            // "a binding on a child root belongs to the parent").
-            const parent = element.parentElement;
-            const parentOwner = parent
-                ? parent.closest(`${this._attrSelector('component')}, [data-component-id], ${this._attrSelector('list')}`)
-                : null;
-            if (!parentOwner) {
-                results.unshift(element);
-            }
+        // Only include root if no parent component/list owns this element's bindings.
+        if (element.matches(selector) && this._isUnownedRoot(element)) {
+            results.unshift(element);
         }
         return results;
     },
+    /**
+     * True when nothing around a component's root reads the bindings written
+     * on it: no component and no list above it. A nested root's bindings are
+     * read by the component (or row) around it, since that is where its tag
+     * was written. Both attribute halves are prefix-aware: a parent declared
+     * after this child has no data-component-id yet, so its data-wf-component
+     * attribute is the only thing that identifies it as the owner (plain-page
+     * canary "a binding on a child root belongs to the parent").
+     * @private
+     */
+    _isUnownedRoot(element) {
+        // Content a portal moved (data-portaled-from on it or on a wrapper
+        // above it) is still read by the component that teleported it.
+        const parent = element.parentElement;
+        return !element.hasAttribute('data-portaled-from') && (!parent ||
+            !parent.closest(`${this._attrSelector('component')}, [data-component-id], ${this._attrSelector('list')}, [data-portaled-from]`));
+    },
     _getComponentElement(element) {
         return element ? element.closest(this._attrSelector('component')) : null;
+    },
+    /**
+     * The owner of the bindings on a component's root: the nearest ancestor
+     * element carrying data-component (data-wf-component), registered or not,
+     * because that is whose markup the tag was written in. Null for a
+     * top-level root. The one rule every claim of a root asks
+     * (_isOwnedBindingElement, _bindingScopeElement, the effect rescan, the
+     * scan-time claim and the fallback collector). While the owner is not
+     * registered, the root's bindings stay inert; it claims them when it
+     * initializes. A root a portal moved (data-portaled-from on it, or on a
+     * wrapper between it and the component around the target) keeps the
+     * owner whose markup it was written in: the component that teleported
+     * it, never the one around the portal target.
+     * @private
+     */
+    _rootOwnerElement(el) {
+        const owner = this._getComponentElement(el.parentElement);
+        const moved = el.closest('[data-portaled-from]');
+        if (moved && moved !== owner && (!owner || owner.contains(moved))) {
+            const source = this.componentInstances.get(moved.getAttribute('data-portaled-from'));
+            return source ? source.element : null;
+        }
+        return owner;
+    },
+    /**
+     * The component element whose scope a binding on `el` reads: the nearest
+     * component, except that a binding on a component's own root is read by
+     * its owner (_rootOwnerElement). A top-level root has no owner and keeps
+     * its own.
+     * @private
+     */
+    _bindingScopeElement(el) {
+        const own = this._getComponentElement(el);
+        return (own === el && this._rootOwnerElement(el)) || own;
     },
     /**
      * Check whether a binding element belongs to this component's direct scope.
@@ -1109,82 +1974,14 @@ export const RenderingCoreMethods = {
         if (ancestorList && ancestorList !== componentElement && componentElement.contains(ancestorList)) return false;
         const closestComponent = this._getComponentElement(el);
         if (closestComponent === componentElement) return true;
-        // Parent claims bindings on direct child component root elements
-        // (bindings on a component element are authored in the parent's template)
-        if (closestComponent && closestComponent === el && componentElement.contains(el)) {
-            const parentComp = el.parentElement?.closest('[data-component-id]');
-            return parentComp === componentElement;
-        }
-        return false;
+        // Bindings on a child component's root are claimed by the root's
+        // owner (bindings on a component element are authored in the
+        // template around it). Elements below a nested component, registered
+        // or not, are not this component's.
+        return closestComponent === el && this._rootOwnerElement(el) === componentElement;
     },
-    _getComponentId(element) {
-        const componentElement = this._getComponentElement(element);
-        return componentElement ? componentElement.dataset.componentId : null;
-    },
-    /**
-     * Find the nearest ancestor element that is a list item (has _listIndex property).
-     * This replaces closest('[data-index]') - no DOM attribute needed, just JS property check.
-     * @param {HTMLElement} element - Starting element
-     * @returns {HTMLElement|null} The nearest list item ancestor, or null if not in a list
-     * @private
-     */
-    _findListItemAncestor(element) {
-        let current = element;
-        while (current && current !== document.body) {
-            // CRITICAL FIX: Stop at component boundaries
-            // If we hit a component boundary (that isn't the starting element itself),
-            // we have left the scope of the current component.
-            // Any list item above this boundary belongs to the PARENT component,
-            // not ours - so it's not our list item ancestor in a binding context.
-            if (current.dataset.componentId && current !== element) {
-                return null;
-            }
-
-            if (current._listIndex !== undefined) {
-                return current;
-            }
-            current = current.parentElement;
-        }
-        return null;
-    },
-    /**
-     * Get list item elements with flexible filtering options
-     * @param {HTMLElement} listElement - The list container element
-     * @param {Object} [options] - Filtering options
-     * @param {boolean} [options.requireDataIndex=true] - Only include items with _listIndex property
-     * @param {boolean} [options.excludeTemplates=true] - Exclude template elements
-     * @param {Function|null} [options.filter=null] - Additional custom filter function
-     * @returns {Array<Element>} Filtered list of child elements
-     * @private
-     */
-    _getListItems(listElement, options = {}) {
-        if (!listElement) return [];
-
-        const {
-            requireDataIndex = true,
-            excludeTemplates = true,
-            filter = null
-        } = options;
-
-        let items = Array.from(listElement.children);
-
-        // Filter by _listIndex JS property (no DOM attribute needed)
-        if (requireDataIndex) {
-            items = items.filter(child => child._listIndex !== undefined);
-        }
-
-        // Exclude template elements
-        if (excludeTemplates) {
-            items = items.filter(child => child.tagName !== 'TEMPLATE');
-        }
-
-        // Apply custom filter if provided
-        if (filter) {
-            items = items.filter(filter);
-        }
-
-        return items;
-    },
+    // _findListItemAncestor, _getComponentId and _getListItems (lists only)
+    // live in ListSharedMethods; shared callers are gated on __FEATURE_LISTS__.
     /**
      * Get a value from an object using dot notation
      * @private
@@ -1252,49 +2049,7 @@ export const RenderingCoreMethods = {
             .filter(instance => instance.name === componentName);
     },
 
-    // ========================================================================
-    // CONTEXT CLEANUP
-    // ========================================================================
-
-    /**
-     * Clean up all contexts for elements in a subtree
-     * Called before removing list items to prevent context accumulation (memory leak)
-     * Context cleanup is deferred to requestIdleCallback
-     * @param {HTMLElement} rootElement - The root element of the subtree
-     * @private
-     */
-    _cleanupContextsInSubtree(rootElement) {
-        if (!this._contextRecords || !this._contextSystemInitialized) return;
-
-        // Skip cleanup for SSR-adopted lists - they have special lifecycle management
-        if (__FEATURE_SSR__) {
-            const listParent = rootElement.closest(this._attrSelector('list'));
-            if (listParent && ssrAdoptedElements.has(listParent)) return;
-        }
-
-        // Quick check: if element has no context markers, skip expensive cleanup
-        // This is a fast path for list items that never had interactions
-        if (!rootElement._needsContexts && !rootElement._listContext && !rootElement._bindingContextId) {
-            // Still need to clean up _listContext on descendants, but skip expensive context search
-            // Per removed row: the selector is cached (_attrSelector), not built
-            const descendants = rootElement.querySelectorAll(this._attrSelector('list'));
-            for (const el of descendants) {
-                if (el._listContext) delete el._listContext;
-            }
-            return;
-        }
-
-        // Collect all elements that might have contexts into a Set for O(1) lookup
-        const elementsToClean = new Set([rootElement, ...rootElement.querySelectorAll('*')]);
-
-        // Clean up _listContext references synchronously (cheap operation)
-        for (const element of elementsToClean) {
-            if (element._listContext) {
-                delete element._listContext;
-            }
-        }
-
-    },
+    // _cleanupContextsInSubtree (list rows) lives in ListSharedMethods.
 
     // ========================================================================
     // COMPONENT BINDING PIPELINE
@@ -1489,638 +2244,6 @@ export const RenderingCoreMethods = {
             );
         });
     },
-    // #region FEATURE_BINDING_VALIDATION
-    // ==========================================
-    // RUNTIME BINDING VALIDATION (Debug Mode Only)
-    // ==========================================
-
-    /**
-     * Validate all bindings for a component against its state properties
-     * Warns in debug mode when bindings reference undefined state properties
-     * @param {Object} instance - The component instance
-     * @private
-     */
-    _validateComponentBindings(instance) {
-        if (!__DEV__) return; // compile-time: bodies in this region are stripped from prod builds
-        if (!this.debug) return;
-
-        const { state, name: componentName, id: componentId, element: componentElement } = instance;
-        const stateKeys = Object.keys(state);
-
-        // Include computed property names; they're valid binding targets
-        if (instance.stateManager && instance.stateManager.computed) {
-            const computedKeys = Object.keys(instance.stateManager.computed);
-            for (const key of computedKeys) {
-                if (!stateKeys.includes(key)) stateKeys.push(key);
-            }
-        }
-
-        // Collect all binding paths from domElements (registered bindings)
-        const bindingCollections = [
-            { collection: this.domElements.bindings, pathKey: 'path', type: 'data-bind' },
-            { collection: this.domElements.models, pathKey: 'path', type: 'data-model' },
-            { collection: this.domElements.conditionals, pathKey: 'path', type: 'data-show' },
-            { collection: this.domElements.htmlBindings, pathKey: 'path', type: 'data-bind-html' },
-            { collection: this.domElements.lists, pathKey: 'path', type: 'data-list' }
-        ];
-
-        for (const { collection, pathKey, type } of bindingCollections) {
-            if (!collection) continue;
-
-            for (const binding of collection) {
-                if (binding.componentId !== componentId) continue;
-                // Inside a record-shape query subtree a bare path reads the
-                // row (data-model excepted), so component state cannot judge
-                // it. WF-997 names a field neither scope carries, once the row
-                // has arrived.
-                if (__FEATURE_QUERY__ && type !== 'data-model' && binding.element && binding.element._wfRecordQuery) continue;
-
-                const path = binding[pathKey];
-                if (!path) continue;
-
-                this._validateBindingPath(path, stateKeys, componentName, type, state);
-            }
-        }
-
-        // Scan component DOM for data-render and data-bind-class attributes
-        // These are not stored in global domElements, so we scan directly
-        // IMPORTANT: Skip elements inside nested data-component scopes; those
-        // belong to child components and will be validated when those initialize
-        if (componentElement) {
-            const isOwnedByThisComponent = (el) => {
-                // Slot templates (data-use-template + data-with) are expanded
-                // against the object named by data-with, so their bindings
-                // resolve in THAT scope, not this component's state. Validating
-                // them here reported valid bindings as undefined (WF-509 false
-                // positive). Every runtime binding processor already skips these
-                // via the same closest() guard — see the call sites around
-                // _processBindingElements / _processClassBindingElements.
-                if (el.closest('[data-use-template-rendered]')) return false;
-                // Same for children of a <template>: only reachable when the
-                // template sits inside <svg> (parsed as an inert element with
-                // live children); they belong to the pool, not to state.
-                if (el.closest('template')) return false;
-
-                let parent = el.parentElement;
-                while (parent && parent !== componentElement) {
-                    if (this._hasAttr(parent, 'component')) return false;
-                    parent = parent.parentElement;
-                }
-                return true;
-            };
-
-            // Validate data-render bindings
-            const renderElements = componentElement.querySelectorAll(this._attrSelector('render'));
-            renderElements.forEach(el => {
-                if (!isOwnedByThisComponent(el)) return;
-                const path = this._getAttr(el, 'render');
-                if (path) {
-                    this._validateBindingPath(path, stateKeys, componentName, 'data-render', state);
-                }
-            });
-
-            // Validate data-bind-class expressions
-            const classBindingElements = componentElement.querySelectorAll(this._attrSelector('bind-class'));
-            classBindingElements.forEach(el => {
-                if (!isOwnedByThisComponent(el)) return;
-                if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
-                const expression = this._getAttr(el, 'bind-class');
-                if (expression) {
-                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-class');
-                }
-            });
-
-            // Validate data-bind-style expressions
-            const styleBindingElements = componentElement.querySelectorAll(this._attrSelector('bind-style'));
-            styleBindingElements.forEach(el => {
-                if (!isOwnedByThisComponent(el)) return;
-                if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
-                const expression = this._getAttr(el, 'bind-style');
-                if (expression) {
-                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-style');
-                }
-            });
-
-            // Validate data-action method references
-            const actionElements = componentElement.querySelectorAll(this._attrSelector('action'));
-            actionElements.forEach(el => {
-                if (!isOwnedByThisComponent(el)) return;
-                const actionAttr = this._getAttr(el, 'action');
-                if (actionAttr) {
-                    this._validateActionMethods(actionAttr, instance, componentName);
-                }
-            });
-        }
-    },
-    /**
-     * Validate a single binding path against available state properties
-     * @param {string} path - The binding path (e.g., "user.name", "count", "!isActive")
-     * @param {Array<string>} stateKeys - Available state property names
-     * @param {string} componentName - Name of the component for error messages
-     * @param {string} bindingType - Type of binding (data-bind, data-model, etc.)
-     * @private
-     */
-    _validateBindingPath(path, stateKeys, componentName, bindingType, state) {
-        if (!__DEV__) return;
-        // Skip validation for special paths
-        if (!path || typeof path !== 'string') return;
-
-        // Skip computed: prefixed paths (these are computed properties)
-        if (path.startsWith('computed:')) return;
-
-        // Skip props. prefixed paths (these resolve via component props, not state)
-        if (path.startsWith('props.') || path.startsWith('props:')) return;
-
-        // Skip external() expressions (cross-component references)
-        if (path.includes('external(')) return;
-
-        // Skip $entity.path shorthand (normalized to external() at bind time)
-        if (path.includes('$')) return;
-
-        // Parse type hint from path (e.g., "price:number" -> path="price", typeHint="number")
-        let typeHint = null;
-        let actualPath = path;
-        const typeHintMatch = path.match(/^([^:]+):(\w+)$/);
-        if (typeHintMatch) {
-            actualPath = typeHintMatch[1];
-            typeHint = typeHintMatch[2];
-        }
-
-        // If the path contains expression operators, it's not a simple property
-        // reference: delegate to the expression-variable validator so each
-        // identifier in the expression is checked individually. Without this,
-        // `data-show="activePattern === 'intro'"` would be treated as a single
-        // property name `"activePattern === 'intro'"` and always report
-        // "undefined state property".
-        // Valid simple-path characters: word chars, dots (nested), and leading `!`.
-        // Anything else (spaces, `=`, `&`, `|`, `?`, `>`, `<`, `+`, `*`, `(`, etc.)
-        // means the attribute holds an expression.
-        if (!/^!?[\w.]+$/.test(actualPath)) {
-            this._validateExpressionVariables(actualPath, stateKeys, componentName, bindingType);
-            return;
-        }
-
-        // Skip list context variables
-        const listContextVars = ['_index', '_length', '_first', '_last', '_item'];
-        const cleanPath = actualPath.replace(/^!/, ''); // Remove negation prefix
-        const pathParts = cleanPath.split('.');
-        const rootVar = pathParts[0];
-
-        if (listContextVars.includes(rootVar)) return;
-
-        // Skip store-alias data-model paths ("storeName.field"): FormHandling
-        // routes these writes to the named store's state, not this component's
-        // (mirrored on the read side in _executeComponentBindingsForEffect),
-        // so the root legitimately has no matching component state key. Scoped
-        // to REGISTERED stores only — an unregistered root still warns, which
-        // is what actually catches typos and genuine component-state mistakes.
-        if (bindingType === 'data-model' && pathParts.length > 1
-            && this.storeManager?.getStoreComponentByName(rootVar)) {
-            return;
-        }
-
-        // Check if root property exists in state
-        if (!stateKeys.includes(rootVar)) {
-            // Find similar property names for typo suggestions
-            const suggestions = this._findSimilarPropertyNames(rootVar, stateKeys);
-            let message = `${bindingType}="${actualPath}" references undefined state property "${rootVar}" in component "${componentName}"`;
-
-            if (suggestions.length > 0) {
-                message += `. Did you mean: ${suggestions.join(', ')}?`;
-            }
-
-            message += ` Available properties: ${stateKeys.join(', ')}`;
-            if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
-            return;
-        }
-
-        // Check nested path if state object is provided and path has multiple parts
-        let finalValue = state ? state[rootVar] : undefined;
-        if (state && pathParts.length > 1) {
-            let currentObj = state[rootVar];
-            for (let i = 1; i < pathParts.length; i++) {
-                const part = pathParts[i];
-                if (currentObj === null || currentObj === undefined) {
-                    // Parent is null/undefined, can't validate further
-                    finalValue = undefined;
-                    break;
-                }
-                if (typeof currentObj !== 'object') {
-                    // Parent is not an object, can't have nested properties
-                    finalValue = undefined;
-                    break;
-                }
-                if (!(part in currentObj)) {
-                    // Nested property doesn't exist - find similar property names
-                    const availableProps = Object.keys(currentObj);
-                    const suggestions = this._findSimilarPropertyNames(part, availableProps);
-                    const parentPath = pathParts.slice(0, i).join('.');
-                    let message = `${bindingType}="${actualPath}" references undefined property "${part}" on "${parentPath}" in component "${componentName}"`;
-
-                    if (suggestions.length > 0) {
-                        message += `. Did you mean: ${suggestions.join(', ')}?`;
-                    }
-
-                    message += ` Available properties: ${availableProps.join(', ')}`;
-                    if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
-                    return;
-                }
-                currentObj = currentObj[part];
-                finalValue = currentObj;
-            }
-        }
-
-        // Validate type hint against actual value
-        if (typeHint && finalValue !== undefined) {
-            const actualType = this._inferTypeFromValue(finalValue);
-            if (actualType !== typeHint && actualType !== 'any') {
-                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, {
-                    warn: true,
-                    context: `Type hint mismatch in component "${componentName}": ` +
-                        `${bindingType}="${path}" expects ${typeHint} but property "${actualPath}" has type ${actualType}. ` +
-                        `Value: ${JSON.stringify(finalValue)}`
-                });
-            }
-        }
-    },
-    /**
-     * Validate variables in an expression (like data-bind-class expressions)
-     * @param {string} expression - The expression to validate
-     * @param {Array<string>} stateKeys - Available state property names
-     * @param {string} componentName - Name of the component for error messages
-     * @param {string} bindingType - Type of binding
-     * @private
-     */
-    _validateExpressionVariables(expression, stateKeys, componentName, bindingType) {
-        if (!__DEV__) return;
-        // Skip $entity.path shorthand (normalized to external() at bind time)
-        if (expression && expression.includes('$')) return;
-
-        // Strip computed: prefix before validation; it's a runtime hint, not a variable
-        const cleanExpression = expression.replace(/\bcomputed:/g, '');
-
-        // Remove string literals before extracting identifiers; words inside
-        // quotes ('priority-option high') are not variable references
-        const noStrings = cleanExpression.replace(/'[^']*'|"[^"]*"/g, '');
-
-        // Extract variable names: only ROOT identifiers, not property accesses.
-        // `(?<!\.)` lookbehind excludes identifiers preceded by a dot so that
-        // `events.length` produces `['events']` not `['events', 'length']`.
-        // Without this, built-in props like .length/.includes/.toLowerCase()
-        // appear as "undefined state property": noisy false positives.
-        const propertyRegex = /(?<!\.)\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
-        const matches = noStrings.match(propertyRegex);
-
-        if (!matches) return;
-
-        // Reserved words and keywords to skip
-        const reserved = new Set([
-            'true', 'false', 'null', 'undefined', 'NaN', 'Infinity',
-            'if', 'else', 'return', 'typeof', 'instanceof', 'new', 'this',
-            'external', 'Math', 'Date', 'String', 'Number', 'Boolean', 'Array', 'Object',
-            'function', 'var', 'let', 'const', 'for', 'while',
-            // List context variables
-            '_index', '_length', '_first', '_last', '_item'
-        ]);
-
-        const checkedVars = new Set();
-
-        for (const varName of matches) {
-            // Skip reserved words, already checked vars, and string literals
-            if (reserved.has(varName) || checkedVars.has(varName)) continue;
-            checkedVars.add(varName);
-
-            // Check if this variable exists in state
-            if (!stateKeys.includes(varName)) {
-                const suggestions = this._findSimilarPropertyNames(varName, stateKeys);
-                let message = `${bindingType} expression "${expression}" references undefined state property "${varName}" in component "${componentName}"`;
-
-                if (suggestions.length > 0) {
-                    message += `. Did you mean: ${suggestions.join(', ')}?`;
-                }
-
-                message += ` Available properties: ${stateKeys.join(', ')}`;
-                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
-            }
-        }
-    },
-    /**
-     * Validate variables in an object-form-capable binding expression
-     * (data-bind-style and data-bind-class). Object form is
-     * { key: stateVar, ... } where the KEY is a CSS property or class NAME,
-     * not a variable — only VALUE-side identifiers are validated. Unquoted
-     * class keys ({ active: isTab1 }) previously hit the generic expression
-     * validator and were flagged as undefined state properties (AI-surface
-     * eval finding F3, 2026-07-16); quoted keys never tripped it because
-     * string-stripping removes them first.
-     * @param {string} expression - The expression (e.g., "{ color: textColor }")
-     * @param {Array<string>} stateKeys - Available state property names
-     * @param {string} componentName - Name of the component for error messages
-     * @param {Object} state - The component state object
-     * @param {string} bindingType - 'data-bind-style' or 'data-bind-class'
-     * @private
-     */
-    _validateObjectFormExpression(expression, stateKeys, componentName, state, bindingType) {
-        if (!__DEV__) return;
-        const trimmed = expression.trim();
-
-        // Object syntax: { key: stateVar, ... }
-        if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-            const inner = trimmed.slice(1, -1).trim();
-            if (!inner) return;
-
-            // Split on commas (respecting nested structures)
-            const pairs = inner.split(',');
-            for (const pair of pairs) {
-                const colonIdx = pair.indexOf(':');
-                if (colonIdx === -1) continue;
-
-                // Only validate the VALUE side (after the colon); the KEY side is a name
-                const valuePart = pair.substring(colonIdx + 1).trim();
-                if (!valuePart) continue;
-
-                // The value might be a simple identifier or an expression
-                this._validateExpressionVariables(valuePart, stateKeys, componentName, bindingType, state);
-            }
-            return;
-        }
-
-        // Non-object syntax: treat as expression (bare property name or expression)
-        this._validateExpressionVariables(expression, stateKeys, componentName, bindingType, state);
-    },
-    /**
-     * Validate action method references against available component methods
-     * @param {string} actionAttr - The data-action attribute value (e.g., "click:save", "increment", "save('draft')")
-     * @param {Object} instance - The component instance
-     * @param {string} componentName - Name of the component for error messages
-     * @private
-     */
-    _validateActionMethods(actionAttr, instance, componentName) {
-        if (!__DEV__) return;
-        // Parse action definitions using the framework's parser if available
-        const actionDefs = typeof this._parseActions === 'function'
-            ? this._parseActions(actionAttr)
-            : this._parseActionDefsSimple(actionAttr);
-
-        const context = instance.context;
-        if (!context) return;
-
-        // Collect available method names for suggestions
-        const methodNames = Object.keys(context).filter(k => typeof context[k] === 'function');
-
-        for (const { methodName } of actionDefs) {
-            if (!methodName) continue;
-
-            if (typeof context[methodName] !== 'function') {
-                // $entity.path in data-action: the generic "undefined method"
-                // message below sends the author hunting for a typo among their
-                // own methods, when the real issue is that $ is a read accessor
-                // for external state and doesn't name action handlers. Same
-                // anchored shape as ExpressionEvaluator's STORE_SHORTHAND_REGEX.
-                const dollar = /^\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z0-9_.]+)$/.exec(methodName);
-                if (dollar) {
-                    wfError(WF_ERRORS.ACTION_STORE_SHORTHAND, {
-                        warn: true,
-                        context: `data-action="${methodName}" in component "${componentName}". ` +
-                            `$entity.path is a read accessor for external state and cannot name an action handler; ` +
-                            `actions are methods on this component. To delegate to another entity's method, define one: ` +
-                            // Wrapper named for the method being invoked (LAST path
-                            // segment): $foo.util.bump -> bump() { ...util.bump(); }
-                            `${dollar[2].split('.').pop()}() { this.getStore('${dollar[1]}').${dollar[2]}(); }`
-                    });
-                    continue;
-                }
-                const suggestions = this._findSimilarPropertyNames(methodName, methodNames);
-                let message = `data-action references undefined method "${methodName}" in component "${componentName}"`;
-
-                if (suggestions.length > 0) {
-                    message += `. Did you mean: ${suggestions.join(', ')}?`;
-                }
-
-                message += ` Available methods: ${methodNames.join(', ')}`;
-                if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
-            }
-        }
-    },
-    /**
-     * Simple fallback parser for action definitions when _parseActions is not available
-     * @param {string} actionAttr - The data-action attribute value
-     * @returns {Array<{eventType: string, methodName: string}>}
-     * @private
-     */
-    _parseActionDefsSimple(actionAttr) {
-        if (!__DEV__) return [];
-        const results = [];
-        const parts = actionAttr.trim().split(/\s+/);
-
-        for (const part of parts) {
-            let methodPart = part;
-            const parenStart = part.indexOf('(');
-            const colonIdx = part.indexOf(':');
-
-            // Handle event:method format (colon before any parenthesis)
-            if (colonIdx !== -1 && (parenStart === -1 || colonIdx < parenStart)) {
-                methodPart = part.substring(colonIdx + 1);
-            }
-
-            // Strip argument list: method(args) -> method
-            const parenIdx = methodPart.indexOf('(');
-            if (parenIdx !== -1) {
-                methodPart = methodPart.substring(0, parenIdx);
-            }
-
-            results.push({ eventType: 'click', methodName: methodPart });
-        }
-
-        return results;
-    },
-    /**
-     * Find property names similar to the given name (for typo suggestions)
-     * Uses Levenshtein distance for fuzzy matching
-     * @param {string} name - The property name to find matches for
-     * @param {Array<string>} candidates - Available property names
-     * @returns {Array<string>} - Similar property names
-     * @private
-     */
-    _findSimilarPropertyNames(name, candidates) {
-        if (!__DEV__) return [];
-        const maxDistance = Math.max(2, Math.floor(name.length / 3));
-        const lowerName = name.toLowerCase();
-        const similar = [];
-
-        for (const candidate of candidates) {
-            // Guard on the raw strings, NOT on distance > 0. Comparison is
-            // case-insensitive, so a pure case slip ("selectedid" written for
-            // "selectedId") scores 0 — excluding zero-distance matches dropped
-            // the single most common typo class, leaving the WF-509 warning with
-            // no suggestion at all on exactly the case the author can fix fastest.
-            if (candidate === name) continue;
-            const distance = this._levenshteinDistance(lowerName, candidate.toLowerCase());
-            if (distance <= maxDistance) {
-                similar.push({ candidate, distance });
-            }
-        }
-
-        // Nearest first. Unsorted, candidates arrive in declaration order and the
-        // 3-item cut can discard a distance-1 match in favour of a distance-3 one
-        // that happened to be declared earlier. Sort is stable, so equal-distance
-        // candidates keep declaration order.
-        similar.sort((a, b) => a.distance - b.distance);
-        return similar.slice(0, 3).map(entry => entry.candidate); // Top 3 suggestions
-    },
-    /**
-     * Calculate Levenshtein distance between two strings
-     * @param {string} a - First string
-     * @param {string} b - Second string
-     * @returns {number} - Edit distance
-     * @private
-     */
-    _levenshteinDistance(a, b) {
-        if (!__DEV__) return 0;
-        if (a.length === 0) return b.length;
-        if (b.length === 0) return a.length;
-
-        const matrix = [];
-
-        // Initialize matrix
-        for (let i = 0; i <= b.length; i++) {
-            matrix[i] = [i];
-        }
-        for (let j = 0; j <= a.length; j++) {
-            matrix[0][j] = j;
-        }
-
-        // Fill matrix
-        for (let i = 1; i <= b.length; i++) {
-            for (let j = 1; j <= a.length; j++) {
-                if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                    matrix[i][j] = matrix[i - 1][j - 1];
-                } else {
-                    matrix[i][j] = Math.min(
-                        matrix[i - 1][j - 1] + 1, // substitution
-                        matrix[i][j - 1] + 1,     // insertion
-                        matrix[i - 1][j] + 1      // deletion
-                    );
-                }
-            }
-        }
-
-        return matrix[b.length][a.length];
-    },
-    // ==========================================
-    // Type inference
-    // ==========================================
-
-    /**
-     * Infer types from initial state values
-     * Creates a type map for all top-level state properties
-     * @param {Object} state - The component's initial state object
-     * @returns {Object} - Map of property names to inferred type strings
-     * @private
-     */
-    _inferTypesFromState(state) {
-        if (!__DEV__) return {};
-        if (!state || typeof state !== 'object') {
-            return {};
-        }
-
-        const types = {};
-
-        for (const key of Object.keys(state)) {
-            types[key] = this._inferTypeFromValue(state[key]);
-        }
-
-        return types;
-    },
-    /**
-     * Infer the type of a single value
-     * @param {*} value - The value to infer the type of
-     * @returns {string} - The inferred type ('string', 'number', 'boolean', 'array', 'object', 'function', 'any')
-     * @private
-     */
-    _inferTypeFromValue(value) {
-        if (!__DEV__) return 'any';
-        if (value === null || value === undefined) {
-            return 'any'; // Can't infer type from null/undefined
-        }
-
-        if (Array.isArray(value)) {
-            return 'array';
-        }
-
-        const jsType = typeof value;
-
-        switch (jsType) {
-            case 'string':
-                return 'string';
-            case 'number':
-                return 'number';
-            case 'boolean':
-                return 'boolean';
-            case 'object':
-                return 'object';
-            case 'function':
-                return 'function';
-            default:
-                return 'any';
-        }
-    },
-    // ==========================================
-    // Runtime type checking
-    // ==========================================
-
-    /**
-     * Check if a value matches the expected type for a property
-     * Emits a console warning if there's a type mismatch
-     * @param {Object} component - The component instance
-     * @param {string} prop - The property name being set
-     * @param {*} value - The new value being assigned
-     * @returns {boolean} - True if types match or no type defined, false if mismatch
-     * @private
-     */
-    _checkTypeMatch(component, prop, value) {
-        if (!__DEV__) return true;
-        // Only check in debug mode
-        if (!this.debug && !this.options?.debug) {
-            return true;
-        }
-
-        // Get expected type from component's type map
-        const expectedType = component?._types?.[prop];
-
-        // No type defined or 'any' type - skip checking
-        if (!expectedType || expectedType === 'any') {
-            return true;
-        }
-
-        // An emptied number field: a type="number" input bound with data-model
-        // writes '' (kept so validation can see the field is empty), which is
-        // a legitimate value for a number property, not a mismatch.
-        if (expectedType === 'number' && value === '') {
-            return true;
-        }
-
-        // Get actual type of the new value
-        const actualType = this._inferTypeFromValue(value);
-
-        // Check if types match
-        if (actualType !== expectedType) {
-            // Allow null/undefined for any type (they become 'any')
-            if (actualType === 'any') {
-                return true;
-            }
-
-            if (__DEV__) console.warn(
-                `[WF] Type mismatch in component "${component.name}": ` +
-                `Property "${prop}" expects ${expectedType} but received ${actualType}. ` +
-                `Value: ${JSON.stringify(value)}`
-            );
-            return false;
-        }
-
-        return true;
-    },
-    // #endregion FEATURE_BINDING_VALIDATION
 
     // =========================================================================
     // Effect-Based Component Binding Rendering
@@ -2139,6 +2262,7 @@ export const RenderingCoreMethods = {
         if (!stateManager?.createEffect) {
             return null;
         }
+        if (instance._rootEffect === undefined) this._createRootEffect(instance);
 
         // Use pre-collected metadata (populated during context creation or data-render re-insertion)
         const bindingMeta = instance._effectMeta;
@@ -2168,6 +2292,124 @@ export const RenderingCoreMethods = {
 
         instance._renderEffect = stopEffect;
         return stopEffect;
+    },
+
+    /**
+     * A component's root: block: its own side of its root element. Every value
+     * is an expression in the component's scope, read as the matching
+     * attribute reads it (the effect loop's evaluator); `directives` run with
+     * the directive system (_processRootDirectives). One effect of its own,
+     * made with the component's first render effect and kept through that
+     * effect's rebuilds; destroy disposes it. The block is compiled once per
+     * definition.
+     * @private
+     */
+    _createRootEffect(instance) {
+        instance._rootEffect = null;
+        const definition = instance.definition;
+        const block = definition && definition.root;
+        if (block === undefined || !instance.element) return;
+        // Compiled (and its shape warnings given) once per definition.
+        let spec = _rootSpecs.get(definition);
+        if (!spec) {
+            _rootSpecs.set(definition, spec = []);
+            const ignored = (key, why) => {
+                if (__DEV__) wfError(WF_ERRORS.DEFINITION_KEY_IGNORED, {
+                    warn: true,
+                    context: `Component '${instance.name}': root:${key ? ' ' + key : ''} ${why}, so it was ignored`,
+                    suggestion: key === 'render'
+                        ? 'A component cannot remove its own root. Put data-render on its tag in the parent\'s markup.'
+                        : 'root: is an object: class, attr and style (name to expression), show (an expression) and directives (registered directive name to value).'
+                });
+            };
+            if (!block || typeof block !== 'object') {
+                ignored('', 'is not an object');
+                return;
+            }
+            for (const key in block) {
+                const value = block[key];
+                if (key === 'show') {
+                    if (typeof value !== 'string') ignored(key, 'is not an expression string');
+                    else spec.push({ type: 'root-show', key, ...this._parseConditionPath(value) });
+                } else if (key === 'class' || key === 'attr' || key === 'style' || key === 'directives') {
+                    if (!value || typeof value !== 'object') {
+                        ignored(key, 'is not an object');
+                        continue;
+                    }
+                    for (const name in value) {
+                        const expr = value[name];
+                        if (typeof expr !== 'string') ignored(`${key}.${name}`, 'is not a string');
+                        else if (key === 'directives') {
+                            // Run by the directive system (_processRootDirectives).
+                            if (!this._customDirectives.has(name)) ignored(`${key}.${name}`, 'names no registered directive');
+                        } else if (key === 'attr' && this._isBlocklistedAttr(name)) ignored(`${key}.${name}`, 'is an attribute bindings cannot set');
+                        else spec.push({ type: 'root-' + key, key: name, ...this._parseConditionPath(expr) });
+                    }
+                } else ignored(key, key === 'render' ? 'is not supported' : 'is not a root: key');
+            }
+        }
+        if (spec.length === 0) return;
+        // The root: block reads the component's own scope only: no `element`
+        // for the effect loop, so a record-shape query around the root (which
+        // the tag's own bindings do read) never merges its row in.
+        const target = instance.element;
+        const metas = spec.map(entry => ({ ...entry, element: null, target }));
+        instance._rootEffect = instance.stateManager.createEffect(() => {
+            this._executeComponentBindingsForEffect(instance, metas);
+        }, { scope: instance, name: __DEV__ ? `root:${instance.name}` : undefined });
+    },
+
+    /**
+     * Write one root: block value. Merged with the bindings on the tag: a
+     * class is on while either side holds it; the root shows only while
+     * neither side hides it; an attribute or style property the tag binds
+     * too is the tag's (WF-520).
+     * @private
+     */
+    _applyRootMeta(meta, value, instance) {
+        const el = meta.target;
+        const key = meta.key;
+        if (meta.negate) value = !value;
+        if (meta.type === 'root-show') {
+            el._wfRootShow = !!value;
+            // The tag's last verdict (every show writer records it), visible
+            // when the tag has none or has not run yet.
+            applyShow(el, el._wfTagShow !== false);
+        } else if (meta.type === 'root-class') {
+            const held = el._wfRootOn || (el._wfRootOn = new Set());
+            const bound = el._prevBoundClasses;
+            // A class the tag carries at mount and does not bind is static
+            // (root: never takes it off) unless this entry is true then: a
+            // server-rendered root carries root:'s own classes, so those are
+            // root:'s.
+            if (meta.fixed === undefined) meta.fixed = !value && el.classList.contains(key) && !(bound && bound.has(key));
+            if (value) {
+                held.add(key);
+                if (!el.classList.contains(key)) el.classList.add(key);
+            } else {
+                held.delete(key);
+                if (!meta.fixed && el.classList.contains(key) && !(bound && bound.has(key))) el.classList.remove(key);
+            }
+        } else {
+            const isAttr = meta.type === 'root-attr';
+            if (meta.tagSets === undefined) {
+                // The tag's object literal names the key (static, so the tag
+                // wins from the first paint, whichever side runs first).
+                const text = this._getAttr(el, isAttr ? 'bind-attr' : 'bind-style') || '';
+                meta.names = isAttr ? [key] : [key, key.replace(/[A-Z]/g, c => '-' + c.toLowerCase()), key.replace(/-([a-z])/g, (m, c) => c.toUpperCase())];
+                meta.tagSets = meta.names.some(name => text.includes(name) &&
+                    new RegExp('(^|[{,(])\\s*[\'"]?' + name.replace(/[^\w-]/g, '\\$&') + '[\'"]?\\s*:').test(text));
+            }
+            const bound = isAttr ? el._boundAttrProps : el._boundStyleProps;
+            if (meta.tagSets || (bound && meta.names.some(name => bound.has(name)))) {
+                if (__DEV__) this._warnRootConflict(instance, isAttr ? 'attribute' : 'style property', key);
+                return;
+            }
+            try {
+                if (isAttr) applyAttrValue(el, key, this._sanitizeAttrValue(key, value));
+                else applyStyleProp(el.style, key, value);
+            } catch (e) { /* invalid name or value: skipped, as in the tag's writers */ }
+        }
     },
 
     /**
@@ -2226,8 +2468,15 @@ export const RenderingCoreMethods = {
             // Excluding on mere presence stripped that nested component's
             // whole meta on rescan. Only rows of a list THIS
             // component owns are row-owned from its point of view.
-            if (listAncestor && listAncestor !== el
-                && listAncestor.closest(componentSel) === element) return false;
+            // A list element is its own closest list, so for one the question
+            // is asked of its parent, as _isOwnedBindingElement does at init:
+            // a top-level container has no list above it and stays
+            // collectible; a row whose root is itself a nested list
+            // (<tr data-list="cells">) is row-owned like any other row.
+            const owningList = listAncestor === el
+                ? (el.parentElement ? el.parentElement.closest(this._attrSelector('list')) : null)
+                : listAncestor;
+            if (owningList && owningList.closest(componentSel) === element) return false;
             // Pool interiors are row-owned in the same way. At init the pool is
             // empty, so this rescan is the only pass that ever sees rendered
             // rows. Collecting one makes the component effect evaluate the row's
@@ -2246,24 +2495,46 @@ export const RenderingCoreMethods = {
             // Nested components may not have data-component-id yet during init batches.
             const closestComp = el.closest(componentSel);
             if (closestComp === element) return true;
-            // Parent claims bindings on direct child component root elements
-            if (closestComp && closestComp === el && element.contains(el)) {
-                const parentComp = el.parentElement?.closest(componentSel);
-                return parentComp === element;
-            }
-            return false;
+            // Bindings on a child component's root belong to the root's owner.
+            return closestComp === el && this._rootOwnerElement(el) === element;
         };
 
+        for (const [attrKey, build] of this._effectMetaSpecs()) {
+            this._querySelfAndDescendants(element, this._attrSelector(attrKey)).forEach(el => {
+                if (!belongsToComponent(el)) return;
+                const path = this._getAttr(el, attrKey);
+                if (path) meta.push(build(el, path));
+            });
+        }
+
+        // Non-list data-render is effect-driven from the component's tracked render
+        // contexts (not a DOM scan: a falsy condition holds a detached element +
+        // placeholder, which a selector query can't rediscover). List-item render
+        // contexts (parentIndex set) stay on their per-item effects; skip them.
+        if (instance._renderContexts) {
+            for (const ctx of instance._renderContexts) {
+                if (!ctx || ctx._parentIndex !== undefined) continue;
+                meta.push(this._buildRenderMeta(ctx, instance));
+            }
+        }
+
+        return meta;
+    },
+
+    /**
+     * One spec per non-render binding type: [attr key, meta-entry builder].
+     * Entry shapes mirror what the init-time _process*Elements push into
+     * _effectMeta: the effect executor reads both interchangeably, so any
+     * field change here must be made there too.
+     * @private
+     */
+    _effectMetaSpecs() {
         // Helper: detect expression paths that need evaluateExpression()
         // rather than simple getValue(). Covers operators, ternary, external(),
         // object literals, and $store.path references.
         const needsExprEval = (path) => this.isExpression(path) || path.includes('$');
 
-        // One spec per binding type: [attr key, meta-entry builder]. Entry
-        // shapes mirror what the init-time _process*Elements push into
-        // _effectMeta: the effect executor reads both interchangeably, so
-        // any field change here must be made there too.
-        const specs = [
+        return [
             ['bind', (el, path) => {
                 const entry = {
                     element: el,
@@ -2325,27 +2596,117 @@ export const RenderingCoreMethods = {
                 };
             }]
         ];
+    },
 
-        for (const [attrKey, build] of specs) {
-            this._querySelfAndDescendants(element, this._attrSelector(attrKey)).forEach(el => {
-                if (!belongsToComponent(el)) return;
-                const path = this._getAttr(el, attrKey);
-                if (path) meta.push(build(el, path));
-            });
+    /**
+     * A component element arriving inside an already-mounted component
+     * (inserted and scanned, or inside a data-render section that just turned
+     * on): the bindings on its root are the mounted component's, but that
+     * component's render effect was built before the element existed. Add the
+     * root's bindings to it, as a data-render insertion does for its subtree.
+     * A data-render on the root becomes one of the component's sections, so a
+     * false one takes the element out before it initializes. A root the
+     * component already reads (it was there at init, or a section put it
+     * back) is left alone.
+     *
+     * Called from the scan loop, where _pendingEffectInstances collects the
+     * effects to create once the batch has initialized: the owner's effect is
+     * taken down at its first claimed root and created again at the end of
+     * the scan over its live entries plus every root claimed in between, so
+     * N appended children cost one rebuild, not N.
+     * @param {HTMLElement} element - A component element, initialized or not
+     * @private
+     */
+    _claimChildRootBindings(element) {
+        const directives = this._customDirectives && this._customDirectives.size > 0;
+        if (!directives && !this._carriesRootBindings(element)) return;
+        const ownerEl = this._rootOwnerElement(element);
+        const ownerId = ownerEl && ownerEl.dataset.componentId;
+        const owner = ownerId && this.componentInstances.get(ownerId);
+        // An owner whose binding pass has not run yet (or that is not
+        // registered) reads the root when it does.
+        if (!owner || owner._effectMeta === undefined) return;
+        // Rows, pool entities, slot content and template children are read
+        // by their own scope.
+        if (!this._isOwnedBindingElement(element, ownerEl)) return;
+        const pool = element.parentElement.closest(this._attrSelector('pool'));
+        if (pool && ownerEl.contains(pool)) return;
+
+        // Custom directives on the tag are the owner's too.
+        if (directives && !this._directiveOwner(element, owner)) this._processCustomDirectives(element, owner);
+        if (!this._carriesRootBindings(element)) return;
+
+        // Typing into the root writes the scope that reads it.
+        const modelPath = this._getAttr(element, 'model');
+        if (modelPath && !element._wfModel && !modelPath.includes('$') && !element.tagName.includes('-')) {
+            element._wfModel = this._buildModelRecord(element, modelPath, owner);
         }
 
-        // Non-list data-render is effect-driven from the component's tracked render
-        // contexts (not a DOM scan: a falsy condition holds a detached element +
-        // placeholder, which a selector query can't rediscover). List-item render
-        // contexts (parentIndex set) stay on their per-item effects; skip them.
-        if (instance._renderContexts) {
-            for (const ctx of instance._renderContexts) {
-                if (!ctx || ctx._parentIndex !== undefined) continue;
-                meta.push(this._buildRenderMeta(ctx, instance));
+        const reads = (list) => !!list && list.some(entry => _entryIsFor(entry, element));
+        if (reads(owner._effectMeta) || reads(owner._renderMeta) || reads(owner._renderContexts)) return;
+
+        const added = [];
+        let renderCtx = null;
+        const renderPath = this._getAttr(element, 'render');
+        if (renderPath) {
+            renderCtx = this._processDataRenderElement(element, renderPath, owner);
+            if (renderCtx) (owner._renderContexts || (owner._renderContexts = [])).push(renderCtx);
+        }
+        // This root's entries only, built as the effect rescan builds them.
+        // A false data-render just took the root out; the section's insertion
+        // collects the rest from its clone.
+        if (element.isConnected) {
+            for (const [attrKey, build] of this._effectMetaSpecs()) {
+                const path = this._getAttr(element, attrKey);
+                if (path) added.push(build(element, path));
             }
         }
+        if (renderCtx) added.push(this._buildRenderMeta(renderCtx, owner));
+        if (added.length === 0) return;
 
-        return meta;
+        // The owner's effect is live: take it down for the rest of this
+        // scan, keeping every entry not already hidden (a hidden entry's
+        // section left, and insertion collects fresh ones; a destroyed
+        // child's were hidden by _releaseChildRoot). A root detached by hand
+        // but still alive keeps its entries, as any detached element does.
+        // The token bump stops a run in progress from going on with the old
+        // entries.
+        if (!owner._effectMeta) {
+            owner._renderToken = (owner._renderToken | 0) + 1;
+            owner._effectMeta = (owner._renderMeta || []).filter(meta => !meta._hidden);
+            this._disposeComponentRenderEffect(owner);
+            this._pendingEffectInstances.push(owner);
+        }
+        owner._effectMeta.push(...added);
+    },
+
+    /** Whether an element carries any of the value bindings a root gives its owner (either prefix). @private */
+    _carriesRootBindings(el) {
+        return el.matches(_ROOT_BINDINGS_SELECTOR);
+    },
+
+    /**
+     * A child component whose root left the page is destroyed: its root's
+     * entries leave the component that read them (_rootOwnerElement), with
+     * its section record and its model record. Entries are hidden at once
+     * (the effect skips them) and removed from the lists after the current
+     * run, since an effect may be iterating them.
+     * @param {Object} owner - The instance that read the root's bindings
+     * @param {HTMLElement} root - The destroyed child's root element
+     * @private
+     */
+    _releaseChildRoot(owner, root) {
+        if (root._wfModel && root._wfModel.componentInstance === owner) root._wfModel = null;
+        if (owner._renderContexts) owner._renderContexts = owner._renderContexts.filter(ctx => ctx.element !== root);
+        if (!this._hideMetas(owner, meta => _entryIsFor(meta, root))) return;
+        queueMicrotask(() => {
+            for (const list of [owner._effectMeta, owner._renderMeta]) {
+                if (!list) continue;
+                let w = 0;
+                for (const meta of list) if (!meta._hidden || !_entryIsFor(meta, root)) list[w++] = meta;
+                list.length = w;
+            }
+        });
     },
 
     /**
@@ -2477,6 +2838,12 @@ export const RenderingCoreMethods = {
                 case 'model':
                     this._executeModelBindForEffect(meta, value);
                     break;
+                case 'root-show':
+                case 'root-class':
+                case 'root-attr':
+                case 'root-style':
+                    this._applyRootMeta(meta, value, instance);
+                    break;
                 case 'render':
                     this._executeRenderForEffect(meta, value, instance);
                     // An insert may have recreated this effect underneath us. Stop
@@ -2542,56 +2909,6 @@ export const RenderingCoreMethods = {
      * @returns {*} The resolved value
      * @private
      */
-    /**
-     * WF-997: a binding inside a record-shape query subtree naming something
-     * neither the row nor the component provides. Scope-merge makes almost
-     * everything resolve, so what is left is a genuine authoring miss (a typo,
-     * or a field the endpoint does not return) that renders empty in silence.
-     *
-     * Only runs once per element, only in dev, and only once a row exists, so
-     * "still loading" is never mistaken for "misspelled". Precision matters
-     * more than coverage here: firing on correct code is the WF-975/976 shape
-     * this project ruled against. Identifiers preceded by a dot (member access
-     * like .toLocaleDateString) and followed by a colon (object-literal keys
-     * like {href: ...}) are skipped, string literals are stripped first, and
-     * known globals are excluded. Anything ambiguous is left alone.
-     * @private
-     */
-    _warnRecordFieldMisses(element, path, scopeState) {
-        if (!path || typeof path !== 'string') return;
-        // Strip string literals, then $name.path store shorthands. A shorthand
-        // resolves through external() and names an entity, not a scope field,
-        // so scanning it reports the query's own name as a missing field. Entity
-        // names may contain hyphens, which would also split into fragments.
-        const stripped = path
-            .replace(/'[^']*'|"[^"]*"|`[^`]*`/g, '')
-            .replace(/\$[A-Za-z_][\w-]*(?:\.[\w.]+)*/g, '');
-        const GLOBALS = this._recordDiagGlobals || (this._recordDiagGlobals = new Set([
-            'true', 'false', 'null', 'undefined', 'NaN', 'Infinity', 'typeof',
-            'instanceof', 'new', 'this', 'in', 'void', 'delete',
-            'Math', 'Date', 'String', 'Number', 'Boolean', 'Array', 'Object',
-            'JSON', 'RegExp', 'Map', 'Set', 'Intl', 'parseInt', 'parseFloat',
-            'isNaN', 'isFinite', 'encodeURIComponent', 'decodeURIComponent',
-            'external', 'computed'
-        ]));
-        const missing = [];
-        const re = /(^|[^.\w$'"`])([A-Za-z_$][\w$]*)\s*(:?)/g;
-        let m;
-        while ((m = re.exec(stripped)) !== null) {
-            const name = m[2];
-            if (m[3] === ':') continue;            // object-literal key
-            if (GLOBALS.has(name)) continue;
-            if (name in scopeState) continue;
-            if (missing.indexOf(name) === -1) missing.push(name);
-        }
-        if (missing.length === 0) return;
-        wfError(WF_ERRORS.QUERY_RECORD_FIELD_MISSING, {
-            warn: true,
-            context: `Query "${element._wfRecordQuery}": the binding "${path}" names ${missing.map((n) => `"${n}"`).join(', ')}, which the row and the component both lack; it renders empty`,
-            suggestion: 'Check the spelling against the row the endpoint returns. A field the server only sometimes sends needs a fallback in the expression'
-        });
-    },
-
     _resolveEffectExpression(path, instance, element) {
         const stateManager = instance.stateManager;
 
@@ -2656,10 +2973,9 @@ export const RenderingCoreMethods = {
         }
 
         if (meta.isInput) {
-            const strValue = value == null ? '' : String(value);
-            if (el.value !== strValue) {
-                el.value = strValue;
-            }
+            // The one writer for a form control's value (it also keeps what a
+            // select was asked to show, for when its options arrive).
+            applyModel(el, value);
         } else {
             applyText(el, value);
         }
@@ -2771,7 +3087,7 @@ export const RenderingCoreMethods = {
     _evaluateCloakShowVerdict(el) {
         const showAttr = this._getAttr ? this._getAttr(el, 'show') : el.getAttribute('data-show');
         if (!showAttr) return true;
-        const componentEl = this._getComponentElement(el);
+        const componentEl = this._bindingScopeElement(el);
         if (!componentEl) return true;
         const componentId = componentEl.dataset && componentEl.dataset.componentId;
         if (!componentId) return true;

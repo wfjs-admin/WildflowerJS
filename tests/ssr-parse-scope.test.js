@@ -54,6 +54,21 @@ describe.skipIf(!hasFeature('ssr'))('SSR adoption reads only the component\'s ow
     expect(container.querySelector('.comp').textContent).toBe('Live: Server')
   })
 
+  it('a binding on a nested component\'s root is the parent\'s, and is adopted', async () => {
+    const parent = uname('ssr-root-parent'), child = uname('ssr-root-child')
+    container.innerHTML = `
+      <div data-component="${parent}" data-ssr="true">
+        <h2 class="heading" data-component="${child}" data-bind="heading">Server Heading</h2>
+      </div>`
+    wildflower.component(child, { state: {} })
+    wildflower.component(parent, { state: { heading: 'Default' } })
+    wildflower.scan(container)
+    await settle(200)
+
+    expect(wildflower.getComponent(parent).state.heading).toBe('Server Heading')
+    expect(container.querySelector('.heading').textContent).toBe('Server Heading')
+  })
+
   it.skipIf(!hasFeature('pools'))('a data-pool row\'s binding is not adopted into the component', async () => {
     const parent = uname('ssr-pool')
     container.innerHTML = `

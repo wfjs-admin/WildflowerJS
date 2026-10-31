@@ -1,9 +1,8 @@
 /**
- * Reproducer tests for findings from the 2026-04-28 reactive peer review.
+ * Reproducer tests for reactive-engine concerns.
  *
- * Multi-reviewer peer review (React/Vue/Svelte/Solid core engineers) identified
- * 9 concerns. This file scaffolds reproductions for the 7 that are testable as
- * behavior tests. Concerns 3 (fast-path duplication) and 7 (batch JSON-diff) are
+ * This file reproduces the 7 of 9 concerns that are testable as behavior
+ * tests. Concerns 3 (fast-path duplication) and 7 (batch JSON-diff) are
  * maintainability/perf concerns addressed elsewhere.
  *
  * Test-first: written to FAIL pre-fix, PASS post-fix.
@@ -19,7 +18,7 @@
  *
  * Run:
  *   npx vitest run --config tests/vitest.browser.config.js \
- *     tests/code-review-2026-04-28-reactive-peer-review.test.js \
+ *     tests/reactive-engine-concerns.test.js \
  *     > test-output.txt 2>&1
  */
 
@@ -31,7 +30,7 @@ import {
   waitForUpdate
 } from './helpers/load-framework.js'
 
-describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
+describe('Reactive engine concerns', () => {
   let testContainer
   let wildflower
 
@@ -325,7 +324,7 @@ describe('Code Review 2026-04-28 — Reactive Peer Review concerns', () => {
         state: { count: 0 },
         destroy() {
           destroyHookRan = true
-          // Mutate state during destroy. Per the reviewer's analysis:
+          // Mutate state during destroy. The order is:
           // ErrorBoundaries.js:463 (destroy hook) fires BEFORE :496
           // (_disposeComponentRenderEffect). This mutation queues an
           // effect that, pre-fix, runs against torn-down state.

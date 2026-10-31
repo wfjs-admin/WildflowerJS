@@ -218,9 +218,6 @@ describe('rebindActions()', () => {
 
         wildflower.component('rebind-events-test', {
             state: {},
-            events: {
-                mouseenter: 'mouseenter'
-            },
             handleHover() {
                 mouseEnterCount++;
             },

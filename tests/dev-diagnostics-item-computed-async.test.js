@@ -45,7 +45,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode item-level async computed diagnosti
         testContainer = null
     })
 
-    const wf235Warnings = () => warnings.filter(w => w.includes('[WF WF-235]'))
+    const wf235Warnings = () => warnings.filter(w => w.includes('[WF-235]'))
 
     it('warns when an item-level computed returns a thenable', async () => {
         wildflower.component('wf235-async-item', {

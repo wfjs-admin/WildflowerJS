@@ -67,7 +67,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode write-guard diagnostics', () => {
 
         const found = warnings.filter(w => w.includes('Cannot set computed property'))
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('[WF WF-220]')
+        expect(found[0]).toContain('[WF-220]')
         expect(found[0]).toContain('"double"')
         expect(found[0]).toContain('read-only')
 
@@ -101,7 +101,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode write-guard diagnostics', () => {
 
         const found = warnings.filter(w => w.includes('Re-entrant store update detected'))
         expect(found.length).toBeGreaterThanOrEqual(1)
-        expect(found[0]).toContain('[WF WF-908]')
+        expect(found[0]).toContain('[WF-908]')
         expect(found[0]).toContain('wg-reentrant-store:total')
 
         // The guard dropped the nested notification; the test completing at

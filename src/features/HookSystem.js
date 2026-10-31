@@ -32,6 +32,10 @@ export const HookSystemMethods = {
 
         this._hooks.get(hookName).push(handler);
 
+        // The update hooks fire from each component's change dispatch.
+        if (__FEATURE_LISTS__ && (hookName === 'component:beforeUpdate' || hookName === 'component:afterUpdate')
+            && this._markAllDispatchBusy) this._markAllDispatchBusy();
+
         // Return unsubscribe function
         return () => {
             const handlers = this._hooks.get(hookName);

@@ -9,6 +9,7 @@
 
 // Import core dependencies
 import { StoreManager } from '../state/StoreManager.js';
+import { diagnosticLog, reportDiagnostic } from './wfUtils.js';
 // Script-tag globals (window.WF_ERRORS, wfError, ...): a side-effect import
 // here, so every tier keeps them and headless bundles of the graph do not.
 import './wfGlobals.js';
@@ -95,6 +96,20 @@ export class WildflowerJS
         this.tier = typeof __TIER__ !== 'undefined' ? __TIER__ : null;
         this.features = Object.freeze(Object.assign({}, typeof __CAPS__ !== 'undefined' ? __CAPS__ : null));
 
+        // Development builds: every coded diagnostic as data, newest last
+        // (see diagnosticLog in wfUtils), and diagnostic(d), which an
+        // extension calls to print and record its own coded diagnostic in
+        // the framework's format. Neither is present in production builds;
+        // an extension feature-detects diagnostic and prints its own line.
+        if (__DEV__) {
+            this.diagnostics = diagnosticLog;
+            this.diagnostic = reportDiagnostic;
+        }
+
+        // Deferred init() sequences scheduled, waiting on stores, or running;
+        // whenInitialized() resolves when it returns to 0 (FrameworkInit).
+        this._initsPending = 0;
+
         // Strict props mode (throw on validation failure even in production)
         this.strictProps = this.options.strictProps;
 
@@ -141,9 +156,6 @@ export class WildflowerJS
             models: [],
             pools: [],
         };
-
-        // Store wrapped debounced/throttled handlers
-        this._wrappedHandlers = new Map();
 
         // Hook for external code to prevent content updates (e.g., preserve syntax highlighting)
         this._beforeContentUpdateHooks = [];

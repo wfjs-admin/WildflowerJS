@@ -51,7 +51,7 @@ describe.skipIf(isMinifiedBuild())('Dev-mode computed-state-write diagnostic (F5
     })
 
     const computedWriteWarnings = () =>
-        warnings.filter(w => w.includes('[WF WF-217]') && /during .*(its own )?evaluation|computed .* mutated|mutated .*computed/i.test(w))
+        warnings.filter(w => w.includes('[WF-217]') && /during .*(its own )?evaluation|computed .* mutated|mutated .*computed/i.test(w))
 
     it('warns when a computed in-place sorts its reactive dependency array', async () => {
         wildflower.component('f5-sort-in-computed', {

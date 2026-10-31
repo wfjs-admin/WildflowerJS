@@ -3,7 +3,6 @@
  *
  * Tests that _scheduleInitialRender batches rapid component registrations
  * into a minimal number of render passes instead of creating redundant timers.
- * Covers issue 2.7 from V1 RC1 Final Code Review.
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'

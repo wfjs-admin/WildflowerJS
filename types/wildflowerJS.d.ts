@@ -2,7 +2,7 @@
  * WildflowerJS TypeScript Definitions
  * A lightweight reactive framework with no build step required
  *
- * @version 1.5.4
+ * @version 1.5.5
  * @license MIT
  *
  * The bundles are IIFEs that assign `window.wildflower`; import this file for
@@ -18,6 +18,25 @@
 export type WildflowerTier = 'nano' | 'mini' | 'mini-pool' | 'lite' | 'core' | 'spa' | 'full';
 
 /** The capabilities that differ between tiers (wildflower.features). */
+/** One coded diagnostic, as development builds record it (wildflower.diagnostics). */
+export interface WildflowerDiagnostic {
+  /** The code, such as 'WF-236' */
+  readonly code: string;
+  readonly severity: 'warning' | 'error';
+  /** What the code means */
+  readonly message: string;
+  /** What was being done, with the names involved */
+  readonly context: string | null;
+  /** How to fix it */
+  readonly suggestion: string | null;
+  /** The message of the error the framework caught, when there was one */
+  readonly cause: string | null;
+  /** The code's entry in the error reference */
+  readonly docs: string;
+  /** Date.now() when it was recorded */
+  readonly time: number;
+}
+
 export interface WildflowerFeatures {
   /** data-list rendering */
   lists: boolean;
@@ -164,6 +183,15 @@ export interface ComponentDefinition<TState extends ComponentState = ComponentSt
   /** Services from plugins, injected on `this` */
   uses?: string[];
 
+  /**
+   * The component's own side of its root element. Every value is an
+   * expression in the component's scope. Merged with the bindings on the tag
+   * (which read the scope the tag was written in): classes are a union, the
+   * root is hidden while either side hides it, and an attribute, style
+   * property or directive set on both sides is the tag's.
+   */
+  root?: RootBlock;
+
   /** Lifecycle: called before each DOM update pass */
   beforeUpdate?: (this: ComponentContext<TState>) => void;
 
@@ -184,6 +212,20 @@ export interface ComponentDefinition<TState extends ComponentState = ComponentSt
 
   /** Custom methods - available on this.context */
   [key: string]: any;
+}
+
+/** A component's `root:` block. Each value is an expression in the component's scope. */
+export interface RootBlock {
+  /** Class name to expression; the class is on while the expression is truthy */
+  class?: Record<string, string>;
+  /** Attribute name to expression, with the `data-bind-attr` rules */
+  attr?: Record<string, string>;
+  /** Style property (camelCase, kebab-case or `--custom`) to expression */
+  style?: Record<string, string>;
+  /** Shown while the expression is truthy */
+  show?: string;
+  /** Registered directive name to its value */
+  directives?: Record<string, string>;
 }
 
 /**
@@ -1350,6 +1392,30 @@ export default class WildflowerJS {
    */
   readonly features: Readonly<WildflowerFeatures>;
 
+  /**
+   * Development builds only (undefined in production builds): every coded
+   * diagnostic the framework printed, as data, newest last, keeping the
+   * newest 200. Clear it with `diagnostics.length = 0`. Each entry is also
+   * dispatched as a `wildflower:diagnostic` event on document.
+   */
+  readonly diagnostics?: WildflowerDiagnostic[];
+
+  /**
+   * Development builds only (undefined in production builds): print a coded
+   * diagnostic in the framework's format and record it in `diagnostics`.
+   * For extensions with their own codes; the docs link is derived from the
+   * code. Returns the frozen entry.
+   */
+  readonly diagnostic?: (d: {
+    code: string;
+    severity?: 'warning' | 'error';
+    message?: string;
+    context?: string;
+    suggestion?: string;
+    data?: unknown;
+    cause?: Error | string;
+  }) => WildflowerDiagnostic;
+
   /** Component definitions registry */
   readonly componentDefinitions: Map<string, ComponentDefinition>;
 
@@ -1722,6 +1788,20 @@ export default class WildflowerJS {
    * `wildflower:idle` event on document.
    */
   whenIdle(): Promise<void>;
+  /**
+   * Resolves once no component has an init() still to run: scheduled,
+   * waiting on its subscribed stores (up to subscribeTimeout), or running
+   * through the afterInit hook and the work an async init() awaits.
+   * Resolves immediately when none is pending. On page load, await
+   * whenIdle() and then this.
+   */
+  whenInitialized(): Promise<void>;
+  /**
+   * Pool tiers only: flush every drawn pool now, synchronously, the flush the
+   * frame loop would run on its next frame, without the ticks. For code that
+   * moves time itself, where no animation frame comes.
+   */
+  flushPools?(): void;
 
   /**
    * Returns a Promise that resolves when all pending reactive updates,

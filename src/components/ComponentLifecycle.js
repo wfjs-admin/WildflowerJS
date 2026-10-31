@@ -5,7 +5,7 @@
  */
 
 import { createStateManager } from '../state/createStateManager.js';
-import { RAW_TARGET } from '../state/ContextProxy.js';
+import { RAW_TARGET, getContextMethod } from '../state/ContextProxy.js';
 import { objectUtils, pathResolver, wfError, WF_ERRORS, COMPUTED_EVAL, wfYield } from '../core/wfUtils.js';
 
 // Late registration (wildflower.component() after the page-load scan) used to
@@ -278,9 +278,14 @@ export const ComponentLifecycleMethods = {
         // This allows browser to paint/handle input between framework work and user code
         // Plugin hooks are also deferred to maintain correct semantics (beforeInit fires right before init)
         // If component subscribes to stores, wait for them before calling init
+        // Counted toward whenInitialized() from here until the sequence ends.
+        this._initsPending++;
         setTimeout(() => {
             this._initWithStoreWait(instance, componentName, definition);
         }, 0);
+
+        // WF-521: a binding on this root that names this component's own value
+        if (__DEV__) this._checkChildRootScope(instance);
 
         // Dispatch component init event
         document.dispatchEvent(new CustomEvent('wildflower:componentInit', {
@@ -399,6 +404,8 @@ export const ComponentLifecycleMethods = {
                 for (const info of Object.values(child._propPaths)) info.parentId = parentInstance.id;
                 this._refreshChildProps(child, { parentPath: null, newValue: undefined, oldValue: undefined });
             }
+            // WF-521: its root's bindings now have an owner to read them
+            if (__DEV__) this._checkChildRootScope(child);
         }
     },
     /**
@@ -671,6 +678,8 @@ export const ComponentLifecycleMethods = {
 
         if (parentInstance) {
             parentInstance.children.push(instance);
+            // A child's props are refreshed from the parent's change dispatch.
+            if (__FEATURE_LISTS__) this._markDispatchBusy(parentInstance);
         }
     },
     /**
@@ -739,30 +748,57 @@ export const ComponentLifecycleMethods = {
         check();
     },
 
+    // Returns what an async init() still has to do, as a promise that settles
+    // when it has (a rejection goes to _handleError, as a throw does), so
+    // whenInitialized() can wait for it.
     _callInitHook(instance, componentName) {
         if (typeof instance.context.init !== 'function') return;
 
+        const failed = (error) => this._handleError(
+            `Error in ${componentName}.init`,
+            error,
+            instance,
+            { lifecycle: 'init' }
+        );
         try {
-            instance.context.init();
+            const result = instance.context.init();
+            if (result && typeof result.then === 'function') {
+                return Promise.resolve(result).then(undefined, failed);
+            }
         } catch (error) {
-            this._handleError(
-                `Error in ${componentName}.init`,
-                error,
-                instance,
-                { lifecycle: 'init' }
-            );
+            failed(error);
         }
     },
     /**
      * Initialize component with store waiting support.
      * If the component subscribes to stores, waits for them to be ready before calling init().
+     * The caller counted this sequence toward whenInitialized() when it
+     * scheduled it; it is counted down once, when the sequence settles,
+     * whichever way it ends (an early return for a destroyed component, or a
+     * throw), or when the component is destroyed while it still waits.
      *
      * @param {Object} instance - Component instance
      * @param {string} componentName - Component name
      * @param {Object} definition - Component definition
+     * @returns {Promise<void>}
      * @private
      */
-    async _initWithStoreWait(instance, componentName, definition) {
+    _initWithStoreWait(instance, componentName, definition) {
+        const countDown = instance._initCountDown = () => {
+            instance._initCountDown = null;
+            this._initDone();
+        };
+        return this._initSequence(instance, componentName, definition).finally(() => {
+            if (instance._initCountDown === countDown) countDown();
+        });
+    },
+    /**
+     * The init sequence itself: subscribe-wait, beforeInit, init(), the
+     * replay, tick registration, portals, afterInit. Called only through
+     * _initWithStoreWait.
+     * @private
+     */
+    async _initSequence(instance, componentName, definition) {
         // Check if component was destroyed while waiting
         if (!this.componentInstances.has(instance.id)) {
             return;
@@ -851,7 +887,7 @@ export const ComponentLifecycleMethods = {
         if (this._triggerHook) {
             this._triggerHook('component:beforeInit', instance);
         }
-        this._callInitHook(instance, componentName);
+        const initWork = this._callInitHook(instance, componentName);
 
         // Mark init complete and replay any queued action calls. Actions
         // bound at the synchronous mount step (ComponentLifecycle.js:127)
@@ -924,6 +960,9 @@ export const ComponentLifecycleMethods = {
         if (this._triggerHook) {
             this._triggerHook('component:afterInit', instance);
         }
+
+        // An async init() holds whenInitialized() until its awaited work is done.
+        if (initWork) await initWork;
     },
     /**
      * Call the beforeUpdate lifecycle hook (before DOM updates)
@@ -1077,6 +1116,10 @@ export const ComponentLifecycleMethods = {
             // Clear the deferred updates for this component
             this._deferredReactiveUpdates.delete(instanceId);
         }
+
+        // Mounted: a subscription to a computed now takes its baseline when
+        // it is made (see EntityHandle._wireComputedNotifiers).
+        if (instance) instance.stateManager._wireComputedNotifiers();
     },
     _performInitialRender()
     {
@@ -1671,7 +1714,7 @@ export const ComponentLifecycleMethods = {
                 while (ancestorEl)
                 {
                     const ancestor = self.componentInstances.get(ancestorEl.dataset.componentId);
-                    if (ancestor && ancestor.context && typeof ancestor.context[handlerName] === 'function')
+                    if (ancestor && getContextMethod(ancestor.context, handlerName))
                     {
                         try
                         {
@@ -1853,7 +1896,6 @@ export const ComponentLifecycleMethods = {
             } else if (key !== 'state' &&
                 key !== 'computed' &&
                 key !== 'watch' &&
-                key !== 'events' &&
                 key !== 'props' &&  // Don't overwrite context.props getter
                 !key.startsWith('_internal')) {
                 // Copy arrays and other data properties
@@ -2152,7 +2194,7 @@ export const ComponentLifecycleMethods = {
                 return;
             }
 
-            // RG-5 (review 2026-07-02, decided): watching a list item by
+            // RG-5: watching a list item by
             // numeric index is an anti-pattern. Reactivity is identity-based, so
             // the index in an onStateChange path reflects the item's position
             // when FIRST observed; after a splice/reorder the watcher misfires
@@ -2169,6 +2211,8 @@ export const ComponentLifecycleMethods = {
             // Register local state watcher
             instance._watcherHandlers = instance._watcherHandlers || new Map();
             instance._watcherHandlers.set(path, boundHandler);
+            // A watcher rides the change dispatch.
+            if (__FEATURE_LISTS__) this._markDispatchBusy(instance);
 
             // A computed change reaches this watcher as a `computed:NAME` pulse
             // (matched by _executeWatchers via exact `computed:NAME` key or the
@@ -2538,8 +2582,11 @@ export const ComponentLifecycleMethods = {
         forceReEvaluation.forEach(componentId => {
             const component = this.componentInstances.get(componentId);
             if (component && component.stateManager) {
-                // Clear computed cache
-                component.stateManager.computedCache.clear();
+                // Invalidate every computed, the store becoming ready counting as a
+                // real input change (an async computed with a request running
+                // relaunches); the loop below re-evaluates them all
+                const sm = component.stateManager;
+                for (const name of sm.getComputedPropertyNames()) sm._invalidateCachedComputed(name, true);
 
                 // Re-evaluate all computed properties
                 Object.keys(component.stateManager.computed || {}).forEach(propName => {
@@ -2711,6 +2758,13 @@ export const ComponentLifecycleMethods = {
         if (instance._renderEffect) {
             this._disposeComponentRenderEffect(instance);
         }
+        // The root: block's effect, and its side of the root's class and
+        // visibility (the tag's bindings keep theirs).
+        if (instance._rootEffect) {
+            instance._rootEffect();
+            instance._rootEffect = null;
+            instance.element._wfRootOn = instance.element._wfRootShow = undefined;
+        }
 
         // No context registry to sweep: binding/conditional contexts no longer
         // exist, action records are element-local (listeners cleaned by
@@ -2725,6 +2779,16 @@ export const ComponentLifecycleMethods = {
         document.dispatchEvent(new CustomEvent('wildflower:componentDestroy', {
             detail: { instance, context: instance.context }
         }));
+
+        // A root that left the page takes the entries its bindings gave the
+        // component around it (the parent reads bindings written on a child's
+        // root) out of that component. A root still in the page keeps them:
+        // a data-render section removing it brings it back, and a destroyed
+        // element still in the document is re-initialized by the next scan.
+        const root = instance.element;
+        if (instance.parent && root && !root.isConnected && this._carriesRootBindings(root)) {
+            this._releaseChildRoot(instance.parent, root);
+        }
 
         // Remove from component hierarchy
         this._removeFromComponentHierarchy(componentId);
@@ -2764,7 +2828,7 @@ export const ComponentLifecycleMethods = {
 
         // Clean up custom directives (only if plugin system is loaded)
         if (instance.element && this._cleanupCustomDirectivesInSubtree) {
-            this._cleanupCustomDirectivesInSubtree(instance.element);
+            this._cleanupCustomDirectivesInSubtree(instance.element, instance);
         }
 
         // Trigger plugin afterDestroy hook (only if plugin system is loaded)
@@ -2817,6 +2881,10 @@ export const ComponentLifecycleMethods = {
 
         this.componentInstances.delete(componentId);
 
+        // An init sequence still waiting (on a store that may never be ready)
+        // stops holding whenInitialized() now.
+        if (instance._initCountDown) instance._initCountDown();
+
         return true;
     },
     _removeFromComponentHierarchy(componentId)
@@ -2864,7 +2932,6 @@ export const ComponentLifecycleMethods = {
             // Use precise matching instead of substring to avoid false positives
             const isComponentHandler = (
                 key.startsWith(`action-${componentId}-`) ||
-                key.startsWith(`listener-${componentId}-`) ||
                 key.startsWith(`outside-${componentId}-`) ||
                 key.startsWith(`model-${componentId}-`) ||
                 key.startsWith(`manual_${componentId}_`) ||  // WildQuery $el().on() handlers
@@ -3032,18 +3099,12 @@ export const ComponentLifecycleMethods = {
         // Clean up orphaned event handlers
         this.eventHandlers.forEach((handler, key) =>
         {
-            // Determine the component ID - prefer explicit componentId property if available
-            // Fall back to parsing the key for older-style handlers
-            let componentId;
-            if (handler && handler.componentId) {
-                // New format: componentId stored explicitly on handler object
-                componentId = handler.componentId;
-            } else {
-                // Fallback format: parse from key (type-componentId-...)
-                // Note: This doesn't work for manual_ keys where component IDs contain hyphens
-                const [_type, parsedId] = key.split('-');
-                componentId = parsedId;
-            }
+            // Only entries that record their componentId are swept. The key
+            // can't be parsed for it: component IDs contain hyphens
+            // ("my-panel-3"), and wildflower.on() entries belong to no
+            // component. A destroyed component's other entries are removed by
+            // _cleanupComponentEventHandlers, which matches exact prefixes.
+            const componentId = handler && handler.componentId;
 
             // If this handler belongs to a component that no longer exists
             if (componentId && !this.componentInstances.has(componentId))

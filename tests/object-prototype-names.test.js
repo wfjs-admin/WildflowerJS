@@ -12,8 +12,6 @@
  *   - The graph's computed map was a `{}`, so a list item or query row field
  *     named `constructor` was read as a computed by `data-show` and stayed
  *     hidden while `data-bind` on the same field rendered it.
- *
- * Part of the rotation's L2 sweep (docs/reviews/).
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest'

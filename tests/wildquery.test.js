@@ -1571,7 +1571,7 @@ describe('WildQuery', () => {
             await waitForUpdate(100)
 
             expect(warnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('[WF WF-105]')
+                expect.stringContaining('[WF-105]')
             )
 
             warnSpy.mockRestore()
@@ -1604,7 +1604,7 @@ describe('WildQuery', () => {
             await waitForUpdate(100)
 
             expect(warnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('[WF WF-105]')
+                expect.stringContaining('[WF-105]')
             )
 
             warnSpy.mockRestore()

@@ -45,6 +45,15 @@ const F_REENTERED = 16; // set on a COMPUTED node when runNode re-enters it whil
                         // wrapper tests-and-clears this one bit at entry as its
                         // cycle detection, replacing a per-eval O(depth) stack
                         // scan; the bit is only ever set on the rare cycle path.
+const F_SHARED = 32; // set on a SOURCE node that more than one live list renders
+                     // (through its listSink and/or the item's owner record).
+                     // notifyNode then skips direct-writer suppression and runs
+                     // every live list's sink; see notifyShared.
+const F_PULL = 64;   // set by the entity-handle facade around a read-forced re-run
+                     // of a source-less computed (its method semantics). A run that
+                     // ends still source-less then keeps its new value without
+                     // waking observers: a pull must not push, or two effects that
+                     // read a computed returning a fresh object wake each other.
 
 // Symbols stamped on raw targets. ONE nodes-map symbol carries all per-object
 // node bookkeeping.
@@ -366,7 +375,10 @@ function notifyNode(target, key) {
   // row removal. All three bounds hold, and detached-but-LIVE rows retain
   // their elements anyway (placeholder revival), so there is no net new
   // retention — pinned white-box in direct-writer-guard.test.js.
-  if (dw !== null && node.observers.length === 0) {
+  // A node two lists share (F_SHARED, set at stamp time) is never suppressed:
+  // the writer serves one list's row, and the other list's sink must run too.
+  const shared = (node.flags & F_SHARED) !== 0;
+  if (dw !== null && node.observers.length === 0 && !shared) {
     // Return DIRECT_HANDLED so the set trap also skips the onStateChange dispatch
     // (notify) for this write; the field is read by nothing else (the renderer's
     // _reactiveGraphPureText gate + the observer check above), so there are no
@@ -390,8 +402,13 @@ function notifyNode(target, key) {
   // propagates after the finally (the app is already erroring); only the
   // bookkeeping is made throw-safe.
   try {
-    if (ls !== null) ls(target, key);
+    if (shared) notifyShared(node, target, key);
+    else if (ls !== null && !sinkIsDead(ls)) ls(target, key);
     else {
+      // A sink left behind by a disposed list (a full clear drops rows without
+      // per-leaf clears, and a static dispatcher's stamps outlive it) must not
+      // stand in front of a live list's owner record: drop it.
+      if (ls !== null) node.listSink = null;
       // A node without a sink of its own (a direct-writer upgrade, or a
       // computed/watcher read that materialized the leaf) on an item a
       // uniform-stamp list owns: the owner sink still applies the row write.
@@ -403,6 +420,96 @@ function notifyNode(target, key) {
     for (let i = 0; i < obs.length; i++) mark(obs[i], DIRTY);
   }
   return true;
+}
+
+// A write to a node more than one list renders (F_SHARED): run one sink per
+// LIVE list, whichever slot it stamped (the node's sink, or the item's owner
+// record), each list once; one throwing does not stop the others. When at
+// most one live list is left (the other was disposed, or released the item),
+// the node heals: the flag clears and dead stamps are dropped, so the next
+// write takes the single-list path again (direct-writer suppression included).
+function notifyShared(node, target, key) {
+  const calls = [];
+  const lists = [];
+  const ls = node.listSink;
+  if (ls !== null) {
+    const m = ls._wfSinks || [ls];
+    for (let i = 0; i < m.length; i++) {
+      const t = m[i]._wfList;
+      if (t == null) calls.push(m[i]);
+      else if (!t.disposed && lists.indexOf(t) === -1) { lists.push(t); calls.push(m[i]); }
+    }
+  }
+  const owner = listOwners.get(target);
+  if (owner !== undefined) {
+    const m = owner._wfOwners || [owner];
+    for (let i = 0; i < m.length; i++) {
+      const o = m[i];
+      if (o.keys.indexOf(key) === -1) continue;
+      const t = o._wfList;
+      if (t == null) { if (calls.indexOf(o.sink) === -1) calls.push(o.sink); }
+      else if (!t.disposed && lists.indexOf(t) === -1) { lists.push(t); calls.push(o.sink); }
+    }
+  }
+  if (calls.length <= 1) {
+    node.flags &= ~F_SHARED;
+    if (ls !== null) node.listSink = ls._wfSinks !== undefined ? liveSink(ls) : (sinkIsDead(ls) ? null : ls);
+    if (owner !== undefined && owner._wfOwners !== undefined) pruneOwner(target, owner);
+    // The direct writer carries no list tag, so it may be the departed
+    // list's: drop it with the dead stamps. The surviving list's sink
+    // (called below) stamps its own writer again.
+    node.directWriter = null;
+    node.dwEl = null;
+  }
+  if (calls.length === 1) calls[0](target, key);
+  else if (calls.length > 1) callEach(calls, (s) => s(target, key));
+}
+
+// Is (target, key) stamped by more than one live list right now, through the
+// node's sink and/or the item's owner record? Stamp-time check (allocation
+// free); the write path reads the F_SHARED flag it sets.
+function sharedNow(node, target, key) {
+  let first = null;
+  const ls = node.listSink;
+  if (ls !== null) {
+    const m = ls._wfSinks;
+    if (m === undefined) first = stampId(ls, ls);
+    else for (let i = 0; i < m.length; i++) {
+      const id = stampId(m[i], m[i]);
+      if (id === null) continue;
+      if (first === null) first = id;
+      else if (id !== first) return true;
+    }
+  }
+  const owner = listOwners.get(target);
+  if (owner === undefined || owner.keys.indexOf(key) === -1) return false;
+  const om = owner._wfOwners;
+  if (om === undefined) {
+    const id = stampId(owner, owner.sink);
+    return id !== null && first !== null && id !== first;
+  }
+  for (let i = 0; i < om.length; i++) {
+    if (om[i].keys.indexOf(key) === -1) continue;
+    const id = stampId(om[i], om[i].sink);
+    if (id === null) continue;
+    if (first === null) first = id;
+    else if (id !== first) return true;
+  }
+  return false;
+}
+
+// A single (non-combined) sink whose list has been disposed.
+function sinkIsDead(ls) {
+  const t = ls._wfList;
+  return t !== undefined && t !== null && t.disposed === true;
+}
+
+// A stamp's list identity: its live tag, the sink function itself when
+// untagged, or null when its list is disposed.
+function stampId(stamp, fn) {
+  const t = stamp._wfList;
+  if (t == null) return fn;
+  return t.disposed ? null : t;
 }
 
 // Pull phase: answer "is this node fresh?" with the minimum work.
@@ -492,9 +599,11 @@ function runNode(node) {
   if (node.kind === COMPUTED) {
     // Avoidable propagation: only a REAL value change bumps version and wakes
     // observers. A recompute that yields the same value stays contained.
+    const pulled = node.flags & F_PULL;
+    if (pulled) node.flags &= ~F_PULL;
     if (!Object.is(result, node.value)) {
       node.value = result;
-      wakeObservers(node);
+      if (!pulled || node.sources.length) wakeObservers(node);
     }
   } else {
     // EFFECT: result may be a cleanup fn in a fuller impl; ignored here.
@@ -524,7 +633,21 @@ function flush() {
   // Drain to fixpoint: effects scheduled during the flush extend the queue.
   while (i < queue.length) {
     if (++guard > 1000000) {
-      console.error('ReactiveGraph: flush loop breaker tripped');
+      let msg = '[WF-238] Reactive updates did not settle';
+      if (__DEV__) {
+        msg += ': one flush ran a million updates, so it stopped. Something keeps waking itself.';
+        // Name the computeds the looping effects read: the queue's tail holds
+        // the effects (unnamed), their sources carry the computed names.
+        const names = new Set();
+        for (let j = Math.max(0, i - 64); j < queue.length && names.size < 6; j++) {
+          const srcs = queue[j].sources;
+          for (let k = 0; k < srcs.length && names.size < 6; k++) {
+            if (srcs[k].kind === COMPUTED && srcs[k].key) names.add(srcs[k].key);
+          }
+        }
+        if (names.size) msg += ' Computeds read in the loop: ' + Array.from(names).join(', ') + '.';
+      }
+      console.error(msg);
       // Un-strand the unvisited suffix: queue.length = 0 below would
       // leave their queued flags true, and schedule() would then skip them
       // forever, a permanent reactivity freeze on top of an already-
@@ -715,6 +838,9 @@ function setDirectWriter(objOrProxy, key, writerFn, el) {
   // el (dwEl stays null). Clearing (writerFn===null) also drops the el ref so a
   // detached row isn't pinned through the node.
   node.dwEl = el || null;
+  // A writer stamped on a leaf another live list also renders must not
+  // suppress (the node may be new, or have had nothing to suppress before).
+  if (liveLists > 1 && (node.flags & F_SHARED) === 0 && sharedNow(node, raw, key)) node.flags |= F_SHARED;
 }
 
 // Stamp a per-list dispatch sink on the (object, key) SOURCE node. notifyNode
@@ -723,7 +849,15 @@ function setDirectWriter(objOrProxy, key, writerFn, el) {
 // the per-item effect for eligible templates while keeping every other reader of
 // the leaf correct. Pass `null` to clear (remove/clear/replace). `objOrProxy`
 // may be a tree proxy (unwrapped via RAW) or a raw object.
-function setListSink(objOrProxy, key, sinkFn) {
+//
+// Two lists can render the same item objects (one store array listed by two
+// components, a filtered view beside the full list). A sink carries its list's
+// tag (`sink._wfList`, from listTag()); stamping over a LIVE other list's sink
+// joins it (a combined sink holds both) instead of replacing it, so neither
+// list goes deaf. A disposed list's sink, the same list's previous sink, or an
+// untagged sink is replaced, as before. Clearing passes the caller's own sink
+// (`own`) and removes only that one; without `own` it clears the slot.
+function setListSink(objOrProxy, key, sinkFn, own) {
   if (!__FEATURE_LISTS__) return;
   if (objOrProxy === null || typeof objOrProxy !== 'object') return;
   const raw = objOrProxy[RAW] || objOrProxy;
@@ -731,10 +865,105 @@ function setListSink(objOrProxy, key, sinkFn) {
     // Clearing never materializes a node.
     const map = nodeTableFor(raw).get(raw);
     const node = map && map.get(key);
-    if (node) node.listSink = null;
+    if (node) node.listSink = liveLists > 1 && own !== undefined ? withoutSink(node.listSink, own) : null;
     return;
   }
-  getNode(raw, key).listSink = sinkFn;
+  const node = getNode(raw, key);
+  const cur = node.listSink;
+  node.listSink = (cur === null || cur === sinkFn) ? sinkFn : joinSink(cur, sinkFn);
+  // With more than one list live, the leaf may now be shared: with another
+  // list's sink (joined above) or with another list that owns the item.
+  if (liveLists > 1 && (node.flags & F_SHARED) === 0 && sharedNow(node, raw, key)) node.flags |= F_SHARED;
+}
+
+// ── Lists sharing items ──
+// listTag()/releaseListTag() bracket a list's life (the renderer tags each
+// list's dispatcher; dispose releases). While at most one list is live,
+// stamping is the plain single-list code: no lookups, nothing can be shared.
+// With more than one live, each stamp checks whether its leaf is now rendered
+// by two live lists, through either slot (node sink, item owner), and sets
+// F_SHARED on the node; the write path only reads that flag. No module state
+// records that sharing ever happened: a node heals itself on the first write
+// after sharing ends (notifyShared).
+let liveLists = 0;
+
+function listTag(el) {
+  liveLists++;
+  return { disposed: false, el: el || null };
+}
+
+function releaseListTag(tag) {
+  if (tag && !tag.disposed) { tag.disposed = true; liveLists--; }
+}
+
+const isLive = (tag) => tag !== undefined && tag !== null && !tag.disposed;
+
+// Call every member even if one throws; rethrow the first error after all ran.
+function callEach(members, call) {
+  let threw = false, err;
+  for (let i = 0; i < members.length; i++) {
+    try { call(members[i]); } catch (e) { if (!threw) { threw = true; err = e; } }
+  }
+  if (threw) throw err;
+}
+
+const isDead = (stamp) => stamp._wfList != null && stamp._wfList.disposed;
+
+// A combined sink marks a node as stamped by several lists. A write to such a
+// node goes through notifyShared (which reads the members); calling it
+// directly still reaches every live member.
+function makeCombinedSink(members) {
+  const f = (target, key) => callEach(members, (m) => { if (!isDead(m)) m(target, key); });
+  f._wfSinks = members;
+  return f;
+}
+
+// Two lists sharing items share ONE combined sink across all those items'
+// nodes (cached by the pair), not a closure per node.
+const sinkPairs = new WeakMap();
+function combinedSink(members) {
+  if (members.length !== 2) return makeCombinedSink(members);
+  let byB = sinkPairs.get(members[0]);
+  if (byB === undefined) { byB = new WeakMap(); sinkPairs.set(members[0], byB); }
+  let f = byB.get(members[1]);
+  if (f === undefined) { f = makeCombinedSink(members); byB.set(members[1], f); }
+  return f;
+}
+
+// The sinks of `cur` that stay: live, and not `next`'s list.
+function keptSinks(cur, nextTag) {
+  const members = cur._wfSinks || [cur];
+  const out = [];
+  for (let i = 0; i < members.length; i++) {
+    const t = members[i]._wfList;
+    if (isLive(t) && t !== nextTag) out.push(members[i]);
+  }
+  return out;
+}
+
+function joinSink(cur, next) {
+  if (cur._wfSinks !== undefined && cur._wfSinks.indexOf(next) !== -1) return cur;
+  const tag = next._wfList;
+  if (!isLive(tag)) return next;
+  const kept = keptSinks(cur, tag);
+  if (kept.length === 0) return next;
+  kept.push(next);
+  return combinedSink(kept);
+}
+
+function withoutSink(cur, own) {
+  if (cur === null) return null;
+  const tag = own._wfList;
+  if (cur === own || (tag != null && cur._wfList === tag)) return null;
+  if (cur._wfSinks === undefined) return cur; // another list's
+  const rest = cur._wfSinks.filter((m) => m !== own && (tag == null || m._wfList !== tag) && isLive(m._wfList));
+  return rest.length === 0 ? null : rest.length === 1 ? rest[0] : combinedSink(rest);
+}
+
+// A combined sink minus its dead members (null, the one left, or combined).
+function liveSink(cur) {
+  const rest = cur._wfSinks.filter((m) => !isDead(m));
+  return rest.length === 0 ? null : rest.length === 1 ? rest[0] : combinedSink(rest);
 }
 
 // Uniform-stamp lists (every reactive dep of the row template is a flat item
@@ -748,12 +977,97 @@ function setListSink(objOrProxy, key, sinkFn) {
 // framework-side allocation. Pass `null` to release (remove, same-key replace).
 const listOwners = new WeakMap();
 
-function setListOwner(objOrProxy, owner) {
+// Shared items follow the sink rules above: an owner tagged with a live other
+// list joins (a combined owner calls each live member for its own keys);
+// release with `own` removes only that member. While at most one list is live
+// this is today's plain set/delete, with no lookup.
+function setListOwner(objOrProxy, owner, own) {
   if (!__FEATURE_LISTS__) return;
   if (objOrProxy === null || typeof objOrProxy !== 'object') return;
   const raw = objOrProxy[RAW] || objOrProxy;
-  if (owner === null) listOwners.delete(raw);
-  else listOwners.set(raw, owner);
+  if (owner === null) {
+    if (liveLists <= 1 || own === undefined) { listOwners.delete(raw); return; }
+    const cur = listOwners.get(raw);
+    if (cur === undefined) return;
+    const rest = keptOwners(cur, own);
+    if (rest === null) return;           // another list's owner: leave it
+    if (rest.length === 0) listOwners.delete(raw);
+    else listOwners.set(raw, rest.length === 1 ? rest[0] : combinedOwner(rest));
+    return;
+  }
+  if (liveLists <= 1) { listOwners.set(raw, owner); return; }
+  const cur = listOwners.get(raw);
+  listOwners.set(raw, (cur === undefined || cur === owner) ? owner : joinOwner(cur, owner));
+  // Leaves of this item that already have a node carrying another list's sink
+  // or a direct writer are now rendered by two lists: flag them. (A leaf with
+  // no node, or a bare node, is served by the owner record itself.)
+  const map = nodeTableFor(raw).get(raw);
+  if (map !== undefined) {
+    const keys = owner.keys;
+    for (let i = 0; i < keys.length; i++) {
+      const node = map.get(keys[i]);
+      if (node !== undefined && (node.flags & F_SHARED) === 0
+        && (node.listSink !== null || node.directWriter !== null)
+        && sharedNow(node, raw, keys[i])) node.flags |= F_SHARED;
+    }
+  }
+}
+
+function makeCombinedOwner(members) {
+  const keys = [];
+  for (let i = 0; i < members.length; i++) {
+    const k = members[i].keys;
+    for (let j = 0; j < k.length; j++) if (keys.indexOf(k[j]) === -1) keys.push(k[j]);
+  }
+  return {
+    keys,
+    sink: (target, key) => callEach(members, (m) => { if (!isDead(m) && m.keys.indexOf(key) !== -1) m.sink(target, key); }),
+    _wfOwners: members,
+  };
+}
+
+// Replace a combined owner by its live members (delete, the one left, or
+// combined).
+function pruneOwner(raw, cur) {
+  const rest = cur._wfOwners.filter((o) => !isDead(o));
+  if (rest.length === cur._wfOwners.length) return;
+  if (rest.length === 0) listOwners.delete(raw);
+  else listOwners.set(raw, rest.length === 1 ? rest[0] : combinedOwner(rest));
+}
+
+const ownerPairs = new WeakMap();
+function combinedOwner(members) {
+  if (members.length !== 2) return makeCombinedOwner(members);
+  let byB = ownerPairs.get(members[0]);
+  if (byB === undefined) { byB = new WeakMap(); ownerPairs.set(members[0], byB); }
+  let o = byB.get(members[1]);
+  if (o === undefined) { o = makeCombinedOwner(members); byB.set(members[1], o); }
+  return o;
+}
+
+function joinOwner(cur, next) {
+  const members = cur._wfOwners || [cur];
+  if (members.indexOf(next) !== -1) return cur;
+  const tag = next._wfList;
+  if (!isLive(tag)) return next;
+  const kept = [];
+  for (let i = 0; i < members.length; i++) {
+    const t = members[i]._wfList;
+    if (isLive(t) && t !== tag) kept.push(members[i]);
+  }
+  if (kept.length === 0) return next;
+  kept.push(next);
+  return combinedOwner(kept);
+}
+
+// Members of `cur` left after releasing `own`, or null when `own` is not in
+// `cur` at all (cur belongs to another list).
+function keptOwners(cur, own) {
+  const tag = own._wfList;
+  const mine = (o) => o === own || (tag != null && o._wfList === tag);
+  if (cur._wfOwners === undefined) return mine(cur) ? [] : null;
+  const rest = cur._wfOwners.filter((o) => !mine(o) && isLive(o._wfList));
+  return rest.length === cur._wfOwners.length ? null : rest;
 }
 
 // Mark a raw array as operation-recording: subsequent bare index writes through
@@ -1053,7 +1367,7 @@ function warnFacadeElements(value, key) {
     if (hit) {
         _facadeElementWarned.add(value);
         console.warn(
-            '[WF WF-966] The value written to reactive state ("' + String(key) + '") holds a ' +
+            '[WF-966] The value written to reactive state ("' + String(key) + '") holds a ' +
             'facade-wrapped object three or more levels deep. The engine unwraps the first two ' +
             'levels on write; deeper copies of state must be unwrapped first (wildflower.toRaw) ' +
             'or the nested proxy corrupts update routing and slows every read.'
@@ -1069,7 +1383,7 @@ function warnComputedWrite(desc) {
     _computedWriteWarned.add(activeObserver);
     const name = activeObserver.key || (activeObserver.fn && activeObserver.fn.name) || '(anonymous)';
     console.warn(
-        `[WF WF-217] Computed "${name}" ${desc} during its own evaluation. ` +
+        `[WF-217] Computed "${name}" ${desc} during its own evaluation. ` +
         'Computeds must be pure: mutating tracked state from inside a computed ' +
         'invalidates it while it runs, and anything bound to it (a data-list, a ' +
         'binding) can silently render empty or stale. If you are sorting or ' +
@@ -1121,7 +1435,7 @@ function devCountRead(target, key) {
     if (devHotReporter) {
         devHotReporter(key, perFrame);
     } else {
-        console.warn(`[WF WF-216] state '${key}' is being read ~${perFrame} times per frame through the reactive facade, sustained across frames. Hoist it to a local outside the loop.`);
+        console.warn(`[WF-216] state '${key}' is being read ~${perFrame} times per frame through the reactive facade, sustained across frames. Hoist it to a local outside the loop.`);
     }
 }
 
@@ -1253,9 +1567,14 @@ function wrapTree(obj, prefix, notify, computedResolver) {
       const isAdd = old === undefined && !hasOwnProp.call(target, key);
       target[key] = value;
       // A directWriter handling the write (DIRECT_HANDLED) already updated its one
-      // bound text node and, by the _reactiveGraphPureText gate, nothing else observes the
-      // field; skip the length pulse and the onStateChange dispatch.
-      if (notifyNode(target, key) === DIRECT_HANDLED) return true;
+      // bound text node and no graph observer reads the field. Whether the
+      // onStateChange dispatch can ALSO be skipped is the OWNING entity's call,
+      // not the rendering list's: the entity whose tree this object belongs to
+      // marks its notify quiet only when nothing rides its dispatch (no
+      // watchers, subscribers or autoSave; see EntityHandle.setDispatchQuiet).
+      // A store is never quiet, so an item of a store listed by some component
+      // still saves, watches and notifies.
+      if (notifyNode(target, key) === DIRECT_HANDLED && notify._wfQuiet === true) return true;
       if (wasArray && key !== 'length' && target.length !== oldLen) {
         notifyNode(target, 'length');
       }
@@ -1423,6 +1742,8 @@ export {
   setDirectWriter,
   setListSink,
   setListOwner,
+  listTag,
+  releaseListTag,
   runInListFrame,
   enableArrayOps,
   consumeArrayOps,
@@ -1437,6 +1758,7 @@ export {
   endBatchScope,
   setFlushObserver,
   F_REENTERED,
+  F_PULL,
   // probes
   __nodeOf,
   // constants (for white-box tests)

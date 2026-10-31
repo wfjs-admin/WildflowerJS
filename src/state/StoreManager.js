@@ -178,9 +178,15 @@ export class StoreManager {
      */
     _wakeComponentForLateEntity(instance) {
         if (!instance || !instance.stateManager) return;
-        // Invalidate ALL computed caches so they re-evaluate with the now-available store
-        if (instance.stateManager.computedCache) {
-            instance.stateManager.computedCache.clear();
+        // Invalidate ALL computeds so they re-evaluate with the now-available store,
+        // and re-evaluate the observed ones now, so what follows them (a watch:,
+        // a subscribe(), a binding elsewhere) hears the store and its later changes.
+        // The arrival is a real input change, not a nudge: an async computed whose
+        // request is running relaunches, since that request ran without the store.
+        const sm = instance.stateManager;
+        if (sm._invalidateCachedComputed) {
+            for (const name of sm.getComputedPropertyNames()) sm._invalidateCachedComputed(name, true);
+            sm._reevaluateObserved();
         }
         if (instance.stateManager._lastEvalResult) {
             instance.stateManager._lastEvalResult.clear();
@@ -247,15 +253,17 @@ export class StoreManager {
                 // _setupStoreSubscriptions deferred because the store didn't
                 // exist yet (see the matching registration there — dev builds
                 // masked this via the dev-only computed-tracking marker).
+                // A component's only: a store's _setupStoreSubscriptions makes
+                // neither this registration nor the query activation below.
                 const subTarget = this.framework._externalFindTarget
                     ? this.framework._externalFindTarget(storeName) : null;
-                if (subTarget && subTarget.id && this.framework._registerEntityDependent) {
+                if (!instance.isVirtual && subTarget && subTarget.id && this.framework._registerEntityDependent) {
                     this.framework._registerEntityDependent(subTarget.id, componentId);
                 }
                 // The same observer edge _setupStoreSubscriptions adds when the
                 // query already exists: without it a late query never fetches.
                 const fw = this.framework;
-                if (__FEATURE_QUERY__ && fw._queryControllers && fw._queryControllers.has(storeName)) {
+                if (__FEATURE_QUERY__ && !instance.isVirtual && fw._queryControllers && fw._queryControllers.has(storeName)) {
                     const qc = fw._queryControllers.get(storeName);
                     if (instance.element) qc.elements.add(instance.element);
                     fw._queryActivate(qc);
@@ -284,9 +292,12 @@ export class StoreManager {
             // Re-evaluate the computed property to get fresh data
             if (computedName && instance.stateManager) {
                 try {
-                    // Invalidate the cached computed value so it will be re-evaluated
-                    if (instance.stateManager.computedCache) {
-                        instance.stateManager.computedCache.delete(computedName);
+                    // Invalidate the cached computed value so it will be re-evaluated,
+                    // at once if something observes it, the arrival counting as a
+                    // real input change (see _wakeComponentForLateEntity)
+                    if (instance.stateManager._invalidateCachedComputed) {
+                        instance.stateManager._invalidateCachedComputed(computedName, true);
+                        instance.stateManager._reevaluateObserved(computedName);
                     }
                     if (instance.stateManager._lastEvalResult) {
                         instance.stateManager._lastEvalResult.delete(computedName);
@@ -631,6 +642,10 @@ export class StoreManager {
                 }
             }
 
+            // Set up: a subscription to a computed now takes its baseline when
+            // it is made (see EntityHandle._wireComputedNotifiers).
+            stateManager._wireComputedNotifiers();
+
             // Register tick lifecycle hook if defined (shared rAF loop with
             // components). Guarded: the frame loop lives in the pool module,
             // absent from tiers without pools (see ComponentLifecycle twin).
@@ -665,6 +680,8 @@ export class StoreManager {
                 this.framework.componentInstances.delete(instanceId);
             }
             if (this._virtualComponents) this._virtualComponents.delete(instanceId);
+            // Nor a wait for a store its subscribe: names that is not registered yet.
+            this.removePendingDependencies(instanceId);
             return null;
         }
     }
@@ -904,9 +921,12 @@ export class StoreManager {
         //      the full ContextProxy resolution chain (6 checks → 2 checks).
         //      The lean proxy only needs: computed check → direct state access.
         //      This eliminates one proxy layer from every cross-store property read.
+        // Each getter is kept, so an unregister of the store it names can put it
+        // back in place of a proxy cached for the discarded instance (_queueReattach).
         const self = this;
+        const refs = instance._storeRefs = {};
         for (const storeName of Object.keys(parsed)) {
-            Object.defineProperty(context.stores, storeName, {
+            const ref = refs[storeName] = {
                 get() {
                     const store = self.framework.getStore(storeName);
                     if (store && !self.framework._computedTrackingContext) {
@@ -1004,11 +1024,18 @@ export class StoreManager {
                 },
                 enumerable: true,
                 configurable: true
-            });
+            };
+            Object.defineProperty(context.stores, storeName, ref);
         }
 
         // Process each store subscription for path notifications
         for (const [storeName, paths] of Object.entries(parsed)) {
+            // Not registered yet: wait for it, as a component does. Its arrival
+            // subscribes the paths below and wakes this store's computeds
+            // (_resolvePendingStoreDependencies).
+            if (!this.getStore(storeName)) {
+                this.registerPendingStoreDependency(storeName, instance.id, '_subscribe_', null);
+            }
             const pathsArray = Array.isArray(paths) ? paths : [paths];
 
             // Subscribe to specific paths (empty array = no path notifications)
@@ -1224,6 +1251,10 @@ export class StoreManager {
             // (subscribe: { name: [] }) records no paths.
             const declared = inst.definition && inst.definition.subscribe;
             if (declared && this._parseSubscribeDeclaration(declared)[name] !== undefined) {
+                // A store's this.stores.<name> may hold a proxy cached for the
+                // instance just discarded: put its getter back.
+                const ref = inst._storeRefs && inst._storeRefs[name];
+                if (ref) Object.defineProperty(inst.context.stores, name, ref);
                 if (inst._storeSubscriptions) {
                     inst._storeSubscriptions = inst._storeSubscriptions.filter((s) => s.storeName !== name);
                 }
