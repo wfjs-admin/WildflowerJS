@@ -224,6 +224,9 @@ export const PluginSystemMethods = {
 
                 if (metadata.state || metadata.methods || metadata.computed || metadata.pools || metadata.watch || typeof metadata.tick === 'function' || hasTopLevelPluginMethods(metadata)) {
                     this._setupPluginState(metadata.name, metadata);
+                    // Whatever read this plugin before it registered runs
+                    // again, as for a late store.
+                    if (this.storeManager) this.storeManager._resolvePendingStoreDependencies(metadata.name);
                 } else if (__DEV__ && typeof metadata.install !== 'function') {
                     // install() has already run above, so an install-only plugin
                     // (registers a directive, wires services) is legitimate.

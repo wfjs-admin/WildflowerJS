@@ -366,7 +366,7 @@ declare namespace WF {
 
     interface QueryConfig<T = any> {
         /** Read source: a URL with `:token` placeholders, or a function returning the data. */
-        from: string | ((params: Record<string, any>) => any);
+        from: string | (() => any);
         /** Row identity field. Default 'id'. */
         key?: string;
         /** Fills URL tokens and the read query string. */
@@ -377,7 +377,7 @@ declare namespace WF {
         /** Rows held before the first fetch. */
         initial?: T[];
         refresh?: RefreshRung | RefreshRung[];
-        /** Event-stream URL for the 'sse' rung. Defaults to `from`. */
+        /** Event-stream URL for the 'sse' rung. Defaults to `from` when `from` is a URL. */
         stream?: string;
         /** Retries after a failed sync. Default 0. */
         retry?: number;
@@ -414,10 +414,11 @@ declare namespace WF {
         /** Data on screen the server has not yet confirmed. */
         readonly isStale: boolean;
         /** The initial load failed. */
-        readonly error: any;
+        readonly error: string | null;
         /** A later refresh failed; existing rows were kept. */
-        readonly syncError: any;
-        readonly lastSync: number | Date | null;
+        readonly syncError: string | null;
+        /** Date.now() of the last confirming sync. */
+        readonly lastSync: number | null;
         /** Writes not yet settled. */
         readonly pendingWrites: number;
         refresh(options?: RefreshOptions): Promise<void>;
@@ -426,11 +427,11 @@ declare namespace WF {
         /** Apply local data optimistically with no transport. */
         patch(data: Partial<T> | Partial<T>[]): void;
         /** Save the key plus the changed fields. Delete when the `deleted` field is truthy, update otherwise. */
-        write(item: Partial<T> & Record<string, any>): Promise<T | void>;
+        write(item: Partial<T> & Record<string, any>): Promise<void>;
         /** Run a named operation from the `to` map. */
-        write(operation: string, item: Partial<T> & Record<string, any>): Promise<T | void>;
+        write(operation: string, item: Partial<T> & Record<string, any>): Promise<void>;
         /** Add a row through the `create` entry. The temporary key is minted for you. */
-        create(item: Partial<T> & Record<string, any>): Promise<T | void>;
+        create(item: Partial<T> & Record<string, any>): Promise<void>;
     }
 
     // ── Framework configuration ──────────────────────────────────────────
@@ -446,6 +447,14 @@ declare namespace WF {
         subscribeTimeout: number;
         forceCSPMode: boolean;
         htmlSanitizer: ((html: string) => string) | null;
+        /** Query header defaults, keyed by origin or 'self'. */
+        headers: Record<string, Record<string, string> | (() => Record<string, string>)>;
+        /** URLs whose rows each query keeps in memory. Default 15; 0 turns the cache off. */
+        queryCacheEntries: number;
+        /** Rows kept across a query's cached URLs. Default 5000. */
+        queryCacheRows: number;
+        /** ms a URL must stay current to be cached. Default 0 (off). */
+        queryCacheMinDwell: number;
     }
 
     // Declared here rather than imported from the package typings, so this
@@ -467,7 +476,7 @@ declare namespace WF {
         alias(aliasPath: string, targetPath: string): RouteManager;
         init(): RouteManager;
         navigate(url: string, options?: { replace?: boolean }): Promise<void>;
-        getRouteUrl(name: string, params?: Record<string, string>, query?: Record<string, string>): string;
+        getRouteUrl(name: string, params?: Record<string, string | number>, query?: Record<string, unknown>): string | null;
         isActive(pattern: string, options?: { exact?: boolean }): boolean;
         getCurrentRoute(): any;
         back(): void;
@@ -563,7 +572,7 @@ declare namespace WF {
         hook(hookName: HookName | (string & {}), handler: (...args: any[]) => void): Api;
 
         getStore<T = any>(name?: string): StoreHandle<T>;
-        getQuery<T = any>(name: string): QueryHandle<T>;
+        getQuery<T = any>(name: string): QueryHandle<T> | undefined;
         /** First live instance of a named component. Reactive inside a computed. */
         getComponent(name: string): ComponentInstance | undefined;
         getComponents(name: string): ComponentInstance[];
@@ -590,13 +599,14 @@ declare namespace WF {
         whenInitialized(): Promise<void>;
         /** Pool tiers only: flush every drawn pool now, as the frame loop's next flush would. */
         flushPools?(): void;
-        config(options: Partial<ConfigOptions>): Api;
+        /** Merges the options in and returns a copy of the current options (not `wildflower`). */
+        config(options?: Partial<ConfigOptions>): ConfigOptions;
         /** Deep plain-object snapshot of reactive state, for structured clone (IndexedDB, postMessage). */
         toRaw<T>(value: T): T;
-        /** Clear persisted query caches. No names clears every query's. */
-        clearPersisted(...names: string[]): void;
+        /** Clear persisted query caches. No names clears every query's. Returns the count removed. */
+        clearPersisted(...names: string[]): number;
         /** Conditional refetch on several queries at once. */
-        invalidateQueries(...names: string[]): Promise<void>;
+        invalidateQueries(...names: string[]): Promise<void[]>;
         createRouter(options?: RouteManagerOptions): RouteManager;
         RouteManager: new (options?: RouteManagerOptions) => RouteManager;
         registerAdapter(tagName: string, config: Record<string, any>): Api;

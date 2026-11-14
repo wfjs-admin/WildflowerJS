@@ -124,7 +124,33 @@
  * @module RouteManager
  * @requires wfUtils.js - Error codes (WF_ERRORS, wfError, wfWarn)
  */
+// wfError() reads context and suggestion in development builds only (a
+// production build prints the code and the cause), so the router builds that
+// text under __DEV__ only.
+
 const NAVIGATION_SETTLE_MS = 50; // Delay for DOM/async operations to settle before navigation
+
+// A malformed escape ('?q=%', '?q=100%') stays as written instead of
+// throwing URIError out of init(), navigate() and popstate.
+const safeDecode = (s) => { try { return decodeURIComponent(s); } catch (e) { return s; } };
+
+// A path as the browser's URL parser writes it (a space as %20, and so on).
+const browserPath = (p) => { try { return new URL(p, 'http://x').pathname; } catch (e) { return p; } };
+
+// The one query serializer (getRouteUrl and URLParser.buildUrl). undefined
+// and null drop out: `{ search: term || undefined }` is the ordinary way to
+// say "leave this key off". An empty string stays, since `?q=` says
+// something different from no `q` at all. An array repeats the key, with the
+// same rule per element.
+const queryString = (query) => {
+    const pairs = [];
+    for (const [key, value] of Object.entries(query || {})) {
+        for (const v of Array.isArray(value) ? value : [value]) {
+            if (v !== undefined && v !== null) pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(v)}`);
+        }
+    }
+    return pairs.length ? '?' + pairs.join('&') : '';
+};
 const PUSH_TO_HISTORY = true;
 const NO_PUSH_TO_HISTORY = false;
 
@@ -213,7 +239,7 @@ export class RouteManager {
     loadRoutes(routes) {
         for (const routeConfig of routes) {
             if (!routeConfig.path) {
-                wfWarn('Route config missing "path", skipping', routeConfig);
+                if (__DEV__) wfWarn('Route config missing "path", skipping', routeConfig);
                 continue;
             }
 
@@ -459,7 +485,7 @@ export class RouteManager {
 
         // Store in named route map if it has a name
         if (route.name) {
-            if (this._namedRoutes.has(route.name)) {
+            if (__DEV__ && this._namedRoutes.has(route.name)) {
                 wfWarn(`Route name "${route.name}" is already registered`);
             }
             this._namedRoutes.set(route.name, route);
@@ -519,7 +545,7 @@ export class RouteManager {
 
             // Store in named route map if it has a name
             if (childRoute.name) {
-                if (this._namedRoutes.has(childRoute.name)) {
+                if (__DEV__ && this._namedRoutes.has(childRoute.name)) {
                     wfWarn(`Route name "${childRoute.name}" is already registered`);
                 }
                 this._namedRoutes.set(childRoute.name, childRoute);
@@ -589,10 +615,10 @@ export class RouteManager {
         const targetRoute = this.routeTree.find(route => route.pattern === targetPath);
 
         if (!targetRoute) {
-            wfError(WF_ERRORS.ROUTE_ALIAS_ERROR, {
+            wfError(WF_ERRORS.ROUTE_ALIAS_ERROR, { ...(__DEV__ && {
                 context: `${aliasPath} -> ${targetPath}`,
                 suggestion: 'Register the target route before creating the alias'
-            });
+            }) });
             return this;
         }
 
@@ -613,7 +639,7 @@ export class RouteManager {
      */
     init() {
         if (this.isInitialized) {
-            wfWarn('Router already initialized');
+            if (__DEV__) wfWarn('Router already initialized');
             return;
         }
 
@@ -681,20 +707,15 @@ export class RouteManager {
         // Skip protocol-relative URLs (//example.com)
         if (href.startsWith('//')) return;
 
-        // At this point, href is a relative or absolute path (starts with / or is relative)
-        // These are internal links - intercept them
-        event.preventDefault();
+        // The browser decides where the link goes: '/\host', a leading
+        // space or tab, and a cross-origin <base> all leave the origin
+        // although the checks above pass them.
+        let url;
+        try { url = new URL(link.href); } catch (e) { return; }
+        if (url.origin !== window.location.origin) return;
 
-        // Parse the href to extract pathname, search, and hash
-        // Use the link's resolved href property which gives us the full URL
-        const resolvedUrl = link.href;
-        try {
-            const url = new URL(resolvedUrl);
-            this.navigate(url.pathname + url.search + url.hash);
-        } catch (e) {
-            // Fallback: just use the href as-is
-            this.navigate(href);
-        }
+        event.preventDefault();
+        this.navigate(url.pathname + url.search + url.hash);
     }
 
     /**
@@ -725,6 +746,11 @@ export class RouteManager {
         } else if (to.name) {
             // Named route navigation
             location = this._resolveNamedRoute(to.name, to.params, to.query);
+            // A refused param (WF-713): stay on the current route.
+            if (!location) {
+                this._dispatchError(new Error('WF-713: a route param holds a value no URL can carry'), to, this.currentRoute);
+                return;
+            }
         } else {
             location = to;
         }
@@ -737,10 +763,10 @@ export class RouteManager {
         const visitedPaths = options._visitedPaths || [];
         if (visitedPaths.includes(location.pathname)) {
             const chain = [...visitedPaths, location.pathname].join(' → ');
-            wfError(WF_ERRORS.CIRCULAR_DEPENDENCY, {
+            wfError(WF_ERRORS.CIRCULAR_DEPENDENCY, { ...(__DEV__ && {
                 context: `Route redirect chain: ${chain}`,
                 suggestion: 'Check route redirects and beforeEnter guards for circular references'
-            });
+            }) });
             throw new Error(`Circular redirect detected: ${chain}`);
         }
 
@@ -753,12 +779,12 @@ export class RouteManager {
         if (this.isNavigating) {
             const retryCount = options._retryCount || 0;
             if (retryCount >= 10) {
-                wfError(WF_ERRORS.ROUTE_NAVIGATION_ERROR, {
+                wfError(WF_ERRORS.ROUTE_NAVIGATION_ERROR, { ...(__DEV__ && {
                     suggestion: 'Check for circular redirects or slow route guards'
-                });
+                }) });
                 return;
             }
-            wfWarn('Navigation already in progress, queuing...');
+            if (__DEV__) wfWarn('Navigation already in progress, queuing...');
             await new Promise(resolve => setTimeout(resolve, NAVIGATION_SETTLE_MS));
             return this.navigate(to, { ...options, _retryCount: retryCount + 1 });
         }
@@ -799,39 +825,17 @@ export class RouteManager {
     getRouteUrl(name, params = {}, query = {}, hash = '') {
         const route = this._namedRoutes.get(name);
         if (!route) {
-            wfError(WF_ERRORS.NAMED_ROUTE_NOT_FOUND, {
+            wfError(WF_ERRORS.NAMED_ROUTE_NOT_FOUND, { ...(__DEV__ && {
                 context: name,
                 suggestion: 'Check route name spelling or register the route'
-            });
+            }) });
             return '/';
         }
 
-        let path = route.pattern;
+        let path = this._fillPattern(route, params);
+        if (path === null) return null;
 
-        // Replace parameters (handle optional params with trailing ?)
-        route.paramNames.forEach(paramName => {
-            const value = params[paramName];
-            if (value !== undefined) {
-                // Replace :param? or :param
-                path = path.replace(`:${paramName}?`, encodeURIComponent(value))
-                           .replace(`:${paramName}`, encodeURIComponent(value));
-            } else {
-                // Remove optional param segment (/:param? or :param?)
-                path = path.replace(`/:${paramName}?`, '').replace(`:${paramName}?`, '');
-            }
-        });
-
-        // Add query string. undefined and null drop out: `{ search: term ||
-        // undefined }` is the ordinary way to say "leave this key off", and
-        // stringifying it wrote a literal "undefined" into the URL that read
-        // back as a real filter value. An empty string stays, since `?q=` says
-        // something different from no `q` at all.
-        const queryPairs = Object.entries(query)
-            .filter(([, value]) => value !== undefined && value !== null)
-            .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
-        if (queryPairs.length > 0) {
-            path += '?' + queryPairs.join('&');
-        }
+        path += queryString(query);
 
         // Add hash fragment
         if (hash) {
@@ -1070,7 +1074,7 @@ export class RouteManager {
                         skipTransition: transitionOptions.skipTransition
                     });
                 } else {
-                    wfWarn('Default route not registered, cannot redirect');
+                    if (__DEV__) wfWarn('Default route not registered, cannot redirect');
                 }
             }
             return;
@@ -1082,7 +1086,8 @@ export class RouteManager {
             let redirectPath = matchedRoute.redirect;
             if (params && Object.keys(params).length > 0) {
                 Object.keys(params).forEach(key => {
-                    redirectPath = redirectPath.replace(`:${key}`, params[key]);
+                    // (?!\w): ':it' must not match inside ':item'
+                    redirectPath = redirectPath.replace(new RegExp(`:${key}(?!\\w)`), () => params[key]);
                 });
             }
 
@@ -1141,7 +1146,7 @@ export class RouteManager {
                 }
             } catch (error) {
                 wfError(WF_ERRORS.ROUTE_GUARD_ERROR, {
-                    context: `beforeLeave guard for ${from.path}`,
+                    ...(__DEV__ && { context: `beforeLeave guard for ${from.path}` }),
                     cause: error
                 });
                 this._dispatchError(error, to, from);
@@ -1182,7 +1187,7 @@ export class RouteManager {
                 }
             } catch (error) {
                 wfError(WF_ERRORS.ROUTE_GUARD_ERROR, {
-                    context: errorContext,
+                    ...(__DEV__ && { context: errorContext }),
                     cause: error
                 });
                 this._dispatchError(error, to, from);
@@ -1313,7 +1318,7 @@ export class RouteManager {
                 // undefined, null, or true = continue to next guard
             } catch (error) {
                 wfError(WF_ERRORS.ROUTE_GUARD_ERROR, {
-                    context: 'beforeEach guard',
+                    ...(__DEV__ && { context: 'beforeEach guard' }),
                     cause: error
                 });
                 throw error;
@@ -1338,7 +1343,7 @@ export class RouteManager {
             return result; // Return whatever the guard returned
         } catch (error) {
             wfError(WF_ERRORS.ROUTE_GUARD_ERROR, {
-                context: `beforeEnter guard for ${to.path}`,
+                ...(__DEV__ && { context: `beforeEnter guard for ${to.path}` }),
                 cause: error
             });
             throw error;
@@ -1354,7 +1359,7 @@ export class RouteManager {
                 hook({ to, from });
             } catch (error) {
                 wfError(WF_ERRORS.ROUTE_HOOK_ERROR, {
-                    context: 'afterEach hook',
+                    ...(__DEV__ && { context: 'afterEach hook' }),
                     cause: error
                 });
             }
@@ -1456,7 +1461,7 @@ export class RouteManager {
                     }
                 } catch (error) {
                     wfError(WF_ERRORS.ROUTE_HANDLER_ERROR, {
-                        context: `Route handler for "${route.pattern}"`,
+                        ...(__DEV__ && { context: `Route handler for "${route.pattern}"` }),
                         cause: error
                     });
                 }
@@ -1485,7 +1490,7 @@ export class RouteManager {
                 this.options.onLoadingStart(to, from);
             } catch (error) {
                 wfError(WF_ERRORS.ROUTE_HOOK_ERROR, {
-                    context: 'onLoadingStart callback',
+                    ...(__DEV__ && { context: 'onLoadingStart callback' }),
                     cause: error
                 });
             }
@@ -1502,7 +1507,7 @@ export class RouteManager {
                             this.options.onLoadingTimeout(to, from);
                         } catch (error) {
                             wfError(WF_ERRORS.ROUTE_HOOK_ERROR, {
-                                context: 'onLoadingTimeout callback',
+                                ...(__DEV__ && { context: 'onLoadingTimeout callback' }),
                                 cause: error
                             });
                         }
@@ -1529,7 +1534,7 @@ export class RouteManager {
                     this.options.onLoadingEnd(to, from);
                 } catch (error) {
                     wfError(WF_ERRORS.ROUTE_HOOK_ERROR, {
-                        context: 'onLoadingEnd callback',
+                        ...(__DEV__ && { context: 'onLoadingEnd callback' }),
                         cause: error
                     });
                 }
@@ -1547,7 +1552,7 @@ export class RouteManager {
                     });
                 } catch (error) {
                     wfError(WF_ERRORS.ROUTE_COMPONENT_ERROR, {
-                        context: `Component init for "${route.pattern}"`,
+                        ...(__DEV__ && { context: `Component init for "${route.pattern}"` }),
                         cause: error
                     });
                 }
@@ -1565,14 +1570,14 @@ export class RouteManager {
                     this.options.onLoadingError(to, error);
                 } catch (cbError) {
                     wfError(WF_ERRORS.ROUTE_HOOK_ERROR, {
-                        context: 'onLoadingError callback',
+                        ...(__DEV__ && { context: 'onLoadingError callback' }),
                         cause: cbError
                     });
                 }
             }
 
             wfError(WF_ERRORS.ROUTE_COMPONENT_ERROR, {
-                context: `Loading component for "${route.pattern}"`,
+                ...(__DEV__ && { context: `Loading component for "${route.pattern}"` }),
                 cause: error
             });
 
@@ -1587,45 +1592,79 @@ export class RouteManager {
     _resolveNamedRoute(name, params = {}, query = {}) {
         const route = this._namedRoutes.get(name);
         if (!route) {
-            // Suggest similar route names
-            const suggestions = this._findSimilarRouteNames(name);
-            let suggestion = 'Check route name spelling or register the route';
+            let suggestion;
+            if (__DEV__) {
+                // Suggest similar route names
+                const suggestions = findSimilarRouteNames(this._namedRoutes, name);
+                suggestion = 'Check route name spelling or register the route';
 
-            if (suggestions.length > 0) {
-                suggestion = `Did you mean: ${suggestions.join(', ')}?`;
-            } else if (this._namedRoutes.size > 0) {
-                const allNames = Array.from(this._namedRoutes.keys()).slice(0, 5);
-                suggestion = `Available routes: ${allNames.join(', ')}`;
+                if (suggestions.length > 0) {
+                    suggestion = `Did you mean: ${suggestions.join(', ')}?`;
+                } else if (this._namedRoutes.size > 0) {
+                    const allNames = Array.from(this._namedRoutes.keys()).slice(0, 5);
+                    suggestion = `Available routes: ${allNames.join(', ')}`;
+                }
             }
 
-            wfError(WF_ERRORS.NAMED_ROUTE_NOT_FOUND, {
+            wfError(WF_ERRORS.NAMED_ROUTE_NOT_FOUND, { ...(__DEV__ && {
                 context: name,
                 suggestion
-            });
+            }) });
             return { pathname: '/', query: {} };
         }
 
-        let pathname = route.pattern;
-
-        // Replace parameters (handle optional params with trailing ?)
-        route.paramNames.forEach(paramName => {
-            const value = params[paramName];
-            if (value !== undefined) {
-                pathname = pathname.replace(`:${paramName}?`, encodeURIComponent(value))
-                                   .replace(`:${paramName}`, encodeURIComponent(value));
-            } else {
-                pathname = pathname.replace(`/:${paramName}?`, '').replace(`:${paramName}?`, '');
-            }
-        });
+        const pathname = this._fillPattern(route, params);
+        if (pathname === null) return null;
 
         return { pathname, query: query || {} };
+    }
+
+    /**
+     * Fill a route pattern's :params. Returns null, with a warning, for a
+     * value no URL can carry: a required param that is missing, null or
+     * empty, an object or array, or '.' / '..' (the URL parser reads those,
+     * and '%2e' spellings of them, as path navigation, not as a segment).
+     * An optional param with no value drops its segment.
+     * @private
+     */
+    _fillPattern(route, params = {}) {
+        let path = route.pattern;
+        for (const name of route.paramNames) {
+            const slot = new RegExp(`:${name}(\\?)?(?!\\w)`);
+            const found = path.match(slot);
+            if (!found) continue; // wildcard pathMatch has no :slot
+            const value = params ? params[name] : undefined;
+            if (value === undefined || value === null || value === '') {
+                if (found[1]) {
+                    path = path.replace(`/:${name}?`, '').replace(`:${name}?`, '');
+                    continue;
+                }
+            } else if (typeof value !== 'object' && value !== '.' && value !== '..') {
+                const text = encodeURIComponent(value);
+                path = path.replace(slot, () => text);
+                continue;
+            }
+            wfError(WF_ERRORS.ROUTE_PARAM_REFUSED, {
+                warn: true,
+                ...(__DEV__ && {
+                    context: `Route "${route.name || route.pattern}": param "${name}" is ${value === undefined ? 'missing'
+                        : value !== null && typeof value === 'object' ? 'an object' : JSON.stringify(value)}; no URL was built`,
+                    suggestion: 'A required param needs a value a path segment can hold: text or a number, and not "." or ".."'
+                })
+            });
+            return null;
+        }
+        return path;
     }
 
     /**
      * Check if two locations are the same
      */
     _isSameLocation(route1, route2) {
-        const samePath = route1.path === (route2.pathname || route2.path);
+        // Compared as the browser writes a path: navigate('/users/a b') and
+        // the '/users/a%20b' the address bar reports for it are one place
+        // (in hash mode the handler ran twice, once for each spelling).
+        const samePath = browserPath(route1.path) === browserPath(route2.pathname || route2.path);
         const sameHash = (route1.hash || '') === (route2.hash || '');
         if (!samePath || !sameHash) return false;
 
@@ -1707,8 +1746,12 @@ export class RouteManager {
             const matchedValue = match[i + 1]; // match[0] is full match
 
             // Use matched value if present, otherwise fall back to default
+            // Decoded, so a handler gets the value whichever way the
+            // navigation arrived (a page load and history hand over the
+            // percent-encoded path; navigate('/users/a b') does not), and a
+            // value round-trips through getRouteUrl.
             if (matchedValue !== undefined && matchedValue !== '') {
-                params[paramName] = matchedValue;
+                params[paramName] = safeDecode(matchedValue);
             } else if (defaults[paramName] !== undefined) {
                 params[paramName] = defaults[paramName];
             }
@@ -1716,60 +1759,61 @@ export class RouteManager {
 
         return params;
     }
+}
 
-    /**
-     * Find similar route names using simple string matching
-     * @private
-     */
-    _findSimilarRouteNames(targetName, maxSuggestions = 3) {
-        const allNames = Array.from(this._namedRoutes.keys());
-        const suggestions = [];
+/**
+ * Find similar route names using simple string matching (development
+ * builds only: the names feed a wfError suggestion)
+ * @private
+ */
+function findSimilarRouteNames(namedRoutes, targetName, maxSuggestions = 3) {
+    const allNames = Array.from(namedRoutes.keys());
+    const suggestions = [];
 
-        for (const name of allNames) {
-            // Calculate similarity score (0-1)
-            const similarity = this._calculateStringSimilarity(targetName, name);
+    for (const name of allNames) {
+        // Calculate similarity score (0-1)
+        const similarity = calculateStringSimilarity(targetName, name);
 
-            // Consider names with >40% similarity
-            if (similarity > 0.4) {
-                suggestions.push({ name, similarity });
-            }
+        // Consider names with >40% similarity
+        if (similarity > 0.4) {
+            suggestions.push({ name, similarity });
         }
-
-        // Sort by similarity and return top N
-        return suggestions
-            .sort((a, b) => b.similarity - a.similarity)
-            .slice(0, maxSuggestions)
-            .map(s => s.name);
     }
 
-    /**
-     * Calculate string similarity using simple character matching
-     * @private
-     */
-    _calculateStringSimilarity(str1, str2) {
-        str1 = str1.toLowerCase();
-        str2 = str2.toLowerCase();
+    // Sort by similarity and return top N
+    return suggestions
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, maxSuggestions)
+        .map(s => s.name);
+}
 
-        // Exact match
-        if (str1 === str2) return 1.0;
+/**
+ * Calculate string similarity using simple character matching
+ * @private
+ */
+function calculateStringSimilarity(str1, str2) {
+    str1 = str1.toLowerCase();
+    str2 = str2.toLowerCase();
 
-        // Check if one contains the other
-        if (str1.includes(str2) || str2.includes(str1)) {
-            return 0.8;
-        }
+    // Exact match
+    if (str1 === str2) return 1.0;
 
-        // Calculate character overlap
-        const chars1 = new Set(str1.split(''));
-        const chars2 = new Set(str2.split(''));
-
-        let overlap = 0;
-        for (const char of chars1) {
-            if (chars2.has(char)) overlap++;
-        }
-
-        const maxLength = Math.max(str1.length, str2.length);
-        return overlap / maxLength;
+    // Check if one contains the other
+    if (str1.includes(str2) || str2.includes(str1)) {
+        return 0.8;
     }
+
+    // Calculate character overlap
+    const chars1 = new Set(str1.split(''));
+    const chars2 = new Set(str2.split(''));
+
+    let overlap = 0;
+    for (const char of chars1) {
+        if (chars2.has(char)) overlap++;
+    }
+
+    const maxLength = Math.max(str1.length, str2.length);
+    return overlap / maxLength;
 }
 
 /**
@@ -1855,8 +1899,11 @@ class URLParser {
             }
         }
 
-        // Strip base path if present
-        if (this.base !== '/' && pathname.startsWith(this.base)) {
+        // Strip base path if present, at a segment boundary: base '/app'
+        // owns '/app' and '/app/x', not '/application'
+        const b = this.base;
+        if (b !== '/' && pathname.startsWith(b) &&
+            (b.endsWith('/') || pathname.length === b.length || pathname[b.length] === '/')) {
             pathname = pathname.slice(this.base.length) || '/';
         }
 
@@ -1876,26 +1923,7 @@ class URLParser {
     buildUrl(location) {
         let url = this.base !== '/' ? this.base + location.pathname : location.pathname;
 
-        // Add query string. Same rule as the path builder above: undefined and
-        // null drop out, an empty string stays. Inside an array the same holds
-        // per element, so one bad entry does not poison the whole key.
-        if (location.query) {
-            const queryPairs = Object.entries(location.query)
-                .filter(([, value]) => value !== undefined && value !== null)
-                .map(([key, value]) => {
-                    if (Array.isArray(value)) {
-                        return value
-                            .filter(v => v !== undefined && v !== null)
-                            .map(v => `${encodeURIComponent(key)}=${encodeURIComponent(v)}`)
-                            .join('&');
-                    }
-                    return `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
-                })
-                .filter(pair => pair !== '');
-            if (queryPairs.length > 0) {
-                url += '?' + queryPairs.join('&');
-            }
-        }
+        url += queryString(location.query);
 
         // Add hash fragment
         if (location.hash) {
@@ -1930,8 +1958,8 @@ class URLParser {
             const key = eqIndex >= 0 ? pair.slice(0, eqIndex) : pair;
             const value = eqIndex >= 0 ? pair.slice(eqIndex + 1) : '';
             if (key) {
-                const decodedKey = decodeURIComponent(key);
-                const decodedValue = decodeURIComponent(value);
+                const decodedKey = safeDecode(key);
+                const decodedValue = safeDecode(value);
                 // Own keys only: `in` also finds Object.prototype's members,
                 // so `?toString=a` read as a second occurrence.
                 if (Object.prototype.hasOwnProperty.call(query, decodedKey)) {
@@ -2043,7 +2071,7 @@ RouteManager._frameworkIntegration = {
                 // Call the hook from definition but bound to context (so 'this' works)
                 definition.onRouteChange.call(context, to, from);
             } catch (error) {
-                wfError(WF_ERRORS.ROUTE_HOOK_ERROR, { context: `onRouteChange (${instance.name})`, cause: error });
+                wfError(WF_ERRORS.ROUTE_HOOK_ERROR, { ...(__DEV__ && { context: `onRouteChange (${instance.name})` }), cause: error });
             }
         };
 

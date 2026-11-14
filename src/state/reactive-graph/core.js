@@ -1083,6 +1083,9 @@ function enableArrayOps(rawArray) {
   if (!__FEATURE_LISTS__) return;
   if (rawArray === null || typeof rawArray !== 'object') return;
   if (rawArray[ARR_OPS]) return;
+  // A frozen array (a shared Object.freeze([]) constant) cannot be mutated, so
+  // there is nothing to record, and defining the log on it would throw.
+  if (!Object.isExtensible(rawArray)) return;
   Object.defineProperty(rawArray, ARR_OPS, { value: { writes: [], mutators: [] }, enumerable: false, configurable: true, writable: true });
 }
 
@@ -1653,6 +1656,21 @@ function isTracking() {
   return activeObserver !== null && !suppressTracking;
 }
 
+// Whether anything live reads a field of this object: an effect, directly or
+// through computeds. A reader that has gone (a disposed effect, a computed
+// nothing observes) does not count. For a caller that keeps work going only
+// while its result is in use (a query's polling), where "was it read lately"
+// misses a reader whose value has simply not changed.
+function isObserved(objOrProxy) {
+  const raw = toRaw(objOrProxy);
+  const map = raw && nodeTableFor(raw).get(raw);
+  if (!map) return false;
+  const live = (node, depth) => node.observers.some((o) => !(o.flags & F_DISPOSED) &&
+    (o.kind === EFFECT || (depth < 16 && live(o, depth + 1))));
+  for (const node of map.values()) if (live(node, 0)) return true;
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // computed(fn) / effect(fn, opts) / batch / untrack
 // ---------------------------------------------------------------------------
@@ -1734,6 +1752,7 @@ export {
   reactive,
   reactiveTree,
   isTracking,
+  isObserved,
   COMPUTED_MISS,
   computed,
   effect,

@@ -76,14 +76,14 @@ export const ExpressionEvaluatorMethods = {
             // A $name.path reference is a query observer edge if `name` names
             // a registered query (no-op for stores/components/plugins). See
             // QuerySystem.js's _queryTouchByShorthand for why this lives here.
-            if (this._queryTouchByShorthand) this._queryTouchByShorthand(storeName);
+            if (__FEATURE_QUERY__ && this._queryTouchByShorthand) this._queryTouchByShorthand(storeName);
             return `external('${storeName}', '${path}')`;
         }
 
         // Replace inline store shorthands within complex expressions
         // e.g., "$expr.count > 3" → "external('expr', 'count') > 3"
         return expression.replace(STORE_SHORTHAND_INLINE_REGEX, (match, storeName, path) => {
-            if (this._queryTouchByShorthand) this._queryTouchByShorthand(storeName);
+            if (__FEATURE_QUERY__ && this._queryTouchByShorthand) this._queryTouchByShorthand(storeName);
             return `external('${storeName}', '${path}')`;
         });
     },
@@ -274,9 +274,11 @@ export const ExpressionEvaluatorMethods = {
         // Note: We check for ternary (?:) separately to avoid matching single colons
         const hasOperators = /[><=!&|+\-*/%]/.test(str);
         const hasTernary = /\?.*:/.test(str); // Ternary operator pattern
-        const hasExternalCall = str.includes('external(');
+        // A call (a.toFixed(2), form.isDirty()): as a property path it read
+        // nothing, while the same call next to an operator rendered.
+        const hasCall = str.includes('(');
         const hasObjectLiteral = str.includes('{');
 
-        return hasOperators || hasTernary || hasExternalCall || hasObjectLiteral;
+        return hasOperators || hasTernary || hasCall || hasObjectLiteral;
     }
 };

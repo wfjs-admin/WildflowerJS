@@ -25,6 +25,10 @@ const suite = hasFeature('query') ? describe : describe.skip
 // tests that assert one only run where one can exist. The BEHAVIOR each
 // diagnostic accompanies is pinned separately, in tests that run everywhere.
 const devIt = isMinifiedBuild() ? it.skip : it
+// What a refused write's message must contain: the words in a development
+// build, the code in a production one, whose message is the code and the
+// code's page on the docs site.
+const says = (words, code) => (isMinifiedBuild() ? '[' + code + ']' : words)
 
 let seq = 0
 const uname = (p) => `${p}-${++seq}`
@@ -282,7 +286,7 @@ suite('data-query: declarative transport form', () => {
             let threw = null
             try { await handle.write('move', { id: 1 }) } catch (e) { threw = e }
             expect(threw, 'an explicit call gets an explicit failure').toBeTruthy()
-            expect(String(threw.message)).toContain('boardId')
+            expect(String(threw.message)).toContain(says('boardId', 'WF-972'))
         })
 
         devIt('names the wait once, not on every skipped attempt', async () => {
@@ -418,7 +422,7 @@ suite('data-query: declarative transport form', () => {
             let threw = null
             try { await handle.write('archive', { id: 1 }) } catch (e) { threw = e }
             expect(threw, 'an undeclared operation must not fall back to update').toBeTruthy()
-            expect(String(threw.message), 'the error names the operation').toContain('archive')
+            expect(String(threw.message), 'the error names the operation, or its code').toContain(says('archive', 'WF-974'))
             expect(calls.some((k) => k.method !== 'GET'), 'nothing was sent').toBe(false)
         })
 
@@ -454,7 +458,7 @@ suite('data-query: declarative transport form', () => {
             let threw = null
             try { await handle.write({ id: 1, gone: true }) } catch (e) { threw = e }
             expect(threw, 'loud where it matters, in every build').toBeTruthy()
-            expect(String(threw.message)).toContain('delete')
+            expect(String(threw.message)).toContain(says('delete', 'WF-974'))
             expect(store.rows.some((r) => r.id === 1), 'and no row was tombstoned on the way out').toBe(true)
         })
 
@@ -478,7 +482,7 @@ suite('data-query: declarative transport form', () => {
             let threw = null
             try { await handle.write('favorite', { id: 1 }) } catch (e) { threw = e }
             expect(threw, 'the function form carries no operation hint').toBeTruthy()
-            expect(String(threw.message)).toContain('favorite')
+            expect(String(threw.message)).toContain(says('favorite', 'WF-974'))
         })
     })
 
@@ -518,8 +522,8 @@ suite('data-query: declarative transport form', () => {
             let threw = null
             try { await handle.write('move', { id: 1 }) } catch (e) { threw = e }
             expect(threw).toBeTruthy()
-            expect(String(threw.message), 'names the token').toContain('boardId')
-            expect(String(threw.message), 'and the operation').toContain('move')
+            expect(String(threw.message), 'names the token, or its code').toContain(says('boardId', 'WF-972'))
+            expect(String(threw.message), 'and the operation, or its code').toContain(says('move', 'WF-972'))
             expect(calls.some((k) => k.method !== 'GET'), 'no request went out').toBe(false)
         })
     })
@@ -539,7 +543,7 @@ suite('data-query: declarative transport form', () => {
             try { await handle.write({ id: '', name: 'renamed' }) } catch (e) { threw = e }
             await settle(20)
             expect(threw, 'the write rejected').toBeTruthy()
-            expect(String(threw.message), 'names the token').toContain('id')
+            expect(String(threw.message), 'names the token, or its code').toContain(says('id', 'WF-972'))
             expect(calls.some((k) => k.method !== 'GET'),
                 'nothing was sent — the collection URL was never addressed').toBe(false)
             // The optimistic phantom (an unseen key appends) rolled back.
@@ -718,7 +722,7 @@ suite('data-query: declarative transport form', () => {
             let threw = null
             try { await handle.create({ name: 'x' }) } catch (e) { threw = e }
             expect(threw).toBeTruthy()
-            expect(String(threw.message)).toContain('create')
+            expect(String(threw.message)).toContain(says('create', 'WF-974'))
         })
 
         devIt('flags a create URL that interpolates the key token', async () => {
@@ -738,7 +742,7 @@ suite('data-query: declarative transport form', () => {
             let threw = null
             try { await handle.create({ name: 'third' }) } catch (e) { threw = e }
             expect(threw, 'that URL would name a temp id the server never issued').toBeTruthy()
-            expect(String(threw.message)).toContain('minted')
+            expect(String(threw.message)).toContain(says('minted', 'WF-973'))
             expect(writes().length, 'nothing was sent').toBe(0)
             await settle()
             expect(store.rows.length, 'and the optimistic row was unwound').toBe(before)
@@ -1177,6 +1181,68 @@ suite('data-query: declarative transport form', () => {
             await settle()
             expect(served, 'a query with no confirmation gets no confirmation, so it refetches')
                 .toBeGreaterThan(before)
+        })
+    })
+
+    // A file upload is the one payload JSON cannot carry: stringifying a
+    // FormData gives "{}", so the request departed empty and the server
+    // answered 422. A body the platform already knows how to send goes as
+    // it is, and the browser sets its own Content-Type (the multipart
+    // boundary lives there).
+    describe('body: a body fetch already knows how to send goes as it is', () => {
+        const kinds = [
+            ['FormData', () => { const fd = new FormData(); fd.append('avatar', new Blob(['png'], { type: 'image/png' }), 'a.png'); return fd }],
+            ['URLSearchParams', () => new URLSearchParams({ name: 'renamed' })],
+            ['Blob', () => new Blob(['raw'], { type: 'text/plain' })]
+        ]
+        for (const [kind, make] of kinds) {
+            it(`a ${kind} body is sent untouched, with no JSON Content-Type`, async () => {
+                const payload = make()
+                const { handle } = await mountWith({
+                    to: { avatar: { url: '/api/items/:id/avatar', method: 'POST', body: () => payload } }
+                })
+                await handle.write('avatar', { id: 2, avatarFile: 'a.png' })
+                await settle()
+                expect(lastWrite().url).toBe('/api/items/2/avatar')
+                expect(lastWrite().body, 'the very object the body returned').toBe(payload)
+                expect(lastWrite().headers['Content-Type'], 'the browser writes its own').toBeUndefined()
+            })
+        }
+
+        it('declared headers still go out beside a FormData body', async () => {
+            const { handle } = await mountWith({
+                headers: () => ({ 'X-CSRF-TOKEN': 'tok', Accept: 'application/json' }),
+                to: { avatar: { url: '/api/items/:id/avatar', method: 'POST', body: () => new FormData() } }
+            })
+            await handle.write('avatar', { id: 2, avatarFile: 'a.png' })
+            await settle()
+            expect(lastWrite().headers['X-CSRF-TOKEN']).toBe('tok')
+            expect(lastWrite().headers.Accept).toBe('application/json')
+        })
+
+        it('a create with a FormData body takes the server record as the row', async () => {
+            const { handle, store } = await mountWith({
+                create: {
+                    url: '/api/items', method: 'POST',
+                    body: (item) => { const fd = new FormData(); fd.append('name', item.name); return fd },
+                    confirmation: (saved) => saved
+                }
+            }, (url, n, init) => {
+                if (!init.method || init.method === 'GET') return jsonResponse(ROWS.map((r) => ({ ...r })))
+                return jsonResponse({ id: 99, name: init.body.get('name') }, { status: 201 })
+            })
+            await handle.create({ name: 'from a form' })
+            await settle()
+            expect(lastWrite().body instanceof FormData, 'sent as FormData').toBe(true)
+            expect(store.rows.some((r) => r.id === 99 && r.name === 'from a form'), 'the saved row replaced the tmp one').toBe(true)
+        })
+
+        it('a plain object body is still JSON', async () => {
+            const { handle } = await mountWith({ to: '/api/items/:id', body: (item) => ({ name: item.name }) })
+            await handle.write({ id: 2, name: 'renamed' })
+            await settle()
+            expect(lastWrite().headers['Content-Type']).toBe('application/json')
+            expect(JSON.parse(lastWrite().body)).toEqual({ name: 'renamed' })
         })
     })
 
@@ -1848,13 +1914,29 @@ suite('data-query: declarative transport form', () => {
         })
 
         // WF-993 — a header-config origin key no request can ever match
-        // (Lane F #4): wrong scheme or port, or `:443` spelled out, and the
-        // Authorization never ships, with no trace. Origins compare exactly,
-        // so the near-miss (same host, different scheme/port) is nameable at
-        // the first request it fails to match.
+        // (Lane F #4): wrong scheme or port, and the Authorization never
+        // ships, with no trace. Origins compare as the URL parser gives
+        // them, so the near-miss (same host, different scheme/port) is
+        // nameable at the first request it fails to match.
+        it('a key that spells out the default port is the same origin: its headers ship', async () => {
+            const q = uname('hd'); const c = uname('hdc')
+            wildflower.config({ headers: { 'https://api.example.com:443': { Authorization: 'Token x' } } })
+            try {
+                stubFetch(() => jsonResponse([]))
+                wildflower.component(c, { state: {} })
+                wildflower.query(q, { from: 'https://api.example.com/items', key: 'id' })
+                mountList(q, c)
+                await settle()
+                expect(calls[0].headers.Authorization).toBe('Token x')
+                expect(warnsWith('WF-993').length).toBe(0)
+            } finally {
+                wildflower.config({ headers: undefined })
+            }
+        })
+
         devIt('WF-993: a key differing only by an explicit port is named at first request, once', async () => {
             const q = uname('hp'); const c = uname('hpc')
-            wildflower.config({ headers: { 'https://api.example.com:443': { Authorization: 'Token x' } } })
+            wildflower.config({ headers: { 'https://api.example.com:8443': { Authorization: 'Token x' } } })
             try {
                 stubFetch(() => jsonResponse([]))
                 wildflower.component(c, { state: {} })
@@ -1864,7 +1946,7 @@ suite('data-query: declarative transport form', () => {
 
                 const hits = warnsWith('WF-993')
                 expect(hits.length, 'the near-miss is named').toBe(1)
-                expect(hits[0], 'naming the declared key').toContain('https://api.example.com:443')
+                expect(hits[0], 'naming the declared key').toContain('https://api.example.com:8443')
                 expect(calls[0].headers.Authorization, 'and indeed nothing shipped').toBeUndefined()
 
                 wildflower.getQuery(q).refresh()

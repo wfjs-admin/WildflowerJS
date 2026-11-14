@@ -101,7 +101,7 @@ export const ComponentRegistryMethods = {
             definition.props = this._normalizePropsDefinition(definition.props);
         }
 
-        this._log('info', `Registering component: ${name}`);
+        if (__DEV__) this._log('info', `Registering component: ${name}`);
 
         // Check if this component is already registered
         if (this.componentDefinitions.has(name))

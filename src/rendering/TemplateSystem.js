@@ -7,7 +7,7 @@
 // Import CSP-safe evaluation functions
 import { getCSPSafeMergedContextEvaluator, getCSPSafeEvaluatorWithArgs } from '../core/CSPExpressionEvaluator.js';
 import { _EXPR_FOOTGUN_RE } from '../core/ExpressionEvaluator.js';
-import { WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { WF_ERRORS, wfError, isNegatedPath } from '../core/wfUtils.js';
 import { slotDataCache } from '../core/DomMetadata.js';
 import { getContextMethod } from '../state/ContextProxy.js';
 import { applyShow, applyText, applyModel } from '../core/BindingWriters.js';
@@ -143,6 +143,10 @@ export const TemplateLookupMethods = {
         // we just resolve each unique element once
         if (paths && paths.length > 0) {
             const allElementsArray = new Array(paths.length);
+            // A template with data-render elements: one of them may be out of
+            // the row, so its paths are walked by position (rowPathElement).
+            // (List rows only: a pool entity has no data-render.)
+            const byPosition = __FEATURE_LISTS__ && compiledMetadata.renders && compiledMetadata.renders.length > 0;
             // PERF OPTIMIZATION 2.1: Inline element path resolution to eliminate function call overhead
             // For 1000 items × 5 bindings = 5000 function calls saved
             for (let i = 0; i < paths.length; i++) {
@@ -150,6 +154,10 @@ export const TemplateLookupMethods = {
                 const plen = path ? path.length : 0;
                 if (plen === 0) {
                     allElementsArray[i] = itemEl;
+                    continue;
+                }
+                if (byPosition) {
+                    allElementsArray[i] = rowPathElement(itemEl, path);
                     continue;
                 }
                 // Resolve each child index by element node-pointers
@@ -174,6 +182,29 @@ export const TemplateLookupMethods = {
         return [];
     },
 };
+
+/**
+ * The element at a compiled child-index path below a row, or null. The
+ * indexes count the template's elements. A data-render element that is out
+ * of the row leaves a comment in its place, and the comment keeps the
+ * element's position, so the elements after it are found where the template
+ * put them. A path that ends on the comment, or runs through it, has no
+ * element. (Counting element children alone moved every later element up
+ * one: a binding after the missing element wrote into its neighbor.)
+ */
+export function rowPathElement(row, path) {
+    let current = row;
+    for (let p = 0; p < path.length; p++) {
+        let node = current.firstChild;
+        for (let k = path[p]; node; node = node.nextSibling) {
+            const type = node.nodeType;
+            if ((type === 1 || (type === 8 && node.data.startsWith(' data-render:'))) && k-- === 0) break;
+        }
+        if (!node || node.nodeType !== 1) return null;
+        current = node;
+    }
+    return current;
+}
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -1024,6 +1055,10 @@ export const TemplateSystemMethods = {
      * @private
      */
     _compileTemplate(template, listPath, options = {}) {
+        // Rows are compiled for lists and pools. A build with neither (nano)
+        // has no caller (each is gated or in a module it does not load), so
+        // the body folds out of it.
+        if (!__FEATURE_LISTS__ && !__FEATURE_POOLS__) return null;
         // Extract template content
         const templateContent = this._extractTemplateContent(template);
 
@@ -1089,8 +1124,9 @@ export const TemplateSystemMethods = {
                             const componentDef = this.componentDefinitions?.get(componentName);
                             if (componentDef) {
                                 const defState = componentDef.state || {};
-                                // If component's state definition has this property, exclude (component owns it)
-                                if (bindProp in defState) {
+                                const defComputed = componentDef.computed || {};
+                                // If the component's state or computed has this name, exclude (component owns it)
+                                if (bindProp in defState || bindProp in defComputed) {
                                     return false;
                                 }
                                 // Component doesn't have this property - include for list binding
@@ -1257,6 +1293,9 @@ export const TemplateSystemMethods = {
 
                 const isComputed = bindHtmlPath.startsWith('computed:');
                 const isExpression = this.isExpression(bindHtmlPath);
+                // A bare _index/_length/_first/_last, as data-bind marks it
+                // (without the flag the resolver read it off the item).
+                const isListContextVar = !!this._listContextVars && this._listContextVars.has(bindHtmlPath);
 
                 const htmlBinding = {
                     index: i,
@@ -1264,7 +1303,9 @@ export const TemplateSystemMethods = {
                     elementPath,
                     isComputed,
                     computedName: isComputed ? bindHtmlPath.slice(9) : null,
-                    isExpression
+                    isExpression,
+                    isListContextVar,
+                    listContextVarType: isListContextVar ? bindHtmlPath : null
                 };
 
                 // PERF: For expressions, pre-extract variables and pre-compile
@@ -1293,9 +1334,8 @@ export const TemplateSystemMethods = {
             let showPath = this._getAttr(el, 'show');
             if (showPath) {
                 // Negate-flag only for a single simple term ("!done"); a
-                // compound expression keeps its leading ! — stripping it would
-                // negate the whole expression (De Morgan flip).
-                const negate = showPath.startsWith('!') && /^[\w.$:]+$/.test(showPath.slice(1));
+                // compound expression keeps its leading !.
+                const negate = isNegatedPath(showPath);
                 let actualPath = negate ? showPath.slice(1) : showPath;
 
                 // Normalize $store.path shorthand to external() calls at compile time
@@ -1330,7 +1370,7 @@ export const TemplateSystemMethods = {
             // Enhanced to match show binding structure for _resolveCompiledBinding compatibility
             const renderPath = this._getAttr(el, 'render');
             if (renderPath) {
-                metadata.renders.push(this._compileRenderBinding(renderPath, i, elementPath));
+                metadata.renders.push(this._compileRenderBinding(renderPath, i, elementPath, true));
             }
 
             // Extract data-action metadata (support both prefixes)
@@ -1957,6 +1997,9 @@ export const TemplateSystemMethods = {
     },
     // _rowTemplateBulkServed (the list bulk path) lives in ListSharedMethods;
     // _buildElementsArrayFromMetadata (lists and pools) in TemplateLookupMethods.
+    // The three helpers below serve only _compileTemplate's row path and the
+    // list renderer, so a tier with neither lists nor pools (nano) leaves them out.
+    ...((__FEATURE_LISTS__ || __FEATURE_POOLS__) && {
     /**
      * Quote bare hyphenated object keys so attr expressions are valid JS:
      * { data-item-id: id } → { 'data-item-id': id }
@@ -2004,17 +2047,26 @@ export const TemplateSystemMethods = {
         }
         return evalFn;
     },
+    }),
     /**
      * Extract data-render binding metadata for one element: shared verbatim
      * by the list-template compiler and the component compiler. The negate
      * strip, computed: detection, and expression precompile must stay
      * identical in both so _resolveCompiledBinding treats either source the
-     * same way.
+     * same way. Only the list compiler passes storeShorthands.
      * @private
      */
-    _compileRenderBinding(renderPath, i, elementPath) {
-        const negate = renderPath.startsWith('!');
-        const actualRenderPath = negate ? renderPath.slice(1) : renderPath;
+    _compileRenderBinding(renderPath, i, elementPath, storeShorthands = false) {
+        const negate = isNegatedPath(renderPath);
+        let actualRenderPath = negate ? renderPath.slice(1) : renderPath;
+        // List templates: $store.path becomes external('store', 'path'), as
+        // for data-show there, since _resolveCompiledBinding does no
+        // normalization of its own. The component compiler leaves it as
+        // written: normalizing touches a query named by the path, which would
+        // wake a query inside a hidden section.
+        if (storeShorthands && actualRenderPath.includes('$') && this._normalizeStoreShorthands) {
+            actualRenderPath = this._normalizeStoreShorthands(actualRenderPath);
+        }
         const isRenderComputed = actualRenderPath.includes('computed:');
         const isRenderExpression = this.isExpression(actualRenderPath);
 
@@ -2036,6 +2088,7 @@ export const TemplateSystemMethods = {
 
         return renderBinding;
     },
+    ...((__FEATURE_LISTS__ || __FEATURE_POOLS__) && {
     /**
      * Create a property accessor function for a dot-notation path
      * Compiles "user.profile.name" into a fast accessor function
@@ -2057,6 +2110,7 @@ export const TemplateSystemMethods = {
             return value;
         };
     },
+    }),
 
     // ═══════════════════════════════════════════════════════════════════════════
     // JIT COMPONENT COMPILATION (Flyweight Pattern for TBT Optimization)
@@ -2157,7 +2211,7 @@ export const TemplateSystemMethods = {
         }
 
         // Also find data-pool elements (entity pools for high-performance rendering)
-        const poolElements = element.querySelectorAll(this._attrSelector('pool'));
+        const poolElements = __FEATURE_POOLS__ ? element.querySelectorAll(this._attrSelector('pool')) : [];
         for (const poolEl of poolElements) {
             let parent = poolEl.parentElement;
             let insideNestedComponent = false;
@@ -2365,7 +2419,7 @@ export const TemplateSystemMethods = {
             // The compiled snapshot registers pool containers by this path,
             // so two instances that differ only in the pool they name must
             // not share a snapshot (the second would bind the first's pool).
-            const poolVal = this._getAttr(el, 'pool');
+            const poolVal = __FEATURE_POOLS__ && this._getAttr(el, 'pool');
             if (poolVal) sig += ':p=' + poolVal;
 
             parts.push(sig);

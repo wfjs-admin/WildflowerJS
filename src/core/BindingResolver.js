@@ -63,7 +63,7 @@ export const BindingResolverMethods = {
         }
 
         // 6. List context variables
-        if (this._listContextVars && this._listContextVars.has(path)) {
+        if (__FEATURE_LISTS__ && this._listContextVars && this._listContextVars.has(path)) {
             return { type: 'listContextVar', varType: path, negate };
         }
 
@@ -148,7 +148,8 @@ export const BindingResolverMethods = {
      */
     _resolveBinding(desc, scope, item) {
         const { componentInstance } = scope;
-        const hasItem = item !== undefined;
+        // Only list code passes an item (_lookupFromItem, _resolveRawBinding).
+        const hasItem = __FEATURE_LISTS__ && item !== undefined;
 
         switch (desc.type) {
             case 'empty': return undefined;
@@ -246,7 +247,7 @@ export const BindingResolverMethods = {
         const { componentInstance, componentState, itemIndex, listLength, listContext } = scope;
         let mergedState;
 
-        if (hasItem) {
+        if (__FEATURE_LISTS__ && hasItem) {
             mergedState = { ...(componentState || {}) };
 
             if (item && typeof item === 'object') {
@@ -287,7 +288,7 @@ export const BindingResolverMethods = {
             }
         }
 
-        const options = { cacheKey: hasItem ? 'listBindingResolved' : 'componentBinding' };
+        const options = { cacheKey: __FEATURE_LISTS__ && hasItem ? 'listBindingResolved' : 'componentBinding' };
         if (desc.path.includes('external(') && componentInstance) {
             options.additionalContext = { external: this._getExternalFn(componentInstance) };
         }
@@ -305,7 +306,8 @@ export const BindingResolverMethods = {
      * @returns {*} Resolved value
      */
     _resolveRawBinding(rawPath, item, scope) {
-        if (!rawPath || !item) return undefined;
+        // Callers are list, portal and SSR code, all in tiers with lists.
+        if (!__FEATURE_LISTS__ || !rawPath || !item) return undefined;
         const desc = this._classifyBinding(rawPath);
         return this._lookupFromItem(desc, item, scope);
     },

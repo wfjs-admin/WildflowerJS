@@ -219,11 +219,21 @@ describeIfSSR('SSR nested lists (scan path)', () => {
 
     it('1.4 an immutable replacement of one of four groups, then an edit inside it', async () => {
         const { host, initial, ctx } = await mountGroups(G4)
-        await step(() => { ctx.groups[0] = { name: 'R0', cells: [{ label: 'r1' }, { label: 'r2' }] } })
-        expect(groupsView(host)).toEqual(['R0:r1|r2', 'G1:3|4', 'G2:5|6', 'G3:7|8'])
-        await step(() => { ctx.groups[0].cells[1].label = 'r2x' })
-        expect(groupsView(host)).toEqual(['R0:r1|r2x', 'G1:3|4', 'G2:5|6', 'G3:7|8'])
-        expect(idsOf(host, initial)).toEqual({ rows: [0, 1, 2, 3], cells: [[0, 1], [2, 3], [4, 5], [6, 7]] })
+        // The row this replaces is updated by the slower path. A development
+        // build says so once, for the developer; a production build does not.
+        const notes = []
+        const warn = console.warn
+        console.warn = (...args) => { if (String(args[0]).includes('missing compiled metadata')) notes.push(args[0]); else warn.apply(console, args) }
+        try {
+            await step(() => { ctx.groups[0] = { name: 'R0', cells: [{ label: 'r1' }, { label: 'r2' }] } })
+            expect(groupsView(host)).toEqual(['R0:r1|r2', 'G1:3|4', 'G2:5|6', 'G3:7|8'])
+            await step(() => { ctx.groups[0].cells[1].label = 'r2x' })
+            expect(groupsView(host)).toEqual(['R0:r1|r2x', 'G1:3|4', 'G2:5|6', 'G3:7|8'])
+            expect(idsOf(host, initial)).toEqual({ rows: [0, 1, 2, 3], cells: [[0, 1], [2, 3], [4, 5], [6, 7]] })
+        } finally {
+            console.warn = warn
+        }
+        expect(notes.length > 0, 'the slow-path note').toBe(!isMinifiedBuild())
     })
 
     it('1.5 a child component in a server row whose list has the row list\'s name keeps its own data', async () => {

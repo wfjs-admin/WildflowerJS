@@ -550,6 +550,10 @@ suite('query cache persistence (persist:)', () => {
         const qa = track(uname('a')); const qb = track(uname('b'))
         const custom = 'test-clear-' + qb
         cleanupKeys.push(custom)
+        // A clear with no names removes every snapshot in storage, whichever
+        // page (here: whichever earlier test) saved it, so the count below
+        // starts from a storage that holds none.
+        wildflower.clearPersisted()
         window.fetch = async () => jsonResponse([{ id: 1 }])
         wildflower.query(qa, { from: '/api/a', key: 'id', persist: true })
         wildflower.query(qb, { from: '/api/b', key: 'id', persist: custom })

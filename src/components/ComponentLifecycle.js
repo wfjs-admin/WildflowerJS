@@ -218,12 +218,6 @@ export const ComponentLifecycleMethods = {
         // Track that this component is initializing (for deferred updates)
         this._initializingComponentIds.add(instanceId);
 
-        // Add modal close method if applicable
-        // Only if modal system is included (not in lite build)
-        if (this._addModalCloseMethod) {
-            this._addModalCloseMethod(element, context, instanceId);
-        }
-
         // Inject store references early so they're available in computed properties and beforeInit
         this._injectStoreReferences(instance);
 
@@ -265,7 +259,7 @@ export const ComponentLifecycleMethods = {
         this._processComponentBindings(instance);
         this._bindComponentActions(instance);
         // Set up entity pools (data-pool): handles declarative pools block + population
-        if (this._setupPools) {
+        if (__FEATURE_POOLS__ && this._setupPools) {
             this._setupPools(instance);
         }
 
@@ -294,7 +288,7 @@ export const ComponentLifecycleMethods = {
 
         // Process portals (teleport content to target locations)
         // Only if portal system is included (not in lite build)
-        if (this._processPortals) {
+        if (__FEATURE_PORTALS__ && this._processPortals) {
             this._processPortals(instance);
         }
 
@@ -579,6 +573,8 @@ export const ComponentLifecycleMethods = {
      * @private
      */
     _findListItemForComponent(element) {
+        // Only the list renderer sets _itemData.
+        if (!__FEATURE_LISTS__) return null;
         // First check if the element itself has _itemData (component IS the list item root)
         if (element._itemData !== undefined) {
             return element._itemData;
@@ -622,7 +618,7 @@ export const ComponentLifecycleMethods = {
 
         // Get list item data if this component is rendered inside a list
         // This enables the `this.listItem` API - available in beforeInit() and all lifecycle methods
-        const listItem = this._findListItemForComponent(element);
+        const listItem = __FEATURE_LISTS__ ? this._findListItemForComponent(element) : null;
 
         return {
             id: instanceId,
@@ -640,7 +636,12 @@ export const ComponentLifecycleMethods = {
             _hasRendered: false,
             _itemTemplates: new Map(),  // Configurable Component Templates - stores parent-defined templates
             _inferredTypes: inferredTypes,  // Types inferred from initial state values
-            _types: types                   // Combined types (explicit overrides inferred)
+            _types: types,                  // Combined types (explicit overrides inferred)
+            // The list renderer's per-instance verdict (ListRenderer._retireSafe),
+            // written when a list first renders rows. Declared here so that write
+            // does not add a property: a new property changes the instance's
+            // shape, and the engine discards code it optimized against the old one.
+            _wfRetireSafe: undefined
         };
     },
     /**
@@ -724,7 +725,7 @@ export const ComponentLifecycleMethods = {
     _registerTickHook(instance) {
         if (instance._tickFn) return;
         if (typeof instance.definition.tick !== 'function') return;
-        if (this._startPoolLoop) {
+        if (__FEATURE_POOLS__ && this._startPoolLoop) {
             instance._tickFn = instance.definition.tick.bind(instance.context);
             if (!this._tickableInstances) this._tickableInstances = [];
             this._tickableInstances.push(instance);
@@ -928,7 +929,7 @@ export const ComponentLifecycleMethods = {
         this._registerTickHook(instance);
 
         // Process portals created dynamically in init()
-        if (this._processPortals) {
+        if (__FEATURE_PORTALS__ && this._processPortals) {
             this._processPortals(instance);
         }
 
@@ -1257,7 +1258,7 @@ export const ComponentLifecycleMethods = {
                 // Try to resolve as a plugin if not found yet (only when plugin feature is enabled)
                 if (__FEATURE_PLUGINS__) {
                     if (!targetEntity) {
-                        const pluginHit = framework._externalPluginGet(entityNameOrId, path, arguments.length, this.id);
+                        const pluginHit = framework._externalPluginGet(entityNameOrId, path, arguments.length, entityId);
                         if (pluginHit) return pluginHit.value;
                     }
                 }
@@ -1266,23 +1267,23 @@ export const ComponentLifecycleMethods = {
                     // PENDING STORE DEPENDENCY: if we're in a computed evaluation
                     // and the store doesn't exist yet, register so the computed
                     // re-evaluates when the store is created.
-                    framework._externalRegisterPending(entityNameOrId, this.id, this.stateManager);
+                    framework._externalRegisterPending(entityNameOrId, entityId, this.stateManager);
 
-                    framework._log('debug', `Entity not found: ${entityNameOrId}, returning fallback value`);
+                    if (__DEV__) framework._log('debug', `Entity not found: ${entityNameOrId}, returning fallback value`);
                     // For 1-arg calls, return null; for 2-arg calls check if it's a computed path
                     return (path && path.startsWith('computed:')) ? 0 : null;
                 }
 
                 // Register entity dependency for stores (virtual components)
                 if (targetEntity.isVirtual) {
-                    framework._registerEntityDependent(targetEntity.id, this.id);
+                    framework._registerEntityDependent(targetEntity.id, entityId);
                 }
 
                 // Register external dependency for list item reactivity.
                 // NOTE: registered for EVERY arity here; the component-context
                 // override registers only on the 2-arg GET. Preserved as-is.
                 if (framework._registerExternalDependency) {
-                    framework._registerExternalDependency(this.id, targetEntity.id, path);
+                    framework._registerExternalDependency(entityId, targetEntity.id, path);
                 }
 
                 // GET ENTITY case - return the entity's context when only name is provided
@@ -1301,7 +1302,7 @@ export const ComponentLifecycleMethods = {
                         // (Ongoing external reactivity is graph-edge driven; the
                         // dependents graph is gone.)
                         if (framework._contextSystemInitialized) {
-                            framework._addDeferredDependency(this.id, targetEntity.id, path, 'external');
+                            framework._addDeferredDependency(entityId, targetEntity.id, path, 'external');
                         }
 
                         return resolvedValue;
@@ -1361,7 +1362,7 @@ export const ComponentLifecycleMethods = {
             // this.stores are the declared-collection containers).
             // Uses instanceId + framework lookup since `instance` doesn't exist yet at context creation time
             getPool: (name, options) => {
-                if (!self._getPool) return null;
+                if (!__FEATURE_POOLS__ || !self._getPool) return null;
                 const inst = self.componentInstances.get(instanceId);
                 if (!inst) return null;
                 const handle = self._getPool(inst, name);
@@ -1400,7 +1401,7 @@ export const ComponentLifecycleMethods = {
                 // Try to resolve as a plugin if not found yet (only when plugin feature is enabled)
                 if (__FEATURE_PLUGINS__) {
                     if (!targetComponent) {
-                        const pluginHit = self._externalPluginGet(componentNameOrId, path, arguments.length, this.id);
+                        const pluginHit = self._externalPluginGet(componentNameOrId, path, arguments.length, instanceId);
                         if (pluginHit) return pluginHit.value;
                     }
                 }
@@ -1412,14 +1413,14 @@ export const ComponentLifecycleMethods = {
                     // re-evaluates when the store is created.
                     self._externalRegisterPending(componentNameOrId, instanceId, stateManager);
 
-                    self._log('debug', `Component not found: ${componentNameOrId}, returning fallback value`);
+                    if (__DEV__) self._log('debug', `Component not found: ${componentNameOrId}, returning fallback value`);
                     // For 1-arg calls, return null; for 2-arg calls check if it's a computed path
                     return (path && path.startsWith('computed:')) ? 0 : null;
                 }
 
                 // Register entity dependency for stores (virtual components)
                 if (targetComponent.isVirtual) {
-                    self._registerEntityDependent(targetComponent.id, this.id);
+                    self._registerEntityDependent(targetComponent.id, instanceId);
                 }
 
                 // GET ENTITY case - return the entity's context when only name is provided
@@ -1440,13 +1441,13 @@ export const ComponentLifecycleMethods = {
                         // base-entity external() registers for every arity.
                         // Preserved as-is.
                         if (self._registerExternalDependency) {
-                            self._registerExternalDependency(this.id, targetComponent.id, path);
+                            self._registerExternalDependency(instanceId, targetComponent.id, path);
                         }
 
                         // Late-binding re-eval: defer so the component re-evaluates
                         // once the external target appears (the dependents graph was
                         // removed; ongoing reactivity is graph-edge driven).
-                        self._addDeferredDependency(this.id, targetComponent.id, path, 'external');
+                        self._addDeferredDependency(instanceId, targetComponent.id, path, 'external');
 
                         return resolved;
 
@@ -1493,7 +1494,7 @@ export const ComponentLifecycleMethods = {
                     if (!appStore) {
                         if (wf._initPhase !== 'ready') {
                             // Still try to defer dependency even if store not found
-                            wf._addDeferredDependency(this.id, 'app-store', storeNameOrPath, 'store-L4046');
+                            wf._addDeferredDependency(instanceId, 'app-store', storeNameOrPath, 'store-L4046');
                             return wf._getStoreFallbackValue(storeNameOrPath.split('.').pop());
                         }
                         wf._log('error', "Default app-store not found");
@@ -1511,12 +1512,12 @@ export const ComponentLifecycleMethods = {
                                 return this.external(appStore.id, storeNameOrPath);
                             } catch (e) {
                                 // If external() fails, manually defer the dependency
-                                wf._addDeferredDependency(this.id, appStore.id, storeNameOrPath, 'store-L4082');
+                                wf._addDeferredDependency(instanceId, appStore.id, storeNameOrPath, 'store-L4082');
                             }
 
                             return wf._getStoreFallbackValue(storeNameOrPath.split('.').pop());
                         } else {
-                            return this.external(appStore.context?.id || appStore.id, storeNameOrPath);
+                            return this.external(appStore.id, storeNameOrPath);
                         }
 
                     }
@@ -1563,7 +1564,7 @@ export const ComponentLifecycleMethods = {
                     if (!storeComponent) {
                         if (wf._initPhase !== 'ready') {
                             // Defer dependency registration
-                            wf._addDeferredDependency(this.id, `store-${storeNameOrPath}`, pathOrValue, 'store');
+                            wf._addDeferredDependency(instanceId, `store-${storeNameOrPath}`, pathOrValue, 'store');
 
                             // Return appropriate fallback
                             if (typeof pathOrValue === 'string' && !pathOrValue.includes('.')) {
@@ -1605,7 +1606,7 @@ export const ComponentLifecycleMethods = {
                             return this.external(storeComponent.id, pathOrValue);
                         } catch (e) {
                             // Defer dependency registration
-                            wf._addDeferredDependency(this.id, storeComponent.id, pathOrValue, 'store');
+                            wf._addDeferredDependency(instanceId, storeComponent.id, pathOrValue, 'store');
                         }
 
                         // Return fallback values
@@ -1691,13 +1692,12 @@ export const ComponentLifecycleMethods = {
             emit: function (eventName, detail = {})
             {
 
-                const componentInstance = self.componentInstances.get(this.id);
+                const componentInstance = self.componentInstances.get(instanceId);
 
                 if (!componentInstance)
                 {
                     self._error(WF_ERRORS.EMIT_NO_INSTANCE, {
-                        context: this.id,
-                        suggestion: 'Ensure the component is initialized before calling emit()'
+                        ...(__DEV__ && { context: instanceId, suggestion: 'Ensure the component is initialized before calling emit()' })
                     });
                     return false;
                 }
@@ -1777,7 +1777,7 @@ export const ComponentLifecycleMethods = {
                 // (_poolItem), whichever encloses the event target.
                 let current = event.target;
                 while (current && current !== document.body) {
-                    if (current._listIndex !== undefined) {
+                    if (__FEATURE_LISTS__ && current._listIndex !== undefined) {
                         return {
                             element: current,
                             index: current._listIndex,
@@ -1787,7 +1787,7 @@ export const ComponentLifecycleMethods = {
                     }
                     // Pool entities carry no stable index — storage reshuffles on
                     // removal — so the descriptor deliberately omits one.
-                    if (current._poolItem !== undefined) {
+                    if (__FEATURE_POOLS__ && current._poolItem !== undefined) {
                         return {
                             element: current,
                             index: undefined,
@@ -2030,6 +2030,7 @@ export const ComponentLifecycleMethods = {
      * the per-frame tick path reads plain properties with zero getter overhead.
      */
     _injectPoolReferences(instance) {
+        if (!__FEATURE_POOLS__) return;
         const { definition, context } = instance;
         if (!definition.pools) return;
         // IMPORTANT: context.pools aliases definition.pools (the user's pool
@@ -2109,16 +2110,14 @@ export const ComponentLifecycleMethods = {
             // lazy lifecycle check prunes it naturally.
             if (__FEATURE_QUERY__ && this._queryControllers && this._queryControllers.has(storeName)) {
                 const qc = this._queryControllers.get(storeName);
-                if (instance.element) qc.elements.add(instance.element);
+                if (instance.element) this._queryObserve(qc, instance.element);
                 this._queryActivate(qc);
             }
             if (!(subTarget && subTarget.id && this._registerEntityDependent) && instance.id) {
                 // Store not created yet: ensure a pending entry exists even for
                 // the wait-only form (the paths loop below never runs for it, so
                 // the existing on-failure registration can't fire).
-                this.storeManager.registerPendingStoreDependency(
-                    storeName, instance.id, '_subscribe_', null
-                );
+                this.storeManager.registerPendingStoreDependency(storeName, instance.id, '_subscribe_');
             }
             // Ensure paths is an array
             const pathsArray = Array.isArray(paths) ? paths : [paths];
@@ -2137,9 +2136,7 @@ export const ComponentLifecycleMethods = {
                         // so the component re-renders when the store is created.
                         // Uses '_subscribe_' as a synthetic computed name to trigger
                         // general re-render + subscribePath retry.
-                        this.storeManager.registerPendingStoreDependency(
-                            storeName, instance.id, '_subscribe_', null
-                        );
+                        this.storeManager.registerPendingStoreDependency(storeName, instance.id, '_subscribe_');
                         break; // All paths for this store will be set up on resolution
                     }
                 }
@@ -2456,12 +2453,6 @@ export const ComponentLifecycleMethods = {
             return false;
         }
 
-        // Skip if this is an array operation with directly nested changes
-        const path = instance._lastChangeInfo?.path;
-        if (this._currentArrayOperation && this._currentArrayOperation.path === path) {
-            return false;
-        }
-
         if (this._batchMode) {
             return false; // Exit early, rendering will occur when batch completes
         }
@@ -2474,7 +2465,7 @@ export const ComponentLifecycleMethods = {
         // descendant querySelectorAll for every component on every entity
         // state change, dominating the main thread on portal-free apps
         // (PM demo: 38% of total scripting time before this gate).
-        if (this._updatePortalVisibility && instance._hasPortals) {
+        if (__FEATURE_PORTALS__ && this._updatePortalVisibility && instance._hasPortals) {
             this._updatePortalVisibility(instance);
         }
 
@@ -2593,7 +2584,7 @@ export const ComponentLifecycleMethods = {
                     try {
                         const oldValue = component.stateManager._cachedComputedValue
                             ? component.stateManager._cachedComputedValue(propName)
-                            : component.stateManager._lastEvalResult?.get(propName);
+                            : undefined;
                         const newValue = component.stateManager.evaluateComputed(propName);
 
                         // Trigger state change notification if value changed
@@ -2677,7 +2668,7 @@ export const ComponentLifecycleMethods = {
 
         // Clean up portaled content before removing context
         // Only if portal system is included (not in lite build)
-        if (this._cleanupComponentPortals) {
+        if (__FEATURE_PORTALS__ && this._cleanupComponentPortals) {
             this._cleanupComponentPortals(componentId);
         }
 
@@ -2693,7 +2684,7 @@ export const ComponentLifecycleMethods = {
         });
 
         // Clean up entity pools (data-pool)
-        if (this._cleanupPools) {
+        if (__FEATURE_POOLS__ && this._cleanupPools) {
             this._cleanupPools(instance);
         }
 
@@ -2784,10 +2775,12 @@ export const ComponentLifecycleMethods = {
         // component around it (the parent reads bindings written on a child's
         // root) out of that component. A root still in the page keeps them:
         // a data-render section removing it brings it back, and a destroyed
-        // element still in the document is re-initialized by the next scan.
+        // element still in the document is re-initialized by the next scan,
+        // and its entries go when the component around it finds it gone.
         const root = instance.element;
-        if (instance.parent && root && !root.isConnected && this._carriesRootBindings(root)) {
-            this._releaseChildRoot(instance.parent, root);
+        if (instance.parent && root && this._carriesRootBindings(root)) {
+            if (!root.isConnected) this._releaseChildRoot(instance.parent, root);
+            else this._markDestroyedRoot(instance.parent, root);
         }
 
         // Remove from component hierarchy

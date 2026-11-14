@@ -7,6 +7,7 @@
 import { RAW_TARGET } from '../state/ContextProxy.js';
 import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING, setOwn } from '../core/wfUtils.js';
 import { beginBatchScope, endBatchScope, discardScheduled, toRaw as graphToRaw } from '../state/reactive-graph/core.js';
+import { entityMissed } from '../state/StoreManager.js';
 
 /**
  * Path listeners strictly below a path whose value was replaced, each with
@@ -162,6 +163,9 @@ export const EntitySystemMethods = {
         }
 
         if (!targetComponent) {
+            // A list row's dependency walk comes through here: the list's
+            // effect then follows the entity's arrival.
+            entityMissed(componentNameOrId);
             return path.startsWith('computed:') ? 0 : null;
         }
 
@@ -247,8 +251,7 @@ export const EntitySystemMethods = {
         this.storeManager.registerPendingStoreDependency(
             entityNameOrId,
             componentId,
-            (trackingContext && trackingContext.computedName) || PENDING_BINDING,
-            null // listElement will be associated during list binding
+            (trackingContext && trackingContext.computedName) || PENDING_BINDING
         );
     },
     /**
@@ -572,6 +575,25 @@ export const EntitySystemMethods = {
             childInstance.stateManager._runEffect(childEffect);
         }
 
+        // A list over a prop reads the plain props object, which no effect
+        // tracks: an array replaced by the parent (a new page's props) has no
+        // other way to reach it. Re-run the child's own props.* lists; each
+        // re-diffs against its rows, so one whose array is unchanged moves
+        // nothing.
+        if (__FEATURE_LISTS__ && this._processList && childInstance.element) {
+            const listEls = childInstance.element.querySelectorAll(this._attrSelector('list'));
+            for (let i = 0; i < listEls.length; i++) {
+                const listEl = listEls[i];
+                const listPath = this._getAttr(listEl, 'list');
+                if (!listPath || !listPath.startsWith('props.')) continue;
+                if (listEl.closest(this._attrSelector('component')) !== childInstance.element) continue;
+                // A mounted list re-reads its source through its own node;
+                // one not yet mounted takes the ordinary list path.
+                if (listEl._mapArrayInitialized && listEl._refreshMapArray) listEl._refreshMapArray();
+                else this._processList({ element: listEl, path: listPath, componentId: childInstance.id }, childInstance, true);
+            }
+        }
+
         // Trigger child's onPropsChange lifecycle hook if defined
         if (this._triggerHook) this._triggerHook('component:onPropsChange', childInstance, propsChangeInfo);
         if (childInstance.definition && typeof childInstance.definition.onPropsChange === 'function') {
@@ -652,8 +674,12 @@ export const EntitySystemMethods = {
 
             this._componentsToUpdate.add(componentId);
 
-            // Update props first if this component receives props from the changed parent
-            this._updateComponentProps(dependentInstance);
+            // Update props first if this component receives props from the
+            // changed entity ($store.path props). A component takes the full
+            // follow-up, as a child does on a parent change: a new value
+            // repaints its bindings, computeds and props lists.
+            if (dependentInstance.isVirtual) this._updateComponentProps(dependentInstance);
+            else this._refreshChildProps(dependentInstance, { parentPath: path, newValue, oldValue, viaEntity: entityId });
 
             // A store change can move this dependent's COMPUTEDS, and its
             // children may receive those computeds as props (the passthrough
@@ -695,7 +721,7 @@ export const EntitySystemMethods = {
             // store change and a modal won't hide when its condition flips to
             // false (it had no own-state write to trigger a render). Gated on
             // _hasPortals so portal-free components pay nothing.
-            if (pathRelevant && this._updatePortalVisibility
+            if (__FEATURE_PORTALS__ && pathRelevant && this._updatePortalVisibility
                 && dependentInstance._hasPortals && dependentInstance.element) {
                 this._updatePortalVisibility(dependentInstance);
             }
@@ -783,8 +809,9 @@ export const EntitySystemMethods = {
                 // Force re-render of the component's lists that use external()
                 const dependentInstance = this.componentInstances.get(componentId);
                 if (dependentInstance && dependentInstance.element) {
-                    // Effect-backed components: effects re-run automatically when external() deps change
-                    if (!dependentInstance._renderEffect) {
+                    // Effect-backed components: effects re-run automatically when external() deps change.
+                    // Without lists the walk below finds nothing to refresh.
+                    if (__FEATURE_LISTS__ && !dependentInstance._renderEffect) {
                         // Find all list contexts in this component
                         const listElements = dependentInstance.element.querySelectorAll(this._attrSelector('list'));
                         listElements.forEach(listEl => {
@@ -830,33 +857,11 @@ export const EntitySystemMethods = {
                         if (__FEATURE_LISTS__) {
                             this._refreshStandaloneExternalBindings(dependentInstance);
                         }
-                    } else if (__FEATURE_LISTS__ && this._processList &&
-                               this._queryControllers && this._queryControllers.size > 0) {
+                    } else if (__FEATURE_SSR__) {
                         // Effect-backed component: effects cover mapArray-managed
-                        // lists, but a $-path list WITHOUT a mapArray effect
-                        // (an SSR-adopted list awaiting its first framework
-                        // render) has no other update channel. Process just
-                        // those; the fingerprint check inside the list path
-                        // keeps unchanged data render-free. Guarded on any
-                        // queries existing: the subtree scan is on the store-
-                        // change hot path, and adopted-list updates only arise
-                        // from the query feature.
-                        const listElements = dependentInstance.element.querySelectorAll(this._attrSelector('list'));
-                        listElements.forEach(listEl => {
-                            if (listEl._mapArrayInitialized) return;
-                            const listPath = this._getAttr(listEl, 'list');
-                            const usesExternalStore = listPath && (
-                                listPath.includes('external(') ||
-                                listPath.includes('$')
-                            );
-                            if (usesExternalStore) {
-                                this._processList(
-                                    { element: listEl, path: listPath, componentId: dependentInstance.id },
-                                    dependentInstance,
-                                    true
-                                );
-                            }
-                        });
+                        // lists; a server list over this source that mapArray
+                        // does not own yet has no other update channel.
+                        this._ssrFollowShared(dependentInstance);
                     }
                 }
             });
@@ -945,57 +950,9 @@ export const EntitySystemMethods = {
             this._batchChangedComponents.add(instanceId);
         }
 
-        // Update binding contexts through context system
-        if (this._contextSystemInitialized && this._contextRecords) {
-            // PERFORMANCE OPTIMIZATION: Skip O(n) binding iteration for array operations
-            // where ListRenderer handles updates through optimized paths.
-            //
-            // Case 1: Array REPLACEMENT (newValue !== oldValue) - clear, replace, full reassignment
-            // Case 2: Array LENGTH CHANGE notification (path ends with .length)
-            // Case 3: Array with recorded operation hint (splice/append/swap detected by state manager)
-            //
-            // We still need binding updates for:
-            // - In-place property mutations (forEach changing item.label) - same ref, same length
-            // - Non-array state changes
-
-            // Check for .length path - indicates array structural change
-            if (path.endsWith('.length')) {
-                const arrayPath = path.slice(0, -7); // Remove '.length'
-                if (this._isListManagedPath(arrayPath, instance)) {
-                    return;
-                }
-            }
-
-            // Check for array with operation hint or replacement
-            if (Array.isArray(newValue) && this._isListManagedPath(path, instance)) {
-                // Replacement: different array reference
-                if (newValue !== oldValue) {
-                    return;
-                }
-                // Check for recorded array operation (splice, append, swap, sparse-update)
-                // These are handled by ListRenderer through optimized paths
-                const stateManager = instance.stateManager;
-                if (stateManager?._arrayOperations?.has(path)) {
-                    const op = stateManager._arrayOperations.get(path);
-                    // Skip for all list operations - ListRenderer handles binding updates
-                    // via _renderListSparseUpdate (for sparse-update) or full re-render
-                    if (op && (op.type === 'splice' || op.type === 'append' || op.type === 'swap' || op.type === 'sparse-update')) {
-                        // Don't consume the hint here - let ListRenderer consume it
-                        // so it can use the metadata for optimized rendering
-                        return;
-                    }
-                }
-                // Check for splice-in-progress or collision lockout
-                if (stateManager?._arrayIndexMutations?.isSpliceInProgress ||
-                    stateManager?._collisionLockout?.has(path)) {
-                    return;
-                }
-            }
-
-            // Per-item effects handle all list-item binding updates
-            // via _bindWithCompiledMetadata in effect re-runs. No EntitySystem
-            // intervention needed for list-item bindings.
-        }
+        // Binding contexts need no update here: the render effect and the
+        // per-item effects handle every binding. (The array-operation checks
+        // that stood here only decided between returning and reaching the end.)
     },
     /**
      * Bind methods from a definition to a context object.
@@ -1193,31 +1150,12 @@ export const EntitySystemMethods = {
      * @private
      */
     /**
-     * Notify path subscribers now, or queue the notification while a computed
-     * is evaluating (flushed by _flushDeferredStoreNotifications).
+     * Notify path subscribers.
      * @private
      */
     _dispatchPathSubscribers(storeName, path, newValue, oldValue, subscribers) {
         if (!subscribers || subscribers.size === 0) return;
-        if (this._isEvaluatingComputed) {
-            this._deferredStoreNotifications = this._deferredStoreNotifications || [];
-
-            // Limit queue size to prevent memory issues
-            if (this._deferredStoreNotifications.length > 1000) {
-                if (__DEV__) console.warn('[WF] Deferred store notifications exceeded limit, forcing flush');
-                this._flushDeferredStoreNotifications();
-            }
-
-            this._deferredStoreNotifications.push({
-                storeName,
-                path,
-                newValue,
-                oldValue,
-                subscribers: new Set(subscribers)
-            });
-        } else {
-            this._notifyPathSubscribers(storeName, path, newValue, oldValue, subscribers);
-        }
+        this._notifyPathSubscribers(storeName, path, newValue, oldValue, subscribers);
     },
 
     _notifyPathSubscribers(storeName, path, newValue, oldValue, subscribers) {
@@ -1265,26 +1203,6 @@ export const EntitySystemMethods = {
         }
     },
     /**
-     * Flush deferred store notifications that accumulated during computed evaluation.
-     * Called when computed evaluation completes.
-     *
-     * @private
-     */
-    _flushDeferredStoreNotifications() {
-        if (!this._deferredStoreNotifications || this._deferredStoreNotifications.length === 0) {
-            return;
-        }
-
-        // Take the queue and clear it to prevent re-entrancy issues
-        const queue = this._deferredStoreNotifications;
-        this._deferredStoreNotifications = [];
-
-        // Process each deferred notification
-        queue.forEach(({ storeName, path, newValue, oldValue, subscribers }) => {
-            this._notifyPathSubscribers(storeName, path, newValue, oldValue, subscribers);
-        });
-    },
-    /**
      * Check if a path is managed by a list context (and thus should skip context iteration)
      * List-managed paths are updated by ListRenderer optimizations, not context iteration.
      * @param {string} path - The state path that changed
@@ -1293,8 +1211,9 @@ export const EntitySystemMethods = {
      * @private
      */
     _isListManagedPath(path, instance) {
-        // No list contexts = not list-managed
-        if (!instance._listContexts || instance._listContexts.size === 0) {
+        // No list contexts = not list-managed. Only the list renderer makes
+        // them (_createListContext), so a tier without lists has none.
+        if (!__FEATURE_LISTS__ || !instance._listContexts || instance._listContexts.size === 0) {
             return false;
         }
 
@@ -1351,7 +1270,7 @@ export const EntitySystemMethods = {
         // PERFORMANCE OPTIMIZATION: Skip context iteration for list-managed paths
         // ListRenderer handles these updates through optimized paths (swap, append, sparse-update)
         // This prevents O(n) context iteration for array operations that should be O(1)
-        if (this._isListManagedPath(path, instance)) {
+        if (__FEATURE_LISTS__ && this._isListManagedPath(path, instance)) {
             return;
         }
 
@@ -1367,7 +1286,7 @@ export const EntitySystemMethods = {
         if (this._customDirectives && this._customDirectives.size > 0 && instance.element) {
             this._updateCustomDirectivesInSubtree(instance.element, instance, path);
             // Content the component's portals moved is still its own.
-            const portals = this._activePortals && this._activePortals.get(instance.id);
+            const portals = __FEATURE_PORTALS__ && this._activePortals && this._activePortals.get(instance.id);
             if (portals) {
                 for (const record of portals) {
                     for (const el of record.content) {
@@ -1567,28 +1486,6 @@ export const EntitySystemMethods = {
         this._batchChangedComponents = this._batchChangedComponents || new Set();
         this._batchChangedPaths = this._batchChangedPaths || new Set();
 
-        // CRITICAL ORDERING: processBatchChanges() on each state manager clears
-        // _batchChanges at the end (ReactiveStateManager.js:2111). Snapshot
-        // those Maps BEFORE the clear runs so _applyBatchChangesFromProxy
-        // has data to walk.
-        const proxyBatchSnapshot = this._snapshotProxyBatchChanges();
-
-        this.componentInstances.forEach(instance => {
-            if (instance.stateManager && typeof instance.stateManager.processBatchChanges === 'function') {
-                instance.stateManager.processBatchChanges();
-            }
-        });
-
-        this._applyBatchChangesFromProxy(proxyBatchSnapshot);
-
-        if (this._pendingDependentUpdates && this._pendingDependentUpdates.size > 0)
-        {
-            this._pendingDependentUpdates.forEach(id =>
-            {
-                this._batchChangedComponents.add(id);
-            });
-        }
-
         this._applyBatchToLists();
 
         if (this._batchChangedComponents.size > 0)
@@ -1599,102 +1496,6 @@ export const EntitySystemMethods = {
         return this;
     },
 
-    /**
-     * Snapshot each state manager's _batchChanges Map keyed by entity id. The proxy
-     * set traps in ProxyHandlers.js populate these Maps for free during
-     * batch-mode writes; we capture them here BEFORE processBatchChanges
-     * clears them, so both the new code path and the dev-mode shadow
-     * comparison can read them.
-     *
-     * @returns {Map<string, Map<string, {newValue, oldValue}>>}
-     * @private
-     */
-    _snapshotProxyBatchChanges() {
-        const snapshot = new Map();
-        this.componentInstances.forEach((instance, id) => {
-            const sm = instance.stateManager;
-            if (sm && sm._batchChanges && sm._batchChanges.size > 0) {
-                // Shallow-copy the Map so the post-clear walk still has data.
-                snapshot.set(id, new Map(sm._batchChanges));
-            }
-        });
-        return snapshot;
-    },
-
-    /**
-     * Proxy-based change detection. For each entity that recorded any
-     * batch-mode mutations, mark the entity dirty and populate
-     * _batchChangedPaths with both the recorded paths and an array
-     * expansion (parent + per-index + nested-array paths for any
-     * top-level state key whose current value is an array). The
-     * expansion ensures downstream list rendering sees the same path
-     * set whether an array was wholesale-replaced, push'd, splice'd,
-     * or had an index assigned directly.
-     *
-     * Filters `.length` paths from the recorded set: those are
-     * proxy-internal markers used to identify array-mutation operations
-     * (push, splice). They feed into the top-level expansion below but
-     * don't belong as standalone changed paths in downstream consumers.
-     * @private
-     */
-    _applyBatchChangesFromProxy(snapshot) {
-        if (!snapshot || snapshot.size === 0) return;
-
-        snapshot.forEach((changes, id) => {
-            this._batchChangedComponents.add(id);
-
-            const instance = this.componentInstances.get(id);
-            const state = instance ? instance.state : null;
-
-            // Collect top-level state keys touched by any change, while
-            // copying recorded paths into _batchChangedPaths (skipping
-            // .length proxy markers).
-            const topLevelKeys = new Set();
-
-            changes.forEach((change, path) => {
-                // .length writes are batch-tracking signals only; they
-                // tell us "this array changed via push/splice/etc." but
-                // shouldn't appear in the public _batchChangedPaths set.
-                if (path.endsWith('.length')) {
-                    const arrayKey = path.slice(0, -'.length'.length);
-                    const dotIdx = arrayKey.indexOf('.');
-                    const topKey = dotIdx === -1 ? arrayKey : arrayKey.slice(0, dotIdx);
-                    if (topKey) topLevelKeys.add(topKey);
-                    return;
-                }
-
-                this._batchChangedPaths.add(path);
-                const dotIdx = path.indexOf('.');
-                const topKey = dotIdx === -1 ? path : path.slice(0, dotIdx);
-                topLevelKeys.add(topKey);
-            });
-
-            // For each top-level key currently holding an array in state,
-            // add the parent path plus per-index paths and any nested-
-            // array sub-paths. Downstream list rendering relies on this
-            // expanded path set whether the array was wholesale-replaced,
-            // push'd, splice'd, or had an index assigned directly.
-            if (state && typeof state === 'object') {
-                topLevelKeys.forEach(topKey => {
-                    const arr = state[topKey];
-                    if (!Array.isArray(arr)) return;
-
-                    this._batchChangedPaths.add(topKey);
-                    for (let i = 0; i < arr.length; i++) {
-                        this._batchChangedPaths.add(`${topKey}.${i}`);
-                        const item = arr[i];
-                        if (item && typeof item === 'object') {
-                            for (const propName of Object.keys(item)) {
-                                if (Array.isArray(item[propName])) {
-                                    this._batchChangedPaths.add(`${topKey}.${i}.${propName}`);
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-    },
 
     _applyBatchToLists()
     {
@@ -1737,25 +1538,9 @@ export const EntitySystemMethods = {
         this._batchMode = false;
         this._suppressRender = false;
 
-        // Clear per-state manager _batchChanges Maps so cancelled mutations don't
-        // leak into the next batch's bookkeeping. The proxy populates
-        // these during batch mode; on a normal apply, processBatchChanges
-        // clears them, but on cancel we have to do it explicitly.
-        //
         // Note: cancelBatch does NOT roll back the writes themselves;
         // mutations made during the batch persist in instance.state.
-        // It only skips the post-batch render scheduling and clears
-        // change-tracking bookkeeping. A true rollback would iterate
-        // _batchChanges and write back .oldValue for each path, but
-        // that is a separate feature, not current behavior.
-        this.componentInstances.forEach(instance => {
-            if (instance.stateManager?._batchChanges) {
-                instance.stateManager._batchChanges.clear();
-            }
-            if (instance.stateManager?._batchArrayUpdates) {
-                instance.stateManager._batchArrayUpdates = [];
-            }
-        });
+        // It only skips the post-batch render scheduling.
 
         // The framework's _suppressRender flag doesn't reach ReactiveGraph's
         // scheduler, which already marked + queued this batch's render effects

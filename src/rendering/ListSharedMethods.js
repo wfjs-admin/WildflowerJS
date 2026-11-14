@@ -10,11 +10,15 @@
 
 import { ssrAdoptedElements } from '../core/DomMetadata.js';
 import { BULK_UNSERVED_ATTR } from '../core/wfUtils.js';
+import { ListContextMethods } from '../core/FrameworkInit.js';
 
 /**
  * Methods to be mixed into ListRendererMethods (and ultimately WildflowerJS.prototype)
  */
 export const ListSharedMethods = {
+    // From FrameworkInit: _createListContext and _listContextMethods.
+    ...ListContextMethods,
+
     // From BindingResolver.
 
     /**

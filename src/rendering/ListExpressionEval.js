@@ -611,7 +611,6 @@ export const ListExpressionMethods = {
                 componentId: instance.id,
                 computedName: computedName,
                 stateManager: instance.stateManager,
-                listElement: null,
                 isItemLevelComputed: true,
                 itemIndex: itemIndex
             };
@@ -1357,8 +1356,12 @@ export const ListExpressionMethods = {
             result = '';
         }
 
-        // Use shared helper to convert string/array/object results to a class string.
-        this._toggleBoundClass(element, this._classResultToString(result));
+        // An object goes to the writer as it is: the writer owns the classes
+        // an object names (its first write clears a false key's class the
+        // markup carried), which a class string cannot tell it. A string or
+        // an array becomes a class string.
+        this._toggleBoundClass(element,
+            result && typeof result === 'object' && !Array.isArray(result) ? result : this._classResultToString(result));
     },
 
     /**

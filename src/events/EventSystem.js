@@ -5,7 +5,7 @@
  */
 
 import { actionBoundElements, keyModifiersCache, boundActionsCache, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
-import { pathResolver, WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { pathResolver, WF_ERRORS, wfError, isNegatedPath } from '../core/wfUtils.js';
 import { applyShow } from '../core/BindingWriters.js';
 import { getContextMethod } from '../state/ContextProxy.js';
 
@@ -1959,7 +1959,12 @@ export const ListEventDelegationMethods = {
                     renderCtx._ownerItemEl = itemElement;
                     if (!itemElement._renderContexts) itemElement._renderContexts = [];
                     // Find matching compiled binding for this render path
-                    const renderBinding = compiledMetadata?.renders?.find(r => r.path === condPath || r.path === condPath.replace(/^!/, ''));
+                    // Compiled paths carry $store.path as external() calls, and
+                    // the "!" as negate: x and !x in one row are two bindings.
+                    const negated = isNegatedPath(condPath);
+                    const bare = negated ? condPath.slice(1) : condPath;
+                    const compiledPath = bare.includes('$') && this._normalizeStoreShorthands ? this._normalizeStoreShorthands(bare) : bare;
+                    const renderBinding = compiledMetadata?.renders?.find(r => r.negate === negated && r.path === compiledPath);
                     // Fallback binding shape needs `elementPath` so root-level render
                     // detection in _mapFn (placeholder substitution) works even when
                     // compiled metadata didn't have a matching entry. The conditional
@@ -1968,8 +1973,8 @@ export const ListEventDelegationMethods = {
                     itemElement._renderContexts.push({
                         context: renderCtx,
                         binding: renderBinding || {
-                            path: condPath.replace(/^!/, ''),
-                            negate: condPath.startsWith('!'),
+                            path: bare,
+                            negate: negated,
                             elementPath: isRootConditional ? [] : undefined
                         }
                     });
@@ -2006,8 +2011,8 @@ export const ListEventDelegationMethods = {
         let negate = false;
         let actualPath = path;
 
-        // Handle negation
-        if (path.startsWith('!')) {
+        // Negation of one path; "!a && b" is an expression, evaluated whole.
+        if (isNegatedPath(path)) {
             negate = true;
             actualPath = path.slice(1);
         }
@@ -2030,6 +2035,13 @@ export const ListEventDelegationMethods = {
         if (!actualPath.includes('.') && instance?.stateManager?.computed?.[actualPath]) {
             const value = this._evaluateComputedInListContext(instance, actualPath, item, itemIndex, frame);
             return negate ? !value : !!value;
+        }
+
+        // $store.path becomes external('store', 'path') first, as the binding
+        // classifier does; unconverted, the evaluator threw on `$store` and the
+        // catch below read every store condition as false.
+        if (actualPath.includes('$') && this._normalizeStoreShorthands) {
+            actualPath = this._normalizeStoreShorthands(actualPath);
         }
 
         // Expression paths (e.g. "shouldRender && true") need full evaluation.
@@ -2685,13 +2697,13 @@ const _eventTail = {
         // Apply debounce if configured (debounce takes precedence over throttle)
         if (config.debounce && config.debounce > 0)
         {
-            this._log('debug', `Applying debounce of ${config.debounce}ms to handler`);
+            if (__DEV__) this._log('debug', `Applying debounce of ${config.debounce}ms to handler`);
             wrappedHandler = this._debounce(handler, config.debounce);
         }
         // Apply throttle if configured
         else if (config.throttle && config.throttle > 0)
         {
-            this._log('debug', `Applying throttle of ${config.throttle}ms to handler`);
+            if (__DEV__) this._log('debug', `Applying throttle of ${config.throttle}ms to handler`);
             wrappedHandler = this._throttle(handler, config.throttle);
         }
 

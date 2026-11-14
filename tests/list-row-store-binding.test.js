@@ -209,14 +209,29 @@ describeIfLists('list rows binding a store field directly', () => {
         await until(disp, ['none', 'none', 'none'])
     })
 
-    // Skipped: a row's data-render naming a store field does not render even
-    // at first paint (true from the start), with or without the walk read;
-    // a separate defect, open.
-    it.skip('data-render in rows follows the store', async () => {
+    it('data-render in rows follows the store', async () => {
         const k = await mount(() => ({}), OUTSIDE,
             '<div><span data-render="$k.time > 0" data-bind="ch"></span></div>')
         expect(rowTexts()).toEqual([])
         k.time = 1
+        await until(rowTexts, ['A', 'B', 'C'])
+        k.time = 0
+        await until(rowTexts, [])
+        k.time = 2
+        await until(rowTexts, ['A', 'B', 'C'])
+    })
+
+    it('data-render in rows renders when the store field is true at mount', async () => {
+        const k = await mount(() => ({}), OUTSIDE,
+            '<div><span data-render="$k.time > 0" data-bind="ch"></span></div>', { time: 1, other: '' })
+        await until(rowTexts, ['A', 'B', 'C'])
+        k.time = 0
+        await until(rowTexts, [])
+    })
+
+    it('data-render on the row element follows the store', async () => {
+        const k = await mount(() => ({}), OUTSIDE,
+            '<span data-render="$k.time > 0" data-bind="ch"></span>', { time: 1, other: '' })
         await until(rowTexts, ['A', 'B', 'C'])
         k.time = 0
         await until(rowTexts, [])

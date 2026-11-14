@@ -31,7 +31,7 @@ import {
 } from './core.js';
 // The two codes by name, not the WF_ERRORS table: a headless bundle of this
 // facade (the thread extension's worker half) must not carry every code.
-import { wfError, WF_ERR_CIRCULAR_DEPENDENCY, WF_ERR_HOT_LOOP_FACADE_READS, COMPUTED_EVAL } from '../../core/wfUtils.js';
+import { wfError, WF_ERR_CIRCULAR_DEPENDENCY, WF_ERR_HOT_LOOP_FACADE_READS, COMPUTED_EVAL, wfLocalStorage } from '../../core/wfUtils.js';
 import { recording as __tlOn, timelineNoteFlush as __tlFlush } from '../TimelineRecorder.js';
 import { reconcile } from './list-reconciler.js';
 
@@ -110,6 +110,10 @@ function cloneBuiltin(v) {
   if (Object.getPrototypeOf(out) !== proto) Object.setPrototypeOf(out, proto);
   return out;
 }
+
+// A store's handle (the store manager marks its entity virtual). Only a
+// store's state carries the framework's _internal record.
+const isStore = (h) => !!(h.component && h.component.isVirtual);
 
 class EntityHandle {
   constructor(options = {}) {
@@ -265,20 +269,36 @@ class EntityHandle {
   // createState so stored values are present before init() runs.
   _loadFromStorage() {
     if (__HEADLESS__) return;
-    if (!this.storageKey || typeof localStorage === 'undefined') return;
+    const storage = this.storageKey && wfLocalStorage();
+    if (!storage) return;
     try {
-      const stored = localStorage.getItem(this.storageKey);
-      if (stored) this.updateState(JSON.parse(stored));
+      const stored = storage.getItem(this.storageKey);
+      if (!stored) return;
+      const state = JSON.parse(stored);
+      // A value an earlier version saved carries the store's _internal
+      // record (see _saveToStorage); it is not loaded.
+      if (isStore(this) && state && typeof state === 'object') delete state._internal;
+      this.updateState(state);
     } catch (_) { /* corrupt/unreadable storage: keep initial state */ }
   }
 
   // Serialize the raw state tree (plain values: the set traps unwrap proxies
-  // on write, so _raw never holds a proxy) to localStorage.
+  // on write, so _raw never holds a proxy) to localStorage. A store's
+  // _internal record (its ready flag) is the framework's, not the store's
+  // state: saved, the next visit loaded ready: true back before init() ran,
+  // so a store with an async init() reported ready at once. A component has
+  // no such record: an _internal field in its state is the app's own.
   _saveToStorage() {
     if (__HEADLESS__) return;
-    if (!this.storageKey || typeof localStorage === 'undefined') return;
+    const storage = this.storageKey && wfLocalStorage();
+    if (!storage) return;
     try {
-      localStorage.setItem(this.storageKey, JSON.stringify(this._raw));
+      let state = this._raw;
+      if (state && state._internal !== undefined && isStore(this)) {
+        state = { ...state };
+        delete state._internal;
+      }
+      storage.setItem(this.storageKey, JSON.stringify(state));
     } catch (_) { /* quota or unserializable value: drop the save */ }
   }
 
@@ -445,8 +465,10 @@ class EntityHandle {
           if (!this._warnedCircular.has(name)) {
             this._warnedCircular.add(name);
             wfError(WF_ERR_CIRCULAR_DEPENDENCY, {
-              context: [...this._evalStack, name].join(' → '),
-              suggestion: 'Refactor computed properties to break the circular chain'
+              ...(__DEV__ && {
+                context: [...this._evalStack, name].join(' → '),
+                suggestion: 'Refactor computed properties to break the circular chain'
+              })
             });
           }
           // THROW (don't return a sentinel) so the cycle aborts the enclosing

@@ -13,6 +13,7 @@ import { listBoundElements } from '../core/DomMetadata.js';
 import { getContextMethod } from '../state/ContextProxy.js';
 import { pathResolver, __wf_str, __wf_txt } from '../core/wfUtils.js';
 import { applyShow, applyClass, applyModel } from '../core/BindingWriters.js';
+import { rowPathElement } from './TemplateSystem.js';
 
 /**
  * V8 OPT: Reusable context object for _bindWithCompiledMetadata.
@@ -133,6 +134,8 @@ export const ListItemBindingMethods = {
         const md = rowEl._compiledMetadata;
         const path = md && md.elementPaths ? md.elementPaths[index] : null;
         if (!path) return null;
+        // By position when a data-render element may be out of the row.
+        if (md.renders && md.renders.length > 0) return rowPathElement(rowEl, path);
         let current = rowEl;
         for (let p = 0; p < path.length; p++) {
             let next = current.firstElementChild;

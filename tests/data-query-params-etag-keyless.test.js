@@ -26,7 +26,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
-import { loadFramework, resetFramework, hasFeature } from './helpers/load-framework.js'
+import { loadFramework, resetFramework, hasFeature, isMinifiedBuild } from './helpers/load-framework.js'
 
 const suite = hasFeature('query') ? describe : describe.skip
 
@@ -561,7 +561,8 @@ suite('data-query: params on internal refetch, ETag keying, keyless write', () =
             await settle()
 
             expect(threw, 'a keyless write must reject rather than silently target row zero').toBeTruthy()
-            expect(String(threw.message || threw), 'the error names the problem').toMatch(/key/i)
+            // The words in a development build; the code and its docs page in a production one.
+            expect(String(threw.message || threw), 'the error names the problem, or its code').toMatch(isMinifiedBuild() ? /^\[WF-969\] https:\/\/www\.wildflowerjs\.com\/docs\/error-codes\?code=WF-969$/ : /key/i)
             expect(store.rows[0].name, 'row zero was not modified').toBe('first')
             expect(store.rows[1].name, 'row one was not modified').toBe('second')
         })

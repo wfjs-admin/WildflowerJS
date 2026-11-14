@@ -149,6 +149,30 @@ export function __wf_txt(el, s) {
 export const HAS_MOVE_BEFORE = typeof Element !== 'undefined' && typeof Element.prototype.moveBefore === 'function';
 
 /**
+ * Whether a condition is "!" before one plain path (!done, !$store.on,
+ * !computed:name), which is that path negated. Anything else that starts
+ * with "!" (!a && b, !!a) is an expression and is evaluated whole: lifting
+ * its "!" into a negate flag would negate the whole expression. The one
+ * rule for data-show and data-render, in a component and in a list row.
+ */
+export const isNegatedPath = (s) => /^![\w$.:]+$/.test(s);
+
+/**
+ * The page's localStorage, or null when there is none or it cannot be read.
+ * A browser that blocks site data throws a SecurityError on the read of
+ * window.localStorage itself, which `typeof localStorage` does not catch
+ * (typeof forgives a missing name, not a getter that throws). Asked at each
+ * use: a page's storage access can change while it is open.
+ */
+export function wfLocalStorage() {
+    try {
+        return typeof localStorage === 'undefined' ? null : localStorage;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
  * Cooperative yield for chunked page-load work: pause so pending input and
  * paint are serviced, then resume PROMPTLY. Prefers scheduler.yield
  * (Chrome 129+, Firefox 142+; continuation priority), then a user-visible
@@ -232,13 +256,15 @@ const WF_ERRORS_PROD = {
     // Component lifecycle (100-199)
     DOM_OWNERSHIP: { code: 'WF-105', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Manual DOM write on a node the engine keeps current' }) },
 
-    // State/reactivity (200-299)
-    CIRCULAR_DEPENDENCY: WF_ERR_CIRCULAR_DEPENDENCY,
-
     // Action/event errors (600-699)
     EMIT_NO_INSTANCE: { code: 'WF-603', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Cannot emit - component instance not found' }) },
 
-    // Router errors (700-799)
+    // Router errors (700-799), and the circular-dependency code the router
+    // raises through the table (the graph imports WF_ERR_CIRCULAR_DEPENDENCY
+    // directly). Production code raises them only in the router tiers, so a
+    // production bundle of any other tier leaves them out.
+    ...((typeof __TIER__ === 'undefined' || typeof __DEV__ === 'undefined' || __DEV__ || __TIER__ === 'spa' || __TIER__ === 'full') && {
+    CIRCULAR_DEPENDENCY: WF_ERR_CIRCULAR_DEPENDENCY,
     ROUTE_ALIAS_ERROR: { code: 'WF-702', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Target route not found for alias' }) },
     ROUTE_GUARD_ERROR: { code: 'WF-703', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route guard' }) },
     ROUTE_NAVIGATION_ERROR: { code: 'WF-704', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Navigation queue exceeded retry limit' }) },
@@ -247,6 +273,8 @@ const WF_ERRORS_PROD = {
     ROUTE_COMPONENT_ERROR: { code: 'WF-710', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading route component' }) },
     ROUTE_SCROLL_ERROR: { code: 'WF-711', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in scroll behavior' }) },
     ROUTE_HOOK_ERROR: { code: 'WF-712', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in route lifecycle hook' }) },
+    ROUTE_PARAM_REFUSED: { code: 'WF-713', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A route param holds a value no URL can carry; no URL was built' }) },
+    }),
 
     // Store errors (900-999)
     STORE_NAME_INVALID: { code: 'WF-901', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Store component name must be a string' }) },
@@ -256,8 +284,13 @@ const WF_ERRORS_PROD = {
     STORE_DEFAULT_ERROR: { code: 'WF-907', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create default app-store' }) },
 
     // Query diagnostics (the query block of the store century; see the
-    // comment above the query entries in WF_ERRORS_DEV_ONLY)
+    // comment above the query entries in WF_ERRORS_DEV_ONLY). Production code
+    // raises this one only where the build has queries, so a production
+    // bundle of any other tier leaves it out; a development build of every
+    // tier holds the whole table.
+    ...((typeof __FEATURE_QUERY__ === 'undefined' || typeof __DEV__ === 'undefined' || __DEV__ || __FEATURE_QUERY__) && {
     QUERY_TO_INVALID: { code: 'WF-964', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'write() needs a `to` function declared on the query' }) },
+    }),
 };
 
 const WF_ERRORS_DEV_ONLY = {
@@ -309,6 +342,7 @@ const WF_ERRORS_DEV_ONLY = {
     ITEM_COMPUTED_CALLED: { code: 'WF-237', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A list-row binding calls an item-level computed; in a row the name is already that computed\'s value, so the call renders nothing' }) },
     // Printed by the reactive graph itself (core.js imports nothing); listed for the registry.
     FLUSH_LOOP_BREAKER: { code: 'WF-238', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Reactive updates did not settle: one flush ran a million updates, so it stopped' }) },
+    STATE_ACCESSOR: { code: 'WF-239', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A getter or setter in state is read once when state is copied, so it never updates' }) },
 
     // Context system (300-399)
     CONTEXT_RESOLVE_ERROR: { code: 'WF-301', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error resolving data in context' }) },
@@ -362,6 +396,7 @@ const WF_ERRORS_DEV_ONLY = {
     ROW_LIST_PATH: { code: 'WF-519', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A dotted data-list path inside a list row reads the component when the component declares its first segment, and the row item otherwise' }) },
     ROOT_BLOCK_CONFLICT: { code: 'WF-520', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component\'s tag and its root: block set the same attribute, style property or directive; the tag\'s value is used' }) },
     ROOT_BINDING_CHILD_SCOPE: { code: 'WF-521', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A binding on a nested component\'s root element reads the component around it, and names a value only the nested component has' }) },
+    BINDING_METHOD: { code: 'WF-522', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A binding names a component method, calls a computed, or shows a function; bindings read state and computeds' }) },
 
     // Action/event errors (600-699)
     ACTION_HANDLER_ERROR: { code: 'WF-601', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in action handler' }) },
@@ -380,6 +415,7 @@ const WF_ERRORS_DEV_ONLY = {
     // SSR errors (800-899)
     SSR_ACTIVATION_ERROR: { code: 'WF-801', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error during SSR activation' }) },
     SSR_HYDRATION_ERROR: { code: 'WF-802', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error during hydration' }) },
+    SSR_ENTITY_NOT_REGISTERED: { code: 'WF-803', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A binding in server-rendered markup reads a store, plugin or query that is not registered, so it keeps its server content and does not update' }) },
 
     // Store errors (900-999)
     STORE_EXTERNAL_ERROR: { code: 'WF-905', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in external() accessing store' }) },
@@ -396,6 +432,7 @@ const WF_ERRORS_DEV_ONLY = {
     QUERY_CONFIRM_NOT_INHERITED: { code: 'WF-940', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A query-level `confirmation` reaches update and create only, so this named operation discarded its response body and refetched the whole collection instead' }) },
     QUERY_ATTR_ON_TEMPLATE: { code: 'WF-941', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'data-query is on the <template> element itself; its content is inert light DOM, so nothing was bound' }) },
     QUERY_UNKNOWN_KEY: { code: 'WF-942', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A query config key that queries do not read, so it was ignored' }) },
+    QUERY_PARAM_OBJECT: { code: 'WF-943', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A query param holds an object, which is sent as the text [object Object]' }) },
 
     QUERY_STORE_EXTERNAL_WRITE: { code: 'WF-950', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'External write to a query-owned store' }) },
     QUERY_DUPLICATE: { code: 'WF-951', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Query name already registered; second registration ignored' }) },
@@ -448,7 +485,7 @@ const WF_ERRORS_DEV_ONLY = {
     QUERY_CONFIRMATION_THREW: { code: 'WF-998', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A confirmation: callback threw, so the write rejected and rolled back even though the server answered ok; confirmation receives the parsed response body, not the Response' }) },
     QUERY_WRITE_BODY_UNPARSED: { code: 'WF-999', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A write succeeded but its response body is not JSON, so there was nothing to apply and the query refetched; an empty body is normal and says nothing here' }) },
     // 950-999 is full. Queries claimed 940-949 and fill it UPWARD from the
-    // top of this block, so the next query code is WF-943 (940-942 are taken,
+    // top of this block, so the next query code is WF-944 (940-943 are taken,
     // and are declared up there in numeric order, not down here). See CODE
     // ALLOCATION at the top of this
     // file before claiming another block: 911-939 is shared headroom that
@@ -709,6 +746,30 @@ export function warnDefinitionCollisions(kind, name, definition) {
                 suggestion: `Drop the underscore to make it ordinary state, or set this.${key} in init() for a non-reactive field.`
             });
         }
+        // State is copied when the entity is created, and the copy reads a getter
+        // once and keeps its value. Own accessors only: a class's prototype getter
+        // survives the copy, which keeps the prototype.
+        const seen = new Set();
+        const walk = (obj, path, depth) => {
+            if (depth > 6 || seen.has(obj)) return;
+            seen.add(obj);
+            const proto = Object.getPrototypeOf(obj);
+            if (!Array.isArray(obj) && proto !== Object.prototype && proto !== null) return;
+            for (const key of Object.keys(obj)) {
+                const d = Object.getOwnPropertyDescriptor(obj, key);
+                const at = path + '.' + key;
+                if (d.get || d.set) {
+                    wfError(WF_ERRORS.STATE_ACCESSOR, {
+                        warn: true,
+                        context: `${kind} '${name}': ${at} is a ${d.get ? 'getter, read once' : 'setter, dropped'} when the ${kind.toLowerCase()} was created`,
+                        suggestion: `Declare it as a computed (computed: { ${key}() { ... } }), which updates when the state it reads changes.`
+                    });
+                } else if (d.value && typeof d.value === 'object') {
+                    walk(d.value, at, depth + 1);
+                }
+            }
+        };
+        walk(state, 'state', 0);
     }
     for (const key of Object.keys(definition)) {
         if (typeof definition[key] !== 'function') continue;

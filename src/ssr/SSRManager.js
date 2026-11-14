@@ -210,7 +210,7 @@ export class SSRManager {
         // Register hook to protect binding content during SSR initialization
         this._registerContentProtectionHook();
 
-        this._log('SSRManager initialized (protection mode)');
+        __DEV__ && this._log('SSRManager initialized (protection mode)');
     }
 
     // =========================================================================
@@ -313,7 +313,7 @@ export class SSRManager {
         // the component definition is registered, then late-registration calls again)
         if (element._ssrPhase) return true;
 
-        this._log('Protecting SSR element:', element);
+        __DEV__ && this._log('Protecting SSR element:', element);
         this.stats.elementsProtected++;
 
         // Set phase to PROTECTED
@@ -359,7 +359,7 @@ export class SSRManager {
             ssrAdoptedElements.add(listEl);
             this.protectedLists.add(listEl);
             this.stats.listsProtected++;
-            this._log('Protected SSR list:', this._attr(listEl, 'list'));
+            __DEV__ && this._log('Protected SSR list:', this._attr(listEl, 'list'));
         });
     }
 
@@ -369,7 +369,7 @@ export class SSRManager {
     enhanceDefinition(element, originalDefinition) {
         if (!this.isSSRElement(element)) return originalDefinition;
 
-        this._log('Enhancing definition for SSR component (protection mode):', originalDefinition.name || 'unnamed');
+        __DEV__ && this._log('Enhancing definition for SSR component (protection mode):', originalDefinition.name || 'unnamed');
 
         // Get parsed state from SSR data
         const ssrData = this.ssrComponents.get(element);
@@ -390,11 +390,14 @@ export class SSRManager {
         // A list nested in a row over a dotted path reads the component (or
         // a $ source) when the AUTHORED definition declares the path's head;
         // the client applies the same test (_rowListReadsComponent), and
-        // parsed state never counts. Only the other lists' server rows are
-        // fields of their row item.
+        // parsed state never counts. An undotted name the definition declares
+        // as a computed reads that computed when the row has no such field
+        // (_rowListValue), so its server rows are not a field either. Only
+        // the other lists' server rows are fields of their row item.
         if (ssrData && ssrData.deferred) {
             for (const d of ssrData.deferred) {
-                if (!d.path.includes('$') && !this.wildflower._declaresListHead(originalDefinition, d.path)) {
+                if (!d.path.includes('$') && !this.wildflower._declaresListHead(originalDefinition, d.path) &&
+                    !this._rowListIsComputed(originalDefinition, d.path)) {
                     pathResolver.set(d.item, d.path, d.rows);
                 }
             }
@@ -418,7 +421,7 @@ export class SSRManager {
      * Create protection context instead of normal context
      */
     createSSRContext(type, id, data) {
-        this._log(`Creating SSR protection context: ${type}/${id}`);
+        __DEV__ && this._log(`Creating SSR protection context: ${type}/${id}`);
 
         const protectionContext = new SSRProtectionContext(type, id, data);
 
@@ -459,13 +462,13 @@ export class SSRManager {
             return;
         }
 
-        this._log('Completing minimal SSR integration for:', instance.id);
+        __DEV__ && this._log('Completing minimal SSR integration for:', instance.id);
         this.stats.componentsProcessed++;
 
         // Minimal integration - just ensure event handlers work
         this._setupEventIntegration(instance);
 
-        this._log('SSR integration completed for:', instance.id);
+        __DEV__ && this._log('SSR integration completed for:', instance.id);
     }
 
     /**
@@ -476,7 +479,7 @@ export class SSRManager {
     activateComponent(element) {
         if (!this.isSSRElement(element)) return false;
 
-        this._log('Activating SSR component for exact functional equivalence:', element);
+        __DEV__ && this._log('Activating SSR component for exact functional equivalence:', element);
 
         // Transition to ACTIVATED phase
         element._ssrPhase = SSRPhase.ACTIVATED;
@@ -488,7 +491,7 @@ export class SSRManager {
         this.protectedElements.delete(element);
         this.ssrComponents.delete(element);
 
-        this._log('SSR component now has exact equivalence to dynamic component:', element);
+        __DEV__ && this._log('SSR component now has exact equivalence to dynamic component:', element);
         return true;
     }
 
@@ -583,7 +586,7 @@ export class SSRManager {
         // lines here even when the page had no SSR markup at all.)
         if (elementsToActivate.length === 0) return 0;
 
-        this._log('Activating all SSR components for full functionality...');
+        __DEV__ && this._log('Activating all SSR components for full functionality...');
 
         // Activate all currently protected components
         elementsToActivate.forEach(element => {
@@ -599,7 +602,7 @@ export class SSRManager {
         // CRITICAL: Re-bind action contexts now that data-index attributes exist
         this._rebindSSRActionContexts(elementsToActivate);
 
-        this._log(`Activated ${activatedCount} SSR components - now have exact equivalence to dynamic components`);
+        __DEV__ && this._log(`Activated ${activatedCount} SSR components - now have exact equivalence to dynamic components`);
         return activatedCount;
     }
 
@@ -763,7 +766,7 @@ export class SSRManager {
             const parsed = JSON.parse(raw);
             return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
         } catch (e) {
-            this._log('data-seed is not valid JSON; ignored:', raw);
+            __DEV__ && this._log('data-seed is not valid JSON; ignored:', raw);
             return null;
         }
     }
@@ -823,11 +826,23 @@ export class SSRManager {
             }
             deferred.push({ item: row, path: this._listPath(nl), rows: this._parseListElement(nl, deferred) });
         }
+        const def = instance && (this.wildflower.componentDefinitions.get(instance.name) || instance.definition);
         for (const d of deferred) {
-            if (!this.wildflower._rowListReadsComponent(instance, d.path) && pathResolver.get(d.item, d.path) === undefined) {
+            if (!this.wildflower._rowListReadsComponent(instance, d.path) && !this._rowListIsComputed(def, d.path) &&
+                pathResolver.get(d.item, d.path) === undefined) {
                 pathResolver.set(d.item, d.path, d.rows);
             }
         }
+    }
+
+    /**
+     * Whether a list nested in a row names, undotted, a computed the
+     * definition declares (data-list="chips" with chips(item)): the row reads
+     * the computed when it has no such field, so the list's server rows are
+     * not a field of the row.
+     */
+    _rowListIsComputed(definition, path) {
+        return path.indexOf('.') < 0 && !!(definition && definition.computed && definition.computed[path]);
     }
 
     /**
@@ -862,6 +877,10 @@ export class SSRManager {
             // the binding (e.g. <li data-bind="title">); querySelectorAll only matches
             // descendants, so include the item element explicitly.
             const bindOrModel = this._sel('bind') + ',' + this._sel('model');
+            // A data-query inside the row is a container of its own: what is
+            // in it belongs to the query's rows (its adoption parses them),
+            // not to this item.
+            const containers = this._sel('list') + ',' + this._sel('query');
             const itemBindings = [
                 ...(itemEl.matches(bindOrModel) ? [itemEl] : []),
                 ...itemEl.querySelectorAll(bindOrModel)
@@ -869,14 +888,14 @@ export class SSRManager {
             itemBindings.forEach(bindEl => {
                 const path = this._attr(bindEl, 'bind') || this._attr(bindEl, 'model');
                 if (path.startsWith('computed:')) return;
-                if (bindEl.closest(this._sel('list')) !== listEl) return;
+                if (bindEl.closest(containers) !== listEl) return;
                 pathResolver.set(itemState, path, this._parseValueFromElement(bindEl));
             });
 
             // First-level nested lists inside this item → recurse into item state.
             const nestedLists = itemEl.querySelectorAll(this._sel('list'));
             nestedLists.forEach(nl => {
-                if (!nl.parentElement || nl.parentElement.closest(this._sel('list')) !== listEl) return;
+                if (!nl.parentElement || nl.parentElement.closest(containers) !== listEl) return;
                 // A list inside a child component in this row is the child's
                 // (the rule _nestedListsOfRow applies), not a field of this item.
                 for (let cur = nl.parentElement; cur; cur = cur.parentElement) {
@@ -885,10 +904,10 @@ export class SSRManager {
                 }
                 const path = this._listPath(nl);
                 const rows = this._parseListElement(nl, deferred);
-                // A dotted path may read the component, not the item: that is
-                // settled once the definition is known (enhanceDefinition).
-                if (path.indexOf('.') > 0) deferred.push({ item: itemState, path, rows });
-                else pathResolver.set(itemState, path, rows);
+                // A dotted path may read the component, and an undotted one a
+                // component computed, not the item: that is settled once the
+                // definition is known (enhanceDefinition).
+                deferred.push({ item: itemState, path, rows });
             });
             // A row that is itself a list (<tr data-list="cells">): its rows are this item's array.
             const ownList = this._attr(itemEl, 'list') && this._listPath(itemEl);
@@ -987,14 +1006,16 @@ export class SSRManager {
             listsProtected: 0,
             componentsProcessed: 0
         };
-        this._log('SSRManager reset');
+        __DEV__ && this._log('SSRManager reset');
     }
 
     /**
      * Internal logging with level control
      */
     _log(...args) {
-        if (this.config.logLevel === 'debug' || this.wildflower.debug) {
+        // Development builds only: production strips console.log.
+        if (!__DEV__) return;
+        if (this.config.logLevel === 'debug' || this.wildflower._debugOptIn) {
             console.log('[SSRManager]', ...args);
         }
     }

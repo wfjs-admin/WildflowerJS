@@ -59,11 +59,15 @@ export default [
                 // Build-time constants (substituted by the build script)
                 __DEV__: 'readonly',
                 __VERSION__: 'readonly',
+                __TIER__: 'readonly',
+                __CAPS__: 'readonly',
+                __HEADLESS__: 'readonly',
                 __FEATURE_TRANSITIONS__: 'readonly',
                 __FEATURE_ERROR_BOUNDARIES__: 'readonly',
                 __FEATURE_PORTALS__: 'readonly',
                 __FEATURE_SSR__: 'readonly',
                 __FEATURE_LISTS__: 'readonly',
+                __FEATURE_POOLS__: 'readonly',
                 __FEATURE_PLUGINS__: 'readonly',
                 __FEATURE_ROUTING__: 'readonly',
                 __FEATURE_PROPS__: 'readonly',
@@ -89,6 +93,10 @@ export default [
                 HTMLFormElement: 'readonly',
                 DOMParser: 'readonly',
                 XMLSerializer: 'readonly',
+                URLSearchParams: 'readonly',
+                AbortController: 'readonly',
+                EventSource: 'readonly',
+                Response: 'readonly',
             }
         },
         rules: {

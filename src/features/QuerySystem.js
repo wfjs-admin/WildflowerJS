@@ -19,8 +19,8 @@
  *   hard/transient error split.
  */
 
-import { QUERY_ENGINE_WRITE, WF_ERRORS, wfError, mergeData } from '../core/wfUtils.js';
-import { toRaw as rgToRaw } from '../state/reactive-graph/core.js';
+import { QUERY_ENGINE_WRITE, WF_ERRORS, wfError, mergeData, wfLocalStorage } from '../core/wfUtils.js';
+import { toRaw as rgToRaw, isObserved as rgIsObserved } from '../state/reactive-graph/core.js';
 
 const QUERY_STATE = () => ({
     rows: [],
@@ -108,6 +108,37 @@ function urlTokenNames(url) {
 // always produces exactly one path segment: interpolating unescaped
 // application state is how a value containing `/` or `..` silently becomes
 // extra segments.
+// A token's value from a params map or a row: the object's own field only.
+// A token named like an inherited member (:toString, :constructor) has no
+// value until one is supplied.
+const ownValue = (obj, key) => (obj != null && Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined);
+
+// An error's text, for the store's error fields and the diagnostics. A
+// rejection can be any value: String() throws for one with no prototype,
+// which left a read loading and skipped a write's rollback.
+function errText(e) {
+    try {
+        return String(e && e.message ? e.message : e);
+    } catch (_) {
+        return 'Error';
+    }
+}
+
+// What a refused write says in a production build: its code and the code's
+// page on the docs site, as every other production error does. A development
+// build says it in words at the call site.
+const codeText = (code) => '[' + code + '] https://www.wildflowerjs.com/docs/error-codes?code=' + code;
+
+// A value as a diagnostic shows it. JSON cannot serialize every value (a
+// BigInt, a cycle), and a diagnostic must not be what throws.
+const showValue = (v) => {
+    try {
+        return JSON.stringify(v);
+    } catch (_) {
+        return errText(v);
+    }
+};
+
 function interpolateUrl(url, resolve) {
     const [s, e] = urlPathSpan(url);
     const consumed = [];
@@ -120,12 +151,18 @@ function interpolateUrl(url, resolve) {
         // empty-segment class axios shipped CVE-2025-27152 over). An
         // empty string is therefore "no value" here: reads wait, writes
         // reject naming the token, exactly like null/undefined.
-        if (v == null || v === '') {
+        // '.' and '..' are the same class: encodeURIComponent leaves dots
+        // alone, and as a whole segment the URL parser resolves them, so the
+        // request climbs to the parent or the collection. Tested on the
+        // encoded text, so a value that only stringifies to '..' (['..']) is
+        // caught too.
+        const enc = v == null ? '' : encodeURIComponent(v);
+        if (enc === '' || enc === '.' || enc === '..') {
             if (missing === null) missing = name;
             return whole;
         }
         consumed.push(name);
-        return encodeURIComponent(v);
+        return enc;
     });
     if (missing !== null) return { missing };
     return { url: url.slice(0, s) + path + url.slice(e), consumed };
@@ -295,6 +332,15 @@ const QUERY_CACHE_MIN_DWELL = 0;
 // Shared by the restore gate and the deferred URL-guard comparison.
 const PERSIST_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+// What in storage is the engine's own, for clearPersisted() with no names: a
+// derived key (persist: true) carries PERSIST_PREFIX, and a custom key
+// (persist: 'orders-42') is listed in PERSIST_INDEX the first time a
+// snapshot is saved under it. persistListed holds the custom keys this page
+// has listed already.
+const PERSIST_PREFIX = 'wf:query:';
+const PERSIST_INDEX = 'wf:query-keys';
+const persistListed = new Set();
+
 // Fingerprint of the CLIENT-SIDE row shapers (survey ruling #4): which
 // `select` source text and key produced a snapshot's rows. Rows persist
 // post-`select:` while the ETag validates the server's raw BYTES, so a
@@ -315,16 +361,17 @@ function shapeFingerprint(controller) {
     return controller._shapeFp;
 }
 
-// Origin of a request URL, for the origin-scoped header default. A URL with
-// no authority is relative, and therefore same-origin by definition — the
-// common case for an application talking to its own server. Userinfo is not
-// part of an origin.
+// Origin of a request URL, for the origin-scoped header default: from the
+// URL parser the request itself goes through, so the header decision and the
+// request cannot disagree (a backslash read as a slash, stripped whitespace,
+// a scheme with one slash, userinfo). A relative URL is the document's own
+// origin. A URL that does not parse matches no origin.
 function urlOrigin(url) {
-    const m = /^([A-Za-z][A-Za-z0-9+.-]*:)?\/\/([^/?#]*)/.exec(url);
-    if (!m) return (typeof location !== 'undefined' && location.origin) || '';
-    const scheme = m[1] || ((typeof location !== 'undefined' && location.protocol) || '');
-    const authority = m[2].indexOf('@') >= 0 ? m[2].slice(m[2].lastIndexOf('@') + 1) : m[2];
-    return (scheme + '//' + authority).toLowerCase();
+    try {
+        return new URL(url, location.href).origin;
+    } catch (_) {
+        return '';
+    }
 }
 
 // A write's HTTP failure, as a rejection the application can act on
@@ -745,7 +792,9 @@ export const QuerySystemMethods = {
                 warn: true,
                 context: `Query "${name}" is already registered; the second registration is ignored`
             });
-            return this.getQuery(name);
+            // The handle, without the read getQuery() counts as: a second
+            // registration is a declaration too, and starts nothing.
+            return this.getStore(name);
         }
         if (this.storeManager && this.storeManager.getStoreComponentByName(name)) {
             if (__DEV__) wfError(WF_ERRORS.QUERY_NAME_COLLISION, {
@@ -844,7 +893,7 @@ export const QuerySystemMethods = {
         // storage key (per-user keys and the like). Anything else truthy is
         // a misdeclaration — warn and run without persistence.
         let persistKey = null;
-        if (config.persist === true) persistKey = 'wf:query:' + name;
+        if (config.persist === true) persistKey = PERSIST_PREFIX + name;
         else if (typeof config.persist === 'string' && config.persist) persistKey = config.persist;
         else if (__DEV__ && config.persist != null && config.persist !== false) {
             wfError(WF_ERRORS.QUERY_PERSIST_INVALID, {
@@ -1190,7 +1239,10 @@ export const QuerySystemMethods = {
                 continue;
             }
             const controller = this._queryControllers.get(name);
-            if (!controller.active) continue;
+            // A query nothing watches is skipped: one that never activated,
+            // and one whose last view has left (a query with no refresh rule
+            // has nothing else that would notice).
+            if (!controller.active || !this._queryWatched(controller)) continue;
             pending.push(this._queryFetch(controller, { conditional: true }));
         }
         return Promise.all(pending);
@@ -1220,7 +1272,7 @@ export const QuerySystemMethods = {
      * safety still means navigate, reload, or unobserve.
      */
     clearPersisted(...names) {
-        if (typeof localStorage === 'undefined') return 0;
+        if (!wfLocalStorage()) return 0;
         const qc = this._queryControllers;
         let cleared = 0;
         const grace = this._queryTeardownGraceMs || 5000;
@@ -1236,7 +1288,36 @@ export const QuerySystemMethods = {
             } catch { /* read-only storage */ }
         };
         if (names.length === 0) {
+            // The registered queries first (that also opens their save
+            // window), then every snapshot the engine saved from any page:
+            // the logout step often runs where not every persisted query is
+            // declared. A derived key is found by its prefix; a custom key
+            // by the index its first save wrote. The index is storage any
+            // script can write, so a key it names goes only if what it holds
+            // is a snapshot.
             if (qc) qc.forEach(wipe);
+            try {
+                const own = [];
+                for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    if (k && k.indexOf(PERSIST_PREFIX) === 0) own.push(k);
+                }
+                let listed = null;
+                try { listed = JSON.parse(localStorage.getItem(PERSIST_INDEX)); } catch { /* not a list */ }
+                if (Array.isArray(listed)) {
+                    for (const k of listed) {
+                        let env = null;
+                        try { env = typeof k === 'string' && JSON.parse(localStorage.getItem(k)); } catch { /* not a snapshot */ }
+                        if (env && env.v === 1 && Array.isArray(env.rows)) own.push(k);
+                    }
+                }
+                for (const k of own) {
+                    localStorage.removeItem(k);
+                    cleared++;
+                }
+                localStorage.removeItem(PERSIST_INDEX);
+                persistListed.clear();
+            } catch { /* read-only storage */ }
             return cleared;
         }
         for (const name of names) {
@@ -1544,8 +1625,28 @@ export const QuerySystemMethods = {
         if (!els) return;
         this._queryLateEls.delete(name);
         for (const el of els) {
-            if (el.isConnected) this._transformQueryElements(el);
+            if (!el.isConnected) continue;
+            this._transformQueryElements(el);
+            // A server-rendered list the store's wake left alone
+            // (_queryLateSSRWaiting): its rows are adopted now, so the render
+            // the wake would have made keeps the server nodes.
+            if (el._listContext && !el._mapArrayInitialized && el.closest(this._attrSelector('ssr', 'true'))) {
+                const owner = el.closest(this._attrSelector('component'));
+                const inst = owner && this.componentInstances.get(owner.dataset.componentId);
+                if (inst) this._renderList(el, null, el._listContext, inst);
+            }
         }
+    },
+
+    /**
+     * Whether a list element is a server-rendered data-query container still
+     * waiting for its query to be declared (the store's wake skips it).
+     * @private
+     */
+    _queryLateSSRWaiting(el) {
+        if (!this._queryLateEls || !this._hasAttr(el, 'query')) return false;
+        const els = this._queryLateEls.get(this._getAttr(el, 'query'));
+        return !!els && els.has(el) && !!el.closest(this._attrSelector('ssr', 'true'));
     },
 
     /**
@@ -1564,7 +1665,7 @@ export const QuerySystemMethods = {
      * _parseQueryRowLists), as the rows of a data-list are.
      */
     _queryAdoptSSRContent(controller, el, isList, instance) {
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store) return;
         // Rows installed by a persist restore do NOT block adoption: the
         // server-rendered markup is the fresher authority, and when the
@@ -1572,11 +1673,18 @@ export const QuerySystemMethods = {
         // above the list, a route-guard getQuery() warm), the activation
         // microtask ran restore first. Adoption still wins retroactively.
         if (store.lastSync !== null) return;
-        if (store.rows && store.rows.length > 0 && !controller._persistRestored) return;
+        // Rows already in the store (another element over this query adopted
+        // first, or initial: rows) are not adopted over. A list the renderer
+        // has not mounted yet still maps its own server rows by key, so the
+        // mount keeps them as the same nodes; a late-declared query's second
+        // list was rebuilt. A mounted list has no server rows left to map.
+        const seeded = store.rows && store.rows.length > 0 && !controller._persistRestored;
+        if (seeded && (!isList || el._mapArrayInitialized)) return;
 
         const SIMPLE = /^[a-zA-Z_]\w*(\.[a-zA-Z_]\w*)*$/;
         const CONTAINERS = this._attrSelector('list') + ',' + this._attrSelector('query');
         const BIND_SEL = this._attrSelector('bind');
+        const RECORD_PREFIX = '$' + controller.name + '.rows.0.';
         const setPath = (obj, path, value) => {
             const parts = path.split('.');
             // `__proto__.x` would walk into Object.prototype and write there.
@@ -1618,7 +1726,10 @@ export const QuerySystemMethods = {
                     const container = n.closest(CONTAINERS);
                     if (container !== el && (container !== root || rootIsList)) continue;
                 }
-                const field = this._getAttr(n, 'bind');
+                let field = this._getAttr(n, 'bind');
+                // A late-declared record query's paths were rewritten at bind
+                // time (_queryRewriteRecordPaths): read the field back.
+                if (field && field.startsWith(RECORD_PREFIX)) field = field.slice(RECORD_PREFIX.length);
                 if (!field || !SIMPLE.test(field)) continue;
                 const type = this._getAttr(n, 'type');
                 const text = n.textContent.trim();
@@ -1677,8 +1788,11 @@ export const QuerySystemMethods = {
                 }
             }
             if (rows.length > 0) {
-                if (adoptedByKey.size > 0) el._ssrAdoptedByKey = adoptedByKey;
-                adopt(rows);
+                if (adoptedByKey.size > 0) {
+                    el._ssrAdoptedByKey = adoptedByKey;
+                    if (__FEATURE_SSR__ && this._ssrNoteSharedList) this._ssrNoteSharedList(el, instance);
+                }
+                if (!seeded) adopt(rows);
             }
         } else {
             const record = readFields(el, {});
@@ -1721,7 +1835,7 @@ export const QuerySystemMethods = {
         // rows came from. Behavior flags keep sole authority over apply
         // mode; the descriptor feeds dev introspection and diagnostics.
         if (source) controller.lastSource = source;
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store) return;
         const incoming = Array.isArray(data) ? data : (data == null ? [] : [data]);
         const key = controller.key;
@@ -1756,10 +1870,13 @@ export const QuerySystemMethods = {
             return !!rc && rc.kind === 'delete';
         };
         const dead = new Set();
-        const live = [];
+        let live = [];
         const arrived = [];
         for (const r0 of incoming) {
             const r = rgToRaw(r0);
+            // A null entry carries no row. Stored, it threw in the list
+            // renderer and took every other row down with it.
+            if (r == null) continue;
             if (df && r && r[df]) {
                 const k = keyOf(r);
                 if (k !== undefined) dead.add(k);
@@ -1796,8 +1913,40 @@ export const QuerySystemMethods = {
             });
             mode = 'replace';
         }
+        // One row per key on a full read, as append and patch already keep:
+        // a repeated key reached the keyed list, which then left a stale
+        // copy on screen at the next read. The first occurrence wins; rows
+        // with no key are all kept.
+        if ((mode === 'replace' || mode === 'merge') && live.length > 1) {
+            const seen = new Set();
+            const once = live.filter((r) => {
+                const k = keyOf(r);
+                if (k === undefined) return true;
+                if (seen.has(k)) return false;
+                seen.add(k);
+                return true;
+            });
+            if (once.length !== live.length) live = once;
+        }
 
         const current = rgToRaw(store.rows) || [];
+        // A key matches in any spelling (see _queryWrite). An arriving row
+        // that joins the rows already here by key (a patch, an append, a
+        // gentle merge) takes the key as the store holds it, unless a row
+        // holds that exact key.
+        if (mode !== 'replace' && live.length > 0 && current.length > 0) {
+            const exact = new Set();
+            const held = new Map();
+            for (const r of current) {
+                const ck = keyOf(r);
+                if (ck != null) { exact.add(ck); held.set(String(ck), ck); }
+            }
+            live = live.map((r) => {
+                const k = keyOf(r);
+                const hk = k == null || exact.has(k) ? undefined : held.get(String(k));
+                return hk === undefined ? r : mergeData({}, r, { [key]: hk });
+            });
+        }
         // Server arrivals and write reconciles honor in-flight claims: an
         // arriving row's copy of a field an in-flight write still owns
         // predates (or races) that write, so the current (optimistic) value
@@ -2117,9 +2266,32 @@ export const QuerySystemMethods = {
      * for the price of a 304.
      */
     _queryPersistRestore(controller) {
-        if (!controller.persistKey || typeof localStorage === 'undefined') return;
+        if (!controller.persistKey || !wfLocalStorage()) return;
         let env = null;
-        try { env = JSON.parse(localStorage.getItem(controller.persistKey)); } catch { return; }
+        let raw = null;
+        try {
+            raw = localStorage.getItem(controller.persistKey);
+            env = JSON.parse(raw);
+        } catch { env = undefined; }
+        if (raw === null) return;
+        // A key the author chose (persist: 'key') may already hold something
+        // else: the app's settings, another library's data. A value there
+        // that is not a snapshot envelope is not this query's to remove, or
+        // to overwrite at the next save, so the query runs without
+        // persistence and the value stays. Under the derived key
+        // (persist: true) everything is the engine's own.
+        if (controller.persistKey !== PERSIST_PREFIX + controller.name &&
+            (env == null || typeof env !== 'object' || env.v !== 1)) {
+            if (__DEV__) {
+                wfError(WF_ERRORS.QUERY_PERSIST_INVALID, {
+                    warn: true,
+                    context: `Query "${controller.name}": persist: '${controller.persistKey}' names a storage key that already holds something else, so it was left alone and this query runs without persistence`,
+                    suggestion: 'Choose a key nothing else on this origin uses, or persist: true for a key derived from the query name'
+                });
+            }
+            controller.persistKey = null;
+            return;
+        }
         if (env == null) return;
         // The age gate must hold under a clock that moved backward (negative
         // age) and under crafted numerics (1e999 parses to Infinity; NaN
@@ -2130,7 +2302,7 @@ export const QuerySystemMethods = {
             try { localStorage.removeItem(controller.persistKey); } catch { /* read-only storage */ }
             return;
         }
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         // Yield only to declared seed data (initial: rows, SSR adoption) —
         // an explicit flag, not a rows-length check: an optimistic write()
         // issued before activation also populates rows, and it must not
@@ -2187,7 +2359,7 @@ export const QuerySystemMethods = {
         for (const k of Object.keys(merged)) {
             if (merged[k] == null) delete merged[k];
         }
-        const built = interpolateUrl(controller.config.from, (t) => merged[t]);
+        const built = interpolateUrl(controller.config.from, (t) => ownValue(merged, t));
         if (built.missing) return built;
         for (const c of built.consumed) delete merged[c];
         const qs = new URLSearchParams(merged).toString();
@@ -2214,7 +2386,7 @@ export const QuerySystemMethods = {
      * yield re-checks here.
      */
     _queryApplyRestore(controller, env) {
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store || controller._seeded) return;
         // Poison-pill guard: rows that fail the query's own data-expect
         // declaration are rows the application has said it cannot use.
@@ -2233,10 +2405,13 @@ export const QuerySystemMethods = {
         // rows. Restore it under that URL when known so the catch-up fetch can
         // still answer 304; a snapshot written before URL keying carries no URL
         // and restores as the last-validator only.
-        if (env.etag) {
+        // The snapshot is untrusted input: only a string is a validator, and
+        // the table has no prototype, so a URL spelled "__proto__" is one
+        // more key and no lookup answers through inheritance.
+        if (env.etag && typeof env.etag === 'string') {
             controller.etag = env.etag;
-            if (env.etagUrl) {
-                if (!controller.etags) controller.etags = {};
+            if (env.etagUrl && typeof env.etagUrl === 'string') {
+                if (!controller.etags) controller.etags = Object.create(null);
                 controller.etags[env.etagUrl] = env.etag;
                 controller.etagUrl = env.etagUrl;
             } else {
@@ -2265,7 +2440,7 @@ export const QuerySystemMethods = {
      * everywhere in the framework).
      */
     _queryPersistSave(controller, rawRows, includeEtag) {
-        if (!controller.persistKey || typeof localStorage === 'undefined') return;
+        if (!controller.persistKey || !this._queryStore(controller) || !wfLocalStorage()) return;
         // The clearPersisted() suppression window: a clear holds through
         // the transition (see clearPersisted's comment). Suppressed, not
         // deferred — the delivery that lands after the grace saves.
@@ -2325,6 +2500,22 @@ export const QuerySystemMethods = {
                 fp: shapeFingerprint(controller),
                 savedAt: Date.now()
             }));
+            // A custom key is listed once, so that a clear-all on any page
+            // can find it (a derived key is found by its prefix). In its own
+            // try: a failed index write must not cost the snapshot.
+            const pk = controller.persistKey;
+            if (pk.indexOf(PERSIST_PREFIX) !== 0 && !persistListed.has(pk)) {
+                persistListed.add(pk);
+                try {
+                    let listed = null;
+                    try { listed = JSON.parse(localStorage.getItem(PERSIST_INDEX)); } catch { /* rewritten below */ }
+                    if (!Array.isArray(listed)) listed = [];
+                    if (listed.indexOf(pk) < 0) {
+                        listed.push(pk);
+                        localStorage.setItem(PERSIST_INDEX, JSON.stringify(listed));
+                    }
+                } catch { /* quota: the snapshot stands, unlisted */ }
+            }
         } catch (e) {
             // Quota or an unserializable row: the save is dropped, and the
             // OLD snapshot goes with it — the engine can no longer vouch
@@ -2340,7 +2531,7 @@ export const QuerySystemMethods = {
                 controller._warnedPersistDrop = true;
                 wfError(WF_ERRORS.QUERY_PERSIST_SAVE_FAILED, {
                     warn: true,
-                    context: `Query "${controller.name}": the persist save threw (${e && e.message ? e.message : e}); the save was dropped and the stored snapshot removed — nothing persists for this query until a save succeeds`,
+                    context: `Query "${controller.name}": the persist save threw (${errText(e)}); the save was dropped and the stored snapshot removed — nothing persists for this query until a save succeeds`,
                     suggestion: 'Storage quota: persist fewer or smaller queries (rows serialize in full). Serialization: a row carries a value JSON.stringify cannot encode. Either way the next reload simply starts cold'
                 });
             }
@@ -2349,7 +2540,7 @@ export const QuerySystemMethods = {
     },
 
     _queryActivate(controller) {
-        if (controller.active) return;
+        if (controller.active || !this._queryStore(controller)) return;
         this._queryPersistRestore(controller);
         const resumed = controller._wasActive === true;
         controller.active = true;
@@ -2373,7 +2564,7 @@ export const QuerySystemMethods = {
         // refresh()/invalidate() calls.
         const eventGuarded = () => {
             if (r.freshSecs > 0) {
-                const s = this.getStore(controller.name);
+                const s = this._queryStore(controller);
                 // The age must be a real elapsed span. A device clock that
                 // moved BACKWARD after a sync makes this negative, which is
                 // less than any window and would suppress every fire until
@@ -2435,7 +2626,7 @@ export const QuerySystemMethods = {
         for (const k of Object.keys(map)) {
             if (map[k] == null) delete map[k];
         }
-        return interpolateUrl(raw, (t) => map[t]);
+        return interpolateUrl(raw, (t) => ownValue(map, t));
     },
 
     /**
@@ -2527,7 +2718,7 @@ export const QuerySystemMethods = {
                 });
             }
         }
-        const store = () => this.getStore(controller.name);
+        const store = () => this._queryStore(controller);
         let hadError = false;
         let staleBeforeError = false;
         es.onmessage = (ev) => {
@@ -2548,19 +2739,31 @@ export const QuerySystemMethods = {
                     this._queryFetch(controller, { conditional: true });
                     return;
                 }
+                const s = store();
+                if (!s) return;
+                // select: turns a read response into rows on EVERY read
+                // delivery, stream included (a shared envelope was otherwise
+                // ingested raw on every push, and WF-980, which lives inside
+                // _querySelect, could not fire here). It runs BEFORE the
+                // supersede: a push whose rows cannot be read has no claim on
+                // the fetch in flight. A throw is recorded as a failed
+                // fetch's would be (syncError over rows, error before any),
+                // never thrown out of the handler.
+                try {
+                    parsed = this._querySelect(controller, parsed);
+                } catch (e) {
+                    const msg = errText(e);
+                    const hadRows = s.lastSync !== null || (s.rows && s.rows.length > 0);
+                    engineWrite(() => {
+                        if (hadRows) s.syncError = msg;
+                        else { s.error = msg; s.isLoading = false; }
+                    });
+                    return;
+                }
                 // Stream data is the newest truth: supersede any in-flight
                 // fetch, then apply through the store (single flush).
                 controller.runId++;
                 if (controller.abort) { controller.abort.abort(); controller.abort = null; controller.inflightRun = null; }
-                const s = store();
-                if (!s) return;
-                // select: turns a read response into rows on EVERY read
-                // delivery, stream included. Before
-                // this call the fetch path was the only caller, so a shared
-                // envelope ingested raw on every push — the list replaced by
-                // one row whose fields were the envelope's — and WF-980,
-                // which lives inside _querySelect, could not fire here.
-                parsed = this._querySelect(controller, parsed);
                 if (__DEV__ && controller.hasRecord && parsed == null
                     && warnOnce(controller, WF_ERRORS.QUERY_NULL_RECORD)) {
                     wfError(WF_ERRORS.QUERY_NULL_RECORD, {
@@ -2673,6 +2876,18 @@ export const QuerySystemMethods = {
         const grace = this._queryTeardownGraceMs || 5000;
         const now = Date.now();
         const recentlyRead = controller.lastRead && (now - controller.lastRead) < grace;
+        // A $name. binding is observation too, but it stamps lastRead only
+        // when its value changes. Before going unobserved, look for one still
+        // in the document and hold it as an element observer (pruned by
+        // isConnected like any other), so a quiet source (304s, identical
+        // bodies, a silent stream) never stops a query whose binding is on
+        // the page. The document is the test here, not the reactive graph: a
+        // list taken out by hand, or a binding in a section data-render has
+        // removed, still has its edges in the graph.
+        if (controller.elements.size === 0 && !recentlyRead && typeof document !== 'undefined') {
+            const el = document.querySelector(this._queryBindingSelector(controller.name));
+            if (el) controller.elements.add(el);
+        }
         if (controller.elements.size > 0 || recentlyRead) {
             controller.unobservedSince = null;
             return true;
@@ -2685,6 +2900,78 @@ export const QuerySystemMethods = {
             this._queryTeardown(controller);
         }
         return false;
+    },
+
+    /**
+     * Whether a live effect reads the query's store, directly or through
+     * computeds: a $name. binding, a list over its rows, a computed over
+     * getQuery() that something shows.
+     * @private
+     */
+    _queryRead(controller) {
+        const store = this._queryStore(controller);
+        return !!store && rgIsObserved(store.state);
+    },
+
+    /**
+     * Whether a fetch the engine starts by itself outside a refresh rule (a
+     * retry, an invalidateQueries() refetch) has anyone to fetch for. No
+     * stamp and no teardown: a query with no refresh rule is only asked.
+     * It is watched while the lifecycle's own tests say so (a connected
+     * element, a recent read, a $name. binding in the document), and also
+     * while the graph shows a live reader, which is how a computed over
+     * getQuery() that a binding shows is seen. The graph can count a reader
+     * whose markup has gone, so it errs toward fetching, as before.
+     * @private
+     */
+    _queryWatched(controller) {
+        for (const el of controller.elements) {
+            if (!el.isConnected) controller.elements.delete(el);
+        }
+        return controller.elements.size > 0 ||
+            (controller.lastRead && (Date.now() - controller.lastRead) < (this._queryTeardownGraceMs || 5000)) ||
+            !!document.querySelector(this._queryBindingSelector(controller.name)) ||
+            this._queryRead(controller);
+    },
+
+    /**
+     * Selector for an element whose binding reads `$name.` (the shorthand a
+     * query observer edge comes from): an attribute-substring match on every
+     * binding attribute, built once per query name.
+     * @private
+     */
+    _queryBindingSelector(name) {
+        const cache = this._queryBindSel || (this._queryBindSel = new Map());
+        let sel = cache.get(name);
+        if (!sel) {
+            const needle = '*="' + CSS.escape('$' + name + '.') + '"]';
+            sel = ['bind', 'bind-attr', 'bind-class', 'bind-style', 'bind-html', 'show', 'render', 'list', 'model']
+                .map((n) => '[data-wf-' + n + needle + (this.options.useWfPrefixOnly ? '' : ',[data-' + n + needle))
+                .join(',');
+            cache.set(name, sel);
+        }
+        return sel;
+    },
+
+    /** Count an element as an observer through the prune-then-add a bound
+     *  [data-query] element gets. A subscribe: root comes through here: added
+     *  directly, every destroyed subscriber's root stayed in the set.
+     *  @private */
+    _queryObserve(controller, el) {
+        observeElement(controller, el);
+    },
+
+    /**
+     * The store a controller reads and writes: none once the controller is
+     * retired (unregistered, or replaced by a query registered again under
+     * its name). Lookups go by name, so without this a retired controller's
+     * unfinished work (a function `from` still running, a write settling)
+     * landed in its successor's store.
+     * @private
+     */
+    _queryStore(controller) {
+        return this._queryControllers && this._queryControllers.get(controller.name) === controller
+            ? this.getStore(controller.name) : null;
     },
 
     /** Tear down rungs and in-flight work; data and ETag persist so a later
@@ -2733,7 +3020,8 @@ export const QuerySystemMethods = {
         const wf = this;
         const fire = () => {
             controller.retryTimerId = null;
-            wf._queryFetch(controller, fetchArgs);
+            // No fetch for a query nothing watches now.
+            if (wf._queryWatched(controller)) wf._queryFetch(controller, fetchArgs);
         };
         if (typeof navigator !== 'undefined' && navigator.onLine === false) {
             const resume = () => {
@@ -2796,10 +3084,16 @@ export const QuerySystemMethods = {
         controller._clearedWrites = cleared.size > 0 ? cleared : null;
     },
 
-    _queryFetch(controller, { params, conditional, append, _retry, clear } = {}) {
+    _queryFetch(controller, { params, conditional, append, _retry, _queued, clear } = {}) {
         const wf = this;
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store) return Promise.resolve();
+        // The tail of the append queue: the promise the next append waits on.
+        const trackAppend = (pr) => {
+            controller.appendTail = pr;
+            pr.then(() => { if (controller.appendTail === pr) controller.appendTail = null; });
+            return pr;
+        };
         // A fresh call (refresh, invalidate, rung tick) is a new episode:
         // any pending retry is cancelled and the ladder resets. A ladder-
         // fired call (_retry) continues the current episode.
@@ -2859,7 +3153,7 @@ export const QuerySystemMethods = {
                     const pk0 = dropped[0];
                     wfError(WF_ERRORS.QUERY_PARAMS_MIXED, {
                         warn: true,
-                        context: `Query "${controller.name}": an engine refetch (a rung tick or invalidation) dropped ${dropped.map((k) => `${k}: ${JSON.stringify(over[k])}`).join(', ')} from the last refresh({ params }) — the override applied to that one fetch only, and this request reverted to the declaration's values`,
+                        context: `Query "${controller.name}": an engine refetch (a rung tick or invalidation) dropped ${dropped.map((k) => `${k}: ${showValue(over[k])}`).join(', ')} from the lastrefresh({ params }) — the override applied to that one fetch only, and this request reverted to the declaration's values`,
                         suggestion: `A value that should persist belongs where params derives it (state a params function reads, e.g. a store field for ${pk0}); keep refresh({ params }) for genuinely one-off requests`
                     });
                 }
@@ -2893,12 +3187,23 @@ export const QuerySystemMethods = {
         if (typeof cfg.from === 'string') {
             merged = Object.assign({}, resolvedParams);
             for (const k of Object.keys(merged)) {
-                if (merged[k] == null) delete merged[k]; // never serialize "undefined"/"null"
+                const v = merged[k];
+                if (v == null) delete merged[k]; // never serialize "undefined"/"null"
+                // A plain object goes out as the text [object Object]: the
+                // server never sees it, and two different ones share a URL.
+                else if (__DEV__ && typeof v === 'object' && v.toString === Object.prototype.toString
+                    && warnOnce(controller, WF_ERRORS.QUERY_PARAM_OBJECT)) {
+                    wfError(WF_ERRORS.QUERY_PARAM_OBJECT, {
+                        warn: true,
+                        context: `Query "${controller.name}": the param "${k}" holds an object, which is sent as the text [object Object]`,
+                        suggestion: 'Param values are strings, numbers, booleans, or arrays. Send each field as a param of its own, or serialize the object yourself (JSON.stringify).'
+                    });
+                }
             }
             // Tokens read the merged map AFTER the null-strip, so a token whose
             // param resolved to null behaves exactly like one that was absent,
             // rather than interpolating the string "null" into a path.
-            built = interpolateUrl(cfg.from, (t) => merged[t]);
+            built = interpolateUrl(cfg.from, (t) => ownValue(merged, t));
             if (built.missing) {
                 if (__DEV__) {
                     // Named once per token, and never again. Waiting is a normal
@@ -2924,6 +3229,25 @@ export const QuerySystemMethods = {
             for (const c of built.consumed) delete merged[c];
         }
 
+        // An appended page in flight is never superseded by another read of
+        // the same list. A further append queues behind it (pages land in
+        // the order they were asked for); an engine refetch (a rung tick, an
+        // invalidation) waits for it instead, since aborting it would drop
+        // the page while the app's page counter has moved on. Only an
+        // explicit refresh() without append (a reset) still supersedes, and
+        // it cancels the queued appends.
+        if (!_retry && !_queued && controller.appendTail) {
+            if (append) {
+                const gen = controller.appendGen;
+                return trackAppend(controller.appendTail.then(() => (controller.appendGen === gen
+                    ? wf._queryFetch(controller, { params, append: true, conditional, _queued: true })
+                    : undefined)));
+            }
+            if (conditional) return controller.appendTail;
+            controller.appendGen = (controller.appendGen || 0) + 1;
+            controller.appendTail = null;
+        }
+
         // The stream follows the reads: this fetch's resolved
         // params are the freshest URL truth, so the sse rung opens or
         // follows here, before the request departs. Idempotent — an
@@ -2940,6 +3264,16 @@ export const QuerySystemMethods = {
         // cleared on a normal settle, so it cannot serve as this test.)
         controller.inflightRun = id;
         const settled = () => { if (controller.inflightRun === id) controller.inflightRun = null; };
+        // A superseded run's promise resolves with its successor's, so an
+        // awaited refresh(), invalidate() or invalidateQueries() means "the
+        // rows are current now", not "my request was aborted". An append is
+        // also the tail the next append queues behind.
+        const follow = (pr) => {
+            const w = pr.then(() => (id !== controller.runId && controller.currentRead && controller.currentRead.id !== id
+                ? controller.currentRead.p : undefined));
+            controller.currentRead = { id, p: w };
+            return append && !_retry && !_queued ? trackAppend(w) : w;
+        };
 
         // Seeded rows (initial: config, SSR adoption) count as usable data:
         // the catch-up fetch is a stale refresh, never a "loading" state
@@ -2995,7 +3329,7 @@ export const QuerySystemMethods = {
                 wf._queryRetrySchedule(controller, fetchArgs);
                 return;
             }
-            const msg = err && err.message ? err.message : String(err);
+            const msg = errText(err);
             // A function source is the application's own code, so its
             // failure reaches the console in every build, once it lands.
             // (A URL source's failed request is already in the network log.)
@@ -3012,7 +3346,7 @@ export const QuerySystemMethods = {
 
         if (typeof cfg.from === 'function') {
             try {
-                return Promise.resolve(cfg.from()).then(applyRows, applyError).finally(settled);
+                return follow(Promise.resolve(cfg.from()).then(applyRows, applyError).finally(settled));
             } catch (e) {
                 applyError(e);
                 settled();
@@ -3090,7 +3424,7 @@ export const QuerySystemMethods = {
             }
         }
 
-        return fetch(url, { signal: ac.signal, headers })
+        return follow(fetch(url, { signal: ac.signal, headers })
             .then((resp) => {
                 // Before the supersession guard: a dropped response still
                 // made the request, and the ride-along already happened.
@@ -3158,7 +3492,18 @@ export const QuerySystemMethods = {
                     throw e;
                 }
                 const et = resp.headers && resp.headers.get && resp.headers.get('ETag');
-                return resp.json().then((data) => {
+                // A 204 says there is no content: no rows, as for a body of
+                // []. An empty 200 does not say that (a broken proxy answers
+                // so, and it must not empty a list and its snapshot): it
+                // stays an error, in words of its own where the JSON
+                // parser's were.
+                const body = resp.status === 204 ? Promise.resolve(null)
+                    : !resp.text ? resp.json()
+                    : resp.text().then((text) => {
+                        if (text === '') throw new Error('HTTP ' + resp.status + ': the response had no body');
+                        return JSON.parse(text);
+                    });
+                return body.then((data) => {
                     // Stored once the body PARSED, and before it is applied.
                     //
                     // After the parse, because a validator vouches for content.
@@ -3181,7 +3526,7 @@ export const QuerySystemMethods = {
                     // site). controller.etag is kept in step as the "last
                     // validator", which is what persistence saves and restores.
                     if (et) {
-                        if (!controller.etags) controller.etags = {};
+                        if (!controller.etags) controller.etags = Object.create(null);
                         controller.etags[url] = et;
                         controller.etag = et;
                         controller.etagUrl = url;
@@ -3198,7 +3543,7 @@ export const QuerySystemMethods = {
                 });
             })
             .catch(applyError)
-            .finally(settled);
+            .finally(settled));
     },
 
     /**
@@ -3253,10 +3598,10 @@ export const QuerySystemMethods = {
             // error: the error-codes page has attributed this case there all
             // along, while this call site threw a bare Error with no code.
             // Rejects, not throws.
-            const err = new Error(
-                `write("${opName}") on query "${controller.name}" needs a declarative \`to\`; ` +
-                `a function \`to\` carries no operation hint.`
-            );
+            const err = new Error(__DEV__
+                ? `write("${opName}") on query "${controller.name}" needs a declarative \`to\`; ` +
+                  `a function \`to\` carries no operation hint.`
+                : codeText('WF-974'));
             if (__DEV__) wfError(WF_ERRORS.QUERY_OP_UNKNOWN, {
                 context: `Query "${controller.name}": write("${opName}") named an operation, but \`to\` is a function and carries no operation hint`,
                 suggestion: 'Declare to: as a URL or an operation map to name operations, or call write(item) and let the transport function handle it'
@@ -3273,16 +3618,15 @@ export const QuerySystemMethods = {
                     ? "Declare it: create: '/api/items' (or { url, method, body, confirmation })"
                     : `Declared operations: ${ops && ops.size ? Array.from(ops.keys()).join(', ') : '(none)'}`
             });
-            const declared = ops && ops.size ? Array.from(ops.keys()).join(', ') : 'none';
             // Rejects, not throws — matching WF-982/WF-969
             // below and the WF-974 docs entry, which promised a rejection
             // all along.
-            return Promise.reject(new Error(
-                `Query "${controller.name}" declares no "${opName}" operation (declared: ${declared}). ` +
-                (opName === 'create'
-                    ? 'create() needs a `create:` declaration.'
-                    : 'Name it in `to:`, or declare `to:` as a URL for update and delete.')
-            ));
+            return Promise.reject(new Error(__DEV__
+                ? `Query "${controller.name}" declares no "${opName}" operation (declared: ${ops && ops.size ? Array.from(ops.keys()).join(', ') : 'none'}). ` +
+                  (opName === 'create'
+                      ? 'create() needs a `create:` declaration.'
+                      : 'Name it in `to:`, or declare `to:` as a URL for update and delete.')
+                : codeText('WF-974')));
         } else {
             op = ops.get(opName);
         }
@@ -3317,7 +3661,7 @@ export const QuerySystemMethods = {
             }
         }
         const wf = this;
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store) return Promise.resolve();
 
         // A delete reached BY NAME applies the declared tombstone field
@@ -3367,10 +3711,10 @@ export const QuerySystemMethods = {
         const boundAsRecord = !!controller.hasRecord && !controller.hasList;
 
         if (opName === 'create' && boundAsRecord) {
-            const err = new Error(
-                `create() on query "${controller.name}" is a record query: it holds one record, ` +
-                `so there is no second record to create. Write to it with write(item).`
-            );
+            const err = new Error(__DEV__
+                ? `create() on query "${controller.name}" is a record query: it holds one record, ` +
+                  `so there is no second record to create. Write to it with write(item).`
+                : codeText('WF-982'));
             if (__DEV__) wfError(WF_ERRORS.QUERY_CREATE_ON_RECORD, {
                 context: `Query "${controller.name}": create() on a record-shaped query`,
                 suggestion: 'A record query binds one record. Use write(item) to change it, or bind the query as a list (a <template> child) if it really holds many rows.'
@@ -3388,7 +3732,18 @@ export const QuerySystemMethods = {
         }
 
         const rows = store.rows || [];
-        const k = item == null ? undefined : item[key];
+        let k = item == null ? undefined : item[key];
+        // A key matches in any spelling: '1' from the DOM or the route names
+        // the row keyed 1. The write takes the key as the row holds it, so
+        // every comparison after this one is exact.
+        if (k != null && !rows.some((r) => r != null && r[key] === k)) {
+            const s = String(k);
+            const hit = rows.find((r) => r != null && r[key] != null && String(r[key]) === s);
+            if (hit) {
+                k = hit[key];
+                item = mergeData({}, item, { [key]: k });
+            }
+        }
         const keyed = k !== undefined;
         // A keyless item on a KEYED query used to target rows[0]: a write missing
         // the key field silently merged into whichever row happened to be first,
@@ -3405,10 +3760,10 @@ export const QuerySystemMethods = {
         // and that second case is why the declared-key test this used to make
         // was the wrong question.
         if (!keyed && (typeof controller.config.key === 'string' || boundAsList)) {
-            const err = new Error(
-                `write() on query "${controller.name}" needs the key field "${key}"; ` +
-                `the item passed has no "${key}" value, so there is no row to write to.`
-            );
+            const err = new Error(__DEV__
+                ? `write() on query "${controller.name}" needs the key field "${key}"; ` +
+                  `the item passed has no "${key}" value, so there is no row to write to.`
+                : codeText('WF-969'));
             if (__DEV__) wfError(WF_ERRORS.QUERY_WRITE_KEYLESS, {
                 context: `Query "${controller.name}": write() item is missing "${key}"`,
                 suggestion: `Include the key: write({ ${key}: <value>, ...fields }).`
@@ -3474,7 +3829,9 @@ export const QuerySystemMethods = {
         for (const f of Object.keys(item || {})) {
             if (f === key) continue; // the key identifies the row; it is not written data
             if (f === '__proto__') continue; // never merged (see mergeData), so never claimed
-            prevByField.set(ck(f), rowExisted ? currentRow[f] : undefined);
+            // The row's own value: a field it lacks is absent, whatever a
+            // name like `constructor` would inherit.
+            prevByField.set(ck(f), rowExisted ? ownValue(currentRow, f) : undefined);
             // Claim monotonicity: writeId comes from a per-controller
             // ++counter, so a later write always issues a strictly larger
             // one — "later claims overwrite earlier" (the tie-break this
@@ -3847,7 +4204,7 @@ export const QuerySystemMethods = {
             // of the rollback's row write.
             engineWrite(() => {
                 store.pendingWrites = controller.pendingWrites;
-                store.syncError = err && err.message ? err.message : String(err);
+                store.syncError = errText(err);
             });
             if (isDelete && rowExisted) {
                 // A rejected delete restores the row from its registry
@@ -4123,11 +4480,11 @@ export const QuerySystemMethods = {
             // The framework minted this key moments ago; interpolating it would
             // address a resource the server has never heard of. Refused in
             // every build, because the request would otherwise look successful.
-            throw new Error(
-                `Query "${controller.name}": create's URL ("${op.url}") interpolates the key ` +
-                `":${controller.key}", but no key was passed and the one the framework minted ` +
-                `names nothing on the server. Pass your own key, or point create: at the collection URL.`
-            );
+            throw new Error(__DEV__
+                ? `Query "${controller.name}": create's URL ("${op.url}") interpolates the key ` +
+                  `":${controller.key}", but no key was passed and the one the framework minted ` +
+                  `names nothing on the server. Pass your own key, or point create: at the collection URL.`
+                : codeText('WF-973'));
         }
         // Tokens resolve from the ITEM's fields first, then params. Item-first
         // because the item IS the resource being addressed: under params-first,
@@ -4137,8 +4494,8 @@ export const QuerySystemMethods = {
         // that lives on the route, not the row), params supply it.
         const params = this._queryResolveParams(controller);
         const built = interpolateUrl(op.url, (t) => {
-            const v = item == null ? undefined : item[t];
-            return v == null ? (params ? params[t] : undefined) : v;
+            const v = ownValue(item, t);
+            return v == null ? ownValue(params, t) : v;
         });
         if (built.missing) {
             if (__DEV__) wfError(WF_ERRORS.QUERY_URL_TOKEN_UNRESOLVED, {
@@ -4146,10 +4503,10 @@ export const QuerySystemMethods = {
                 context: `Query "${controller.name}": the "${op.name}" URL "${op.url}" needs a value for ":${built.missing}"`,
                 suggestion: `Carry ${built.missing} on the item being written, or supply it from params:`
             });
-            throw new Error(
-                `Query "${controller.name}": the URL token ":${built.missing}" in the "${op.name}" ` +
-                `operation ("${op.url}") has no value on the item or in params, so nothing was sent.`
-            );
+            throw new Error(__DEV__
+                ? `Query "${controller.name}": the URL token ":${built.missing}" in the "${op.name}" ` +
+                  `operation ("${op.url}") has no value on the item or in params, so nothing was sent.`
+                : codeText('WF-972'));
         }
         const headers = this._queryHeaders(controller, built.url);
         // Taken before the engine adds Content-Type below: WF-986 concerns
@@ -4165,8 +4522,15 @@ export const QuerySystemMethods = {
             // their own data and passes through untouched.
             const payload = bodyFn(mintedKey ? omitKey(item, controller.key) : item);
             if (payload !== undefined) {
-                headers['Content-Type'] = 'application/json';
-                init.body = JSON.stringify(payload);
+                // fetch sends these itself and writes their Content-Type (a
+                // form's multipart boundary lives there); stringified, each
+                // would arrive as "{}".
+                if (payload instanceof FormData || payload instanceof URLSearchParams || payload instanceof Blob) {
+                    init.body = payload;
+                } else {
+                    headers['Content-Type'] = 'application/json';
+                    init.body = JSON.stringify(payload);
+                }
             }
         } else if (__DEV__ && !controller._warnedBody) {
             // A body-less request is a legal declaration (some APIs take
@@ -4253,7 +4617,7 @@ export const QuerySystemMethods = {
                     // exactly as before; additive only.
                     if (__DEV__) wfError(WF_ERRORS.QUERY_CONFIRMATION_THREW, {
                         warn: true,
-                        context: `Query "${controller.name}": the "${op.name}" confirmation: threw (${e && e.message ? e.message : e}); the server answered ${resp.status} ok`,
+                        context: `Query "${controller.name}": the "${op.name}" confirmation: threw (${errText(e)}); the server answered ${resp.status} ok`,
                         suggestion: 'confirmation receives the parsed response body and the written item, not the Response; return the record to apply (confirmation: body => body), return the item to keep what was written, or nothing to refetch'
                     });
                     throw e;
@@ -4282,7 +4646,7 @@ export const QuerySystemMethods = {
         if (id !== controller.runId) return;
         controller.lastUrl = url;
         if (controller.accumulated || controller.pendingWrites > 0) return;
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store) return;
 
         const bound = (v, d) => (typeof v === 'number' && isFinite(v) && v >= 0 ? v : d);
@@ -4308,7 +4672,13 @@ export const QuerySystemMethods = {
         }
 
         if (m.has(url)) m.delete(url);
-        m.set(url, (rgToRaw(store.rows) || []).map(rgToRaw));
+        // A copy of each row as the server's answer left it: the store's own
+        // row objects take in-place edits (a data-model input in a row), and
+        // the cache would repaint an unsaved edit as the server's answer.
+        m.set(url, (rgToRaw(store.rows) || []).map((r) => {
+            const raw = rgToRaw(r);
+            return raw !== null && typeof raw === 'object' ? mergeData({}, raw) : raw;
+        }));
         controller.snapUrl = url;
         controller.snapAt = now;
 
@@ -4318,6 +4688,13 @@ export const QuerySystemMethods = {
             const oldest = m.keys().next().value;
             rows -= m.get(oldest).length;
             m.delete(oldest);
+        }
+        // A validator is of use only for a URL whose rows are still here:
+        // the table follows the cache, or it grew by one entry per URL
+        // fetched for the life of the page. (With the cache off the table is
+        // left alone: nothing says which URLs' rows the page still holds.)
+        if (controller.etags) {
+            for (const u in controller.etags) if (!m.has(u)) delete controller.etags[u];
         }
     },
 
@@ -4470,8 +4847,13 @@ export const QuerySystemMethods = {
                 map.set(urlOrigin(''), src[k]);
                 continue;
             }
-            if (__DEV__ && k.indexOf('//') < 0) {
-                wfError(WF_ERRORS.QUERY_HEADERS_INVALID, {
+            // Skipped in every build: read as a URL, a key with no authority
+            // is relative, which is the document's own origin, so a
+            // misspelled key ('api.example.com') would stand for 'self' and
+            // replace the real self entry. Only the warning is the
+            // development build's.
+            if (k.indexOf('//') < 0) {
+                if (__DEV__) wfError(WF_ERRORS.QUERY_HEADERS_INVALID, {
                     warn: true,
                     context: `config({ headers }): "${k}" is not an origin, so no request will ever match it`,
                     suggestion: "Keys are origins ('https://api.example.com') or 'self' for this document's own origin"
@@ -4494,7 +4876,7 @@ export const QuerySystemMethods = {
      *  carrying fields still claimed by pending writes onto the survivor,
      *  so no duplicate row survives and no optimistic edit is lost. */
     _queryRenameRowKey(controller, oldK, newK, carryFields) {
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store) return;
         const key = controller.key;
         const rows = rgToRaw(store.rows) || [];
@@ -4537,7 +4919,7 @@ export const QuerySystemMethods = {
      *  construction. For an unkeyed (record) rollback `k` is undefined
      *  and matches rows that lack the key field. */
     _queryRemoveRow(controller, k) {
-        const store = this.getStore(controller.name);
+        const store = this._queryStore(controller);
         if (!store) return;
         const key = controller.key;
         const rows = rgToRaw(store.rows) || [];

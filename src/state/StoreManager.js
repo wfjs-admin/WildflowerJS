@@ -8,7 +8,17 @@ import { WF_ERRORS, objectUtils, wfError, definitionSignature, validateEntityDef
 // (validateEntityDefinition allowlist — keep in sync with createStoreComponent).
 const STORE_CONTRACT_KEYS = ['state', 'computed', 'subscribe', 'storageKey', 'autoSave', 'pools', 'watch'];
 import { createStateManager } from './createStateManager.js';
+import { reactive as rgReactive } from './reactive-graph/core.js';
 import { createContextProxy, patchSelfReferences, warnCollisions, RAW_TARGET } from './ContextProxy.js';
+
+// One graph source per entity name (a store, a plugin, a query's store). A
+// lookup that finds no entity reads its source, so whatever was running (a
+// component's render effect, a list's effect, a computed) depends on the
+// arrival; _resolvePendingStoreDependencies writes it when the entity
+// registers, and exactly those run again. A lookup that hits never reads it.
+const arrivals = rgReactive({});
+let arrivalSeq = 0;
+export const entityMissed = (name) => { void arrivals[name]; };
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════════════════
@@ -114,16 +124,13 @@ export class StoreManager {
 
         /**
          * Pending store dependencies - tracks components waiting for stores to be created.
-         * Map<storeName, Set<{ componentId, computedName, listElement }>>
+         * Map<storeName, Set<"componentId|computedName">>
          *
          * When a component's computed property calls external('storeName') before that store
          * exists, we register the dependency here. When store() is called, we
          * re-evaluate those computed properties to trigger reactive updates.
          */
         this._pendingStoreDependencies = new Map();
-
-        // V8 OPT: Pre-initialize to stabilize hidden class
-        this._pendingListElements = new Map();
     }
 
     // =========================================================================
@@ -139,36 +146,25 @@ export class StoreManager {
      * @param {string} storeName - Name of the store being waited for
      * @param {string} componentId - ID of the component that needs the store
      * @param {string} computedName - Name of the computed property that needs re-evaluation
-     * @param {HTMLElement} [listElement] - Optional list element that needs re-rendering
      */
-    registerPendingStoreDependency(storeName, componentId, computedName, listElement = null) {
+    registerPendingStoreDependency(storeName, componentId, computedName) {
+        entityMissed(storeName);
         if (!this._pendingStoreDependencies.has(storeName)) {
             this._pendingStoreDependencies.set(storeName, new Set());
         }
 
-        // Use composite string key for Set deduplication.
-        // listElement (DOM node) is stored separately in _pendingListElements below
-        // because DOM nodes are not serializable and would be silently stripped.
-        const dedupKey = `${componentId}|${computedName}`;
-        this._pendingStoreDependencies.get(storeName).add(dedupKey);
-
-        // PENDING LIST ELEMENT: If there's a list element in the tracking context,
-        // store it separately (DOM elements can't be serialized to JSON)
-        // This allows _resolvePendingStoreDependencies to re-render the list when the store is created
-        const trackingContext = this.framework?._computedTrackingContext;
-        const trackedListElement = trackingContext?.listElement;
-        if (trackedListElement && componentId && computedName) {
-            const key = `${componentId}:${computedName}`;
-            this._pendingListElements.set(key, trackedListElement);
-        }
+        // Composite string key for Set deduplication.
+        this._pendingStoreDependencies.get(storeName).add(`${componentId}|${computedName}`);
     }
 
     /**
-     * Re-evaluate a component's cached work and re-render its lists after an
-     * entity it referenced finally registered. Its computed caches were filled
-     * with the misses (external() returns null for an absent entity), and its
-     * mapArray lists captured an array function that resolved to nothing, so
-     * both have to be dropped rather than merely marked dirty.
+     * Re-evaluate a component's cached work after an entity it referenced
+     * finally registered. Its computed caches were filled with the misses
+     * (external() returns null for an absent entity), so they are dropped
+     * rather than merely marked dirty. A list the component has mounted is
+     * left as it is: the effects in it that missed the entity read its
+     * arrival source (entityMissed) and run again by themselves, so its rows
+     * stay the same nodes, with what was typed or focused in them.
      *
      * Shared by the deferred-subscribe path and the pending-binding path: the
      * two arrive for different reasons and need identical recovery.
@@ -188,18 +184,19 @@ export class StoreManager {
             for (const name of sm.getComputedPropertyNames()) sm._invalidateCachedComputed(name, true);
             sm._reevaluateObserved();
         }
-        if (instance.stateManager._lastEvalResult) {
-            instance.stateManager._lastEvalResult.clear();
-        }
-        // Re-render any list elements in this component that may depend on the store
-        if (instance.element && this.framework._renderList) {
+        // A mounted list reads its array again, in place (the reconciler
+        // keeps its rows by key). A list not mounted yet (server rows adopted
+        // and waiting, or no data until now) renders with the entity there.
+        if (__FEATURE_LISTS__ && instance.element && this.framework._renderList) {
             const listEls = instance.element.querySelectorAll('[data-list],[data-wf-list]');
             for (const listEl of listEls) {
-                if (listEl._mapArrayInitialized && listEl._disposeMapArray) {
-                    listEl._disposeMapArray();
-                    listEl._mapArrayInitialized = false;
-                    listEl._disposeMapArray = null;
-                    listEl.innerHTML = '';
+                // A server-rendered list waiting on a late-declared query keeps
+                // its server rows: the query's drain adopts them into the new
+                // store, then renders the list (_queryDrainLate).
+                if (__FEATURE_QUERY__ && this.framework._queryLateSSRWaiting && this.framework._queryLateSSRWaiting(listEl)) continue;
+                if (listEl._mapArrayInitialized) {
+                    if (listEl._refreshMapArray) listEl._refreshMapArray();
+                    continue;
                 }
                 const ctx = listEl._listContext;
                 if (ctx) {
@@ -216,6 +213,8 @@ export class StoreManager {
      * @param {string} storeName - Name of the store that was just created
      */
     _resolvePendingStoreDependencies(storeName) {
+        // Every effect and computed that missed this name runs again.
+        arrivals[storeName] = ++arrivalSeq;
         const pendingSet = this._pendingStoreDependencies.get(storeName);
         if (!pendingSet || pendingSet.size === 0) {
             return;
@@ -265,7 +264,7 @@ export class StoreManager {
                 const fw = this.framework;
                 if (__FEATURE_QUERY__ && !instance.isVirtual && fw._queryControllers && fw._queryControllers.has(storeName)) {
                     const qc = fw._queryControllers.get(storeName);
-                    if (instance.element) qc.elements.add(instance.element);
+                    if (instance.element) fw._queryObserve(qc, instance.element);
                     fw._queryActivate(qc);
                 }
                 this._wakeComponentForLateEntity(instance);
@@ -298,47 +297,6 @@ export class StoreManager {
                     if (instance.stateManager._invalidateCachedComputed) {
                         instance.stateManager._invalidateCachedComputed(computedName, true);
                         instance.stateManager._reevaluateObserved(computedName);
-                    }
-                    if (instance.stateManager._lastEvalResult) {
-                        instance.stateManager._lastEvalResult.delete(computedName);
-                    }
-
-                    // Check if there's a list element stored for this pending dependency
-                    // (DOM elements can't be serialized to JSON, so we use a separate Map)
-                    // Key is just componentId:computedName since we don't know the store when registering
-                    const key = `${componentId}:${computedName}`;
-                    const listElement = this._pendingListElements?.get(key);
-
-                    // If there's a list element, trigger re-render
-                    if (listElement && listElement.isConnected) {
-                        // Get the list renderer and trigger update
-                        // ListRendererMethods is mixed into the framework, so _renderList is on this.framework
-                        if (this.framework._renderList) {
-                            // For mapArray lists, we need to dispose and re-initialize
-                            // so the arrayFn can re-evaluate with the now-existing store
-                            if (listElement._mapArrayInitialized && listElement._disposeMapArray) {
-                                listElement._disposeMapArray();
-                                listElement._mapArrayInitialized = false;
-                                listElement._disposeMapArray = null;
-                                listElement.innerHTML = '';
-                            }
-
-                            // Get the list context
-                            const context = listElement._listContext;
-
-                            // Force the list to re-render with new data
-                            if (context) {
-                                this.framework._renderList(
-                                    listElement,
-                                    null, // Let it re-resolve the data
-                                    context,
-                                    instance
-                                );
-                            }
-                        }
-
-                        // Clean up the list element reference
-                        this._pendingListElements?.delete(key);
                     }
 
                     // Re-run the render effect so it picks up the new store value
@@ -401,15 +359,14 @@ export class StoreManager {
         // Validate inputs
         if (!name || typeof name !== 'string') {
             this.framework._error(WF_ERRORS.STORE_NAME_INVALID, {
-                suggestion: 'Provide a string name as the first argument to store()'
+                ...(__DEV__ && { suggestion: 'Provide a string name as the first argument to store()' })
             });
             return null;
         }
 
         if (!definition || typeof definition !== 'object') {
             this.framework._error(WF_ERRORS.STORE_DEF_INVALID, {
-                context: name,
-                suggestion: 'Provide an object with state and optional computed properties'
+                ...(__DEV__ && { context: name, suggestion: 'Provide an object with state and optional computed properties' })
             });
             return null;
         }
@@ -559,7 +516,7 @@ export class StoreManager {
             // before init() so init can populate them. Guarded: the pool module
             // is absent from tiers without pools (see the tick() twin below).
             const fw = this.framework;
-            if (fw._setupDataPools) {
+            if (__FEATURE_POOLS__ && fw._setupDataPools) {
                 rawContext.getPool = function(poolName, options) {
                     const handle = (instance._pools && instance._pools.get(poolName)) || null;
                     if (handle && options) fw._applyPoolHooks(handle, options, instance.context);
@@ -567,7 +524,7 @@ export class StoreManager {
                 };
             }
             if (definition.pools) {
-                if (fw._setupDataPools) {
+                if (__FEATURE_POOLS__ && fw._setupDataPools) {
                     fw._setupDataPools(instance, definition.pools);
                     // Pool entities are plain objects nothing tracks, so
                     // autoSave cannot see them change; storageKey is for state.
@@ -651,7 +608,7 @@ export class StoreManager {
             // absent from tiers without pools (see ComponentLifecycle twin).
             if (typeof definition.tick === 'function') {
                 const fw = this.framework;
-                if (fw._startPoolLoop) {
+                if (__FEATURE_POOLS__ && fw._startPoolLoop) {
                     instance._tickFn = definition.tick.bind(context);
                     if (!fw._tickableInstances) fw._tickableInstances = [];
                     fw._tickableInstances.push(instance);
@@ -667,8 +624,7 @@ export class StoreManager {
             return instance;
         } catch (error) {
             this.framework._error(WF_ERRORS.STORE_CREATE_ERROR, {
-                context: name,
-                suggestion: 'Check the store definition for errors',
+                ...(__DEV__ && { context: name, suggestion: 'Check the store definition for errors' }),
                 cause: error
             });
             // A throw part way through (an arrow-function entity method in a
@@ -676,7 +632,7 @@ export class StoreManager {
             // could unregister it, and getStore() would return it.
             const partial = this.framework.componentInstances.get(instanceId);
             if (partial) {
-                if (this.framework._cleanupPools) this.framework._cleanupPools(partial);
+                if (__FEATURE_POOLS__ && this.framework._cleanupPools) this.framework._cleanupPools(partial);
                 this.framework.componentInstances.delete(instanceId);
             }
             if (this._virtualComponents) this._virtualComponents.delete(instanceId);
@@ -943,8 +899,9 @@ export class StoreManager {
                             // one). The lean proxy is only used outside a tracking context,
                             // where the inner proxy's tracking is a no-op, so target the RAW
                             // state object directly. Halves the per-read proxy cost (~222ns ->
-                            // ~55ns, faster than Vue). Falls back to _state if no raw target.
-                            const storeState = sm._originalState || sm._state;
+                            // ~55ns, faster than Vue). (It read sm._originalState, which no
+                            // state manager sets, so this has always been sm._state.)
+                            const storeState = sm._state;
                             const storeComputed = sm.computed;
                             const rawCtx = store[RAW_TARGET];
                             const leanProxy = new Proxy(storeState, {
@@ -1034,7 +991,7 @@ export class StoreManager {
             // subscribes the paths below and wakes this store's computeds
             // (_resolvePendingStoreDependencies).
             if (!this.getStore(storeName)) {
-                this.registerPendingStoreDependency(storeName, instance.id, '_subscribe_', null);
+                this.registerPendingStoreDependency(storeName, instance.id, '_subscribe_');
             }
             const pathsArray = Array.isArray(paths) ? paths : [paths];
 
@@ -1206,13 +1163,30 @@ export class StoreManager {
     unregisterStore(name) {
         if (!this._namedStores || !this._namedStores.has(name)) return false;
         const store = this._namedStores.get(name);
+        const fw = this.framework;
+        const readers = new Set();
         if (store && store.id) {
-            if (this.framework.destroyComponent) this.framework.destroyComponent(store.id);
+            for (const map of [fw._entityDependents, fw._externalDependencies]) {
+                const ids = map && map.get(store.id);
+                if (ids) ids.forEach((id) => readers.add(id));
+            }
+            if (fw.destroyComponent) fw.destroyComponent(store.id);
             if (this._virtualComponents) this._virtualComponents.delete(store.id);
         }
         this._namedStores.delete(name);
         if (this._pendingStoreDependencies) this._pendingStoreDependencies.delete(name);
         this._queueReattach(name, store && store.id);
+        // Whatever read this instance reads the name again: its computeds are
+        // dropped and its effects run again, on the next flush. A store
+        // registered under the name by then is the one they read; until one
+        // is, they miss, and the miss follows the name's arrival
+        // (entityMissed). Without this they stayed on the discarded instance.
+        readers.forEach((id) => {
+            const inst = fw.componentInstances.get(id);
+            if (!inst || !inst.stateManager) return;
+            this._wakeComponentForLateEntity(inst);
+            inst.stateManager._effects.forEach((effect) => { effect.dirty = true; });
+        });
         return true;
     }
 
@@ -1228,8 +1202,7 @@ export class StoreManager {
             return;
         }
         this.framework._error(WF_ERRORS.STORE_INIT_ERROR, {
-            context: name,
-            suggestion: 'Check the init() function in your store definition',
+            ...(__DEV__ && { context: name, suggestion: 'Check the init() function in your store definition' }),
             cause: error
         });
     }
@@ -1258,7 +1231,7 @@ export class StoreManager {
                 if (inst._storeSubscriptions) {
                     inst._storeSubscriptions = inst._storeSubscriptions.filter((s) => s.storeName !== name);
                 }
-                this.registerPendingStoreDependency(name, id, '_subscribe_', null);
+                this.registerPendingStoreDependency(name, id, '_subscribe_');
             }
             const specs = inst._storeWatchSpecs;
             if (specs && specs.some((s) => s.storeName === name)) {
@@ -1270,7 +1243,7 @@ export class StoreManager {
                 }
                 inst._storeWatchSpecs = specs.filter((s) => s.storeName !== name);
                 inst._storeWatchPending = (inst._storeWatchPending || []).concat(specs.filter((s) => s.storeName === name));
-                this.registerPendingStoreDependency(name, id, PENDING_STORE_WATCH, null);
+                this.registerPendingStoreDependency(name, id, PENDING_STORE_WATCH);
             }
         });
     }
@@ -1323,7 +1296,12 @@ export class StoreManager {
             }
         }
 
-        if (!storeContext) return null;
+        if (!storeContext) {
+            // A computed or an effect that asked for it runs again when it
+            // registers.
+            entityMissed(name);
+            return null;
+        }
 
         // AUTOMATIC DEPENDENCY TRACKING: If we're inside a computed property evaluation,
         // use the shared tracking proxy to automatically register dependencies
@@ -1393,7 +1371,7 @@ export class StoreManager {
 
         if (!store) {
             this.framework._error(WF_ERRORS.STORE_DEFAULT_ERROR, {
-                suggestion: 'Check the store configuration for errors'
+                ...(__DEV__ && { suggestion: 'Check the store configuration for errors' })
             });
             return null;
         }

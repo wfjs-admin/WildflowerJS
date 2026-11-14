@@ -20,8 +20,143 @@
 
 import { ssrAdoptedElements, ssrStateChangedElements, ssrItemWriteMarks, ssrTakeoverAtActivation } from '../core/DomMetadata.js';
 import { applyShow, applyModel } from '../core/BindingWriters.js';
+import { wfError, WF_ERRORS } from '../core/wfUtils.js';
+
+// The binding attributes a row's own scope reads (a data-list in the row is
+// a list of its own).
+const _ROW_BINDINGS = ['bind', 'bind-html', 'bind-attr', 'bind-class', 'bind-style', 'show', 'render', 'model'];
+
+// Components that hold a server list over a shared source ($store.path, a
+// query's rows, external(...)) which mapArray does not own yet
+// (_ssrFollowShared).
+const ssrSharedOwners = new WeakSet();
 
 export const SSRListMethods = {
+    /**
+     * The entities a binding's path or expression names, or null: $name
+     * outside quoted text (a template literal counts what its ${ } hold),
+     * and the long form external('name', 'path').
+     * @private
+     */
+    _ssrEntityNames(path) {
+        if (typeof path !== 'string') return null;
+        let names = null;
+        let m;
+        if (path.indexOf('external(') !== -1) {
+            const long = /external\(\s*['"]([^'"]+)['"]/g;
+            while ((m = long.exec(path))) (names || (names = [])).push(m[1].startsWith('plugin:') ? m[1].slice(7) : m[1]);
+        }
+        if (path.indexOf('$') !== -1) {
+            const bare = path
+                .replace(/`[^`]*`/g, (literal) => (literal.match(/\$\{[^}]*\}/g) || []).join(' '))
+                .replace(/'[^']*'|"[^"]*"/g, '');
+            // Entity names may hold hyphens (a query named my-feed).
+            const short = /\$([A-Za-z_][\w-]*)/g;
+            while ((m = short.exec(bare))) (names || (names = [])).push(m[1].replace(/-+$/, ''));
+        }
+        return names;
+    },
+
+    /**
+     * Whether a list's rows have a binding that reads a shared source: its
+     * row templates are read, or its first server row when the template is
+     * elsewhere. A list inside the rows answers for itself, and a component
+     * inside them reads its own bindings.
+     * @private
+     */
+    _ssrRowsReadShared(listEl, firstRow) {
+        const templates = listEl.querySelectorAll(':scope > template');
+        const roots = templates.length ? Array.from(templates, (t) => t.content) : [firstRow];
+        const listSel = this._attrSelector('list');
+        const componentSel = this._attrSelector('component');
+        for (const root of roots) {
+            if (!root) continue;
+            const els = root.querySelectorAll('*');
+            for (let i = root === firstRow ? -1 : 0; i < els.length; i++) {
+                const el = i < 0 ? root : els[i];
+                if (root === firstRow && el !== root && el.closest(listSel) !== listEl) continue;
+                // Below a component in the row (its root included): the component's.
+                const owner = el !== root && el.parentElement && el.parentElement.closest(componentSel);
+                if (owner && root.contains(owner)) continue;
+                for (const type of _ROW_BINDINGS) {
+                    const value = this._getAttr(el, type);
+                    if (value && this._ssrEntityNames(value)) return true;
+                }
+            }
+        }
+        return false;
+    },
+
+    /**
+     * Whether a binding in server-rendered markup reads an entity that is not
+     * registered yet: a $name anywhere in its path or expression, the long
+     * form external('name', ...), or a record
+     * query's store. A late-declared record query counts until its drain has
+     * adopted the server content: the store's creation wakes the binding
+     * before the drain runs. The names are read once per binding, and only
+     * for a binding inside server-rendered markup; once every one of them is
+     * there the binding holds none, so the rule ends with the entity's
+     * arrival (one that unregisters later is read as any absent entity is)
+     * and a binding whose entities are present pays one property read.
+     * @private
+     */
+    _ssrEntityMissing(meta) {
+        let names = meta._ssrNames;
+        if (names === undefined) {
+            names = null;
+            const el = meta.element;
+            if (el && el.closest(this._attrSelector('ssr', 'true'))) {
+                names = this._ssrEntityNames(meta.path);
+                const record = __FEATURE_QUERY__ && el._wfRecordQuery;
+                if (record) (names || (names = [])).push(record);
+            }
+            meta._ssrNames = names;
+        }
+        if (!names) return false;
+        const el = meta.element;
+        for (const name of names) {
+            // A plugin is an entity too; _externalFindTarget knows stores and
+            // components only.
+            const present = (__FEATURE_PLUGINS__ && this._pluginStates && this._pluginStates.has(name)) ||
+                this._externalFindTarget(name);
+            if (!present ||
+                (__FEATURE_QUERY__ && name === el._wfRecordQuery && this._queryLateEls && this._queryLateEls.has(name))) {
+                if (__DEV__) this._ssrNoteLateEntity(name, meta);
+                return true;
+            }
+        }
+        meta._ssrNames = null;
+        return false;
+    },
+
+    /**
+     * WF-803 (development builds): an entity a server-rendered binding waits
+     * for that is still not registered after a settle window. Once per name;
+     * the server content stays either way.
+     * @private
+     */
+    _ssrNoteLateEntity(name, meta) {
+        if (!__DEV__) return;
+        const noted = this._ssrLateNoted || (this._ssrLateNoted = new Set());
+        if (noted.has(name)) return;
+        noted.add(name);
+        const el = meta.element;
+        const path = meta.path;
+        setTimeout(() => {
+            const arrived = (__FEATURE_PLUGINS__ && this._pluginStates && this._pluginStates.has(name)) ||
+                this._externalFindTarget(name);
+            if (arrived || !el || !el.isConnected) {
+                noted.delete(name);
+                return;
+            }
+            wfError(WF_ERRORS.SSR_ENTITY_NOT_REGISTERED, {
+                warn: true,
+                context: `"${path}" reads $${name}, and no store, plugin or query named '${name}' is registered`,
+                suggestion: `If '${name}' registers later by design (after a lazy import, or on interaction), nothing is wrong and this note can be ignored. Otherwise check the name and that its script loaded: every binding that reads $${name} in server-rendered markup shows what the server rendered and never updates.`
+            });
+        }, this._devSsrLateMs ?? 1500);
+    },
+
     /**
      * An item-level write (`rows.0.x`, `groups.1.cells.length`) reached an
      * adopted list that mapArray does not own yet. Its fingerprint records
@@ -72,6 +207,44 @@ export const SSRListMethods = {
             else this._scheduleRender();
         }
         return hit;
+    },
+
+    /**
+     * A server list over a shared source was adopted in this component.
+     * @private
+     */
+    _ssrNoteSharedList(el, instance) {
+        if (!instance) {
+            const owner = el.closest(this._attrSelector('component'));
+            instance = owner && this.componentInstances.get(owner.dataset.componentId);
+        }
+        if (instance) ssrSharedOwners.add(instance);
+    },
+
+    /**
+     * A source this component reads changed. Its mounted lists follow the
+     * source through their own effects; an adopted list over a shared source
+     * that mapArray does not own yet has no effect and no other signal, so
+     * each one is processed here (the fingerprint check in the list path
+     * keeps unchanged data render-free). Only a component recorded at
+     * adoption is looked at, and it is dropped once none of its lists is
+     * waiting, so a store write costs other components one set lookup.
+     * (This ran only while a query was registered: without one, a server
+     * list over $store.path never followed its store.)
+     * @private
+     */
+    _ssrFollowShared(instance) {
+        if (!ssrSharedOwners.has(instance)) return;
+        let waiting = false;
+        instance.element.querySelectorAll(this._attrSelector('list')).forEach(listEl => {
+            if (listEl._mapArrayInitialized) return;
+            const listPath = this._getAttr(listEl, 'list');
+            if (listPath && (listPath.includes('external(') || listPath.includes('$'))) {
+                waiting = true;
+                this._processList({ element: listEl, path: listPath, componentId: instance.id }, instance, true);
+            }
+        });
+        if (!waiting) ssrSharedOwners.delete(instance);
     },
 
     /**
@@ -340,7 +513,7 @@ export const SSRListMethods = {
                         }
 
                         // FALLBACK PATH: Use querySelectorAll (for items without compiled metadata)
-                        if (!itemEl._warnedSlowPath) {
+                        if (__DEV__ && !itemEl._warnedSlowPath) {
                             itemEl._warnedSlowPath = true;
                             console.warn('[WildflowerJS] List item missing compiled metadata; using querySelectorAll fallback (slower). This may happen with configurable templates or SSR-adopted lists.');
                         }
@@ -734,13 +907,17 @@ export const SSRListMethods = {
         // long form external(...)) or a computed (by name, or as the head of
         // a dotted path such as menu.items), nothing is taken over: such rows
         // can lag the server markup until the source loads, and a takeover
-        // would blank them.
+        // would blank them. A shared source that already holds rows has
+        // loaded, so its list is taken over like a state array; that is
+        // asked of the list that reads the source (its own rows), not of a
+        // list inside its rows.
         if (mismatch) {
             let root = null;
             for (let c = context; c; c = (c.parent && c.parent.type === 'list') ? c.parent : null) {
                 const p = String(c.path);
                 const csm = (c.componentInstance || instance)?.stateManager;
-                if (p.indexOf('$') !== -1 || p.indexOf('external(') !== -1 || p.startsWith('computed:') ||
+                const rows = c === context ? data : c.data;
+                if (((p.indexOf('$') !== -1 || p.indexOf('external(') !== -1) && !(rows && rows.length)) || p.startsWith('computed:') ||
                     (csm && csm.computed && csm.computed[p.split('.')[0]])) {
                     root = null;
                     break;
@@ -775,6 +952,18 @@ export const SSRListMethods = {
             }
         }
 
+        // Rows whose bindings read a shared source ($store, a plugin, a
+        // query, external()) change through that source, which no write to
+        // this list names. Adopted rows are bound once and have no effect of
+        // their own, so nothing in them followed it. With every server row
+        // matched, the list is taken over at activation: mapArray keeps the
+        // rows as the same nodes, and each row's effect follows the source.
+        if (pairs.length > 0 && !mismatch && this._ssrRowsReadShared(element, pairs[0][0])) {
+            let top = context;
+            while (top && top.parent && top.parent.type === 'list') top = top.parent;
+            ssrTakeoverAtActivation.add(top && top.element ? top.element : element);
+        }
+
         // Mark list as having completed initial render
         element._initialRenderDone = true;
         element._previousData = [...data];
@@ -790,6 +979,7 @@ export const SSRListMethods = {
         // stamping replacements, so adopted DOM identity survives the first
         // re-render (focus, selection, transitions, third-party state intact).
         element._ssrAdoptedByKey = itemElements;
+        if (String(listPath).indexOf('$') !== -1 || String(listPath).indexOf('external(') !== -1) this._ssrNoteSharedList(element, instance);
 
         // Set up event delegation on the container element
         this._ensureListEventDelegation(element, instance, listPath);
@@ -802,6 +992,18 @@ export const SSRListMethods = {
         // can name child paths for a list whose rows hold no list at all: one
         // query decides for every row (a row that is itself a list is a
         // descendant of the container too; template content is not).
+        // A data-query in the row template is a list too, once it is rewritten
+        // to data-list="$name.rows". A client mount rewrites the template as
+        // it caches the nested templates (_processNestedTemplates); adopted
+        // rows come here first, so it is rewritten and its relationship
+        // recorded now, or the query lists in these rows would never mount.
+        if (__FEATURE_QUERY__ && context) {
+            const tpl = element.querySelector(':scope > template');
+            if (tpl && tpl.content && tpl.content.querySelector(this._attrSelector('query'))) {
+                this._transformQueryElementsInTemplate(tpl.content);
+                this._detectAndRegisterListRelationships(element);
+            }
+        }
         const childPaths = context && this._listRelationships && this._listRelationships.get(context.path);
         if (childPaths && childPaths.size && this._contextSystemInitialized &&
             element.querySelector(this._attrSelector('list'))) {

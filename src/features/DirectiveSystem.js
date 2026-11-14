@@ -257,7 +257,7 @@ export const DirectiveSystemMethods = {
             skip = null;
             if (own) {
                 // Content another component's portal moved here is that component's.
-                const from = element !== rootElement && element.getAttribute('data-portaled-from');
+                const from = __FEATURE_PORTALS__ && element !== rootElement && element.getAttribute('data-portaled-from');
                 if (from && from !== own.dataset.componentId) {
                     skip = element;
                     continue;

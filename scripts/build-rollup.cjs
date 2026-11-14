@@ -133,6 +133,7 @@ const FEATURES_ALL = {
     __FEATURE_TRANSITIONS__: 'true',
     __FEATURE_SSR__: 'false',
     __FEATURE_LISTS__: 'true',
+    __FEATURE_POOLS__: 'true',
     __FEATURE_QUERY__: 'false',
 };
 // data-query rides the SSR tier by decision:
@@ -144,12 +145,18 @@ const FEATURES_LITE = {
     __FEATURE_TRANSITIONS__: 'false',
     __FEATURE_SSR__: 'false',
     __FEATURE_LISTS__: 'true',
+    __FEATURE_POOLS__: 'true',
     __FEATURE_QUERY__: 'false',
 };
 // NANO: below mini — everything in lite/mini minus the data-list render cluster.
 // __FEATURE_LISTS__ = false constant-folds the list call-sites out of the
 // nano-shipped modules (crash-safe) and drops the cluster spread.
-const FEATURES_NANO = { ...FEATURES_LITE, __FEATURE_LISTS__: 'false' };
+const FEATURES_NANO = { ...FEATURES_LITE, __FEATURE_LISTS__: 'false', __FEATURE_POOLS__: 'false' };
+// The entry files decide which tiers carry PoolRenderer; __FEATURE_POOLS__
+// folds the pool call-sites in shared modules out of the two that do not
+// (nano, mini). It follows TIER_CAPS.pools.
+const FEATURES_MINI = { ...FEATURES_LITE, __FEATURE_POOLS__: 'false' };
+const FEATURES_MINI_POOL = { ...FEATURES_NANO, __FEATURE_POOLS__: 'true' };
 
 // The eight capabilities that differ between tiers, read at runtime as
 // wildflower.features (extensions probe it).
@@ -195,11 +202,11 @@ const configs = [
     { entry: 'index.nano.js', file: 'wildflower.nano.min.js',  features: FEATURES_NANO, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
 
     // MINI-POOL (mini's composition with pools in place of lists) — the lean
-    // games/simulation tier. Same FEATURES_NANO flags: __FEATURE_LISTS__ = false
+    // games/simulation tier. Nano's flags with pools on: __FEATURE_LISTS__ = false
     // folds list call-sites out; PoolRenderer comes in via the entry point.
-    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.js',     features: FEATURES_NANO, dev: true,  minify: false, mangleProps: false, footer: 'core' },
-    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.dev.js', features: FEATURES_NANO, dev: true,  minify: true,  mangleProps: false, footer: 'core' },
-    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.min.js', features: FEATURES_NANO, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
+    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.js',     features: FEATURES_MINI_POOL, dev: true,  minify: false, mangleProps: false, footer: 'core' },
+    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.dev.js', features: FEATURES_MINI_POOL, dev: true,  minify: true,  mangleProps: false, footer: 'core' },
+    { entry: 'index.mini-pool.js', file: 'wildflower.mini-pool.min.js', features: FEATURES_MINI_POOL, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
 
     // CORE
     { entry: 'index.js',      file: 'wildflower.js',           features: FEATURES_ALL,  dev: true,  minify: false, mangleProps: false, footer: 'core' },
@@ -207,9 +214,9 @@ const configs = [
     { entry: 'index.js',      file: 'wildflower.min.js',       features: FEATURES_ALL,  dev: false, minify: true,  mangleProps: true,  footer: 'core' },
 
     // MINI
-    { entry: 'index.mini.js', file: 'wildflower.mini.js',      features: FEATURES_LITE, dev: true,  minify: false, mangleProps: false, footer: 'core' },
-    { entry: 'index.mini.js', file: 'wildflower.mini.dev.js',  features: FEATURES_LITE, dev: true,  minify: true,  mangleProps: false, footer: 'core' },
-    { entry: 'index.mini.js', file: 'wildflower.mini.min.js',  features: FEATURES_LITE, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
+    { entry: 'index.mini.js', file: 'wildflower.mini.js',      features: FEATURES_MINI, dev: true,  minify: false, mangleProps: false, footer: 'core' },
+    { entry: 'index.mini.js', file: 'wildflower.mini.dev.js',  features: FEATURES_MINI, dev: true,  minify: true,  mangleProps: false, footer: 'core' },
+    { entry: 'index.mini.js', file: 'wildflower.mini.min.js',  features: FEATURES_MINI, dev: false, minify: true,  mangleProps: true,  footer: 'core' },
 
     // LITE
     { entry: 'index.lite.js', file: 'wildflower.lite.js',      features: FEATURES_LITE, dev: true,  minify: false, mangleProps: false, footer: 'core' },
@@ -273,6 +280,16 @@ function extensionConfigs(name) {
     // to www/js/extensions/ (gitignored), the path the site's demos and docs
     // load it from; sync-www publishes that directory, unlike js/dist.
     const site = (file) => path.join(ROOT, 'www', 'js', 'extensions', file);
+    // The files the manifest lists (wildflower.outputs: entry, file, dev,
+    // minify), so a package can ship more than one, as Kinetic ships
+    // kinetic.25d.js beside kinetic.wf.js.
+    const outputs = tpkg.wildflower && tpkg.wildflower.outputs;
+    if (outputs && outputs.length) {
+        return outputs.map((o) => {
+            const file = path.basename(o.file);
+            return { ...base, entryPath: path.join(dir, o.entry), file, outPath: path.join(dir, o.file), alsoWrite: site(file), dev: !!o.dev, minify: !!o.minify, mangleProps: false };
+        });
+    }
     return [
         { ...base, file: name + '.wf.js',     outPath: path.join(dir, 'dist', name + '.wf.js'),     alsoWrite: site(name + '.wf.js'),     dev: true,  minify: false, mangleProps: false },
         { ...base, file: name + '.wf.min.js', outPath: path.join(dir, 'dist', name + '.wf.min.js'), alsoWrite: site(name + '.wf.min.js'), dev: false, minify: true,  mangleProps: false },

@@ -5,10 +5,10 @@
  */
 
 import { listBoundElements } from '../core/DomMetadata.js';
-import { WF_ERRORS, wfError, mergeData } from '../core/wfUtils.js';
+import { WF_ERRORS, wfError, mergeData, isNegatedPath } from '../core/wfUtils.js';
 import { getContextMethod } from '../state/ContextProxy.js';
 import { recording as __tlOn, timelineNoteFrame as __tlFrame } from '../state/TimelineRecorder.js';
-import { applyShow, applyAttrObj, applyAttrValue, applyStyleObj, applyStyleProp, applyText, applyModel, applyClass } from '../core/BindingWriters.js';
+import { applyShow, applyAttrObj, applyAttrValue, applyStyleObj, applyStyleProp, applyText, applyModel, applyClass, classTokens } from '../core/BindingWriters.js';
 
 /** Blocklisted attributes for data-bind-attr security (O(1) lookup, no per-call allocation).
  *  Relocated from ListExpressionEval so data-bind-attr sanitization ships in the nano
@@ -68,6 +68,20 @@ const RenderingCoreDevMethods = {
             }
         }
 
+        // The component's methods and computeds, for WF-522: a binding that
+        // names a method or calls a computed renders nothing.
+        const methods = new Set();
+        const def = instance.definition;
+        if (def) for (const key of Object.keys(def)) {
+            if (typeof def[key] === 'function' && !stateKeys.includes(key)) methods.add(key);
+        }
+        const names = {
+            methods,
+            computed: new Set(instance.stateManager && instance.stateManager.computed ? Object.keys(instance.stateManager.computed) : []),
+            // A computed's current value: one that returns a function may be called.
+            value(name) { try { return instance.context[name]; } catch (e) { return undefined; } }
+        };
+
         // Collect all binding paths from domElements (registered bindings)
         const bindingCollections = [
             { collection: this.domElements.bindings, pathKey: 'path', type: 'data-bind' },
@@ -91,7 +105,7 @@ const RenderingCoreDevMethods = {
                 const path = binding[pathKey];
                 if (!path) continue;
 
-                this._validateBindingPath(path, stateKeys, componentName, type, state);
+                this._validateBindingPath(path, stateKeys, componentName, type, state, names);
             }
         }
 
@@ -99,11 +113,11 @@ const RenderingCoreDevMethods = {
         // are not checked, here as on a tag (a directive may take a literal).
         const block = instance.definition && instance.definition.root;
         if (block && typeof block === 'object') {
-            if (typeof block.show === 'string') this._validateBindingPath(block.show, stateKeys, componentName, 'root: show', state);
+            if (typeof block.show === 'string') this._validateBindingPath(block.show, stateKeys, componentName, 'root: show', state, names);
             for (const key of ['class', 'attr', 'style']) {
                 const group = block[key];
                 if (group && typeof group === 'object') for (const name in group) {
-                    if (typeof group[name] === 'string') this._validateBindingPath(group[name], stateKeys, componentName, `root: ${key}.${name}`, state);
+                    if (typeof group[name] === 'string') this._validateBindingPath(group[name], stateKeys, componentName, `root: ${key}.${name}`, state, names);
                 }
             }
         }
@@ -141,7 +155,7 @@ const RenderingCoreDevMethods = {
                 if (!isOwnedByThisComponent(el)) return;
                 const path = this._getAttr(el, 'render');
                 if (path) {
-                    this._validateBindingPath(path, stateKeys, componentName, 'data-render', state);
+                    this._validateBindingPath(path, stateKeys, componentName, 'data-render', state, names);
                 }
             });
 
@@ -152,7 +166,7 @@ const RenderingCoreDevMethods = {
                 if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
                 const expression = this._getAttr(el, 'bind-class');
                 if (expression) {
-                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-class');
+                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-class', names);
                 }
             });
 
@@ -163,7 +177,7 @@ const RenderingCoreDevMethods = {
                 if (__FEATURE_QUERY__ && el._wfRecordQuery) return;   // reads the row; see the collection loop
                 const expression = this._getAttr(el, 'bind-style');
                 if (expression) {
-                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-style');
+                    this._validateObjectFormExpression(expression, stateKeys, componentName, state, 'data-bind-style', names);
                 }
             });
 
@@ -195,7 +209,7 @@ const RenderingCoreDevMethods = {
      * @param {string} bindingType - Type of binding (data-bind, data-model, etc.)
      * @private
      */
-    _validateBindingPath(path, stateKeys, componentName, bindingType, state) {
+    _validateBindingPath(path, stateKeys, componentName, bindingType, state, names) {
         if (!__DEV__) return;
         // Skip validation for special paths
         if (!path || typeof path !== 'string') return;
@@ -231,7 +245,7 @@ const RenderingCoreDevMethods = {
         // Anything else (spaces, `=`, `&`, `|`, `?`, `>`, `<`, `+`, `*`, `(`, etc.)
         // means the attribute holds an expression.
         if (!/^!?[\w.]+$/.test(actualPath)) {
-            this._validateExpressionVariables(actualPath, stateKeys, componentName, bindingType);
+            this._validateExpressionVariables(actualPath, stateKeys, componentName, bindingType, state, names);
             return;
         }
 
@@ -251,6 +265,11 @@ const RenderingCoreDevMethods = {
         // is what actually catches typos and genuine component-state mistakes.
         if (bindingType === 'data-model' && pathParts.length > 1
             && this.storeManager?.getStoreComponentByName(rootVar)) {
+            return;
+        }
+
+        if (names && pathParts.length === 1 && names.methods.has(rootVar)) {
+            this._warnBindingMethod(bindingType, actualPath, `names the method ${rootVar}()`, componentName);
             return;
         }
 
@@ -305,6 +324,11 @@ const RenderingCoreDevMethods = {
             }
         }
 
+        if (typeof finalValue === 'function') {
+            this._warnBindingMethod(bindingType, actualPath, `names a function without calling it${bindingType === 'data-bind' ? ' (data-bind shows its source)' : ''}; call it: ${cleanPath}()`, componentName);
+            return;
+        }
+
         // Validate type hint against actual value
         if (typeHint && finalValue !== undefined) {
             const actualType = this._inferTypeFromValue(finalValue);
@@ -326,7 +350,7 @@ const RenderingCoreDevMethods = {
      * @param {string} bindingType - Type of binding
      * @private
      */
-    _validateExpressionVariables(expression, stateKeys, componentName, bindingType) {
+    _validateExpressionVariables(expression, stateKeys, componentName, bindingType, state, names) {
         if (!__DEV__) return;
         // Skip $entity.path shorthand (normalized to external() at bind time)
         if (expression && expression.includes('$')) return;
@@ -365,6 +389,22 @@ const RenderingCoreDevMethods = {
             if (reserved.has(varName) || checkedVars.has(varName)) continue;
             checkedVars.add(varName);
 
+            // A method is not in a binding's scope, and a computed's name is
+            // already its value, so either call renders nothing (WF-522).
+            if (names) {
+                const called = new RegExp('(?<![\\w$.])' + varName + '\\s*\\(').test(noStrings);
+                if (names.methods.has(varName)) {
+                    this._warnBindingMethod(bindingType, expression, `${called ? 'calls' : 'names'} the method ${varName}()`, componentName);
+                    continue;
+                }
+                if (called && names.computed.has(varName)) {
+                    // A computed that returns a function is called for its result.
+                    if (typeof names.value(varName) === 'function') continue;
+                    this._warnBindingMethod(bindingType, expression, `calls the computed ${varName}, whose name is already its value; bind ${varName} without the call`, componentName);
+                    continue;
+                }
+            }
+
             // Check if this variable exists in state
             if (!stateKeys.includes(varName)) {
                 const suggestions = this._findSimilarPropertyNames(varName, stateKeys);
@@ -378,6 +418,19 @@ const RenderingCoreDevMethods = {
                 if (__DEV__) wfError(WF_ERRORS.BINDING_VALIDATION, { warn: true, context: message });
             }
         }
+    },
+    /**
+     * WF-522: a binding that names a method, calls a computed, or names a
+     * function without calling it.
+     * @private
+     */
+    _warnBindingMethod(bindingType, expression, what, componentName) {
+        if (!__DEV__) return;
+        wfError(WF_ERRORS.BINDING_METHOD, {
+            warn: true,
+            context: `${bindingType}="${expression}" in component "${componentName}" ${what}`,
+            suggestion: 'Bindings read state and computeds. For a value a method works out, declare a computed that returns it and bind its name.'
+        });
     },
     /**
      * Validate variables in an object-form-capable binding expression
@@ -395,7 +448,7 @@ const RenderingCoreDevMethods = {
      * @param {string} bindingType - 'data-bind-style' or 'data-bind-class'
      * @private
      */
-    _validateObjectFormExpression(expression, stateKeys, componentName, state, bindingType) {
+    _validateObjectFormExpression(expression, stateKeys, componentName, state, bindingType, names) {
         if (!__DEV__) return;
         const trimmed = expression.trim();
 
@@ -415,13 +468,13 @@ const RenderingCoreDevMethods = {
                 if (!valuePart) continue;
 
                 // The value might be a simple identifier or an expression
-                this._validateExpressionVariables(valuePart, stateKeys, componentName, bindingType, state);
+                this._validateExpressionVariables(valuePart, stateKeys, componentName, bindingType, state, names);
             }
             return;
         }
 
         // Non-object syntax: treat as expression (bare property name or expression)
-        this._validateExpressionVariables(expression, stateKeys, componentName, bindingType, state);
+        this._validateExpressionVariables(expression, stateKeys, componentName, bindingType, state, names);
     },
     /**
      * Validate action method references against available component methods
@@ -1030,8 +1083,10 @@ export const RenderingCoreMethods = {
      */
     _processDataRenderElement(element, path, instance)
     {
-        // Evaluate the initial condition
-        let conditionValue = this._evaluateCondition(path, instance);
+        // Evaluate the initial condition. Server-rendered markup whose
+        // condition reads an entity not registered yet stays rendered; the
+        // render effect decides once the entity arrives.
+        const conditionValue = this._evaluateCondition(path, instance, element);
 
         // Clone the element as template before any DOM manipulation
         const templateClone = element.cloneNode(true);
@@ -1088,7 +1143,7 @@ export const RenderingCoreMethods = {
         let expr = condition;
         if (expr.startsWith('computed:!')) expr = '!' + expr.slice(10);
         else if (expr.startsWith('computed:')) expr = expr.slice(9);
-        const negate = expr.startsWith('!') && /^[\w.$:]+$/.test(expr.slice(1));
+        const negate = isNegatedPath(expr);
         const path = negate ? expr.slice(1) : expr;
         return { path, negate, isExpression: this.isExpression(path) || path.includes('$') };
     },
@@ -1104,13 +1159,18 @@ export const RenderingCoreMethods = {
      * so a $route-gated section that was true at init was removed and then
      * re-inserted as a clone by the effect, and a slot template inside it was
      * skipped for good.
+     * A false verdict in server-rendered markup whose condition reads an
+     * entity that is not registered yet counts as true: the server's content
+     * stays until the entity arrives, when the effect decides
+     * (_ssrEntityMissing). The rule is here so that every reader has it.
      * @param {string} condition
      * @param {Object} instance - Component instance
      * @param {HTMLElement} [element] - The conditional element (record-query scope)
+     * @param {HTMLElement} [serverEl=element] - The element the server-markup rule is asked of
      * @returns {boolean}
      * @private
      */
-    _conditionVerdict(condition, instance, element) {
+    _conditionVerdict(condition, instance, element, serverEl = element) {
         const { path, negate, isExpression } = this._parseConditionPath(condition);
         // A bare path on a record-marked element reads the row, as in the effect.
         const rowScoped = !!(__FEATURE_QUERY__ && element && element._wfRecordQuery);
@@ -1122,7 +1182,8 @@ export const RenderingCoreMethods = {
         } catch (error) {
             value = undefined;
         }
-        return negate ? !value : !!value;
+        return (negate ? !value : !!value) ||
+            !!(__FEATURE_SSR__ && serverEl && this._ssrEntityMissing({ element: serverEl, path: condition }));
     },
 
     /**
@@ -1132,9 +1193,9 @@ export const RenderingCoreMethods = {
      * @returns {boolean} The evaluated condition
      * @private
      */
-    _evaluateCondition(path, instance)
+    _evaluateCondition(path, instance, serverEl)
     {
-        return this._conditionVerdict(path, instance);
+        return this._conditionVerdict(path, instance, undefined, serverEl);
     },
     /**
      * Get the external() function bound to a component instance
@@ -1357,40 +1418,13 @@ export const RenderingCoreMethods = {
         }
 
 
-        // The component queues (_componentsToUpdate, _batchChangedComponents,
-        // _pendingDependentUpdates) are no longer merged into a processing set
-        // here: bindings, lists and conditionals are effect-driven, so the
-        // merged set had no consumer. _componentsToUpdate is reset below and
-        // _pendingDependentUpdates is drained for computed re-evaluation.
+        // The component queues (_componentsToUpdate, _batchChangedComponents)
+        // are no longer merged into a processing set here: bindings, lists and
+        // conditionals are effect-driven, so the merged set had no consumer.
+        // _componentsToUpdate is reset below.
 
         if (!this._renderCounter) this._renderCounter = 0;
         ++this._renderCounter;
-
-        if (this._pendingDependentUpdates && this._pendingDependentUpdates.size > 0)
-        {
-            this._pendingDependentUpdates.forEach(componentId =>
-            {
-                const instance = this.componentInstances.get(componentId);
-                if (instance && instance.stateManager &&
-                    instance.stateManager.computed && Object.keys(instance.stateManager.computed).length > 0)
-                {
-                    // Re-evaluate computed properties
-                    Object.keys(instance.stateManager.computed).forEach(propName =>
-                    {
-                        // Clear cache for this property
-                        instance.stateManager.computedCache.delete(propName);
-                        // Force re-evaluation
-                        try
-                        {
-                            instance.stateManager.evaluateComputed(propName);
-                        } catch (error)
-                        {
-                            if (__DEV__) console.error(`Error re-evaluating ${propName}:`, error);
-                        }
-                    });
-                }
-            });
-        }
 
         // Bindings/HTML/class/models are handled by effects. List bootstrap is
         // handled at discovery time (_mountLists at every scan/reveal path), so
@@ -1404,7 +1438,7 @@ export const RenderingCoreMethods = {
         // Mark components that were actually rendered in this cycle as having been rendered
         // CRITICAL: Only mark components whose lists were actually processed, not just queued for update
         // This happens after ALL update methods (bindings, lists, conditionals, models) have completed
-        if (this._actuallyRenderedComponents && this._actuallyRenderedComponents.size > 0)
+        if (__FEATURE_LISTS__ && this._actuallyRenderedComponents && this._actuallyRenderedComponents.size > 0)
         {
             this._actuallyRenderedComponents.forEach(componentId =>
             {
@@ -1487,12 +1521,6 @@ export const RenderingCoreMethods = {
         {
             this._batchChangedComponents = null;
             this._batchChangedPaths = null;
-        }
-
-        //Clean up the pendingDependentUpdates too
-        if (this._pendingDependentUpdates)
-        {
-            this._pendingDependentUpdates.clear();
         }
 
         // _componentsToUpdate is pre-initialized in the constructor for V8 hidden class stability
@@ -1614,9 +1642,6 @@ export const RenderingCoreMethods = {
             if (instance._htmlContextsReady) {
                 const propertyName = bindPath.startsWith('computed:') ? bindPath.slice(9) : bindPath;
                 instance._htmlContextsReady.add(propertyName);
-                if (instance.stateManager && typeof instance.stateManager._processHtmlInitialQueue === 'function') {
-                    instance.stateManager._processHtmlInitialQueue();
-                }
             }
         };
 
@@ -1845,27 +1870,33 @@ export const RenderingCoreMethods = {
         };
     },
     /**
-     * Process slots for component composition
+     * Process slots for component composition. A component fills its own
+     * containers with its own slot content: a container or a slot inside a
+     * component within this one belongs to that component.
      * @private
      */
     _processSlots(instance)
     {
         const {element} = instance;
+        const componentSel = this._attrSelector('component');
+        // The nearest component around the node is this one. (From the
+        // parent, so that a slot which is itself a component's root counts
+        // as the content of the component around it.)
+        const own = (node) => node.parentElement.closest(componentSel) === element;
 
-        // Find all slot containers
+        // Find this component's slot containers
         element.querySelectorAll(this._attrSelector('slot-container')).forEach(container =>
         {
+            if (!own(container)) return;
             const slotName = this._getAttr(container, 'slot-container');
 
-            // Find matching slot content
-            const slotContent = element.querySelector(this._attrSelector('slot', slotName));
+            // The first slot of that name that is this component's
+            const slotContent = Array.from(element.querySelectorAll(this._attrSelector('slot', slotName))).find(own);
             if (slotContent)
             {
                 // Clear container and append slot content
                 container.innerHTML = '';
                 container.appendChild(slotContent);
-
-
             }
         });
     },
@@ -1910,6 +1941,8 @@ export const RenderingCoreMethods = {
         // Content a portal moved (data-portaled-from on it or on a wrapper
         // above it) is still read by the component that teleported it.
         const parent = element.parentElement;
+        if (!__FEATURE_PORTALS__) return !parent ||
+            !parent.closest(`${this._attrSelector('component')}, [data-component-id], ${this._attrSelector('list')}`);
         return !element.hasAttribute('data-portaled-from') && (!parent ||
             !parent.closest(`${this._attrSelector('component')}, [data-component-id], ${this._attrSelector('list')}, [data-portaled-from]`));
     },
@@ -1932,7 +1965,7 @@ export const RenderingCoreMethods = {
      */
     _rootOwnerElement(el) {
         const owner = this._getComponentElement(el.parentElement);
-        const moved = el.closest('[data-portaled-from]');
+        const moved = __FEATURE_PORTALS__ && el.closest('[data-portaled-from]');
         if (moved && moved !== owner && (!owner || owner.contains(moved))) {
             const source = this.componentInstances.get(moved.getAttribute('data-portaled-from'));
             return source ? source.element : null;
@@ -1988,6 +2021,8 @@ export const RenderingCoreMethods = {
      */
     _getValueFromItem(item, path)
     {
+        // Every caller reads a list item.
+        if (!__FEATURE_LISTS__) return;
         return pathResolver.get(item, path);
     },
     /**
@@ -2021,7 +2056,7 @@ export const RenderingCoreMethods = {
             { attribute: 'data-show', altAttribute: 'data-wf-show', collectionName: 'conditionals' },
             { attribute: 'data-list', altAttribute: 'data-wf-list', collectionName: 'lists' },
             { attribute: 'data-model', altAttribute: 'data-wf-model', collectionName: 'models' },
-            { attribute: 'data-pool', altAttribute: 'data-wf-pool', collectionName: 'pools' }
+            ...(__FEATURE_POOLS__ ? [{ attribute: 'data-pool', altAttribute: 'data-wf-pool', collectionName: 'pools' }] : [])
         ];
     },
 //COMPONENT RELATIONSHIPS
@@ -2201,7 +2236,7 @@ export const RenderingCoreMethods = {
 
         // Process data-pool elements (entity pools)
         if (!this.domElements.pools) this.domElements.pools = [];
-        if (compiled.pools) {
+        if (__FEATURE_POOLS__ && compiled.pools) {
             for (const pool of compiled.pools) {
                 const el = this._getElementByPath(element, pool.elementPath);
                 if (el) {
@@ -2343,7 +2378,11 @@ export const RenderingCoreMethods = {
                             // Run by the directive system (_processRootDirectives).
                             if (!this._customDirectives.has(name)) ignored(`${key}.${name}`, 'names no registered directive');
                         } else if (key === 'attr' && this._isBlocklistedAttr(name)) ignored(`${key}.${name}`, 'is an attribute bindings cannot set');
-                        else spec.push({ type: 'root-' + key, key: name, ...this._parseConditionPath(expr) });
+                        // A class key may name several classes, as a
+                        // data-bind-class key does: one entry for each.
+                        else for (const one of key === 'class' ? classTokens(name) : [name]) {
+                            spec.push({ type: 'root-' + key, key: one, ...this._parseConditionPath(expr) });
+                        }
                     }
                 } else ignored(key, key === 'render' ? 'is not supported' : 'is not a root: key');
             }
@@ -2710,6 +2749,21 @@ export const RenderingCoreMethods = {
     },
 
     /**
+     * A child destroyed with its root still in the page keeps its root's
+     * entries in the component around it. Mark them: the owner's effect
+     * releases them once the root has left with no new instance on it. A
+     * root with its own data-render is marked too; the effect tells a root
+     * its section took out (which the section brings back) from one removed
+     * by hand.
+     * @private
+     */
+    _markDestroyedRoot(owner, root) {
+        for (const list of [owner._effectMeta, owner._renderMeta]) {
+            if (list) for (const meta of list) if (_entryIsFor(meta, root)) meta._destroyedRoot = root;
+        }
+    },
+
+    /**
      * Execute all component bindings within Effect context.
      * This is called by the Render Effect when dependencies change.
      *
@@ -2732,6 +2786,17 @@ export const RenderingCoreMethods = {
             // nothing on the page shows. An element detached by hand is NOT
             // marked and keeps its writes, so it is current when reattached.
             if (meta._hidden) continue;
+            // A destroyed child's root kept for the next scan (_markDestroyedRoot)
+            // that has since left the page.
+            // Gone once it has left with no new instance on it. A root its
+            // own data-render took out is not gone: its section's entry (the
+            // only one of the root's not hidden then) stays to bring it back.
+            const gone = meta._destroyedRoot;
+            if (gone && !gone.isConnected && !this.componentInstances.has(gone.dataset.componentId) &&
+                !(meta.type === 'render' && meta.context && !meta.context.isRendered)) {
+                this._releaseChildRoot(instance, gone);
+                continue;
+            }
             // Read value via reactive proxy (establishes dependency tracking).
             // Inside a record-shape query subtree (element marked by the query
             // transform) a BARE path in data-show / -class / -style / -attr /
@@ -2769,40 +2834,40 @@ export const RenderingCoreMethods = {
             // WF-512 note fire); the store READ below stays gated on the
             // value.
             if (meta.type === 'model' && meta._storeAlias === undefined) {
-                    meta._storeAlias = null;
                     const dot = meta.path.indexOf('.');
-                    if (dot > 0) {
-                        const root = meta.path.slice(0, dot);
-                        if (this.storeManager?.getStoreComponentByName(root)) {
-                            // Component-first, the same
-                            // discriminator as the write path: a root the
-                            // component's own state declares is component
-                            // scope, and the same-named store is never read —
-                            // without this, a state-owned root whose leaf was
-                            // still undefined painted the STORE's value into
-                            // a component-state input. The store alias is the
-                            // fallback for unowned roots only.
-                            const ownState = instance.state;
-                            const rootOwned = ownState != null && (root in ownState);
-                            if (!rootOwned) {
-                                meta._storeAlias = root;
-                                meta._storeFieldPath = meta.path.slice(dot + 1).split('.');
-                            } else if (__DEV__) {
-                                // WF-512: a name serving two masters is
-                                // confusing even now that it is coherent —
-                                // say once, per component and root, which
-                                // one wins.
-                                if (!instance._warnedModelShadow) instance._warnedModelShadow = new Set();
-                                if (!instance._warnedModelShadow.has(root)) {
-                                    instance._warnedModelShadow.add(root);
-                                    wfError(WF_ERRORS.MODEL_STORE_SHADOW, {
-                                        warn: true,
-                                        context: `data-model="${meta.path}": the component's own state declares "${root}", so this binds component state; the store named "${root}" is not involved`,
-                                        suggestion: 'Rename the state key or the store if you meant the store-backed form pattern'
-                                    });
-                                }
+                    const root = dot > 0 ? meta.path.slice(0, dot) : '';
+                    // Component-first, the same discriminator as the write
+                    // path: a root the component's own state declares is
+                    // component scope, and the same-named store is never read
+                    // — without this, a state-owned root whose leaf was
+                    // still undefined painted the STORE's value into a
+                    // component-state input. The store alias is the fallback
+                    // for unowned roots only.
+                    const ownState = instance.state;
+                    const rootOwned = !root || (ownState != null && (root in ownState));
+                    // An unowned root that names no store yet is left
+                    // undecided: the lookup's miss follows the name's arrival
+                    // (getStore), so a store registered after this ran is
+                    // found on the run that arrival causes.
+                    const store = root && (__DEV__ || !rootOwned) && this.storeManager && this.storeManager.getStore(root);                    if (rootOwned) {
+                        meta._storeAlias = null;
+                        // WF-512: a name serving two masters is confusing
+                        // even now that it is coherent — say once, per
+                        // component and root, which one wins.
+                        if (__DEV__ && store) {
+                            if (!instance._warnedModelShadow) instance._warnedModelShadow = new Set();
+                            if (!instance._warnedModelShadow.has(root)) {
+                                instance._warnedModelShadow.add(root);
+                                wfError(WF_ERRORS.MODEL_STORE_SHADOW, {
+                                    warn: true,
+                                    context: `data-model="${meta.path}": the component's own state declares "${root}", so this binds component state; the store named "${root}" is not involved`,
+                                    suggestion: 'Rename the state key or the store if you meant the store-backed form pattern'
+                                });
                             }
                         }
+                    } else if (store) {
+                        meta._storeAlias = root;
+                        meta._storeFieldPath = meta.path.slice(dot + 1).split('.');
                     }
             }
             if (meta.type === 'model' && value === undefined && meta._storeAlias) {
@@ -2814,6 +2879,11 @@ export const RenderingCoreMethods = {
                     value = v;
                 }
             }
+
+            // Server-rendered markup whose binding reads an entity not registered
+            // yet ($name, or a record query's store) keeps its server state: the
+            // entity's arrival wakes this effect, which writes then.
+            if (__FEATURE_SSR__ && this._ssrEntityMissing(meta)) continue;
 
             // Update the DOM based on binding type
             switch (meta.type) {
@@ -2924,9 +2994,17 @@ export const RenderingCoreMethods = {
         }
 
         // Provide the external() function for cross-component references
-        const additionalContext = normalized.includes('external(')
+        let additionalContext = normalized.includes('external(')
             ? { external: this._getExternalFn(instance) }
             : undefined;
+
+        // A component's props live on the instance, not in its state, so an
+        // expression naming props (data-bind-attr="{ href: props.next }") gets
+        // them here. The plain-path read (getValue) has its own props branch;
+        // a props change re-runs this effect explicitly (_refreshChildProps).
+        if (instance.props && normalized.includes('props')) {
+            (additionalContext || (additionalContext = {})).props = instance.props;
+        }
 
         // Record-shape query subtree: merge the single row into scope so a bare
         // field name resolves the same way it does inside a data-list template
@@ -2954,6 +3032,7 @@ export const RenderingCoreMethods = {
         });
     },
 
+    // _ssrEntityMissing (SSR only) lives in ssr-list.js.
     /**
      * Execute data-bind for Effect.
      * @private

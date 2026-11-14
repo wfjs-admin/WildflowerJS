@@ -70,6 +70,9 @@ describe.skipIf(isMinifiedBuild())('Dev-mode write-guard diagnostics', () => {
         expect(found[0]).toContain('[WF-220]')
         expect(found[0]).toContain('"double"')
         expect(found[0]).toContain('read-only')
+        // ...and says what to do instead.
+        expect(found[0]).toContain('this.double still reads the computed')
+        expect(found[0]).toContain('Keep the value under another name, or rename the computed.')
 
         // The assignment was a no-op: the binding still shows the computed value.
         expect(testContainer.querySelector('span').textContent).toBe('42')

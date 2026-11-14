@@ -68,7 +68,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
     // here also ensures the op log is only armed when a fastPath will drain it.
     const useFastPaths = !!(keyProp && options.onMove);
 
-    const dispose = mEffect(() => {
+    const reconcileOnce = () => {
       const arr = arrayFn() || [];
       const n = arr.length;                 // track length
       // Read keys off the RAW array so the structural effect does NOT track (and
@@ -330,6 +330,14 @@ export function reconcile(arrayFn, mapFn, options = {}) {
       });
 
       prev = next;
+    };
+    // A throw inside the reconcile is logged and swallowed, as createEffect
+    // does for every other effect: `prev` keeps the last good rows, and the
+    // next change reconciles again. Uncaught, the graph kept it on the node,
+    // where nothing reads an effect's error, so the list went stale silently.
+    const dispose = mEffect(() => {
+      try { reconcileOnce(); }
+      catch (error) { console.error(`[Effect "data-list=${options.name}"] Error:`, error); }
     }, { scope: options.scope });
 
     // === Structural operation fast paths ===

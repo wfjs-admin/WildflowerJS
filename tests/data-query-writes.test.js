@@ -2214,7 +2214,8 @@ suite('data-query writes — write(): one option, one method', () => {
         let caught = null
         await h.write('publish', { id: 1 }).catch((e) => { caught = e })
         expect(caught, 'the failure reaches the .catch the author wrote').not.toBe(null)
-        expect(String(caught)).toMatch(/operation hint/)
+        // The words in a development build; the code and its docs page in a production one.
+        expect(String(caught)).toMatch(isMinifiedBuild() ? /\[WF-974\]/ : /operation hint/)
     })
 
     // 54 — the refactor-typo shape: an undeclared operation
@@ -2238,7 +2239,7 @@ suite('data-query writes — write(): one option, one method', () => {
         let caught = null
         await h.write('updte', { id: 1, done: true }).catch((e) => { caught = e })
         expect(caught).not.toBe(null)
-        expect(String(caught), 'the declared operations are named').toMatch(/update/)
+        expect(String(caught), 'the declared operations are named, or the code is').toMatch(isMinifiedBuild() ? /\[WF-974\]/ : /update/)
         expect(h.rows[0].done, 'nothing applied optimistically').toBe(false)
         expect(nonGet, 'no request departed').toBe(0)
         expect(h.pendingWrites, 'no pending write registered').toBe(0)

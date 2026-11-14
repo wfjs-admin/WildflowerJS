@@ -86,14 +86,17 @@ export const ListNestedMethods = {
         // Find all initialized components (those with data-component-id)
         const nestedComponents = itemEl.querySelectorAll('[data-component-id]');
 
-        if (nestedComponents.length === 0) return;
-
         nestedComponents.forEach(componentEl => {
             const componentId = componentEl.dataset.componentId;
             if (componentId) {
                 this._destroyComponentQuiet(componentId);
             }
         });
+        // A component on the row's own element (<template><li data-component="x">):
+        // querySelectorAll only searches descendants, so it is destroyed here.
+        if (itemEl.dataset.componentId) {
+            this._destroyComponentQuiet(itemEl.dataset.componentId);
+        }
     },
     /**
      * Dispose the mapArray effects of any nested data-list inside a removed list
@@ -345,7 +348,13 @@ export const ListNestedMethods = {
                             instance._listContexts.set(contextKey, childContext);
                         }
 
-                        this._renderList(nestedListEl, nestedData, childContext, instance);
+                        // A server-rendered list waiting on a late-declared
+                        // query keeps its server rows, as the store's wake
+                        // leaves it alone: the query's drain adopts them,
+                        // then renders the list (_queryDrainLate).
+                        if (!(__FEATURE_QUERY__ && this._queryLateSSRWaiting && this._queryLateSSRWaiting(nestedListEl))) {
+                            this._renderList(nestedListEl, nestedData, childContext, instance);
+                        }
 
                         // CRITICAL: Ensure nested list has its own event delegation
                         // Without this, clicks on nested list items won't be handled correctly

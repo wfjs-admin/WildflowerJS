@@ -1,6 +1,7 @@
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
 import { boundActionsCache } from '../core/DomMetadata.js';
 import { getContextMethod } from './ContextProxy.js';
+import { applyClass } from '../core/BindingWriters.js';
 
 // Attribute prefix helpers
 const _isStrict = () => window.wildflower?.options?.useWfPrefixOnly;
@@ -185,7 +186,7 @@ class RenderRecord
             // subtree teleports now (after the effect collected its content's
             // bindings in place), and its conditions follow the component's
             // state from here on.
-            if (componentLevel && wildflower._processPortalsInSubtree) {
+            if (__FEATURE_PORTALS__ && componentLevel && wildflower._processPortalsInSubtree) {
                 wildflower._processPortalsInSubtree(newElement, instance);
             }
         }
@@ -323,9 +324,8 @@ class RenderRecord
         // need to set up list, action (event handlers) and pool here; a
         // row-level record still creates its nested render records here.
         const componentLevel = this._parentIndex === undefined;
-        const selector = [
-            _cmAttrSelector('render'), _cmAttrSelector('list'), _cmAttrSelector('action'), _cmAttrSelector('pool')
-        ].join(', ');
+        const selector = _cmAttrSelector('render') + ', ' + _cmAttrSelector('list') + ', ' + _cmAttrSelector('action') +
+            (__FEATURE_POOLS__ ? ', ' + _cmAttrSelector('pool') : '');
         const queried = this.element.querySelectorAll(selector);
 
         const processEl = (el) => {
@@ -336,7 +336,7 @@ class RenderRecord
             if (!componentLevel && _cmHasAttr(el, 'render')) this._processRenderElement(el, wildflower);
             if (_cmHasAttr(el, 'list')) this._processListElement(el, wildflower);
             if (_cmHasAttr(el, 'action')) this._processActionElement(el, wildflower);
-            if (_cmHasAttr(el, 'pool')) this._processPoolElement(el);
+            if (__FEATURE_POOLS__ && _cmHasAttr(el, 'pool')) this._processPoolElement(el);
         };
 
         processEl(this.element);
@@ -356,6 +356,7 @@ class RenderRecord
      * @private
      */
     _processPoolElement(el) {
+        if (!__FEATURE_POOLS__) return;
         const path = _cmGetAttr(el, 'pool');
         const instance = this.componentInstance;
         const handle = path && instance && instance._pools && instance._pools.get(path);
@@ -503,7 +504,7 @@ class RenderRecord
         // subtree. The teleported content would otherwise stay on the page
         // after the section left, and re-insertion would teleport the
         // clone's copy beside it.
-        if (wildflower._withdrawPortalsInSubtree) {
+        if (__FEATURE_PORTALS__ && wildflower._withdrawPortalsInSubtree) {
             wildflower._withdrawPortalsInSubtree(this.element, this.componentInstance);
         }
 
@@ -614,19 +615,21 @@ if (__FEATURE_PORTALS__)
     {
         if (!this.element || !this.isElementAttached()) return;
 
-        // Friendly dev-mode shape check; historically, returning an object
-        // from a data-bind-class computed threw `TypeError: t.split is not a
-        // function` deep in the framework, with no actionable hint. The
-        // Effect-based class path (RenderingCore._executeClassBindForEffect)
-        // accepts both strings and `{className: bool}` objects, but this
-        // path only handles strings. Coerce objects rather than throw so
-        // the page keeps rendering, and warn once per binding record.
-        if (newValue && typeof newValue === 'object') {
-            // An inline {'is-active': cond} expression is the documented object
-            // form (portal content paints through here), so only a named
-            // computed returning an object is reported.
-            const inlineObject = typeof this.path === 'string' && this.path.trim().charAt(0) === '{';
-            if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._classBindingShapeWarned && !inlineObject) {
+        // Friendly dev-mode shape check, once per binding record (WF-505, as
+        // RenderingCore._executeClassBindForEffect gives it).
+        if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._classBindingShapeWarned
+            && newValue != null && typeof newValue !== 'string') {
+            if (typeof newValue !== 'object') {
+                // Numbers, booleans, etc.
+                this._classBindingShapeWarned = true;
+                wfError(WF_ERRORS.CLASS_BINDING_SHAPE, {
+                    context: `expected string, got ${typeof newValue}; coercing`,
+                    warn: true
+                });
+            } else if (!(typeof this.path === 'string' && this.path.trim().charAt(0) === '{')) {
+                // An inline {'is-active': cond} expression is the documented
+                // object form, so only a named computed returning an object
+                // is reported.
                 this._classBindingShapeWarned = true;
                 wfError(WF_ERRORS.CLASS_BINDING_SHAPE, {
                     context: 'computed returned an object; coercing truthy keys to a class string',
@@ -634,61 +637,13 @@ if (__FEATURE_PORTALS__)
                     warn: true
                 });
             }
-            // Coerce {className: truthy} → "className" space-separated
-            newValue = Object.keys(newValue)
-                .filter(k => newValue[k])
-                .join(' ');
-        } else if (newValue != null && typeof newValue !== 'string') {
-            // Numbers, booleans, etc., coerce to string and warn once.
-            if (typeof __DEV__ !== 'undefined' && __DEV__ && !this._classBindingShapeWarned) {
-                this._classBindingShapeWarned = true;
-                wfError(WF_ERRORS.CLASS_BINDING_SHAPE, {
-                    context: `expected string, got ${typeof newValue}; coercing`,
-                    warn: true
-                });
-            }
-            newValue = String(newValue);
         }
 
-        // On first call, capture static classes and clean up any stale dynamic classes
-        if (this._staticClasses === undefined)
-        {
-            // Current classes minus new dynamic classes are static
-            const newClasses = newValue ? new Set(newValue.split(/\s+/).filter(Boolean)) : new Set();
-            this._staticClasses = new Set(
-                Array.from(this.element.classList).filter(c => !newClasses.has(c))
-            );
-
-            // Clean up any stale dynamic classes (classes that aren't static and aren't the new value)
-            const newClassSet = newValue ? new Set(newValue.split(/\s+/).filter(Boolean)) : new Set();
-            const toRemove = Array.from(this.element.classList).filter(
-                c => !this._staticClasses.has(c) && !newClassSet.has(c)
-            );
-            toRemove.forEach(className => {
-                this.element.classList.remove(className);
-            });
-        }
-
-        // Remove any previous classes we added
-        if (this._previousClass)
-        {
-            const previousClasses = this._previousClass.split(/\s+/).filter(Boolean);
-            previousClasses.forEach(className => {
-                this.element.classList.remove(className);
-            });
-        }
-
-        // Add new classes
-        if (newValue)
-        {
-            const classes = newValue.split(/\s+/).filter(Boolean);
-            classes.forEach(className => {
-                this.element.classList.add(className);
-            });
-        }
-
-        // Track what we added (even empty string to indicate we've processed this)
-        this._previousClass = newValue || '';
+        // The one class writer, as for every other data-bind-class: a string,
+        // an array or an object, with the classes this binding put on tracked
+        // on the element and the others left alone. (This path had its own
+        // copy, which took strings only: an array's indexes became classes.)
+        applyClass(this.element, newValue);
     };
 }
 
@@ -720,6 +675,8 @@ export class ContextRecords
      * @private
      */
     _generateContextId(path, options = {}) {
+        // Only list contexts ask (_createListContext).
+        if (!__FEATURE_LISTS__) return;
         // Preserve component IDs for easy lookup
         if (options.type === 'component' && options.componentInstance) {
             return options.componentInstance.id;
@@ -847,6 +804,8 @@ export class ContextRecords
     detectTemplateRelationships(element)
     {
         const relationships = [];
+        // ListRenderer is the one caller; a tier without lists keeps the stub.
+        if (!__FEATURE_LISTS__) return relationships;
 
         // Helper to process a single list element
         const processListElement = (listEl, depth = 0) => {

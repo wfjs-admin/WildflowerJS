@@ -41,7 +41,7 @@ const RAW_TARGET = Symbol('contextProxy.rawTarget');
  * Used by the ContextProxy to decide collision resolution.
  */
 const ESSENTIAL_FRAMEWORK_PROPERTIES = new Set([
-    'id', 'state', 'stateManager', 'computed', 'element', 'stores', '$el',
+    'state', 'stateManager', 'computed', 'element', 'stores', '$el',
     'update', 'subscribe', 'isReady', 'waitForReady', 'external',
     'find', 'findAll', 'closest',
     'saveToStorage', 'loadFromStorage', 'getItemFromEvent', 'debug',
@@ -51,13 +51,17 @@ const ESSENTIAL_FRAMEWORK_PROPERTIES = new Set([
 
 /**
  * All framework-reserved property names: includes essential properties
- * plus those where state is allowed to win on collision (parent, listItem,
- * name, reset). Used for dev-mode collision warnings so users know their
- * state property shares a name with a framework property.
+ * plus those where state is allowed to win on collision (id, parent,
+ * listItem, name, reset). `id` and `name` are the columns every server
+ * record has, so a form's state holds them; the framework's own code reads
+ * the entity's id from its closure, never through `this`. Used for dev-mode
+ * collision warnings: a state property warns only for an essential name,
+ * since state wins for the rest; a computed warns for any of them, since a
+ * framework property still shadows a computed.
  */
 const FRAMEWORK_PROPERTIES = new Set([
     ...ESSENTIAL_FRAMEWORK_PROPERTIES,
-    'parent', 'listItem', 'name', 'reset'
+    'id', 'parent', 'listItem', 'name', 'reset'
 ]);
 
 /**
@@ -182,7 +186,7 @@ function createContextProxy(rawContext, stateManager) {
             if (stateManager.computed && stateManager.computed[prop]) {
                 if (__DEV__) wfError(WF_ERRORS.COMPUTED_ASSIGNMENT, {
                     warn: true,
-                    context: `Cannot set computed property "${prop}"; computed properties are read-only`
+                    context: `Cannot set computed property "${prop}"; computed properties are read-only. this.${prop} still reads the computed. Keep the value under another name, or rename the computed.`
                 });
                 return true;
             }
@@ -257,7 +261,7 @@ function warnCollisions(stateManager, entityName, computedDef) {
     const computed = computedDef || {};
 
     for (const prop of FRAMEWORK_PROPERTIES) {
-        if (prop in state) {
+        if (ESSENTIAL_FRAMEWORK_PROPERTIES.has(prop) && prop in state) {
             console.warn(
                 `[WF] "${entityName}": state property "${prop}" collides with a framework property. ` +
                 `Use this.state.${prop} to access it explicitly.`

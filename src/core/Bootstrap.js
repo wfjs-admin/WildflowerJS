@@ -94,7 +94,7 @@ function _createDevToolsHook(wf) {
             wf.componentInstances.forEach((i, id) => {
                 if (i.isVirtual) return;
                 const c = {}; try { const d = i.definition; if (d?.computed) for (const k of Object.keys(d.computed)) try { const v = i.context[k]; c[k] = typeof v === 'function' ? '(per item)' : v; } catch { c[k] = '(error)'; } } catch {}
-                r.push({ id, name: i.name, tag: i.element?.tagName?.toLowerCase() || null, state: ss(i.stateManager), computed: c, props: i.props || {}, stores: i.definition?.stores || [], poolCount: i._pools?.size || 0, parentId: wf.componentParents?.get(id) || null });
+                r.push({ id, name: i.name, tag: i.element?.tagName?.toLowerCase() || null, state: ss(i.stateManager), computed: c, props: i.props || {}, stores: i.definition?.stores || [], poolCount: (__FEATURE_POOLS__ && i._pools?.size) || 0, parentId: wf.componentParents?.get(id) || null });
             });
             return r;
         },
@@ -108,7 +108,7 @@ function _createDevToolsHook(wf) {
         },
         getPools() {
             const r = [];
-            wf.componentInstances.forEach(i => { if (!i._pools) return; i._pools.forEach((p, n) => { r.push({ name: n, owner: i.name, ownerId: i.id, entityCount: p.items?.length ?? 0, recycleSize: p.recycleSize ?? 0, keyProp: p._keyProp || 'id', targetFps: p._targetFps || null }); }); });
+            if (__FEATURE_POOLS__) wf.componentInstances.forEach(i => { if (!i._pools) return; i._pools.forEach((p, n) => { r.push({ name: n, owner: i.name, ownerId: i.id, entityCount: p.items?.length ?? 0, recycleSize: p.recycleSize ?? 0, keyProp: p._keyProp || 'id', targetFps: p._targetFps || null }); }); });
             return r;
         },
         getBindings() {
@@ -118,6 +118,9 @@ function _createDevToolsHook(wf) {
             return r;
         },
         getRoutes() {
+            // Only the router tiers (spa, full) set wf.RouteManager.
+            // (__CAPS__ is defined by build-rollup; other pipelines leave it out.)
+            if (typeof __CAPS__ !== 'undefined' && __CAPS__ && !__CAPS__.router) return null;
             const rt = wf.RouteManager?._activeRouter; if (!rt) return null;
             const sr = r => r ? { path: r.path || r.pattern || null, name: r.name || null, params: r.params || {}, query: r.query || {}, hash: r.hash || null, meta: r.meta || {} } : null;
             const rr = []; try { if (rt.routeTree) for (const r of rt.routeTree) rr.push({ path: r.path || r.pattern || '?', name: r.name || null, meta: r.meta || {}, hasGuard: !!r.beforeEnter, hasChildren: !!(r.children?.length) }); } catch {}

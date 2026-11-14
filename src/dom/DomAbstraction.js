@@ -14,6 +14,7 @@
 
 import { listBoundElements } from '../core/DomMetadata.js';
 import { WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { classTokens } from '../core/BindingWriters.js';
 
 /**
  * Methods to be mixed into WildflowerJS.prototype
@@ -55,11 +56,11 @@ export const DomAbstractionMethods = {
 
             // --- CLASSES ---
             addClass(c) {
-                els.forEach(el => el.classList.add(...c.split(' ')));
+                els.forEach(el => el.classList.add(...classTokens(c)));
                 return this;
             },
             removeClass(c) {
-                els.forEach(el => el.classList.remove(...c.split(' ')));
+                els.forEach(el => el.classList.remove(...classTokens(c)));
                 return this;
             },
             toggleClass(c, f) {
@@ -108,9 +109,13 @@ export const DomAbstractionMethods = {
                 const sanitized = framework._sanitizeOrPassHTML ? framework._sanitizeOrPassHTML(v) : v;
                 els.forEach(el => {
                     if (framework.debug && (framework._hasAttr(el, 'bind-html') || framework._hasAttr(el, 'list'))) {
-                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .html() overwrite on reactive node', data: el });
+                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, ...(__DEV__ && { context: 'Manual .html() overwrite on reactive node', data: el }) });
                     }
                     el.innerHTML = sanitized;
+                    // A list row's html writers record what they wrote, and
+                    // the position sweep compares against it: record this one
+                    // too, so the next sweep repaints the binding's value.
+                    if (__FEATURE_LISTS__) el._wfHtmlValue = v;
                     // Rescan for new components in injected HTML
                     if (framework._scanForDynamicComponents) {
                         framework._scanForDynamicComponents(el);
@@ -122,7 +127,7 @@ export const DomAbstractionMethods = {
                 if (v === undefined) return els[0]?.textContent;
                 els.forEach(el => {
                     if (framework.debug && framework._hasAttr(el, 'bind')) {
-                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .text() overwrite on bound node', data: el });
+                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, ...(__DEV__ && { context: 'Manual .text() overwrite on bound node', data: el }) });
                     }
                     el.textContent = v;
                 });
@@ -211,7 +216,7 @@ export const DomAbstractionMethods = {
             remove() {
                 els.forEach(el => {
                     if (framework.debug && framework._hasAttr(el, 'component')) {
-                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, context: 'Manual .remove() on managed node', suggestion: 'Consider updating state instead.', data: el });
+                        wfError(WF_ERRORS.DOM_OWNERSHIP, { warn: true, ...(__DEV__ && { context: 'Manual .remove() on managed node', suggestion: 'Consider updating state instead.', data: el }) });
                     }
                     el.remove();
                 });

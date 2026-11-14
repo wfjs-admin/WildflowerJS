@@ -160,25 +160,41 @@ describe.skipIf(isMinifiedBuild())(`members the tier carries (${LANE_TIER})`, ()
     })
 })
 
-// window.WF_ERRORS. Production files carry only the entries production code
-// raises (WF_ERRORS_PROD in wfUtils.js): the keys below are every key a
-// production bundle of any tier reads, as scripts/check-wf-errors-prod.cjs
-// found them. Development and raw files carry the whole table, including the
+// window.WF_ERRORS. A production file carries only the entries its own tier's
+// production code raises (WF_ERRORS_PROD in wfUtils.js), as
+// scripts/check-wf-errors-prod.cjs found them: seven in every tier, the
+// router's where the tier has a router, and the query's where it has
+// queries. Development and raw files carry the whole table, including the
 // entries only dev diagnostics raise.
 describe(`window.WF_ERRORS (${LANE_TIER})`, () => {
-    const PROD_KEYS = [
-        'CIRCULAR_DEPENDENCY', 'DOM_OWNERSHIP', 'EMIT_NO_INSTANCE', 'NAMED_ROUTE_NOT_FOUND', 'QUERY_TO_INVALID',
-        'ROUTE_ALIAS_ERROR', 'ROUTE_COMPONENT_ERROR', 'ROUTE_GUARD_ERROR', 'ROUTE_HANDLER_ERROR', 'ROUTE_HOOK_ERROR',
-        'ROUTE_NAVIGATION_ERROR', 'ROUTE_SCROLL_ERROR', 'STORE_CREATE_ERROR', 'STORE_DEFAULT_ERROR', 'STORE_DEF_INVALID',
+    const EVERY_TIER = [
+        'DOM_OWNERSHIP', 'EMIT_NO_INSTANCE', 'STORE_CREATE_ERROR', 'STORE_DEFAULT_ERROR', 'STORE_DEF_INVALID',
         'STORE_INIT_ERROR', 'STORE_NAME_INVALID',
     ]
+    const ROUTER_KEYS = [
+        'CIRCULAR_DEPENDENCY', 'NAMED_ROUTE_NOT_FOUND', 'ROUTE_ALIAS_ERROR', 'ROUTE_COMPONENT_ERROR', 'ROUTE_GUARD_ERROR',
+        'ROUTE_HANDLER_ERROR', 'ROUTE_HOOK_ERROR', 'ROUTE_NAVIGATION_ERROR', 'ROUTE_PARAM_REFUSED', 'ROUTE_SCROLL_ERROR',
+    ]
+    const QUERY_KEYS = ['QUERY_TO_INVALID']
     const DEV_ONLY_KEYS = ['ROW_LIST_PATH', 'BINDING_VALIDATION', 'ROUTE_NOT_FOUND']
+    const whole = !isMinifiedBuild()
+    const carried = [
+        ...EVERY_TIER,
+        ...(whole || TIERS[LANE_TIER].router ? ROUTER_KEYS : []),
+        ...(whole || TIERS[LANE_TIER].query ? QUERY_KEYS : []),
+    ]
 
-    it('carries every key production code reads, each with a code', () => {
+    it('carries every key its production code reads, each with a code', () => {
         expect(typeof window.WF_ERRORS).toBe('object')
-        const codes = Object.fromEntries(PROD_KEYS.map((k) => [k, typeof window.WF_ERRORS[k]?.code]))
-        expect(codes).toEqual(Object.fromEntries(PROD_KEYS.map((k) => [k, 'string'])))
-        for (const k of PROD_KEYS) expect(window.WF_ERRORS[k].code).toMatch(/^WF-/)
+        const codes = Object.fromEntries(carried.map((k) => [k, typeof window.WF_ERRORS[k]?.code]))
+        expect(codes).toEqual(Object.fromEntries(carried.map((k) => [k, 'string'])))
+        for (const k of carried) expect(window.WF_ERRORS[k].code).toMatch(/^WF-/)
+    })
+
+    it('a production file leaves out the router and query entries its tier cannot raise', () => {
+        const left = [...ROUTER_KEYS, ...QUERY_KEYS].filter((k) => !carried.includes(k))
+        const present = Object.fromEntries(left.map((k) => [k, k in window.WF_ERRORS]))
+        expect(present).toEqual(Object.fromEntries(left.map((k) => [k, false])))
     })
 
     it(isMinifiedBuild() ? 'production files leave out the dev-only entries' : 'development files keep the dev-only entries', () => {

@@ -11,6 +11,7 @@
 import { WF_ERRORS, wfError, __wf_txt, validateEntityDefinition, HAS_MOVE_BEFORE, mergeData } from '../core/wfUtils.js';
 import { reactive as rgReactive, isTracking as rgIsTracking } from '../state/reactive-graph/core.js';
 import { getContextMethod } from '../state/ContextProxy.js';
+import { classTokens } from '../core/BindingWriters.js';
 import { TemplateLookupMethods } from './TemplateSystem.js';
 
 // Non-function keys the pool entity block actually consumes
@@ -1182,8 +1183,8 @@ class PoolHandle {
                     const old = target._poolClassList;
                     for (let j = 0; j < old.length; j++) cl.remove(old[j]);
                 }
-                if (classStr) {
-                    const names = classStr.split(' ');
+                const names = classTokens(classStr);
+                if (names.length) {
                     target.classList.add(...names);
                     target._poolClassList = names;
                 } else {
@@ -1846,6 +1847,7 @@ export const PoolRendererMethods = {
                     if (!element.isConnected) return;                     // container left the document
                     if (handle._everAdded) return;                        // populated at some point
                     if (handle._undeclaredWarned) return;                 // already diagnosed at setup
+                    if (defs && defs.has(path)) return;                   // declared: may fill later by design
                     if (_warnedPoolContainers.has(guardKey)) return;
                     _warnedPoolContainers.add(guardKey);
                     // Empty because it points at a pool it can't render (a

@@ -262,7 +262,9 @@ export const PropsSystemMethods = {
                         }
                         else
                         {
-                            props[key] = JSON.stringify(value);
+                            // An array or object is itself: _resolvePropsValue
+                            // passes a non-string value through as a literal.
+                            props[key] = value;
                         }
                     }
                 }
@@ -360,6 +362,9 @@ export const PropsSystemMethods = {
      */
     _resolvePropsValue(valuePath, parentInstance, childInstanceId, childElement = null)
     {
+        // An array or object from JSON data-props is the value itself.
+        if (typeof valuePath !== 'string') return valuePath;
+
         // Handle literal values FIRST - these don't require a parent instance
         // This allows static HTML with literal props to work without parent components
         const literal = this._parsePropLiteral(valuePath);
@@ -503,7 +508,7 @@ export const PropsSystemMethods = {
         }
         catch (error)
         {
-            this._log('debug', `Failed to resolve prop value "${valuePath}": ${error.message}`);
+            if (__DEV__) this._log('debug', `Failed to resolve prop value "${valuePath}": ${error.message}`);
             return undefined;
         }
     },

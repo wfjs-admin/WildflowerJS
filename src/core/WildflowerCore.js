@@ -82,6 +82,11 @@ export class WildflowerJS
 
         // Debug mode
         this.debug = this.options.debug;
+        // Debug asked for (data-debug, or debug: true), not the dev build's
+        // default: the SSR manager's progress lines print only then. A
+        // production build prints none (console.log is stripped), so it
+        // keeps no record.
+        if (__FEATURE_SSR__ && __DEV__) this._debugOptIn = !!options && options.debug === true;
 
         // Framework version, stamped from package.json at build time (__VERSION__
         // is a build-time define, like __DEV__). Read it as wildflower.version.
@@ -707,7 +712,7 @@ export class WildflowerJS
         if (!name || typeof name !== 'string') return false;
         // A query's controller (poll, stream, window listeners) goes with its
         // store, or a second query(name) is taken for a duplicate.
-        const queryController = this._queryControllers && this._queryControllers.get(name);
+        const queryController = __FEATURE_QUERY__ && this._queryControllers && this._queryControllers.get(name);
         if (queryController) {
             this._queryTeardown(queryController);
             this._queryControllers.delete(name);

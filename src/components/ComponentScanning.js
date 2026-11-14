@@ -141,10 +141,6 @@ _setupDynamicComponentDetection()
         // still queued (takeRecords()), and count a mount made by markup alone.
         const onMutations = this._onMutations = mutations =>
         {
-            // OPTIMIZATION: Skip processing if we're in batch list cleanup mode
-            // The cleanup is already handled by _batchCleanupListItems
-            if (this._inBatchListCleanup) return;
-
             let needsScan = false;
             let needsGarbageCollection = false;
 
@@ -198,7 +194,7 @@ _setupDynamicComponentDetection()
                             // Mirrors the removed-node loop below, which has always
                             // skipped these. A component added INTO a row later is its own
                             // added node and still gets scanned.
-                            if (node._listIndex !== undefined || node._poolEntity) continue;
+                            if ((__FEATURE_LISTS__ && node._listIndex !== undefined) || (__FEATURE_POOLS__ && node._poolEntity)) continue;
                             // Fast path: check attribute first (no DOM traversal).
                             // Both prefixes: a data-wf-component root must trigger
                             // the scan too, or it is never initialized.
@@ -222,7 +218,7 @@ _setupDynamicComponentDetection()
                         const node = removedNodes[j];
                         if (node.nodeType === 1) { // ELEMENT_NODE
                             // OPTIMIZATION: Skip list items and pool entities - they're already cleaned up
-                            if (node._listIndex !== undefined || node._poolEntity) continue;
+                            if ((__FEATURE_LISTS__ && node._listIndex !== undefined) || (__FEATURE_POOLS__ && node._poolEntity)) continue;
 
                             // Fast path: check attribute first (no DOM traversal)
                             if (node.hasAttribute('data-component-id')) {
@@ -452,10 +448,12 @@ _setupDynamicComponentDetection()
             if (!componentElement || componentElement === parent) continue;
 
             // The owning component is initialized: the same verdict its render
-            // effect reaches (_conditionVerdict).
+            // effect reaches (_conditionVerdict). A server-rendered section
+            // kept for an entity not registered yet is not false
+            // (_processDataRenderElement keeps it rendered).
             if (componentElement.dataset.componentId) {
                 const instance = this.componentInstances.get(componentElement.dataset.componentId);
-                if (instance && !this._evaluateCondition(conditionPath, instance)) return true;
+                if (instance && !this._evaluateCondition(conditionPath, instance, parent)) return true;
                 continue;
             }
 
@@ -696,7 +694,7 @@ _setupDynamicComponentDetection()
         this._processComponentBindings(instance);
         this._bindComponentActions(instance);
         // Set up entity pools (data-pool): handles declarative pools block + population
-        if (this._setupPools) {
+        if (__FEATURE_POOLS__ && this._setupPools) {
             this._setupPools(instance);
         }
 
@@ -711,7 +709,7 @@ _setupDynamicComponentDetection()
         // (for init-created portals), which no-init components never reach, so their
         // markup portals were never teleported on real page loads. Idempotent with the
         // later init-time pass, exactly as on the incremental path.
-        if (this._processPortals) {
+        if (__FEATURE_PORTALS__ && this._processPortals) {
             this._processPortals(instance);
         }
     },
@@ -1148,7 +1146,7 @@ _setupDynamicComponentDetection()
         }
 
         // Apply services from providers (uses: [...]) - only if plugin system is loaded
-        if (definition.uses && this._useServices) {
+        if (__FEATURE_PLUGINS__ && definition.uses && this._useServices) {
             this._useServices(instance, definition.uses, /* applyToContext */ true);
         }
 

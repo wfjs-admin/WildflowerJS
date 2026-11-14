@@ -76,7 +76,7 @@ import { ListItemBindingMethods } from './ListItemBinding.js';
 import { ListExpressionMethods, warnItemComputedCalls } from './ListExpressionEval.js';
 import { ListEventDelegationMethods } from '../events/EventSystem.js';
 import { ListSharedMethods } from './ListSharedMethods.js';
-import { TemplateLookupMethods } from './TemplateSystem.js';
+import { TemplateLookupMethods, rowPathElement } from './TemplateSystem.js';
 import { needsComponentInitSet, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
 import { SSRListMethods } from './ssr-list.js';
 import { DIRECT_WRITERS } from '../state/bindingConstants.js';
@@ -473,16 +473,14 @@ export const ListRendererMethods = {
                     ? normalizedPath : null;
 
                 if (computedName) {
-                    // PENDING STORE DEPENDENCY: Set list element in tracking context
-                    // so that external() calls from within the computed can associate
-                    // the list element with pending store dependencies
+                    // The tracking context names the computed, so an
+                    // external() miss inside it registers against it.
                     const previousTrackingContext = this._computedTrackingContext;
                     // V8 OPT: Canonical shape; all fields always present
                     this._computedTrackingContext = {
                         componentId: instance.id,
                         computedName: computedName,
                         stateManager: instance.stateManager || null,
-                        listElement: element,
                         isItemLevelComputed: false,
                         itemIndex: -1
                     };
@@ -513,17 +511,6 @@ export const ListRendererMethods = {
                         peers.push(context);
                         registered._wfPeers = peers;
                     }
-                }
-
-                // PENDING STORE DEPENDENCY: If this is a computed list, register the list element
-                // with the StoreManager so pending store dependencies can be resolved
-                // This must happen AFTER context is created (computed evaluated) but list is now known
-                if (computedName && this.storeManager) {
-                    const key = `${instance.id}:${computedName}`;
-                    if (!this.storeManager._pendingListElements) {
-                        this.storeManager._pendingListElements = new Map();
-                    }
-                    this.storeManager._pendingListElements.set(key, element);
                 }
             }
         }
@@ -601,9 +588,11 @@ export const ListRendererMethods = {
      * Context cleanup is deferred to requestIdleCallback
      * Does NOT remove items from DOM - caller handles that
      * @param {HTMLElement[]} items - Array of list item elements to clean up
+     * @param {boolean} [hasNestedComponents] - the list's template has a component
+     *   (on the row element or inside it)
      * @private
      */
-    _batchCleanupListItemsWithNestedComponents(items) {
+    _batchCleanupListItemsWithNestedComponents(items, hasNestedComponents) {
         if (!items || items.length === 0) return;
 
         // Skip if no context system
@@ -641,17 +630,16 @@ export const ListRendererMethods = {
             // The context object itself is stored in instance._listContexts by path, not by element.
 
             // PERF: Only check for nested components if template actually has them
-            // Check cached flag on parent element to avoid querySelectorAll on every cleanup
             const parent = items[0]?.parentElement;
-            if (parent && parent._templateHasNestedComponents && this.componentInstances.size > 1) {
+            if (parent && hasNestedComponents && this.componentInstances.size > 1) {
                 // Single query for all nested components in parent
                 const nestedComponents = parent.querySelectorAll('[data-component-id]');
                 if (nestedComponents.length > 0) {
                     // Build Set of items for O(1) containment check
                     const itemSet = new Set(items);
                     for (const componentEl of nestedComponents) {
-                        // Check if this component is inside one of our items
-                        let el = componentEl.parentElement;
+                        // Check if this component is one of our items or inside one
+                        let el = componentEl;
                         while (el && el !== parent) {
                             if (itemSet.has(el)) {
                                 const componentId = componentEl.dataset.componentId;
@@ -1326,7 +1314,6 @@ export const ListRendererMethods = {
                     componentId: instance?.id || null,
                     computedName: computedName,
                     stateManager: sm || null,
-                    listElement: element,
                     isItemLevelComputed: false,
                     itemIndex: -1
                 };
@@ -1598,13 +1585,7 @@ export const ListRendererMethods = {
                     let te;
                     if (tg.isRoot) te = rowEl;
                     else if (els && tg.elIndex !== undefined) te = els[tg.elIndex];
-                    else if (tg.elementPath && tg.elementPath.length) {
-                        te = rowEl;
-                        for (const ix of tg.elementPath) {
-                            if (!te || !te.children) { te = null; break; }
-                            te = te.children[ix];
-                        }
-                    }
+                    else if (tg.elementPath && tg.elementPath.length) te = rowPathElement(rowEl, tg.elementPath);
                     if (!te) return null;
                     if (el === null) el = te;
                     else if (el !== te) return null;
@@ -2148,13 +2129,7 @@ export const ListRendererMethods = {
                         let te;
                         if (tg.isRoot) te = rowEl;
                         else if (els && tg.elIndex !== undefined) te = els[tg.elIndex];
-                        else if (tg.elementPath && tg.elementPath.length) {
-                            te = rowEl;
-                            for (const ix of tg.elementPath) {
-                                if (!te || !te.children) { te = null; break; }
-                                te = te.children[ix];
-                            }
-                        }
+                        else if (tg.elementPath && tg.elementPath.length) te = rowPathElement(rowEl, tg.elementPath);
                         if (!te) return null;
                         if (el === null) el = te;
                         else if (el !== te) return null;
@@ -2483,6 +2458,8 @@ export const ListRendererMethods = {
             mapFn,
             {
                 key: keyProp,
+                // The list's path, for the reconciler's error message.
+                name: listPath,
                 // OPTIMIZATION: bulk create fast path; clone a cached row prototype
                 // + direct textContent setter writes (see _buildRowsCloneSetter),
                 // instead of N cloneNode calls or a serialize+reparse. Non-qualifying
@@ -2535,13 +2512,6 @@ export const ListRendererMethods = {
                     const results = new Array(resultCount);
                     let resultIdx = 0;
 
-                    // Pre-create enriched context once
-                    const enrichedContext = {
-                        ...context,
-                        componentInstance: instance,
-                        listLength: newArray.length
-                    };
-
                     // PERF: Pre-allocate reusable merged context for class bindings.
                     // Uses a Proxy that delegates to the current item, avoiding 10K
                     // object allocations + spread operations in the per-row loop.
@@ -2558,17 +2528,10 @@ export const ListRendererMethods = {
                         };
                     }
 
-                    // Cache binding arrays
-                    const styleBindings = compiledMetadata.styleBindings || [];
-                    const attrBindings = compiledMetadata.attrBindings || [];
-                    const rootStyleExpr = compiledMetadata.rootBindings?.hasBindStyle && compiledMetadata.rootBindings?.bindStyleExpr;
-                    const rootAttrExpr = compiledMetadata.rootBindings?.hasBindAttr && compiledMetadata.rootBindings?.bindAttrExpr;
-                    const hasStyleBindings = rootStyleExpr || styleBindings.length > 0;
-                    const hasAttrBindings = rootAttrExpr || attrBindings.length > 0;
-
-                    // PERF: Pre-check whether root model/show exists
-                    // Avoids N function calls + metadata lookups when template doesn't use them
-                    const hasRootModelOrShow = compiledMetadata.rootBindings?.modelPath || compiledMetadata.rootBindings?.showPath;
+                    // No style, attr, root model or root show binding reaches
+                    // this path: a template with any of them never gets
+                    // innerHTMLParts (_compileTemplate's canUseInnerHTML), so
+                    // the loop below applies class bindings only.
 
                     // Pre-resolve outside-click actions on row-template children.
                     // Lazy context creation in this bulk path means
@@ -2663,44 +2626,6 @@ export const ListRendererMethods = {
                                 reusableMergedCtx._last = i === newArray.length - 1;
                             }
                             self._applyClassBindingsToRow(row, itemProxy, i, newArray.length, classEvaluators, componentState, instance, context, reusableMergedCtx);
-                        }
-
-                        // Apply style bindings
-                        const elements = (hasStyleBindings || hasAttrBindings) ? self._rowElements(row) : null;
-                        if (hasStyleBindings) {
-                            if (rootStyleExpr) {
-                                self._processStyleBinding(row, itemProxy, rootStyleExpr, i, enrichedContext);
-                            }
-                            for (const styleBinding of styleBindings) {
-                                const targetEl = (elements && styleBinding.index !== undefined)
-                                    ? elements[styleBinding.index]
-                                    : row;
-                                if (targetEl && styleBinding.expression) {
-                                    self._processStyleBinding(targetEl, itemProxy, styleBinding.expression, i, enrichedContext);
-                                }
-                            }
-                        }
-
-                        // Apply attr bindings
-                        if (hasAttrBindings) {
-                            if (rootAttrExpr) {
-                                self._processAttrBinding(row, itemProxy, rootAttrExpr, i, enrichedContext);
-                            }
-                            for (const attrBinding of attrBindings) {
-                                const targetEl = (elements && attrBinding.index !== undefined)
-                                    ? elements[attrBinding.index]
-                                    : row;
-                                if (targetEl && attrBinding.expression) {
-                                    self._processAttrBinding(targetEl, itemProxy, attrBinding.expression, i, enrichedContext);
-                                }
-                            }
-                        }
-
-                        // === INTEGRATION: Handle root element model/show bindings ===
-                        // PERF: Only call if template actually has root model/show bindings
-                        if (hasRootModelOrShow) {
-                            const ds = { model: self._getAttr(row, 'model'), show: self._getAttr(row, 'show') };
-                            self._bindRootElementModelShow(row, itemProxy, ds, i, enrichedContext);
                         }
 
                         // Store binding data for context creation
@@ -2892,7 +2817,7 @@ export const ListRendererMethods = {
                     // Use optimized batch cleanup (same as context mode)
                     // This does: batched directive cleanup, batched component destruction,
                     // deferred context cleanup - all with minimal querySelectorAll calls
-                    self._batchCleanupListItemsWithNestedComponents(elements);
+                    self._batchCleanupListItemsWithNestedComponents(elements, hasNestedComponents);
 
                     // Tear down nested data-list mapArrays in each removed row (the
                     // batch cleanup destroys nested components + item effects but not
@@ -3626,8 +3551,10 @@ export const ListRendererMethods = {
         // shadow-compare verifies the first row against the generic build and
         // disables the path on any mismatch. Force-generic mode or the proxy
         // path opt out.
-        const _compileMode = getRowCompileMode();
-        const _textSpec = (_compileMode !== 'generic' && !needsProxy && !compiledMetadata._rowCompileDisabled)
+        // The mode override and the shadow-compare's disable flag are
+        // development-only: a production build always takes the composed
+        // path when it can.
+        const _textSpec = (!needsProxy && !(__DEV__ && (getRowCompileMode() === 'generic' || compiledMetadata._rowCompileDisabled)))
             ? getTextEmitters(compiledMetadata) : null;
         let _shadowChecked = compiledMetadata._rowCompileShadowChecked === true;
         // Plain text templates write by element path and leave the row's
@@ -3683,9 +3610,13 @@ export const ListRendererMethods = {
                     shadowCompareRow(compiledMetadata, row, item, proto,
                         (r) => this._buildElementsArrayFromMetadata(r, compiledMetadata));
                 }
-            } else {
+            } else if (__DEV__) {
                 // FAST PATH: all bindings are simple item properties; direct read,
                 // direct textContent write, no calls (the flat text-row shape).
+                // Development only (the forced generic mode, or a template the
+                // shadow-compare disabled): in production _textSpec is null here
+                // only for a template with no text binding at all, where this
+                // writes nothing.
                 for (let j = 0; j < bcount; j++) {
                     const b = bindings[j];
                     const el = els[b.index];
@@ -3741,16 +3672,12 @@ export const ListRendererMethods = {
         let v = md._createNeedsElements;
         if (v !== undefined) return v;
         v = false;
-        const rb = md.rootBindings;
-        if ((md.styleBindings && md.styleBindings.length) || (md.attrBindings && md.attrBindings.length)
-            || (rb && (rb.hasBindStyle || rb.hasBindAttr))) {
-            v = true;
-        } else {
-            const ce = md.classEvaluators;
-            if (ce) for (let i = 0; i < ce.length; i++) { if (!ce[i].isRoot) { v = true; break; } }
-            const acts = md.actions;
-            if (!v && acts) for (let i = 0; i < acts.length; i++) { if (acts[i].hasEventOutside) { v = true; break; } }
-        }
+        // (Style and attr bindings never reach the bulk path, the only
+        // caller: see canUseInnerHTML in _compileTemplate.)
+        const ce = md.classEvaluators;
+        if (ce) for (let i = 0; i < ce.length; i++) { if (!ce[i].isRoot) { v = true; break; } }
+        const acts = md.actions;
+        if (!v && acts) for (let i = 0; i < acts.length; i++) { if (acts[i].hasEventOutside) { v = true; break; } }
         md._createNeedsElements = v;
         return v;
     },
@@ -3971,11 +3898,7 @@ export const ListRendererMethods = {
                 if (elements && evaluator.index !== undefined) {
                     targetEl = elements[evaluator.index];
                 } else if (evaluator.elementPath && evaluator.elementPath.length > 0) {
-                    targetEl = row;
-                    for (const idx of evaluator.elementPath) {
-                        if (!targetEl || !targetEl.children) break;
-                        targetEl = targetEl.children[idx];
-                    }
+                    targetEl = rowPathElement(row, evaluator.elementPath);
                 }
             }
 
@@ -4187,13 +4110,7 @@ export const ListRendererMethods = {
             let targetEl;
             if (evaluator.isRoot) { targetEl = row; }
             else if ((elements === undefined ? (elements = this._rowElements(row)) : elements) && evaluator.index !== undefined) { targetEl = elements[evaluator.index]; }
-            else if (evaluator.elementPath?.length > 0) {
-                targetEl = row;
-                for (const idx of evaluator.elementPath) {
-                    if (!targetEl?.children) break;
-                    targetEl = targetEl.children[idx];
-                }
-            }
+            else if (evaluator.elementPath?.length > 0) targetEl = rowPathElement(row, evaluator.elementPath);
             if (!targetEl) continue;
             let resultObject;
             // Runtime-resolved forms (external()/$store): the compiled
@@ -4284,13 +4201,7 @@ export const ListRendererMethods = {
             let targetEl;
             if (evaluator.isRoot) { targetEl = row; }
             else if ((elements === undefined ? (elements = this._rowElements(row)) : elements) && evaluator.index !== undefined) { targetEl = elements[evaluator.index]; }
-            else if (evaluator.elementPath?.length > 0) {
-                targetEl = row;
-                for (const idx of evaluator.elementPath) {
-                    if (!targetEl?.children) break;
-                    targetEl = targetEl.children[idx];
-                }
-            }
+            else if (evaluator.elementPath?.length > 0) targetEl = rowPathElement(row, evaluator.elementPath);
             if (!targetEl) continue;
             // Runtime-resolved forms (external()/$store): the compiled
             // evaluator cannot express them; delegate to the generic
@@ -4620,6 +4531,12 @@ export const ListRendererMethods = {
     _computeReactiveGraphFastTouch(metadata, instance, sampleItem) {
         if (!sampleItem || typeof sampleItem !== 'object') return null;
         this._computeDeps(metadata);
+        // A store, plugin or query field read by name ($k.time) is a shared
+        // dep whatever kind of binding reads it: the dependency walk reads it
+        // under the list's effect, which then follows it. The component
+        // refresh effect follows component state only, so a class binding
+        // that read one was followed by nothing.
+        if (metadata._extReads) return null;
         const reserved = this._expressionReservedWords;
         const itemProps = new Set();
         // ANY computed read (item- OR component-level) forces the full first run:
@@ -5618,6 +5535,20 @@ export const ListRendererMethods = {
 
             // Schedule render
             this._scheduleRender();
+        }
+        // Batch mode: an adopted list that mapArray does not own yet has no
+        // effect to run, and the batch's proxy snapshot may not record the
+        // write. Enrol the component so _applyBatchToLists processes its
+        // lists, as _ssrNoteItemWrite does for an item write.
+        else if (__FEATURE_SSR__ && contextsAffected)
+        {
+            for (const context of affectedContexts) {
+                const el = context.element;
+                if (el && !el._mapArrayInitialized && el._ssrAdoptedByKey) {
+                    (this._batchChangedComponents || (this._batchChangedComponents = new Set())).add(instanceId);
+                    break;
+                }
+            }
         }
 
         return contextsAffected;

@@ -11,7 +11,7 @@
  * __DEV__-gated; skipped on min variants. Requires the pools feature.
  */
 
-import { describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from 'vitest'
 import { loadFramework, resetFramework, isMinifiedBuild, hasFeature, waitForCompleteRender } from './helpers/load-framework.js'
 
 function ensureComponentScanning(wildflower) {
@@ -121,19 +121,37 @@ describe.skipIf(isMinifiedBuild() || !hasFeature('pools'))('Dev-mode pool-contai
 
     // ------------------------------------------------ (b) never populated
 
-    it('notes a wired container that was never populated once the settle window passes', async () => {
+    it('stays silent for an empty container whose pool the pools block declares (it fills later by design)', async () => {
+        // A declared pool that fills on interaction (stellar-flock,
+        // tower-defense-pools) is the case the note could not tell from a
+        // mistake, so it says nothing.
         window.wildflower.component('pc-empty', {
             state: {},
             pools: { orbs: {} }
         })
-        testContainer.innerHTML = '<div data-component="pc-empty"><div data-pool="orbs"><template><span data-bind="label"></span></template></div></div>'
+        // The control: a markup-only pool, set up after it, does get the
+        // note. Its arrival shows the settle window has passed for both, so
+        // the silence below is not a wait that ended too soon.
+        window.wildflower.component('pc-empty-control', { state: {} })
+        testContainer.innerHTML = '<div data-component="pc-empty"><div data-pool="orbs"><template><span data-bind="label"></span></template></div></div>' +
+            '<div data-component="pc-empty-control"><div data-pool="motes"><template><span data-bind="label"></span></template></div></div>'
+        ensureComponentScanning(window.wildflower)
+        await waitForCompleteRender()
+        await vi.waitFor(() => expect(neverPopulatedWarnings('motes').length).toBe(1), { timeout: 5000, interval: 20 })
+
+        expect(neverPopulatedWarnings('orbs')).toEqual([])
+    })
+
+    it('notes a markup-only container that was never populated once the settle window passes', async () => {
+        window.wildflower.component('pc-empty-markup', { state: {} })
+        testContainer.innerHTML = '<div data-component="pc-empty-markup"><div data-pool="orbs"><template><span data-bind="label"></span></template></div></div>'
         ensureComponentScanning(window.wildflower)
         await waitForCompleteRender()
         await new Promise(r => setTimeout(r, 150))
 
         const found = neverPopulatedWarnings('orbs')
         expect(found.length).toBe(1)
-        expect(found[0]).toContain('pc-empty')
+        expect(found[0]).toContain('pc-empty-markup')
         // The suggestion interpolates the user's own pool name
         expect(warnings.join('\n')).toContain("getPool('orbs')")
         // and leads with the common harmless case: a pool that fills later

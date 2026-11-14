@@ -2,7 +2,7 @@
  * WildflowerJS TypeScript Definitions
  * A lightweight reactive framework with no build step required
  *
- * @version 1.5.5
+ * @version 1.5.6
  * @license MIT
  *
  * The bundles are IIFEs that assign `window.wildflower`; import this file for
@@ -93,6 +93,15 @@ export interface WildflowerOptions {
    * A query's own `headers:` declaration wins over these.
    */
   headers?: Record<string, Record<string, string> | (() => Record<string, string>)>;
+
+  /** Request URLs whose rows each query keeps in memory (default: 15; 0 turns the result cache off) */
+  queryCacheEntries?: number;
+
+  /** Rows retained across a query's cached URLs (default: 5000) */
+  queryCacheRows?: number;
+
+  /** Milliseconds a URL must stay current to be worth caching (default: 0, off) */
+  queryCacheMinDwell?: number;
 }
 
 // =============================================================================
@@ -763,7 +772,7 @@ export interface RouteManager {
    * @param params - Route parameters
    * @param query - Query parameters
    */
-  getRouteUrl(name: string, params?: Record<string, string>, query?: Record<string, string>): string;
+  getRouteUrl(name: string, params?: Record<string, string | number>, query?: Record<string, unknown>): string | null;
 
   /**
    * Check if a route pattern matches the current URL
@@ -1012,8 +1021,8 @@ export interface WriteOperation<T = any> {
  * Declaration passed to `wildflower.query(name, config)`
  */
 export interface QueryConfig<T = any> {
-  /** Read source: a URL with `:token` placeholders, or a function returning the rows (or a promise of them) */
-  from: string | ((params: Record<string, any>) => any);
+  /** Read source: a URL with `:token` placeholders, or a function, called with no arguments, returning the rows (or a promise of them) */
+  from: string | (() => any);
 
   /** Row identity field (default: 'id') */
   key?: string;
@@ -1032,7 +1041,7 @@ export interface QueryConfig<T = any> {
 
   refresh?: RefreshRung | RefreshRung[];
 
-  /** Event-stream URL for the 'sse' rung (defaults to `from`) */
+  /** Event-stream URL for the 'sse' rung (defaults to `from` when `from` is a URL) */
   stream?: string;
 
   /** Retries after a failed read, with backoff (default: 0) */
@@ -1082,13 +1091,14 @@ export interface QueryHandle<T = any> {
   /** Data on screen the server has not yet confirmed */
   readonly isStale: boolean;
 
-  /** The initial load failed */
-  readonly error: any;
+  /** The initial load failed: the failure's message */
+  readonly error: string | null;
 
-  /** A later refresh failed; existing rows were kept */
-  readonly syncError: any;
+  /** A later refresh or a write failed; existing rows were kept */
+  readonly syncError: string | null;
 
-  readonly lastSync: number | Date | null;
+  /** Date.now() of the last confirming sync */
+  readonly lastSync: number | null;
 
   /** Writes dispatched but not yet settled */
   readonly pendingWrites: number;
@@ -1101,14 +1111,14 @@ export interface QueryHandle<T = any> {
   /** Apply local data with no transport */
   patch(data: Partial<T> | Partial<T>[]): void;
 
-  /** Save the key plus the changed fields. Delete when the `deleted` field is truthy, update otherwise */
-  write(item: Partial<T> & Record<string, any>): Promise<T | void>;
+  /** Save the key plus the changed fields. Delete when the `deleted` field is truthy, update otherwise. Resolves once settled (the row is read from `rows`); rejects on failure */
+  write(item: Partial<T> & Record<string, any>): Promise<void>;
 
   /** Run a named operation from the `to` map */
-  write(operation: string, item: Partial<T> & Record<string, any>): Promise<T | void>;
+  write(operation: string, item: Partial<T> & Record<string, any>): Promise<void>;
 
   /** Add a row through the `create` entry. The temporary key is minted for you */
-  create(item: Partial<T> & Record<string, any>): Promise<T | void>;
+  create(item: Partial<T> & Record<string, any>): Promise<void>;
 }
 
 /**
@@ -1537,6 +1547,11 @@ export default class WildflowerJS {
    * changes go. Markup binds it with `data-query="name"` and reads state as `$name`.
    * @param name - Query name (a noun: the data it delivers)
    * @param config - Query declaration
+   * @returns The query's handle (a repeated name returns the existing
+   *   handle). A declaration that is refused, because a store already has the
+   *   name or `from` is neither a URL nor a function, returns null, and a
+   *   development build reports why. The type leaves null out, so a valid
+   *   declaration needs no check.
    */
   query<T = any>(name: string, config: QueryConfig<T>): QueryHandle<T>;
 
@@ -1550,12 +1565,13 @@ export default class WildflowerJS {
    * Mark several queries out of date and refetch them. Resolves once every
    * triggered refetch has settled; inactive queries are skipped.
    */
-  invalidateQueries(...names: string[]): Promise<void>;
+  invalidateQueries(...names: string[]): Promise<void[]>;
 
   /**
-   * Remove persisted query rows from localStorage. No names clears every query's.
+   * Remove persisted query rows from localStorage. No names clears every
+   * query's. Returns the number of snapshots removed.
    */
-  clearPersisted(...names: string[]): void;
+  clearPersisted(...names: string[]): number;
 
   // =========================================================================
   // PLUGIN METHODS
@@ -1722,7 +1738,7 @@ export default class WildflowerJS {
    * htmlSanitizer, per-origin query headers, ...)
    * @param options - Options to merge into the current configuration
    */
-  config(options: Partial<WildflowerOptions>): this;
+  config(options?: Partial<WildflowerOptions>): WildflowerOptions;
 
   /**
    * Deep plain-object snapshot of reactive state, for structured clone

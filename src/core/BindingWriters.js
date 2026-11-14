@@ -290,6 +290,12 @@ export function applyStyleObj(element, object) {
 const EMPTY_CLASSES = [];
 
 /**
+ * The class names in a string. Any whitespace separates them, and any run of
+ * it: classList takes no token with whitespace in it, and no empty one.
+ */
+export const classTokens = (s) => s.match(/\S+/g) || EMPTY_CLASSES;
+
+/**
  * Apply a data-bind-class value to an element.
  *
  * Canonical diff-tracking semantics (the previously-correct ListItemBinding
@@ -322,19 +328,34 @@ export function applyClass(element, value) {
     let names;
     if (value == null || value === false || value === '') {
         names = EMPTY_CLASSES;
-    } else if (typeof value === 'string') {
-        const trimmed = value.trim();
-        names = trimmed ? trimmed.split(/\s+/) : EMPTY_CLASSES;
+    } else if (typeof value !== 'object') {
+        names = classTokens(String(value));
     } else if (Array.isArray(value)) {
-        names = value.filter(c => c && typeof c === 'string');
-    } else if (typeof value === 'object') {
-        names = [];
-        for (const key in value) {
-            if (value[key]) names.push(key);
-        }
+        // An entry may name several classes, as a string does.
+        names = classTokens(value.filter(c => c && typeof c === 'string').join(' '));
     } else {
-        const trimmed = String(value).trim();
-        names = trimmed ? trimmed.split(/\s+/) : EMPTY_CLASSES;
+        names = [];
+        // An object binding owns the classes it names: on its first write a
+        // false key clears that class from the markup (a server-rendered class
+        // or a template default), as every later write does; one a root:
+        // block holds on stays.
+        const first = !element._wfClassOwned;
+        if (first) element._wfClassOwned = true;
+        const held = element._wfRootOn;
+        for (const key in value) {
+            const on = value[key];
+            if (!/\s/.test(key)) {
+                if (!key) continue;
+                if (on) names.push(key);
+                else if (first && !(held && held.has(key))) element.classList.remove(key);
+            } else {
+                // A key may name several classes ({ 'a b': cond }).
+                for (const part of classTokens(key)) {
+                    if (on) names.push(part);
+                    else if (first && !(held && held.has(part))) element.classList.remove(part);
+                }
+            }
+        }
     }
 
     const prev = element._prevBoundClasses;
@@ -345,10 +366,12 @@ export function applyClass(element, value) {
 
     // Early-exit when the set is unchanged: same count and every desired class is
     // already bound. Avoids a Set allocation and any DOM op on the unchanged path.
+    // A name listed twice (two keys naming one class, "a a") makes the counts
+    // agree with a class gone, so it takes the full path below.
     if (names.length === prevSize) {
         let allMatch = true;
         for (let i = 0; i < names.length; i++) {
-            if (!prev.has(names[i])) { allMatch = false; break; }
+            if (!prev.has(names[i]) || (i > 0 && names.indexOf(names[i]) < i)) { allMatch = false; break; }
         }
         if (allMatch) return;
     }

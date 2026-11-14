@@ -7,9 +7,9 @@ import { ContextRecords } from '../state/ContextRecords.js';
 import { listTemplateId } from './wfUtils.js';
 
 /**
- * Methods to be mixed into WildflowerJS.prototype
+ * Methods to be mixed into WildflowerJS.prototype (with FrameworkInitTail below)
  */
-export const FrameworkInitMethods = {
+const FrameworkInitHead = {
 /**
      * Initialize the framework
      * @private
@@ -24,7 +24,7 @@ export const FrameworkInitMethods = {
         }
         this._hasInitialized = true;
 
-        this._log('info', 'Initializing WildflowerJS');
+        if (__DEV__) this._log('info', 'Initializing WildflowerJS');
 
         this._ensureContextSystem();
 
@@ -51,7 +51,7 @@ export const FrameworkInitMethods = {
         if (this.options.disableDefaultStore !== true)
         {
             this.storeManager.createDefaultStore();
-            this._log('info', 'Default app-store initialized');
+            if (__DEV__) this._log('info', 'Default app-store initialized');
         }
 
         // Apply any pending store updates that were queued
@@ -142,7 +142,7 @@ export const FrameworkInitMethods = {
             // Use setTimeout to ensure activation happens on next tick after all initialization
             setTimeout(() => {
                 const activatedCount = this.ssrManager.activateAllComponents();
-                this._log('SSR activation complete: ' + activatedCount + ' components now have exact equivalence to dynamic components');
+                __DEV__ && this._log('SSR activation complete: ' + activatedCount + ' components now have exact equivalence to dynamic components');
             }, 0);
         }
 
@@ -292,6 +292,13 @@ export const FrameworkInitMethods = {
         // Also validate on change; clears errors immediately for selects, checkboxes, radios
         document.addEventListener('change', boundValidationBlur, true);
     },
+};
+
+/**
+ * List contexts (list renderer only). Spread into ListSharedMethods, so the
+ * tiers without lists (nano, mini-pool) do not ship them.
+ */
+export const ListContextMethods = {
 // GLOBAL EVENT BINDING
     _createListContext(path, data, componentInstance, parentContext = null, itemIndex = undefined, register = true)
     {
@@ -606,7 +613,13 @@ export const FrameworkInitMethods = {
             return Array.isArray(this.data) ? this.data : [];
         }
     },
+};
 
+/**
+ * Methods to be mixed into WildflowerJS.prototype
+ */
+export const FrameworkInitMethods = {
+    ...FrameworkInitHead,
 
 // TEMPLATE DISCOVERY AND PROCESSING
     /**

@@ -252,7 +252,7 @@ export const FormHandlingMethods = {
         for (let cur = el; cur && cur.nodeType === 1; cur = cur.parentElement)
         {
             if (this._hasAttr(cur, 'component')) return { boundary: cur, id: cur.dataset.componentId || null, portal: false };
-            const from = cur.getAttribute('data-portaled-from');
+            const from = __FEATURE_PORTALS__ && cur.getAttribute('data-portaled-from');
             if (from) return { boundary: cur, id: from, portal: true };
         }
         return el._wfFormOwner ? { boundary: null, id: el._wfFormOwner, portal: false } : null;
@@ -333,9 +333,12 @@ export const FormHandlingMethods = {
         // not a component action's (event, element, details), and the pool's
         // own listener calls them. Calling the method from here as well ran
         // it a second time with the wrong arguments.
-        for (let el = formElement; el && el !== owner.boundary; el = el.parentElement)
+        if (__FEATURE_POOLS__)
         {
-            if (el._poolItem != null) return;
+            for (let el = formElement; el && el !== owner.boundary; el = el.parentElement)
+            {
+                if (el._poolItem != null) return;
+            }
         }
 
         // Get the component ID
