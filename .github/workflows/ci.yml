@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # One lane per shipped tier (production .min.js) plus the full development
     # build, so every published bundle runs the suite, not just full-dev. The
     # list-free tiers (nano, mini-pool) use their own config, which excludes
@@ -51,7 +51,7 @@ jobs:
         run: npx cross-env WILDFLOWER_DIST=${{ matrix.dist }} npm run ${{ matrix.script }}
 
   bundle-size:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
