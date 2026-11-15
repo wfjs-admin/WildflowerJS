@@ -7,6 +7,7 @@
 import { listBoundElements } from '../core/DomMetadata.js';
 import { WF_ERRORS, wfError, mergeData, isNegatedPath } from '../core/wfUtils.js';
 import { getContextMethod } from '../state/ContextProxy.js';
+import { microtask } from '../state/reactive-graph/core.js';
 import { recording as __tlOn, timelineNoteFrame as __tlFrame } from '../state/TimelineRecorder.js';
 import { applyShow, applyAttrObj, applyAttrValue, applyStyleObj, applyStyleProp, applyText, applyModel, applyClass, classTokens } from '../core/BindingWriters.js';
 
@@ -436,11 +437,10 @@ const RenderingCoreDevMethods = {
      * Validate variables in an object-form-capable binding expression
      * (data-bind-style and data-bind-class). Object form is
      * { key: stateVar, ... } where the KEY is a CSS property or class NAME,
-     * not a variable — only VALUE-side identifiers are validated. Unquoted
-     * class keys ({ active: isTab1 }) previously hit the generic expression
-     * validator and were flagged as undefined state properties (AI-surface
-     * eval finding F3, 2026-07-16); quoted keys never tripped it because
-     * string-stripping removes them first.
+     * not a variable — only VALUE-side identifiers are validated. The generic
+     * expression validator would flag an unquoted class key
+     * ({ active: isTab1 }) as an undefined state property; a quoted key
+     * passes it, because string-stripping removes it first.
      * @param {string} expression - The expression (e.g., "{ color: textColor }")
      * @param {Array<string>} stateKeys - Available state property names
      * @param {string} componentName - Name of the component for error messages
@@ -1154,10 +1154,10 @@ export const RenderingCoreMethods = {
      * (_buildRenderMeta + _resolveEffectExpression, or getValue for a simple
      * path), so an initial verdict, a hidden-section check, a scanner skip,
      * a cloak strip and a portal condition all agree with the effect that
-     * drives the element afterwards. There used to be a second evaluator
-     * here with no external(); it answered false to every $store expression,
-     * so a $route-gated section that was true at init was removed and then
-     * re-inserted as a clone by the effect, and a slot template inside it was
+     * drives the element afterwards. A second evaluator here with no
+     * external() would answer false to every $store expression, so a
+     * $route-gated section that is true at init would be removed and then
+     * re-inserted as a clone by the effect, and a slot template inside it
      * skipped for good.
      * A false verdict in server-rendered markup whose condition reads an
      * entity that is not registered yet counts as true: the server's content
@@ -1341,7 +1341,7 @@ export const RenderingCoreMethods = {
         // ReactiveGraph the DOM is mutated by graph effects (also microtasks);
         // _render is bookkeeping that just needs to run after them.
         this._renderScheduled = true;
-        queueMicrotask(() =>
+        microtask(() =>
         {
             if (!this._renderScheduled) return;
             const __tlT0 = (__DEV__ && __tlOn) ? performance.now() : 0;

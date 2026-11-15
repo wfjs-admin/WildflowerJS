@@ -1,11 +1,12 @@
 /**
  * Bulk create builds a row's binding-element array on first need, not per
- * row at create (2026-09-03, perf/clear-op create path). A plain text
- * template (text bindings, a root class, child actions) writes its text by
- * compiled element path and leaves the array to _rowElements; the first
- * reader (an action dispatch, a sink write) builds and stashes it. Templates
- * whose create loop reads the array (style/attr bindings, a non-root class
- * evaluator, data-event-outside) keep the eager build.
+ * row at create. A plain text template (text bindings, a root class, child
+ * actions) writes its text by compiled element path and leaves the array to
+ * _rowElements; the first reader that needs it (a sink write, an applier)
+ * builds and stashes it. An action dispatch resolves its action element by
+ * that element's compiled path and builds no array. Templates whose create
+ * loop reads the array (style/attr bindings, a non-root class evaluator,
+ * data-event-outside) keep the eager build.
  *
  * White-box on purpose: the pins are the presence/absence of the array and
  * the identity of the elements it resolves, plus the behaviors that rely on
@@ -65,7 +66,7 @@ describe.skipIf(isMinifiedBuild())('bulk create: lazy binding-element array', ()
     }
   })
 
-  it('a plain text template leaves the array unbuilt; the first dispatch builds it and resolves the right elements', async () => {
+  it('a plain text template leaves the array unbuilt; a dispatch resolves its action by path and builds none; the first reader builds the right elements', async () => {
     const log = []
     wildflower.component('lazy-els-plain', {
       state: { rows: items(), selectedId: null },
@@ -97,14 +98,22 @@ describe.skipIf(isMinifiedBuild())('bulk create: lazy binding-element array', ()
       expect(row._cachedElementsArray).toBeUndefined()
     }
 
-    // First interaction on an untouched row: dispatch resolves through the
-    // compiled metadata, which builds the array for that row only.
+    // First interaction on an untouched row: dispatch resolves the action
+    // element by its compiled path, and the row still carries no array.
     rows[4].querySelector('.lbl').click()
     await waitForCompleteRender()
     expect(log).toEqual(['5:4'])
+    expect(rows[4]._bindingElements).toBeUndefined()
+    expect(rows[4]._cachedElementsArray).toBeUndefined()
+    // A second click on the same row dispatches again, from its record.
+    rows[4].querySelector('.act').click()
+    await waitForCompleteRender()
+    expect(log).toEqual(['5:4', '5:4'])
+    // The first reader that needs the array builds it for that row only.
     const md = rows[4]._compiledMetadata
-    const els = rows[4]._bindingElements
+    const els = wildflower._rowElements(rows[4])
     expect(Array.isArray(els)).toBe(true)
+    expect(rows[4]._bindingElements).toBe(els)
     expect(els.length).toBe(md.elementPaths.length)
     // Every compiled index resolves to the element the path names.
     for (const b of md.bindings) expect(els[b.index].textContent).toBe(String(items()[4][b.path]))

@@ -294,7 +294,7 @@ export const ListSharedMethods = {
             // we have left the scope of the current component.
             // Any list item above this boundary belongs to the PARENT component,
             // not ours - so it's not our list item ancestor in a binding context.
-            if (current.dataset.componentId && current !== element) {
+            if (current !== element && current.getAttribute('data-component-id')) {
                 return null;
             }
 

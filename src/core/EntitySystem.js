@@ -5,7 +5,7 @@
  */
 
 import { RAW_TARGET } from '../state/ContextProxy.js';
-import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING, setOwn } from '../core/wfUtils.js';
+import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING, setOwn, isDigits } from '../core/wfUtils.js';
 import { beginBatchScope, endBatchScope, discardScheduled, toRaw as graphToRaw } from '../state/reactive-graph/core.js';
 import { entityMissed } from '../state/StoreManager.js';
 
@@ -1231,7 +1231,7 @@ export const EntitySystemMethods = {
         }
 
         // Check if second part is numeric (array index)
-        if (parts.length === 2 && !/^\d+$/.test(parts[1])) {
+        if (parts.length === 2 && !isDigits(parts[1])) {
             // Second part is not numeric - this is a property, not an index
             return false;
         }

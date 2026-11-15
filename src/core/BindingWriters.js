@@ -293,7 +293,16 @@ const EMPTY_CLASSES = [];
  * The class names in a string. Any whitespace separates them, and any run of
  * it: classList takes no token with whitespace in it, and no empty one.
  */
-export const classTokens = (s) => s.match(/\S+/g) || EMPTY_CLASSES;
+export const classTokens = (s) => {
+    // A string of printable ASCII with no space in it is one class name (or
+    // none): it needs no split, so the common value costs no regular
+    // expression.
+    for (let i = s.length; i-- > 0;) {
+        const c = s.charCodeAt(i);
+        if (c < 33 || c > 126) return s.match(/\S+/g) || EMPTY_CLASSES;
+    }
+    return s ? [s] : EMPTY_CLASSES;
+};
 
 /**
  * Apply a data-bind-class value to an element.

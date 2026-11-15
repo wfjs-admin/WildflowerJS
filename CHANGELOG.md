@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.5.7] - 2026-11-15
+
+### Changed
+- [A click on an action inside a list row runs less framework code](https://www.wildflowerjs.com/changelog.html#row-action-click-path)
+- [A class value that is one name is applied without a regular expression](https://www.wildflowerjs.com/changelog.html#single-class-name)
+- [Update and render passes are queued as promise jobs](https://www.wildflowerjs.com/changelog.html#update-render-promise-jobs)
+- [A write to a list's array runs less framework code](https://www.wildflowerjs.com/changelog.html#list-write-path-check)
+
 ## [1.5.6] - 2026-11-13
 
 ### Fixed

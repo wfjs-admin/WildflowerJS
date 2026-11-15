@@ -117,8 +117,8 @@ const nodeTable = new WeakMap();
 // The object tables gain one entry per rendered list item (sink stamp nodes,
 // tree proxies), so after a list clears they hold thousands of dead keys, and
 // the clear's own inserts (the new empty array's `length` node and tree proxy)
-// were paying a ~50µs rehash of each big table (measured 2026-09-02, a forced
-// GC right before the clear, which is exactly what the krausest runner does).
+// would pay a ~50µs rehash of each big table when a GC has run right before
+// the clear.
 // Arrays are few, so their tables stay tiny and that insert costs ~1µs. Every
 // lookup pays one Array.isArray; the item-path tables are otherwise unchanged.
 const arrayNodeTable = new WeakMap();
@@ -615,13 +615,27 @@ function runNode(node) {
 // Scheduler
 // ---------------------------------------------------------------------------
 
+// Queue a microtask as a promise job. queueMicrotask() is a call into the
+// browser, and its first call after a full garbage collection costs several
+// times what a promise job does. An error the job throws is still reported
+// as an uncaught error (the global error event), not as an unhandled
+// rejection.
+const settled = Promise.resolve();
+const reportUncaught = (e) => {
+  if (typeof reportError === 'function') reportError(e);
+  else setTimeout(() => { throw e; });
+};
+function microtask(job) {
+  settled.then(job).then(undefined, reportUncaught);
+}
+
 function schedule(node) {
   if (node.queued) return;
   node.queued = true;
   queue.push(node);
   if (!flushScheduled && batchDepth === 0) {
     flushScheduled = true;
-    queueMicrotask(flush);
+    microtask(flush);
   }
 }
 
@@ -778,7 +792,7 @@ function discardScheduled() {
   }
   if (queue.length && !flushScheduled && batchDepth === 0) {
     flushScheduled = true;
-    queueMicrotask(flush);
+    microtask(flush);
   }
 }
 
@@ -1293,7 +1307,7 @@ const COMPUTED_MISS = Symbol('reactive-graph.computed-miss');
 // normally.
 const ARRAY_MUTATORS = new Set(['splice', 'push', 'pop', 'shift', 'unshift', 'reverse', 'sort', 'copyWithin', 'fill']);
 
-// __DEV__ diagnostic (F5, AI-surface eval 2026-07-16): computeds must be pure.
+// __DEV__ diagnostic: computeds must be pure.
 // Mutating tracked state from INSIDE a computed invalidates the computed while
 // it runs (an in-place `sort()` routes through the mutator wrapper, whose
 // `length` pulse re-enters the evaluating node), and everything bound to it
@@ -1306,8 +1320,8 @@ const ARRAY_MUTATORS = new Set(['splice', 'push', 'pop', 'shift', 'unshift', 're
 // unwrap the assigned VALUE, but a container's ELEMENTS can smuggle facade
 // proxies into the raw graph — each later read then re-wraps them
 // (proxy-over-proxy), which corrupts path + NODES routing (bindings wake
-// the wrong fields) and deepens every ownKeys walk until reads crawl (the
-// 2026-08-16 query-ingest freeze was exactly this, one layer per write).
+// the wrong fields) and deepens every ownKeys walk until reads crawl (one
+// layer per write on a query ingest is enough to freeze the page).
 // Bounded scan (first 20 elements/values), one warn per stored container.
 // Write-time invariant: the raw graph never holds a facade. The set trap
 // unwraps the assigned VALUE; this unwraps what the value CONTAINS, so the
@@ -1772,6 +1786,7 @@ export {
   batch,
   untrack,
   flushSync,
+  microtask,
   discardScheduled,
   beginBatchScope,
   endBatchScope,

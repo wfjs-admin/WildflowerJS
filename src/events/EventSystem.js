@@ -955,7 +955,13 @@ export const ListEventDelegationMethods = {
             // an inner button still win after the row has been clicked.
             const md = row._compiledMetadata;
             const metaActions = (md && md.actions && md.actions.length > 0) ? md.actions : null;
+            // Which compiled action an element is: by the row's element array
+            // when it has one, else by each action's own compiled path, so a
+            // click does not build the whole array of a row that has none.
+            // Metadata without element paths still builds the array.
             let els = null;
+            const byPath = metaActions !== null && !(row._cachedElementsArray || row._bindingElements)
+                && md.elementPaths && md.elementPaths.length > 0;
             let actionEl = null, metaAction = null, dispatchEventType = null;
             for (let i = 0; i < chain.length; i++) {
                 const el = chain[i];
@@ -974,10 +980,11 @@ export const ListEventDelegationMethods = {
                 let meta = null;
                 if (!hasRecord && !hasAttr) {
                     if (metaActions === null) continue;
-                    if (els === null) els = this._rowElements(row) || false;
+                    if (!byPath && els === null) els = this._rowElements(row) || false;
                     if (els === false) continue;
                     for (let a = 0; a < metaActions.length; a++) {
-                        if (els[metaActions[a].index] === el) { meta = metaActions[a]; break; }
+                        const i = metaActions[a].index;
+                        if ((byPath ? this._rowElementAt(row, i) : els[i]) === el) { meta = metaActions[a]; break; }
                     }
                     if (meta === null) continue;
                 }

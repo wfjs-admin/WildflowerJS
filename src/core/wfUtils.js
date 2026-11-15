@@ -93,7 +93,7 @@
  * that all framework modules can use.
  *
  * Error codes provide a stable reference for debugging production issues.
- * Format: WF-XXX where XXX is a 3-digit number
+ * Format: WF-NNN where NNN is a 3-digit number
  *
  * Ranges:
  * - 001-099: Core/initialization errors
@@ -158,6 +158,21 @@ export const HAS_MOVE_BEFORE = typeof Element !== 'undefined' && typeof Element.
 export const isNegatedPath = (s) => /^![\w$.:]+$/.test(s);
 
 /**
+ * Whether a string is one or more ASCII digits: an array index as a state
+ * path's segment. A loop, not a regular expression, because the callers run
+ * on every array write.
+ */
+export const isDigits = (s) => {
+    let i = s.length;
+    if (i === 0) return false;
+    while (i-- > 0) {
+        const c = s.charCodeAt(i);
+        if (c < 48 || c > 57) return false;
+    }
+    return true;
+};
+
+/**
  * The page's localStorage, or null when there is none or it cannot be read.
  * A browser that blocks site data throws a SecurityError on the read of
  * window.localStorage itself, which `typeof localStorage` does not catch
@@ -178,10 +193,10 @@ export function wfLocalStorage() {
  * (Chrome 129+, Firefox 142+; continuation priority), then a user-visible
  * scheduler.postTask (Chrome 94+), then setTimeout (Safari — matches the
  * previous shim's cadence). Deliberately NOT requestIdleCallback: idle
- * priority starves under main-thread contention — the 2026-07-15 headroom
- * probe measured 240-component page-load init at 418 ms via rIC vs 90 ms via
- * postTask under animation-grade contention, identical when idle, with
- * worst-case input wait bounded by the caller's chunk budget.
+ * priority starves under main-thread contention. A 240-component page-load
+ * init measures 418 ms through requestIdleCallback against 90 ms through
+ * postTask while an animation runs, and the same when idle; the caller's
+ * chunk budget bounds the worst-case input wait.
  */
 export const wfYield = (() => {
     const sch = typeof scheduler !== 'undefined' ? scheduler : null;
@@ -248,10 +263,9 @@ export const WF_ERR_HOT_LOOP_FACADE_READS = { code: 'WF-216', ...((typeof __DEV_
 // diagnostics raise, and a production build drops it. WF_ERRORS (and so
 // window.WF_ERRORS, see wfGlobals.js) is the full table in development builds
 // and WF_ERRORS_PROD alone in production. A wfError call that moves out of a
-// __DEV__ block takes its entry with it into WF_ERRORS_PROD:
-// scripts/check-wf-errors-prod.cjs (npm run check:wf-errors, Step 1c of
-// build-and-test.cjs) fails when a production bundle references a key its
-// table does not carry.
+// __DEV__ block takes its entry with it into WF_ERRORS_PROD: a build check
+// (npm run check:wf-errors) fails when a production bundle references a key
+// its table does not carry.
 const WF_ERRORS_PROD = {
     // Component lifecycle (100-199)
     DOM_OWNERSHIP: { code: 'WF-105', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Manual DOM write on a node the engine keeps current' }) },
@@ -316,15 +330,15 @@ const WF_ERRORS_DEV_ONLY = {
     STATE_LOAD_ERROR: { code: 'WF-205', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error loading state from storage' }) },
     STATE_SAVE_ERROR: { code: 'WF-206', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error saving state to storage' }) },
     STATE_UPDATE_INVALID: { code: 'WF-207', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid parameter for state update' }) },
-    // WF-208 (COMPUTED_NOT_FOUND) RETIRED 2026-07-17: defined at launch but
-    // never fired from any code path; misspelled computed references are
-    // caught by binding validation instead. Do not reuse the code number.
+    // WF-208 (COMPUTED_NOT_FOUND) is retired: no code path raises it, and a
+    // misspelled computed reference is caught by binding validation. Do not
+    // reuse the code number.
     COMPUTED_NOT_FUNCTION: { code: 'WF-209', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Computed property must be a function' }) },
     PATH_INVALID: { code: 'WF-210', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Invalid path segment' }) },
     SUBSCRIPTION_ERROR: { code: 'WF-211', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error in subscription callback' }) },
-    // WF-212 (POOL_AGGREGATE_NONREACTIVE) RETIRED 2026-07-12: pool.length/.size
-    // are reactive on demand now (B2, DX diagnostics sweep) — the trap the
-    // warning guarded no longer exists. Do not reuse the code number.
+    // WF-212 (POOL_AGGREGATE_NONREACTIVE) is retired: pool.length and .size
+    // are reactive on demand, so the warning has nothing to guard. Do not
+    // reuse the code number.
     INDEXED_PATH_OBSERVER: { code: 'WF-213', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Watch/subscribe path targets a list item by numeric index; index paths reflect the item\'s position when first observed and go stale after splice/reorder' }) },
     ITEM_COMPUTED_THIS_MISS: { code: 'WF-214', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Zero-arg computed referenced in a list row reads a property via `this` that is undefined on the component but present on the list item; item-level computeds receive the item as their first argument' }) },
     DUPLICATE_REGISTRATION_CONFLICT: { code: 'WF-215', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A component or store is being re-registered under a name that already exists with a DIFFERENT definition; the new definition is ignored and the original is kept. Unregister the existing one first (wildflower.unregister(name)) or use a distinct name' }) },
@@ -378,8 +392,8 @@ const WF_ERRORS_DEV_ONLY = {
     HTML_BINDING_ERROR: { code: 'WF-503', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Failed to create HTML binding context' }) },
     CONDITIONAL_UPDATE_ERROR: { code: 'WF-504', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Error updating conditional context' }) },
     CLASS_BINDING_SHAPE: { code: 'WF-505', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Class binding shape mismatch (coerced)' }) },
-    // WF-506 RETIRED 2026-07-16: briefly used for $-in-props before that became
-    // a supported feature (c9a0a953) the same day. Do not reuse the number.
+    // WF-506 is retired: a $ path in a prop is a supported feature. Do not
+    // reuse the number.
     PROP_PATH_UNRESOLVED: { code: 'WF-507', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A data-prop path resolved to undefined and is still unresolvable in the parent after init settled' }) },
     PROP_ATTR_UNDECLARED: { code: 'WF-508', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'A data-prop-*/data-props value names a prop the component never declared, so it is ignored' }) },
     BINDING_VALIDATION: { code: 'WF-509', ...((typeof __DEV__ !== 'undefined' && __DEV__) && { message: 'Binding validation' }) },
@@ -1105,17 +1119,17 @@ export function listTemplateId(listEl) {
  *
  * Ten or more rows created at once are cloned from a stripped copy of the
  * template and bound from compiled metadata. That is only right when every
- * framework attribute in the template is one the path is known to handle. The
- * rule used to be a list of exclusions checked against the compiled metadata,
- * so an attribute nobody had listed took the stripped path by default (a
- * <form data-action> in a row worked at nine rows and was dead at ten).
+ * framework attribute in the template is one the path is known to handle. A
+ * rule made of exclusions checked against the compiled metadata would send an
+ * attribute nobody had listed down the stripped path by default (a
+ * <form data-action> in a row would work at nine rows and be dead at ten).
  *
- * At run time this is still a list of names, and a name that is not on it is
- * served. What keeps it complete is scripts/check-attr-vocabulary.cjs: every
+ * At run time this is a list of names, and a name that is not on it is
+ * served. What keeps it complete is the attribute vocabulary check: every
  * attribute name the source reads through the prefix helpers must be either
  * here or on the served line below, or the test run fails. So an attribute
  * added to the framework has to be placed deliberately; when in doubt it goes
- * here, the slower path that handles everything. (The script sees helper
+ * here, the slower path that handles everything. (The check sees helper
  * calls with a literal name. An attribute read any other way is not checked.)
  *
  * Served by the bulk path (the script reads this line):

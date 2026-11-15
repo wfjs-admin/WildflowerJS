@@ -81,7 +81,7 @@ import { needsComponentInitSet, storedTemplateCache, storedTemplatesCache } from
 import { SSRListMethods } from './ssr-list.js';
 import { DIRECT_WRITERS } from '../state/bindingConstants.js';
 import { applyAttrObj, applyStyleProp, applyStyleObj, applyClass, reapplySelectValue } from '../core/BindingWriters.js';
-import { WF_ERRORS, wfError } from '../core/wfUtils.js';
+import { WF_ERRORS, wfError, isDigits } from '../core/wfUtils.js';
 import { getContextMethod } from '../state/ContextProxy.js';
 import { __wf_str, __wf_txt, HAS_MOVE_BEFORE, wfYield, listTemplateId } from '../core/wfUtils.js';
 import { getRowCompileMode, getTextEmitters, applyRowText, shadowCompareRow,
@@ -3818,8 +3818,8 @@ export const ListRendererMethods = {
         // _evaluateComputedInListContext inside the per-evaluator loop below.
         // Eagerly evaluating ALL item-level computeds in that case allocates
         // two Proxies per computed per row per update with the result never
-        // read, which was 18% / 28% of main-thread time on the PM-demo
-        // profile (2026-05-16). Gate the loop on actual need.
+        // read (18% to 28% of main-thread time in a profiled app). The loop
+        // is gated on actual need.
         //
         // CRITICAL: use _evaluateComputedInListContext (not a direct fn.call) so
         // dependency tracking sees the state reads inside the computed. Direct
@@ -5237,7 +5237,7 @@ export const ListRendererMethods = {
 
     // Single shared writer for the _listRelationships registry. All three
     // discovery paths (scan-time prepopulate, per-component context setup,
-    // nested-template caching) funnel through here. Census 2026-07-02: all
+    // nested-template caching) funnel through here. All
     // three paths produce novel writes (dynamic mounts and external
     // data-use-template children are invisible to the scan-time walk), so
     // every call site is load-bearing.
@@ -5483,13 +5483,19 @@ export const ListRendererMethods = {
                     // - splice operations
                     // - item-level changes (e.g., "0", "10" - numeric indices)
                     // - ALSO handle property changes within items (e.g., "0.label", "1.name") for direct mutations
-                    const itemWrite = /^\d+\./.test(subPath);
-                    if (subPath === 'length' || subPath === 'splice' || subPath.startsWith('splice.') ||
-                        subPath.match(/^\d+$/) || itemWrite)
+                    // (Read without regular expressions: this runs on
+                    // every write to an array a list renders.)
+                    const structural = subPath === 'length' || subPath === 'splice' || subPath.startsWith('splice.');
+                    const dot = structural ? -1 : subPath.indexOf('.');
+                    const indexFirst = !structural && isDigits(dot === -1 ? subPath : subPath.slice(0, dot));
+                    const itemWrite = indexFirst && dot !== -1;
+                    if (structural || indexFirst)
                     {
                         if (__FEATURE_SSR__ && itemWrite) this._ssrNoteItemWrite(context, instanceId);
                         const fullContextPath = context.getFullPath();
-                        const dotNotationPath = fullContextPath.replace(/\[(\d+)]/g, '.$1');
+                        const dotNotationPath = fullContextPath.indexOf('[') === -1
+                            ? fullContextPath
+                            : fullContextPath.replace(/\[(\d+)]/g, '.$1');
 
                         // Check if there's a pending optimization (append, swap, or sparse-update)
                         const pendingOp = instance?.stateManager?._arrayOperations?.get(dotNotationPath);
