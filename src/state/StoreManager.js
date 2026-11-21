@@ -11,14 +11,22 @@ import { createStateManager } from './createStateManager.js';
 import { reactive as rgReactive } from './reactive-graph/core.js';
 import { createContextProxy, patchSelfReferences, warnCollisions, RAW_TARGET } from './ContextProxy.js';
 
-// One graph source per entity name (a store, a plugin, a query's store). A
-// lookup that finds no entity reads its source, so whatever was running (a
-// component's render effect, a list's effect, a computed) depends on the
-// arrival; _resolvePendingStoreDependencies writes it when the entity
+// One graph source per entity name (a store, a plugin, a query's store, a
+// component). A lookup that finds no entity reads its source, so whatever was
+// running (a component's render effect, a list's effect, a computed) depends
+// on the arrival; _resolvePendingStoreDependencies writes it when the entity
 // registers, and exactly those run again. A lookup that hits never reads it.
 const arrivals = rgReactive({});
 let arrivalSeq = 0;
-export const entityMissed = (name) => { void arrivals[name]; };
+// The names a lookup has missed and that have not arrived since.
+const missed = new Set();
+export const entityMissed = (name) => { missed.add(name); void arrivals[name]; };
+// A component instance is ready under its name. Components mount far more
+// often than anything waits for one, so the arrival runs only for a name
+// that something missed.
+export const componentArrived = (storeManager, name) => {
+    if (missed.has(name)) storeManager._resolvePendingStoreDependencies(name);
+};
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════════════════
@@ -214,6 +222,7 @@ export class StoreManager {
      */
     _resolvePendingStoreDependencies(storeName) {
         // Every effect and computed that missed this name runs again.
+        missed.delete(storeName);
         arrivals[storeName] = ++arrivalSeq;
         const pendingSet = this._pendingStoreDependencies.get(storeName);
         if (!pendingSet || pendingSet.size === 0) {
@@ -275,6 +284,13 @@ export class StoreManager {
             // stale, so the component gets the same wake a deferred subscribe
             // gets. The render-effect re-run below covers the non-list bindings.
             if (computedName === PENDING_BINDING) {
+                // A query counts as observed once a shorthand binding that
+                // reads it is evaluated. This binding was evaluated before
+                // the query existed, and a record in a list row is not
+                // evaluated again, so the query is marked as observed here.
+                if (__FEATURE_QUERY__ && this.framework._queryTouchByShorthand) {
+                    this.framework._queryTouchByShorthand(storeName);
+                }
                 this._wakeComponentForLateEntity(instance);
             }
 

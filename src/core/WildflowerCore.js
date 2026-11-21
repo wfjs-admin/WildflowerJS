@@ -134,12 +134,11 @@ export class WildflowerJS
 
         // Consolidated template cache - single structure for all template-related caching
         this._templateCache = {
-            general: new Map(),       // General templates (was: this.templates)
-            lists: new Map(),         // List-specific templates (was: this._listTemplates)
-            compiled: new Map(),      // Pre-compiled template metadata (was: this._compiledTemplates)
-            extracted: new Map(),     // Pre-extracted template content (was: this._extractedTemplateContent)
-            fragmentPools: new Map(), // Pool of pre-cloned fragments (was: this._templateFragmentPools)
-            stats: new Map()          // Pool statistics (was: this._templateStats)
+            lists: new Map(),         // List-specific templates
+            compiled: new Map(),      // Pre-compiled template metadata
+            extracted: new Map(),     // Pre-extracted template content
+            fragmentPools: new Map(), // Pool of pre-cloned fragments
+            stats: new Map()          // Pool statistics
         };
         this._listRelationships = new Map();
 

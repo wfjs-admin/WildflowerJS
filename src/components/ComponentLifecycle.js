@@ -5,19 +5,20 @@
  */
 
 import { createStateManager } from '../state/createStateManager.js';
+import { componentArrived } from '../state/StoreManager.js';
 import { RAW_TARGET, getContextMethod } from '../state/ContextProxy.js';
 import { objectUtils, pathResolver, wfError, WF_ERRORS, COMPUTED_EVAL, wfYield } from '../core/wfUtils.js';
 
-// Late registration (wildflower.component() after the page-load scan) used to
-// initialize every matching element in one synchronous loop with no cap, so a
-// component registered from a lazily loaded script, a script at the end of
-// <body>, or added dynamically blocked the main thread in proportion to how
-// many elements it matched: measured 2026-09-18 under 4x CPU throttle at about
-// 8 ms fixed plus 0.06-0.12 ms per element, one long task (50 ms+) from a few
-// hundred elements, 310 ms at 25,000 nodes. The page-load scan does the same
-// work as a 20 ms sprint then 8 ms chunks and stays flat.
+// Late registration (wildflower.component() after the page-load scan) can
+// match any number of elements. Initializing them all in one synchronous
+// loop blocks the main thread in proportion to that number, for a component
+// registered from a lazily loaded script, a script at the end of <body>, or
+// added dynamically: under 4x CPU throttle, about 8 ms fixed plus 0.06-0.12
+// ms per element. A few hundred elements make one long task (50 ms+), and
+// 25,000 nodes take 310 ms. The page-load scan does the same work as a 20 ms
+// sprint then 8 ms chunks and stays flat.
 //
-// The late path now mirrors it, with a floor: the first LATE_INIT_SYNC_FLOOR
+// The late path mirrors it, with a floor: the first LATE_INIT_SYNC_FLOOR
 // elements are always initialized before the call returns, whatever the clock
 // says, so small pages keep the synchronous contract every existing test and
 // most applications rely on (no test in the suite registers more than 32 late).
@@ -374,9 +375,14 @@ export const ComponentLifecycleMethods = {
      * parent that now exists. Reuses the parent-state-change follow-up
      * (_refreshChildProps), so props-dependent computeds, the child's render
      * effect, and onPropsChange all see the resolved values.
+     *
+     * Its state and computeds are readable at this point, so this is also
+     * where the readers that looked the component up by name before it was
+     * mounted run again.
      * @private
      */
     _adoptPendingChildren(parentInstance) {
+        componentArrived(this.storeManager, parentInstance.name);
         const links = this._pendingParentLinks;
         const parentElement = parentInstance.element;
         const waiting = links && links.get(parentElement);
@@ -1217,9 +1223,9 @@ export const ComponentLifecycleMethods = {
                 return !state._internal || state._internal.ready !== false;
             },
 
-            // TODO(v2): Replace polling with event-driven notification from state manager.
-            // Requires threading a "ready" event through the state manager subscription
-            // system. Polling is correct but inelegant for a reactive framework.
+            // Polls for readiness. An event from the state manager would
+            // need a "ready" notification threaded through its subscription
+            // system.
             waitForReady: function() {
                 return new Promise((resolve, reject) => {
                     if (!state._internal || state._internal.ready !== false) {
@@ -3218,7 +3224,6 @@ export const ComponentLifecycleMethods = {
         this.componentParents.clear();
         this.componentChildren.clear();
         this._pendingParentLinks = null;
-        this._templateCache.general.clear();
         this._templateCache.lists.clear();
         this._templateCache.compiled.clear();
         this._templateCache.extracted.clear();

@@ -2,7 +2,7 @@
  * WildflowerJS TypeScript Definitions
  * A lightweight reactive framework with no build step required
  *
- * @version 1.5.7
+ * @version 1.5.8
  * @license MIT
  *
  * The bundles are IIFEs that assign `window.wildflower`; import this file for

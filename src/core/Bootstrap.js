@@ -191,7 +191,7 @@ function _createDevToolsHook(wf) {
             const components = [];
             if (wf.componentDefinitions) wf.componentDefinitions.forEach((d, name) => {
                 const methods = []; try { for (const k of Object.keys(d)) if (typeof d[k] === 'function') methods.push(k); } catch {}
-                components.push({ name, hasState: !!d.state, stateKeys: (d.state && typeof d.state !== 'function') ? Object.keys(d.state) : [], computed: d.computed ? Object.keys(d.computed) : [], methods, stores: Array.isArray(d.stores) ? d.stores.slice() : [], props: d.props ? Object.keys(d.props) : [], hasTemplate: !!d.template, hasPools: !!d.pools });
+                components.push({ name, hasState: !!d.state, stateKeys: (d.state && typeof d.state !== 'function') ? Object.keys(d.state) : [], computed: d.computed ? Object.keys(d.computed) : [], methods, stores: Array.isArray(d.stores) ? d.stores.slice() : [], props: d.props ? Object.keys(d.props) : [], hasPools: !!d.pools });
             });
             const stores = [], sm = wf.storeManager?._namedStores;
             if (sm) sm.forEach((st, n) => {

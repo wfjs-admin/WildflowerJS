@@ -676,6 +676,10 @@ export class RouteManager {
      * @param {Event} event - Click event
      */
     _handleLinkClick(event) {
+        // A handler that ran first cancelled the click: the link is not
+        // followed, by the browser or by the router.
+        if (event.defaultPrevented) return;
+
         // Find the closest anchor element
         const link = event.target.closest('a[href]');
         if (!link) return;
@@ -1952,8 +1956,11 @@ class URLParser {
         // Remove leading '?'
         const queryString = search.startsWith('?') ? search.slice(1) : search;
 
-        // Parse parameters (handle duplicates → arrays)
-        queryString.split('&').forEach(pair => {
+        // Parse parameters (handle duplicates → arrays). A plus in a query
+        // is a space, as a GET form writes it. A literal plus arrives as
+        // %2B, which the replacement leaves alone and the decode below
+        // turns back into a plus.
+        queryString.split('+').join(' ').split('&').forEach(pair => {
             const eqIndex = pair.indexOf('=');
             const key = eqIndex >= 0 ? pair.slice(0, eqIndex) : pair;
             const value = eqIndex >= 0 ? pair.slice(eqIndex + 1) : '';

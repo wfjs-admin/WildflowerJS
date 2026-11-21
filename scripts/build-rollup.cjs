@@ -58,7 +58,7 @@ if (!fs.existsSync(MANGLE_PROPS_JSON)) {
 }
 
 // -----------------------------------------------------------------------------
-// Load mangle config (single source of truth, shared with rollup.config.js).
+// Load mangle config (mangle-properties.json is its single source).
 // -----------------------------------------------------------------------------
 const mangleConfig = JSON.parse(fs.readFileSync(MANGLE_PROPS_JSON, 'utf8'));
 const MANGLE_PROPERTIES = mangleConfig.mangle;
@@ -75,7 +75,7 @@ const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 const VERSION = pkg.version || '1.0.0';
 
 // -----------------------------------------------------------------------------
-// Banner / footer (mirrors rollup.config.js)
+// Banner / footer
 // -----------------------------------------------------------------------------
 // `/*!` (not `/**`) so terser's `comments: /^!/` keeps the license notice in
 // the minified builds too: CDN users only ever see the .min.js file.
@@ -125,7 +125,7 @@ if (typeof self !== 'undefined') {
 };
 
 // -----------------------------------------------------------------------------
-// Feature flags (mirrors rollup.config.js)
+// Feature flags
 // -----------------------------------------------------------------------------
 const FEATURES_ALL = {
     __FEATURE_PLUGINS__: 'true',
@@ -341,7 +341,7 @@ function makeReplacePlugin(replacements) {
 }
 
 // -----------------------------------------------------------------------------
-// Terser config (mirrors rollup.config.js exactly)
+// Terser config
 // -----------------------------------------------------------------------------
 const terserBaseCompress = {
     drop_console: false,

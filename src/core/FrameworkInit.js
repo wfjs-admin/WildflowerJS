@@ -660,26 +660,12 @@ export const FrameworkInitMethods = {
         // Find all HTML5 template elements
         this.root.querySelectorAll('template').forEach(template =>
         {
-            // Use the template ID or generate one (monotonic counter avoids Date.now() collisions)
-            if (!this._templateIdCounter) this._templateIdCounter = 0;
-            const templateId = template.id || `template-${++this._templateIdCounter}`;
-
             // Determine component type based on template
             let componentType = this._getAttr(template, 'component');
 
             // Check if it's a list template
             const listElement = template.closest(this._attrSelector('list'));
             const isList = !!listElement;
-
-            // Store template with metadata (HTML5 templates stay in DOM - they're natively hidden)
-            this._templateCache.general.set(templateId, {
-                element: template,
-                componentType,
-                parent: template.parentElement,
-                isList,
-                isModal: false,
-                id: templateId
-            });
 
             // For list templates, compile and cache for performance
             // SKIP: Configurable template references (data-use-template) - these are resolved dynamically

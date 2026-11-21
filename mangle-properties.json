@@ -634,7 +634,6 @@
     "_flushCount",
     "_boundTextNode",
     "_webComponentAdapter",
-    "_templateIdCounter",
     "_running",
     "_processPortalBindingType",
     "_isBlocklistedAttr",
@@ -1411,7 +1410,17 @@
     "_ssrEntityMissing",
     "_ssrNoteLateEntity",
     "_queryLateSSRWaiting",
-    "_rowListIsComputed"
+    "_rowListIsComputed",
+    "snapUrl",
+    "snapAt",
+    "inflightRun",
+    "appendTail",
+    "appendGen",
+    "currentRead",
+    "_queryRewriteRecordPaths",
+    "_transformQueryElements",
+    "_wfRecordQuery",
+    "_wfQueryBound"
   ],
   "reserved": [
     "_listContext",

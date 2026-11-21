@@ -1108,14 +1108,11 @@ suite('data-query: declarative transport form', () => {
             expect(row.done, 'and carried fields the write never touched').toBe(true)
         })
 
-        // Survey probe #5b (Lane F #2, the axios error.response scar;
-        // ruled 2026-08-29): a rejected write carried only the string
-        // 'HTTP 422', so a validation response's field errors could not
-        // reach the UI through a declarative to:. The rejection now
-        // carries `status` (the number) and `body` (the parsed JSON, or
-        // undefined when the body is not JSON) as additive properties on
-        // the same Error. syncError stays the plain string — it is bound
-        // in markup as text.
+        // A rejected declarative write carries `status` (the number) and
+        // `body` (the parsed JSON, or undefined when the body is not JSON)
+        // as additive properties on the Error, which is how a validation
+        // response's field errors reach the UI. syncError stays the plain
+        // string, since it is bound in markup as text.
         it('a rejected declarative write carries status and the parsed body', async () => {
             const { handle, store } = await mountWith(
                 { to: '/api/items/:id' },
@@ -1220,6 +1217,60 @@ suite('data-query: declarative transport form', () => {
             expect(lastWrite().headers.Accept).toBe('application/json')
         })
 
+        // A query that sends JSON often declares its Content-Type once, for
+        // every request. With a FormData, URLSearchParams, or typed Blob
+        // body, that declaration would replace the type fetch writes: a
+        // form's multipart boundary is in it, and a server cannot split the
+        // parts without it. The Request built from what fetch was handed
+        // shows the header the network would carry.
+        const sentContentType = (call) => new Request(call.url, {
+            method: call.method, headers: call.headers, body: call.body
+        }).headers.get('content-type')
+        const declaredContentType = (call) => Object.keys(call.headers)
+            .filter((h) => h.toLowerCase() === 'content-type')
+
+        const ownTypes = {
+            FormData: /^multipart\/form-data; boundary=/,
+            URLSearchParams: /^application\/x-www-form-urlencoded/,
+            Blob: /^text\/plain$/
+        }
+        for (const [kind, make] of kinds) {
+            it(`a declared Content-Type does not go out with a ${kind} body`, async () => {
+                const { handle } = await mountWith({
+                    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                    to: { avatar: { url: '/api/items/:id/avatar', method: 'POST', body: make } }
+                })
+                await handle.write('avatar', { id: 2, avatarFile: 'a.png' })
+                await settle()
+                expect(declaredContentType(lastWrite()), 'the declared one is dropped').toEqual([])
+                expect(sentContentType(lastWrite()), 'the type is the one fetch writes for the body').toMatch(ownTypes[kind])
+                expect(lastWrite().headers.Accept, 'the other declared headers are still sent').toBe('application/json')
+            })
+        }
+
+        it('the declared Content-Type is dropped whatever its letter case', async () => {
+            const { handle } = await mountWith({
+                headers: () => ({ 'content-type': 'application/json' }),
+                to: { avatar: { url: '/api/items/:id/avatar', method: 'POST', body: () => new FormData() } }
+            })
+            await handle.write('avatar', { id: 2, avatarFile: 'a.png' })
+            await settle()
+            expect(declaredContentType(lastWrite())).toEqual([])
+            expect(sentContentType(lastWrite())).toMatch(ownTypes.FormData)
+        })
+
+        // A Blob with no type brings nothing for fetch to write, so the
+        // declared Content-Type is the only one the request can carry.
+        it('a declared Content-Type stays with a Blob that has no type', async () => {
+            const { handle } = await mountWith({
+                headers: { 'Content-Type': 'application/octet-stream' },
+                to: { avatar: { url: '/api/items/:id/avatar', method: 'POST', body: () => new Blob(['raw']) } }
+            })
+            await handle.write('avatar', { id: 2, avatarFile: 'a.png' })
+            await settle()
+            expect(sentContentType(lastWrite())).toBe('application/octet-stream')
+        })
+
         it('a create with a FormData body takes the server record as the row', async () => {
             const { handle, store } = await mountWith({
                 create: {
@@ -1243,6 +1294,19 @@ suite('data-query: declarative transport form', () => {
             await settle()
             expect(lastWrite().headers['Content-Type']).toBe('application/json')
             expect(JSON.parse(lastWrite().body)).toEqual({ name: 'renamed' })
+        })
+
+        // Header names are case-insensitive, so two spellings of one name
+        // are one header with two values, and fetch joins them with a comma.
+        it('a JSON body carries one Content-Type, whatever case the declared one was in', async () => {
+            const { handle } = await mountWith({
+                headers: { 'content-type': 'text/plain' },
+                to: '/api/items/:id', body: (item) => ({ name: item.name })
+            })
+            await handle.write({ id: 2, name: 'renamed' })
+            await settle()
+            expect(declaredContentType(lastWrite()), 'one spelling only').toEqual(['Content-Type'])
+            expect(sentContentType(lastWrite())).toBe('application/json')
         })
     })
 
@@ -1344,6 +1408,23 @@ suite('data-query: declarative transport form', () => {
 
             expect(calls[0].headers.Authorization, 'the query wins for the key it names').toBe('Token query')
             expect(calls[0].headers['X-Client'], 'and inherits the ones it does not').toBe('wf')
+        })
+
+        it('a Content-Type in the origin default does not go out with a FormData body', async () => {
+            wildflower.config({
+                headers: { self: { 'Content-Type': 'application/json', 'X-Client': 'wf' } }
+            })
+            const { handle } = await mountWith({
+                to: { avatar: { url: '/api/items/:id/avatar', method: 'POST', body: () => new FormData() } }
+            })
+            await handle.write('avatar', { id: 2, avatarFile: 'a.png' })
+            await settle()
+
+            const sent = new Request(lastWrite().url, {
+                method: 'POST', headers: lastWrite().headers, body: lastWrite().body
+            }).headers.get('content-type')
+            expect(sent, 'the form keeps its multipart boundary').toMatch(/^multipart\/form-data; boundary=/)
+            expect(lastWrite().headers['X-Client'], 'the rest of the default still goes').toBe('wf')
         })
 
         devIt('a headers function that throws is named, and the request still goes', async () => {

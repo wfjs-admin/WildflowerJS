@@ -577,7 +577,7 @@ export const COMPUTED_EVAL = { depth: 0, owners: [] };
  * @param {string} code - Error code (e.g., 'WF-505')
  * @returns {string} Full URL to the error-codes page deep-linked to the code
  */
-function errorDocUrl(code) {
+export function errorDocUrl(code) {
     return `https://www.wildflowerjs.com/docs/error-codes?code=${code}`;
 }
 

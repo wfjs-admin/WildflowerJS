@@ -19,7 +19,7 @@
  *   hard/transient error split.
  */
 
-import { QUERY_ENGINE_WRITE, WF_ERRORS, wfError, mergeData, wfLocalStorage } from '../core/wfUtils.js';
+import { QUERY_ENGINE_WRITE, WF_ERRORS, wfError, mergeData, wfLocalStorage, errorDocUrl } from '../core/wfUtils.js';
 import { toRaw as rgToRaw, isObserved as rgIsObserved } from '../state/reactive-graph/core.js';
 
 const QUERY_STATE = () => ({
@@ -138,6 +138,22 @@ const showValue = (v) => {
         return errText(v);
     }
 };
+
+// A copy of a params map without its null and undefined entries, which are
+// never serialized ("undefined"/"null") and never resolve a token.
+function withoutNulls(params) {
+    const out = Object.assign({}, params);
+    for (const k of Object.keys(out)) {
+        if (out[k] == null) delete out[k];
+    }
+    return out;
+}
+
+// base with params appended as its query string (none when params is empty).
+function withQuery(base, params) {
+    const qs = new URLSearchParams(params).toString();
+    return qs ? base + (base.indexOf('?') >= 0 ? '&' : '?') + qs : base;
+}
 
 function interpolateUrl(url, resolve) {
     const [s, e] = urlPathSpan(url);
@@ -586,15 +602,45 @@ function parseRungs(refresh, name) {
 // past that point a sweep only re-runs once the set has grown enough since
 // the last one to be worth the walk, which amortizes to O(1) per add.
 const OBSERVE_SWEEP_WATERMARK = 32;
+// Drop the observers that have left the document.
+function pruneElements(controller) {
+    for (const e of controller.elements) {
+        if (!e.isConnected) controller.elements.delete(e);
+    }
+}
+
+// The grace before a query nothing observes is torn down, in ms. A test
+// shortens it by setting _queryTeardownGraceMs.
+function graceMs(wf) {
+    return wf._queryTeardownGraceMs || 5000;
+}
+
 function observeElement(controller, el) {
     const size = controller.elements.size;
     if (size < OBSERVE_SWEEP_WATERMARK || size >= (controller._obsSweepAt || OBSERVE_SWEEP_WATERMARK)) {
-        for (const e of controller.elements) {
-            if (!e.isConnected) controller.elements.delete(e);
-        }
+        pruneElements(controller);
         controller._obsSweepAt = Math.max(OBSERVE_SWEEP_WATERMARK, controller.elements.size * 2);
     }
     controller.elements.add(el);
+}
+
+// The [data-query] elements at and under root, root first.
+function queryElements(wf, root) {
+    const els = [];
+    const querySel = wf._attrSelector('query');
+    if (root.matches && root.matches(querySel)) els.push(root);
+    root.querySelectorAll(querySel).forEach((el) => els.push(el));
+    return els;
+}
+
+// A list-shape [data-query] element's transform attributes: data-list over the
+// rows and, given a key, data-key; an attribute already present stays. Prefix
+// parity: a data-wf-query element gets data-wf-* attributes, so wf-prefixed
+// markup stays uniformly prefixed.
+function setListAttrs(wf, el, name, key) {
+    const pre = el.hasAttribute('data-wf-query') ? 'data-wf-' : 'data-';
+    if (!wf._hasAttr(el, 'list')) el.setAttribute(pre + 'list', '$' + name + '.rows');
+    if (key != null && !wf._hasAttr(el, 'key')) el.setAttribute(pre + 'key', key);
 }
 
 // Every key query() and its helpers read from a config. WF-942 warns on any
@@ -686,11 +732,7 @@ const QuerySystemDevMethods = {
     _queryOrphanSweep(root) {
         if (!__DEV__) return;
         if (!root || !root.querySelectorAll) return;
-        const els = [];
-        const querySel = this._attrSelector('query');
-        if (root.matches && root.matches(querySel)) els.push(root);
-        root.querySelectorAll(querySel).forEach((el) => els.push(el));
-        for (const el of els) {
+        for (const el of queryElements(this, root)) {
             if (el._wfQueryBound || el._wfQueryOrphanWarned) continue;
             if (el.closest(this._attrSelector('component'))) continue;
             el._wfQueryOrphanWarned = true;
@@ -979,7 +1021,6 @@ export const QuerySystemMethods = {
             elements: new Set(),      // bound [data-query] elements (observers)
             unobservedSince: null,    // timestamp when observers last hit zero
             lastRead: null,           // last getQuery() read (also an observer edge)
-            lastSource: null,         // R1 provenance descriptor: 'fetch'|'stream'|'ssr'|'patch'|'write'|'persist' (dev introspection only)
             // §2 auto-retry: opt-in count, fixed doubling curve, no policy
             // object (a configurable policy is the retry library we ruled
             // out of core). Clamped 0..10; 0 = off.
@@ -1172,15 +1213,7 @@ export const QuerySystemMethods = {
             });
             return undefined;
         }
-        const controller = this._queryControllers.get(name);
-        controller.lastRead = Date.now();
-        if (!controller.active && !controller._activationQueued) {
-            controller._activationQueued = true;
-            Promise.resolve().then(() => {
-                controller._activationQueued = false;
-                this._queryActivate(controller);
-            });
-        }
+        this._queryTouchByShorthand(name);
         return this.getStore(name);
     },
 
@@ -1258,13 +1291,12 @@ export const QuerySystemMethods = {
      * cleared disk means nothing restores when it does. Returns the count
      * of snapshots removed.
      *
-     * A clear holds through the TRANSITION (survey probe #3, ruled
-     * 2026-08-29): saves are suppressed for the same fixed grace the
-     * lifecycle teardown uses, then persistence resumes on its own. The
-     * save site is the ingest choke point, so without the window the
-     * next delivery — an in-flight fetch settling, a focus tick as the
-     * logout view swaps in — wrote the snapshot right back (the
-     * TanStack #3782 "re-appears one second later" shape). A window
+     * A clear holds through the TRANSITION: saves are suppressed for the
+     * same fixed grace the lifecycle teardown uses, then persistence
+     * resumes on its own. The save site is the ingest choke point, so
+     * without the window the next delivery (an in-flight fetch settling,
+     * a focus tick as the logout view swaps in) writes the snapshot right
+     * back (the TanStack #3782 "re-appears one second later" shape). A window
      * rather than a latch: there is no re-arm event to define and no
      * silent persistence-off mode for the next session to trip over;
      * once the grace lapses, whatever the server now delivers is
@@ -1275,7 +1307,7 @@ export const QuerySystemMethods = {
         if (!wfLocalStorage()) return 0;
         const qc = this._queryControllers;
         let cleared = 0;
-        const grace = this._queryTeardownGraceMs || 5000;
+        const grace = graceMs(this);
         const wipe = (c) => {
             if (!c.persistKey) return;
             c._persistClearedUntil = Date.now() + grace;
@@ -1347,29 +1379,17 @@ export const QuerySystemMethods = {
      */
     _transformQueryElementsInTemplate(root) {
         if (!root || !root.querySelectorAll) return;
-        const els = [];
-        const querySel = this._attrSelector('query');
-        if (root.matches && root.matches(querySel)) els.push(root);
-        root.querySelectorAll(querySel).forEach((el) => els.push(el));
-        for (const el of els) {
+        for (const el of queryElements(this, root)) {
             const name = this._getAttr(el, 'query');
             if (!name) continue;
-            const wfPrefixed = el.hasAttribute('data-wf-query');
             const controller = this._queryControllers && this._queryControllers.get(name);
             if (!el.querySelector(':scope > template')) {
                 this._queryRewriteRecordPaths(el, name);
                 if (controller) controller.hasRecord = true;
                 continue;
             }
-            if (!this._hasAttr(el, 'list')) {
-                el.setAttribute(wfPrefixed ? 'data-wf-list' : 'data-list', '$' + name + '.rows');
-            }
-            if (controller) {
-                if (!this._hasAttr(el, 'key')) {
-                    el.setAttribute(wfPrefixed ? 'data-wf-key' : 'data-key', controller.key);
-                }
-                controller.hasList = true;
-            }
+            setListAttrs(this, el, name, controller && controller.key);
+            if (controller) controller.hasList = true;
         }
     },
 
@@ -1385,15 +1405,13 @@ export const QuerySystemMethods = {
      */
     _transformQueryElements(rootEl, instance) {
         if (!rootEl || !rootEl.querySelectorAll) return;
-        // There used to be a production-only guard here skipping the scan when
-        // no query was registered YET. That is exactly the late-declaration
-        // case, so it made the whole late-binding path inert in production
-        // while dev passed: a dev/prod divergence the minified arm caught. It
-        // cannot be kept, because a late-declared query's attributes have to be
-        // written at bind time or no binding compiles at all, and by
-        // registration the component's bindings are long since compiled.
+        // No guard skips the scan when no query is registered YET. That is
+        // exactly the late-declaration case: a late-declared query's
+        // attributes have to be written at bind time or no binding compiles
+        // at all, and by registration the component's bindings are long since
+        // compiled.
         //
-        // Cost of removing it: one matches() + one querySelectorAll per
+        // Cost of scanning every time: one matches() + one querySelectorAll per
         // COMPONENT init (this runs from _processComponentBindings and
         // _setupListContexts, both per component instance, never per list row),
         // paid by apps that use no queries at all. Measured in real Chromium on
@@ -1401,13 +1419,9 @@ export const QuerySystemMethods = {
         // us at 120 elements, 6.89 us at 600. A thousand-component page pays
         // under 1.5 ms once, at init, and nothing per frame. Apps that use
         // queries always paid this.
-        const els = [];
         // In exclusive mode a bare data-query belongs to someone else: it is
         // neither matched nor rewritten.
-        const querySel = this._attrSelector('query');
-        if (rootEl.matches && rootEl.matches(querySel)) els.push(rootEl);
-        rootEl.querySelectorAll(querySel).forEach((el) => els.push(el));
-        for (const el of els) {
+        for (const el of queryElements(this, rootEl)) {
             const name = this._getAttr(el, 'query');
             if (!name) continue;
             // The attribute belongs on the CONTAINER, with <template> as its
@@ -1461,10 +1475,7 @@ export const QuerySystemMethods = {
                 // half (key, observation, activation) is finished by the drain in
                 // query(), and the pending-entity wake renders the rows.
                 if (hasTemplateEarly) {
-                    const wfPre = el.hasAttribute('data-wf-query');
-                    if (!this._hasAttr(el, 'list')) {
-                        el.setAttribute(wfPre ? 'data-wf-list' : 'data-list', '$' + name + '.rows');
-                    }
+                    setListAttrs(this, el, name);
                 } else {
                     this._queryRewriteRecordPaths(el, name);
                 }
@@ -1510,13 +1521,7 @@ export const QuerySystemMethods = {
                 continue;
             }
             if (hidden) {
-                const wfPre = el.hasAttribute('data-wf-query');
-                if (!this._hasAttr(el, 'list')) {
-                    el.setAttribute(wfPre ? 'data-wf-list' : 'data-list', '$' + name + '.rows');
-                }
-                if (!this._hasAttr(el, 'key')) {
-                    el.setAttribute(wfPre ? 'data-wf-key' : 'data-key', controller.key);
-                }
+                setListAttrs(this, el, name, controller.key);
                 continue;
             }
             el._wfQueryBound = true;
@@ -1527,17 +1532,7 @@ export const QuerySystemMethods = {
             // list binding means the rows carry keys.
             controller.hasList = true;
             observeElement(controller, el);
-            // Prefix parity: a data-wf-query element gets data-wf-* transform
-            // attributes, so wf-prefixed markup stays uniformly prefixed.
-            const wfPrefixed = el.hasAttribute('data-wf-query');
-            const listAttr = wfPrefixed ? 'data-wf-list' : 'data-list';
-            const keyAttr = wfPrefixed ? 'data-wf-key' : 'data-key';
-            if (!this._hasAttr(el, 'list')) {
-                el.setAttribute(listAttr, '$' + name + '.rows');
-            }
-            if (!this._hasAttr(el, 'key')) {
-                el.setAttribute(keyAttr, controller.key);
-            }
+            setListAttrs(this, el, name, controller.key);
             this._queryActivate(controller);
         }
     },
@@ -1831,10 +1826,13 @@ export const QuerySystemMethods = {
         // Any full delivery (fetch, stream, append page) is fresher than
         // whatever a superseded fetch was carrying: the miss is subsumed.
         if (!patch && !seed) controller.missedArrival = false;
-        // Envelope provenance ruling: every caller declares where the
-        // rows came from. Behavior flags keep sole authority over apply
-        // mode; the descriptor feeds dev introspection and diagnostics.
-        if (source) controller.lastSource = source;
+        // Every caller declares where the rows came from. The behavior
+        // flags alone decide the apply mode; the source feeds dev
+        // introspection and diagnostics. controller.lastSource holds it
+        // ('fetch', 'stream', 'ssr', 'patch', 'write', or 'persist') and
+        // is read only by the dev-only devtools getQueries(), which
+        // reports an unset one as null.
+        if (__DEV__ && source) controller.lastSource = source;
         const store = this._queryStore(controller);
         if (!store) return;
         const incoming = Array.isArray(data) ? data : (data == null ? [] : [data]);
@@ -2355,15 +2353,11 @@ export const QuerySystemMethods = {
      * { missing: token }.
      */
     _queryResolveReadUrl(controller) {
-        const merged = Object.assign({}, this._queryResolveParams(controller));
-        for (const k of Object.keys(merged)) {
-            if (merged[k] == null) delete merged[k];
-        }
+        const merged = withoutNulls(this._queryResolveParams(controller));
         const built = interpolateUrl(controller.config.from, (t) => ownValue(merged, t));
         if (built.missing) return built;
         for (const c of built.consumed) delete merged[c];
-        const qs = new URLSearchParams(merged).toString();
-        return { url: qs ? built.url + (built.url.indexOf('?') >= 0 ? '&' : '?') + qs : built.url };
+        return { url: withQuery(built.url, merged) };
     },
 
     /**
@@ -2599,7 +2593,7 @@ export const QuerySystemMethods = {
             if (pollSecs <= 0) {
                 controller.lifecycleTimerId = setInterval(
                     () => { this._queryLifecycleCheck(controller); },
-                    this._queryTeardownGraceMs || 5000
+                    graceMs(this)
                 );
             }
         }
@@ -2620,12 +2614,7 @@ export const QuerySystemMethods = {
             ? cfg.stream
             : (typeof cfg.from === 'string' ? cfg.from : null);
         if (!raw) return null;
-        const map = Object.assign({}, params !== undefined && params !== null
-            ? params
-            : this._queryResolveParams(controller));
-        for (const k of Object.keys(map)) {
-            if (map[k] == null) delete map[k];
-        }
+        const map = withoutNulls(params != null ? params : this._queryResolveParams(controller));
         return interpolateUrl(raw, (t) => ownValue(map, t));
     },
 
@@ -2834,8 +2823,7 @@ export const QuerySystemMethods = {
             const s = store();
             if (s) { engineWrite(() => { s.syncError = null; }); }
             // The reopen catch-up honors the declared freshness window
-            // (survey ruling #6, ruled 2026-08-29: reuse the fresh:N
-            // gate). A flapping stream — a proxy recycling idle
+            // (the fresh:N gate). A flapping stream — a proxy recycling idle
             // connections, a fleet reconnecting after an outage — fires
             // one conditional catch-up per reopen per client,
             // synchronized, with no backoff (contrast the read ladder);
@@ -2870,10 +2858,8 @@ export const QuerySystemMethods = {
      * churn (brief zero-observer windows) never thrash the rungs.
      */
     _queryLifecycleCheck(controller) {
-        for (const el of controller.elements) {
-            if (!el.isConnected) controller.elements.delete(el);
-        }
-        const grace = this._queryTeardownGraceMs || 5000;
+        pruneElements(controller);
+        const grace = graceMs(this);
         const now = Date.now();
         const recentlyRead = controller.lastRead && (now - controller.lastRead) < grace;
         // A $name. binding is observation too, but it stamps lastRead only
@@ -2925,11 +2911,9 @@ export const QuerySystemMethods = {
      * @private
      */
     _queryWatched(controller) {
-        for (const el of controller.elements) {
-            if (!el.isConnected) controller.elements.delete(el);
-        }
+        pruneElements(controller);
         return controller.elements.size > 0 ||
-            (controller.lastRead && (Date.now() - controller.lastRead) < (this._queryTeardownGraceMs || 5000)) ||
+            (controller.lastRead && (Date.now() - controller.lastRead) < graceMs(this)) ||
             !!document.querySelector(this._queryBindingSelector(controller.name)) ||
             this._queryRead(controller);
     },
@@ -3185,19 +3169,20 @@ export const QuerySystemMethods = {
         let merged = null;
         let built = null;
         if (typeof cfg.from === 'string') {
-            merged = Object.assign({}, resolvedParams);
-            for (const k of Object.keys(merged)) {
-                const v = merged[k];
-                if (v == null) delete merged[k]; // never serialize "undefined"/"null"
-                // A plain object goes out as the text [object Object]: the
-                // server never sees it, and two different ones share a URL.
-                else if (__DEV__ && typeof v === 'object' && v.toString === Object.prototype.toString
-                    && warnOnce(controller, WF_ERRORS.QUERY_PARAM_OBJECT)) {
-                    wfError(WF_ERRORS.QUERY_PARAM_OBJECT, {
-                        warn: true,
-                        context: `Query "${controller.name}": the param "${k}" holds an object, which is sent as the text [object Object]`,
-                        suggestion: 'Param values are strings, numbers, booleans, or arrays. Send each field as a param of its own, or serialize the object yourself (JSON.stringify).'
-                    });
+            merged = withoutNulls(resolvedParams);
+            if (__DEV__) {
+                for (const k of Object.keys(merged)) {
+                    const v = merged[k];
+                    // A plain object goes out as the text [object Object]: the
+                    // server never sees it, and two different ones share a URL.
+                    if (typeof v === 'object' && v.toString === Object.prototype.toString
+                        && warnOnce(controller, WF_ERRORS.QUERY_PARAM_OBJECT)) {
+                        wfError(WF_ERRORS.QUERY_PARAM_OBJECT, {
+                            warn: true,
+                            context: `Query "${controller.name}": the param "${k}" holds an object, which is sent as the text [object Object]`,
+                            suggestion: 'Param values are strings, numbers, booleans, or arrays. Send each field as a param of its own, or serialize the object yourself (JSON.stringify).'
+                        });
+                    }
                 }
             }
             // Tokens read the merged map AFTER the null-strip, so a token whose
@@ -3360,9 +3345,7 @@ export const QuerySystemMethods = {
         // legitimately consume different subsets of the same params.
         const ac = new AbortController();
         controller.abort = ac;
-        const qs = new URLSearchParams(merged).toString();
-        const base = built.url;
-        const url = qs ? base + (base.indexOf('?') >= 0 ? '&' : '?') + qs : base;
+        const url = withQuery(built.url, merged);
         // A restore deferred by an unresolvable token (URL guard): the
         // first fetch to resolve a URL settles the comparison — a match
         // paints here, before the request departs (ahead of any
@@ -3384,7 +3367,7 @@ export const QuerySystemMethods = {
         // about the author's credentials, and a validator riding a redirect
         // is harmless.
         const headers = this._queryHeaders(controller, url);
-        const declaredHeaderCount = Object.keys(headers).length;
+        const declaredHeaderCount = __DEV__ ? Object.keys(headers).length : 0;
         // The validator belongs to the URL it was issued for. A single unkeyed
         // field sent page 1's ETag with page 2's request; a param-varying query
         // makes that the normal case rather than the exception. Keyed by the
@@ -3583,8 +3566,7 @@ export const QuerySystemMethods = {
                 context: `Query "${controller.name}": write() was called, but the query declares no \`to\` and no operations`,
                 suggestion: "Declare the write side: to: '/api/items/:id' (or an operation map, or a function)"
             });
-            return Promise.reject(new Error('[' + def.code + '] ' + (def.message ||
-                ('https://www.wildflowerjs.com/docs/error-codes?code=' + def.code))));
+            return Promise.reject(new Error('[' + def.code + '] ' + (def.message || errorDocUrl(def.code))));
         }
         // Resolve the operation BEFORE anything optimistic happens: an
         // undeclared destination must send nothing and touch no rows.
@@ -4041,13 +4023,9 @@ export const QuerySystemMethods = {
             controller.etagUrl = null;
             controller.etags = null;
             if (controller.snapshots) controller.snapshots.clear();
-            if (result == null) {
-                // Resolved with nothing: the next sync fetches the truth.
-                maybeClearAliases();
-                return store.invalidate();
-            }
-            if (typeof result !== 'object') {
-                // Not a record at all. `confirmation` extracts the server's
+            // Resolved with nothing: the next sync fetches the truth.
+            if (result == null || typeof result !== 'object') {
+                // A non-null non-object is not a record at all. `confirmation` extracts the server's
                 // answer FOR THE ROW, so a boolean, number or string is the
                 // status-envelope mistake WF-965 already names, one step
                 // further along: that guard requires an object, so a primitive
@@ -4055,7 +4033,7 @@ export const QuerySystemMethods = {
                 // payload under `reconcile` collapses the entire row set to one
                 // element holding the primitive. Same remedy as the envelope
                 // case, so the same code and the same resolve-with-nothing arm.
-                if (__DEV__) wfError(WF_ERRORS.QUERY_WRITE_KEYLESS_RESULT, {
+                if (__DEV__ && result != null) wfError(WF_ERRORS.QUERY_WRITE_KEYLESS_RESULT, {
                     warn: true,
                     context: `Query "${controller.name}": write() resolved with a ${typeof result}, not a record; the query invalidates instead of applying it`,
                     suggestion: 'Resolve with nothing (undefined) for this behavior without the warn, or have confirmation return the saved record itself.'
@@ -4063,7 +4041,8 @@ export const QuerySystemMethods = {
                 maybeClearAliases();
                 return store.invalidate();
             }
-            if (result && typeof result === 'object' && !Array.isArray(result)) {
+            // result is a non-null object from here on (the arm above).
+            if (!Array.isArray(result)) {
                 // A later in-flight write's captured pre-image for a field
                 // this record carries was MY optimistic value; the server's
                 // answer replaces it, so that write's eventual rollback
@@ -4085,7 +4064,7 @@ export const QuerySystemMethods = {
                     for (const ckf of wroteKeys) prevs.delete(ckf);
                 }
             }
-            if (keyed && result && typeof result === 'object' && !Array.isArray(result)) {
+            if (keyed && !Array.isArray(result)) {
                 const rk = result[key];
                 if (rk == null) {
                     // A keyed write resolved with an object lacking the query
@@ -4380,8 +4359,7 @@ export const QuerySystemMethods = {
                     // matches); a STREAM-deferred confirm moved the rows
                     // past the held validator, and persisting the pair
                     // would let a later restore + lagging 304 confirm rows
-                    // it never vouched for (the d6bd925e class by the
-                    // drain route — combo-tier oracle find, 2026-08-29).
+                    // it never vouched for.
                     wf._queryPersistSave(controller, rgToRaw(store.rows) || [], held === 'fetch');
                 }
             }
@@ -4511,7 +4489,7 @@ export const QuerySystemMethods = {
         const headers = this._queryHeaders(controller, built.url);
         // Taken before the engine adds Content-Type below: WF-986 concerns
         // the author's declared credentials only.
-        const declaredHeaderCount = Object.keys(headers).length;
+        const declaredHeaderCount = __DEV__ ? Object.keys(headers).length : 0;
         const init = { method: op.method, headers };
         if (bodyFn) {
             // A key the FRAMEWORK minted is bookkeeping, not the author's data:
@@ -4525,7 +4503,17 @@ export const QuerySystemMethods = {
                 // fetch sends these itself and writes their Content-Type (a
                 // form's multipart boundary lives there); stringified, each
                 // would arrive as "{}".
-                if (payload instanceof FormData || payload instanceof URLSearchParams || payload instanceof Blob) {
+                const sendsItself = payload instanceof FormData || payload instanceof URLSearchParams || payload instanceof Blob;
+                // The body decides the Content-Type, so a declared one is
+                // dropped in any letter case: it would replace the type fetch
+                // writes, or be sent beside the JSON one as a second value. A
+                // Blob with no type decides nothing and keeps the declared one.
+                if (!sendsItself || payload.type !== '') {
+                    for (const h in headers) {
+                        if (h.toLowerCase() === 'content-type') delete headers[h];
+                    }
+                }
+                if (sendsItself) {
                     init.body = payload;
                 } else {
                     headers['Content-Type'] = 'application/json';
@@ -4597,6 +4585,10 @@ export const QuerySystemMethods = {
                     });
                     return undefined;
                 }
+                // Production builds call confirmFn directly. The catch below
+                // is for development builds, where it reports which function
+                // threw.
+                if (!__DEV__) return confirmFn(body, item);
                 try {
                     // The written item rides along as the second argument. An
                     // ok response means one of three things and only the body

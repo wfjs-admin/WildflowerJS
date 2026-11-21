@@ -430,6 +430,12 @@ export const ListNestedMethods = {
             // lists one level further in. Give those their ids first, so the
             // rows carry them and never hash. (The recursion computes the
             // same ids: nothing inside those lists has been touched yet.)
+            // A data-query in this template is rewritten before the copy is
+            // taken too: rows cloned from an unrewritten copy would keep the
+            // bare data-query attribute, which nothing binds.
+            if (__FEATURE_QUERY__ && this._transformQueryElementsInTemplate) {
+                this._transformQueryElementsInTemplate(childTemplate.content || childTemplate);
+            }
             const inner = (childTemplate.content || childTemplate).querySelectorAll(this._attrSelector('list'));
             for (let i = 0; i < inner.length; i++) listTemplateId(inner[i]);
             const cachedChildTemplate = childTemplate.cloneNode(true);

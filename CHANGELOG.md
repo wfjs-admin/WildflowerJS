@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.5.8] - 2026-11-21
+
+### Fixed
+- [A write body sets its own `Content-Type`, and one declared for the query is not sent](https://www.wildflowerjs.com/changelog.html#write-content-type)
+- [A `data-query` element in the rows of a list inside another list's rows fetches and shows its rows](https://www.wildflowerjs.com/changelog.html#query-in-nested-list-rows)
+- [A `data-query` element with no `<template>` in a list row fetches and shows its record when the query is declared after the component has scanned](https://www.wildflowerjs.com/changelog.html#query-record-in-row-late-declaration)
+- [A `+` in a router query string reads as a space, so `?q=red+shoes` gives `q: 'red shoes'`](https://www.wildflowerjs.com/changelog.html#router-query-plus-space)
+- [The router leaves a link click alone when an earlier handler has called `preventDefault()` on it](https://www.wildflowerjs.com/changelog.html#router-click-prevented)
+- [A binding or computed that reads another component's state with `$other.count` or `external()` runs again when that component mounts later](https://www.wildflowerjs.com/changelog.html#external-late-mount)
+
 ## [1.5.7] - 2026-11-15
 
 ### Changed
