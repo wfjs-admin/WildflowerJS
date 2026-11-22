@@ -196,16 +196,16 @@ Every tier has a `.dev.js` build with the diagnostics, and an ES module build (`
 
 Build steps optimize bundle delivery, not the runtime work that follows it. WildflowerJS writes directly to the DOM, with no virtual DOM and no reconciliation pass between a state change and the screen.
 
-On the official Krausest [js-framework-benchmark](https://krausest.github.io/js-framework-benchmark/2026/chrome156.html), Chrome 156 run, WildflowerJS v1.5.1 is at or better than the most full-featured reactive frameworks, with the pool implementation approaching vanilla JS. Both entries measure the framework exactly as it ships from this package, script tag and all.
+On the official Krausest [js-framework-benchmark](https://krausest.github.io/js-framework-benchmark/2026/chrome158.html), Chrome 158 run, WildflowerJS v1.5.6 is at or better than the most full-featured reactive frameworks, with the pool implementation approaching vanilla JS. Both entries measure the framework exactly as it ships from this package, script tag and all.
 
-- **`wildflowerjs-v1.5.1`** posted a **1.11** weighted geomean slowdown, ahead of Inferno and Vue Vapor at 1.12, Solid at 1.14, Svelte at 1.19, Vue at 1.30 and React at 1.56. This entry renders through `data-list`, the same fully reactive model every framework on the board benchmarks.
-- **`wildflowerjs-pool-v1.5.1`** posted a **1.09**, ahead of every major framework and approaching vanilla JS at 1.02, rendering the same markup through entity pools, the per-frame primitive WildflowerJS ships for bulk and high-frequency workloads.
+- **`wildflowerjs-v1.5.6`** posted a **1.10** weighted geomean slowdown, level with Inferno and ahead of Vue Vapor at 1.11, Solid at 1.13, Svelte at 1.18, Vue at 1.28 and React at 1.55. This entry renders through `data-list`, the same fully reactive model every framework on the board benchmarks.
+- **`wildflowerjs-pool-v1.5.6`** posted a **1.09**, ahead of every major framework and approaching vanilla JS at 1.03, rendering the same markup through entity pools, the per-frame primitive WildflowerJS ships for bulk and high-frequency workloads.
 
 Both entries run in CSP-safe mode and suffer no performance penalty. Neither carries an issue flag, and all results were run on the benchmark maintainer's hardware.
 
-![The official js-framework-benchmark results table for Chrome 156, showing all nine duration benchmarks and the weighted geometric mean for vanillajs (1.02), wildflowerjs-pool-v1.5.1 (1.09), wildflowerjs-v1.5.1 (1.11), inferno-v10.0.0 (1.12), vue-vapor-v3.6.0-rc.5 (1.12), solid-v1.9.3 (1.14), octane-v0.2.7 (1.15), svelte-v5.42.1 (1.19), solid-store-v1.9.3 (1.20), vue-v3.5.39 (1.30), react-hooks-v19.2.0 (1.56), and alpine-v3.14.7 (2.98).](assets/benchmarks/krausest-chrome156-official.png)
+![The official js-framework-benchmark results table for Chrome 158, showing all nine duration benchmarks and the weighted geometric mean for vanillajs (1.03), wildflowerjs-pool-v1.5.6 (1.09), wildflowerjs-v1.5.6 (1.10), inferno-v10.0.0 (1.10), vue-vapor-v3.6.0-rc.5 (1.11), octane-v0.15.0 (1.12), solid-v1.9.3 (1.13), solid-next-v2.0.0-rc.18 (1.13), svelte-v5.42.1 (1.18), vue-v3.5.39 (1.28), react-hooks-v19.2.0 (1.55), and alpine-v3.14.7 (2.95).](assets/benchmarks/krausest-chrome158-official.png)
 
-*The official results table, framework selection made with the results page's own picker. Octane v0.2.7 (alpha) and Vue Vapor v3.6.0-rc.5 (release candidate) are pre-stable; all other entries are stable releases. Verify against the [interactive board](https://krausest.github.io/js-framework-benchmark/2026/chrome156.html).*
+*The official results table, framework selection made with the results page's own picker. Octane v0.15.0 (pre-1.0), Vue Vapor v3.6.0-rc.5 (release candidate), and Solid Next v2.0.0-rc.18 (release candidate) are pre-stable; all other entries are stable releases. Verify against the [interactive board](https://krausest.github.io/js-framework-benchmark/2026/chrome158.html).*
 
 ## For AI Assistants
 
