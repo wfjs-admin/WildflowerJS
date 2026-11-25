@@ -12,7 +12,7 @@
  */
 
 import {
-  reactiveTree, computed as mComputed, effect as mEffect,
+  reactiveTree, computed as mComputed, disposeComputed as mDisposeComputed, effect as mEffect,
   refresh as mRefresh, setDirectWriter as mSetDirectWriter,
   setListSink as mSetListSink,
   setListOwner as mSetListOwner,
@@ -436,6 +436,8 @@ class EntityHandle {
       // Async control record for this computed (v1.5). Stays null until the
       // body first returns a thenable, so sync computeds pay one null check.
       let asyncCtl = null;
+      // The tracking record this computed sets on the framework while it runs.
+      let tc = null;
       const getter = mComputed(() => {
         // Circular-dependency guard. The core has no throwing re-entrancy guard,
         // so a computed that (directly or transitively) reads itself would
@@ -510,16 +512,19 @@ class EntityHandle {
         // through evaluateComputed/scheduleComputedEvaluation: the framework contract
         // is that those never throw (callers include non-effect framework paths
         // that don't catch, e.g. the cross-store/prop nudge after a mutation).
-        // DEV-only: mark "currently evaluating a computed" so a pool aggregate
-        // read (PoolHandle.length/.size) inside the body can emit WF-212. The
-        // framework sets _framework._computedTrackingContext around each computed eval; ReactiveGraph
-        // doesn't carry that bookkeeping, so the shared warning never fired. This
-        // is a transient dev-only marker (NOT the dependency machinery a later cleanup deletes);
-        // __DEV__-gated so it's stripped from production.
+        // Mark "currently evaluating this computed" on the framework, in every
+        // build. getStore(), getComponent() and the plugin accessor read the
+        // mark to register this entity as a dependent of what the body reads,
+        // and a store with no dependents skips the work that refreshes its
+        // readers' children (a computed passed to a child as a prop). A dev
+        // build also reads it to warn about a pool aggregate read (WF-212).
+        // One record per computed, reused, so an evaluation allocates nothing.
         let prevTc;
-        if (__DEV__ && this._wf) {
-          prevTc = this._wf._computedTrackingContext;
-          this._wf._computedTrackingContext = { computedName: name, componentId: this.component && this.component.id };
+        const wf = this._wf;
+        if (wf) {
+          prevTc = wf._computedTrackingContext;
+          if (tc === null || tc.componentId === undefined) tc = { computedName: name, componentId: this.component && this.component.id };
+          wf._computedTrackingContext = tc;
         }
         this._evalStack.push(name);
         // Fresh-run reset: `name` in _circularDependencies means a PRIOR
@@ -592,7 +597,7 @@ class EntityHandle {
         } finally {
           this._evalStack.pop();
           this._cyclePoisoned = prevPoison;
-          if (__DEV__ && this._wf) this._wf._computedTrackingContext = prevTc;
+          if (wf) wf._computedTrackingContext = prevTc;
         }
       });
       this._getters[name] = getter;
@@ -1054,6 +1059,9 @@ class EntityHandle {
   // skips) and disposes every tracked effect: the component destroy sweep also
   // iterates _effects, so this is belt-and-suspenders and idempotent
   // (_disposeEffect short-circuits on already-disposed handles).
+  // The computeds are disposed too. One that read a store is linked into the
+  // store's observers, and the store outlives the component, so a computed
+  // left linked keeps the component and its elements alive.
   destroy() {
     if (this._destroyed) return;
     this._destroyed = true;
@@ -1061,6 +1069,7 @@ class EntityHandle {
       const remaining = Array.from(this._effects);
       for (let i = 0; i < remaining.length; i++) this._disposeEffect(remaining[i]);
     }
+    for (const name in this._getters) mDisposeComputed(this._getters[name]);
   }
 
   // state-manager-contract forced synchronous re-run. The prop-propagation path

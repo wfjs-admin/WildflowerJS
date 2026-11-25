@@ -80,7 +80,10 @@ const RenderingCoreDevMethods = {
             methods,
             computed: new Set(instance.stateManager && instance.stateManager.computed ? Object.keys(instance.stateManager.computed) : []),
             // A computed's current value: one that returns a function may be called.
-            value(name) { try { return instance.context[name]; } catch (e) { return undefined; } }
+            value(name) { try { return instance.context[name]; } catch (e) { return undefined; } },
+            // Each $name a binding reads, with the first binding that reads
+            // it. Checked once the page has settled, at the end of this pass.
+            entities: new Map()
         };
 
         // Collect all binding paths from domElements (registered bindings)
@@ -105,6 +108,39 @@ const RenderingCoreDevMethods = {
 
                 const path = binding[pathKey];
                 if (!path) continue;
+
+                // data-bind writes a control's value; whether a checkbox or a
+                // radio is checked is another property.
+                const control = type === 'data-bind' && binding.element && binding.element.type;
+                if (control === 'checkbox' || control === 'radio') {
+                    wfError(WF_ERRORS.BINDING_VALIDATION, {
+                        warn: true,
+                        context: `data-bind="${path}" on a ${control} in component "${componentName}" sets its value, not whether it is checked`,
+                        suggestion: `Use data-model="${path}" for a control the user edits, or data-bind-attr="{ checked: ${path} }" to show a value.`
+                    });
+                }
+
+                // A name in braces is an object to the expression reader
+                // (and the {{ }} of other templating is two of them).
+                const braced = /^\{+\s*([\w$.]+)\s*\}+$/.exec(path);
+                if (braced) {
+                    wfError(WF_ERRORS.BINDING_VALIDATION, {
+                        warn: true,
+                        context: `${type}="${path}" in component "${componentName}" puts a name in braces. A binding takes the name alone${type === 'data-bind' ? '; in braces it is an object and shows as [object Object]' : ''}`,
+                        suggestion: `Write ${type}="${braced[1]}".`
+                    });
+                    continue;
+                }
+
+                // A list's rows replace everything inside its element.
+                if (type === 'data-list' && binding.element && binding.element.tagName === 'TABLE'
+                    && Array.from(binding.element.children).some(child => child.tagName !== 'TEMPLATE' && child.tagName !== 'TR')) {
+                    wfError(WF_ERRORS.BINDING_VALIDATION, {
+                        warn: true,
+                        context: `data-list="${path}" is on a <table> in component "${componentName}". The rows replace everything inside the element, so its <thead>, <tfoot> and <caption> are removed`,
+                        suggestion: `Put data-list on a <tbody> inside the table: <table><thead>...</thead><tbody data-list="${path}"><template>...</template></tbody></table>`
+                    });
+                }
 
                 this._validateBindingPath(path, stateKeys, componentName, type, state, names);
             }
@@ -200,6 +236,67 @@ const RenderingCoreDevMethods = {
                 if (this._hasAttr(el, 'component')) return;
                 checkAction(el);
             });
+
+            // {{ name }} in text is shown as written. Looked for in the
+            // component's own text and in its row templates, outside code
+            // samples; the first one found is reported.
+            const roots = [componentElement];
+            componentElement.querySelectorAll('template').forEach(template => {
+                if (template.content && isOwnedByThisComponent(template)) roots.push(template.content);
+            });
+            mustache: for (const root of roots) {
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                let node;
+                while ((node = walker.nextNode())) {
+                    const match = /\{\{\s*([\w$.]+)\s*\}\}/.exec(node.nodeValue);
+                    const parent = match && node.parentElement;
+                    if (!parent || parent.closest('pre, code, script, style, textarea')) continue;
+                    if (root === componentElement && parent !== componentElement
+                        && (this._hasAttr(parent, 'component') || !isOwnedByThisComponent(parent))) continue;
+                    wfError(WF_ERRORS.BINDING_VALIDATION, {
+                        warn: true,
+                        context: `Text "${match[0]}" in component "${componentName}" is shown as written: {{ }} is not read as a binding`,
+                        suggestion: `Bind the value to an element: <span data-bind="${match[1]}"></span>`
+                    });
+                    break mustache;
+                }
+            }
+        }
+
+        // A $name no store, query, plugin, or component answers to, once
+        // the page has had time to register everything.
+        if (names.entities.size) {
+            setTimeout(() => {
+                if (!this.componentInstances.has(componentId) || !componentElement || !componentElement.isConnected) return;
+                for (const [entity, binding] of names.entities) {
+                    if (this._externalFindTarget(entity) || (this._pluginStates && this._pluginStates.has(entity))) continue;
+                    const stores = this.storeManager && this.storeManager._virtualComponents
+                        ? Array.from(this.storeManager._virtualComponents.values(), store => String(store.name).replace(/^store-/, ''))
+                        : [];
+                    const similar = this._findSimilarPropertyNames(entity, stores);
+                    wfError(WF_ERRORS.BINDING_VALIDATION, {
+                        warn: true,
+                        context: `${binding} in component "${componentName}" reads $${entity}, and no store, query, plugin, or component has that name after the page settled. The binding stays empty`,
+                        suggestion: `${similar.length ? `Did you mean $${similar[0]}? ` : ''}Stores registered: ${stores.join(', ') || '(none)'}. If "${entity}" is registered later by design, ignore this note.`
+                    });
+                }
+            }, this._devPropsSettleMs ?? 1500);
+        }
+    },
+    /**
+     * Record each $name a binding reads, for the settled-page check.
+     * @private
+     */
+    _noteEntityNames(text, bindingType, names) {
+        if (!__DEV__ || !names) return;
+        const pattern = /\$([a-zA-Z_][a-zA-Z0-9_-]*)\./g;
+        let match;
+        while ((match = pattern.exec(text))) {
+            const entity = match[1];
+            // $item and $this are the row, inside a list.
+            if (entity !== 'item' && entity !== 'this' && !names.entities.has(entity)) {
+                names.entities.set(entity, `${bindingType}="${text}"`);
+            }
         }
     },
     /**
@@ -224,8 +321,12 @@ const RenderingCoreDevMethods = {
         // Skip external() expressions (cross-component references)
         if (path.includes('external(')) return;
 
-        // Skip $entity.path shorthand (normalized to external() at bind time)
-        if (path.includes('$')) return;
+        // $entity.path shorthand (normalized to external() at bind time):
+        // nothing to check against this component's state.
+        if (path.includes('$')) {
+            this._noteEntityNames(path, bindingType, names);
+            return;
+        }
 
         // Parse type hint from path (e.g., "price:number" -> path="price", typeHint="number")
         let typeHint = null;
@@ -353,8 +454,12 @@ const RenderingCoreDevMethods = {
      */
     _validateExpressionVariables(expression, stateKeys, componentName, bindingType, state, names) {
         if (!__DEV__) return;
-        // Skip $entity.path shorthand (normalized to external() at bind time)
-        if (expression && expression.includes('$')) return;
+        // $entity.path shorthand (normalized to external() at bind time):
+        // nothing to check against this component's state.
+        if (expression && expression.includes('$')) {
+            this._noteEntityNames(expression, bindingType, names);
+            return;
+        }
 
         // Strip computed: prefix before validation; it's a runtime hint, not a variable
         const cleanExpression = expression.replace(/\bcomputed:/g, '');
@@ -376,7 +481,7 @@ const RenderingCoreDevMethods = {
         // Reserved words and keywords to skip
         const reserved = new Set([
             'true', 'false', 'null', 'undefined', 'NaN', 'Infinity',
-            'if', 'else', 'return', 'typeof', 'instanceof', 'new', 'this',
+            'if', 'else', 'return', 'typeof', 'instanceof', 'in', 'void', 'new', 'this',
             'external', 'Math', 'Date', 'String', 'Number', 'Boolean', 'Array', 'Object',
             'function', 'var', 'let', 'const', 'for', 'while',
             // List context variables

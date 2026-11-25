@@ -75,6 +75,24 @@ describe('Exclusive data-wf-prefix Mode', () => {
             wildflower.setWfPrefixMode(false)
             expect(wildflower.options.useWfPrefixOnly).toBe(false)
         })
+
+        it('config({ useWfPrefixOnly: true }) enables exclusive mode', async () => {
+            wildflower.config({ useWfPrefixOnly: true })
+            expect(wildflower.options.useWfPrefixOnly).toBe(true)
+
+            wildflower.component('prefix-by-config', { state: { message: 'shown' } })
+            testContainer.innerHTML = `
+                <div data-wf-component="prefix-by-config">
+                    <span class="plain" data-bind="message"></span>
+                    <span class="prefixed" data-wf-bind="message"></span>
+                </div>
+            `
+            wildflower.scan(testContainer)
+            await waitForUpdate(100)
+
+            expect(testContainer.querySelector('.plain').textContent).toBe('')
+            expect(testContainer.querySelector('.prefixed').textContent).toBe('shown')
+        })
     })
 
     describe('Helper Methods in Exclusive Mode', () => {

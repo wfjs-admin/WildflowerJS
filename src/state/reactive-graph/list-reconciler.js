@@ -55,9 +55,12 @@ export function reconcile(arrayFn, mapFn, options = {}) {
     // (the framework's defaultKey behavior). Lists without an id field are then keyed
     // positionally, so replacing one item is a same-key in-place update (its row
     // is reused and onItemUpdate refreshes the bindings) rather than a churn.
+    // A null or undefined entry gets a key of its own, by position: the bare
+    // index could equal a real item's key (an id of 1, or the number 1 in a
+    // list of numbers).
     const keyOf = keyProp
-      ? ((it, i) => { const k = (it == null ? undefined : it[keyProp]); return (k === undefined || k === null) ? i : k; })
-      : ((it, i) => (it == null ? i : it));
+      ? ((it, i) => { if (it == null) return '\0' + i; const k = it[keyProp]; return (k === undefined || k === null) ? i : k; })
+      : ((it, i) => (it == null ? '\0' + i : it));
     // entries: { key, element, itemProxy, disposeEffect }; mapFn returns
     // { element, disposeEffect }, and the DOM callbacks take .element.
     let prev = [];
@@ -118,6 +121,9 @@ export function reconcile(arrayFn, mapFn, options = {}) {
       const next = new Array(n);
       const oldLen = prev.length;
       let anyCreated = false;
+      // Optional: whether a surviving row can still show its item. A row
+      // that cannot is removed and made again, as if its key were new.
+      const fits = options.rowFits;
 
       mUntrack(() => {
         // Full-clear fast path: the list emptied (`state.rows = []`) with existing
@@ -183,6 +189,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
           for (let i = 0; i < oldLen; i++) {
             if (keys[i] !== prev[i].key) { pureAppend = false; break; }
             if (items[i] !== prev[i].itemProxy && mToRaw(items[i]) !== mToRaw(prev[i].itemProxy)) { pureAppend = false; break; }
+            if (fits && !fits(prev[i].element, items[i])) { pureAppend = false; break; }
           }
           if (pureAppend) {
             const bulkResults = options.onBulkCreate(arr, keyProp, oldLen);
@@ -246,7 +253,7 @@ export function reconcile(arrayFn, mapFn, options = {}) {
         for (let i = 0; i < n; i++) {
           const k = keys[i];
           const ex = oldByKey.get(k);
-          if (ex && !used.has(k)) {
+          if (ex && !used.has(k) && (!fits || fits(ex.element, items[i]))) {
             used.add(k);
             if (ex.itemProxy !== items[i]) {
               // Same key, new object (e.g. whole-array replace): onItemUpdate

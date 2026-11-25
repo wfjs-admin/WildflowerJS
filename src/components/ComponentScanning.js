@@ -618,6 +618,12 @@ _setupDynamicComponentDetection()
         this._injectStoreReferences(instance);
         this._injectPoolReferences(instance);
 
+        // Props were first resolved when the instance was created, before any
+        // computed existed. Parents come first here, so the parent's computeds
+        // exist by now: resolve again, before this component's own computeds
+        // can read a prop.
+        if (instance._propPaths) this._updateComponentProps(instance);
+
         if (!instance.definition.computed) return;
         this._setupComputedProperties(
             instance.definition,

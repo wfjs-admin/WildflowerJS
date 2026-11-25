@@ -162,6 +162,10 @@ export const ListNestedMethods = {
      * asked too and finds nothing changed. The full follow-up runs for those
      * that did change: props-dependent computeds, the child's render effect,
      * onPropsChange.
+     *
+     * Each child's `listItem` is looked up again from its own place as well,
+     * so a component in the row gets the new item and one inside another
+     * component, or in a nested row, keeps what it had.
      * @param {HTMLElement} itemEl - The list row (already carrying the new item)
      * @param {Object} newItemData - The row's new item
      * @param {string} listPath - The list's path, for onPropsChange
@@ -173,14 +177,26 @@ export const ListNestedMethods = {
         if (nested.length === 0 && !self) return;
 
         const propsChangeInfo = { parentPath: listPath, newValue: newItemData, oldValue: undefined };
-        if (self) {
-            const inst = this.componentInstances.get(self);
-            if (inst && inst._propPaths) this._refreshChildProps(inst, propsChangeInfo);
-        }
+        if (self) this._repointRowComponent(itemEl, self, propsChangeInfo);
         for (let i = 0; i < nested.length; i++) {
-            const inst = this.componentInstances.get(nested[i].dataset.componentId);
-            if (inst && inst._propPaths) this._refreshChildProps(inst, propsChangeInfo);
+            this._repointRowComponent(nested[i], nested[i].dataset.componentId, propsChangeInfo);
         }
+    },
+    /**
+     * One component of a row whose item was replaced: its `listItem`, then
+     * its props.
+     * @private
+     */
+    _repointRowComponent(el, id, propsChangeInfo) {
+        const inst = this.componentInstances.get(id);
+        if (!inst) return;
+        const item = this._findListItemForComponent(el);
+        if (inst.listItem !== item) {
+            inst.listItem = item;
+            // Wake the computeds and effects that read listItem.
+            if (inst._listItemCell !== null) inst._listItemCell.n++;
+        }
+        if (inst._propPaths) this._refreshChildProps(inst, propsChangeInfo);
     },
     /**
      * The nested lists of one row for one child path: the matching
@@ -415,6 +431,24 @@ export const ListNestedMethods = {
             // Pass instance to enable data-use-template lookups for nested external templates
             const childTemplate = this._findTemplate(nestedList, instance);
             if (!childTemplate) return;
+
+            // A named template reached again inside itself has no last
+            // level: each copy holds the list that asks for the next one.
+            // Each resolved copy carries the names above it, so the second
+            // meeting of a name is the place to say so.
+            if (__DEV__) {
+                const name = nestedList._usedTemplateName;
+                const above = parentTemplate._usedTemplateNames || [];
+                if (name && above.includes(name)) {
+                    wfError(WF_ERRORS.TEMPLATE_LOOKUP_MISS, {
+                        context: `Template '${name}' uses itself: a data-list inside it (data-list="${childPath}") asks for '${name}' again${above.length > 1 ? ` (through ${above.slice(above.indexOf(name) + 1).map(n => `'${n}'`).join(', ')})` : ''}. Nested templates are resolved when the list is set up, so the nesting has to end. The list rendered nothing`,
+                        suggestion: `Write each level out with its own template, or for data of any depth, flatten it into one array with a depth field and render one data-list (see the Tree View pattern).`,
+                        data: nestedList
+                    });
+                    throw new Error(`Template '${name}' uses itself`);
+                }
+                childTemplate._usedTemplateNames = name ? [...above, name] : above;
+            }
 
             // Store the child template under its parent's key and its own id
             // (`parentKey>childPath|id`), so two parents over the same child

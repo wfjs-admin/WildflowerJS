@@ -276,7 +276,7 @@ export class WildflowerJS
         // Reserved words for expression evaluation (should not be extracted as state variables)
         this._expressionReservedWords = new Set([
             'true', 'false', 'null', 'undefined', 'NaN', 'Infinity',
-            'if', 'else', 'return', 'typeof', 'instanceof', 'new', 'this',
+            'if', 'else', 'return', 'typeof', 'instanceof', 'in', 'void', 'new', 'this',
             'Math', 'Date', 'String', 'Number', 'Boolean', 'Array', 'Object'
             // NOTE: 'external' is NOT reserved - it needs to be passed to compiled expressions
         ]);

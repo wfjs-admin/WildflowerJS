@@ -7,6 +7,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > **Per-entry detail lives at <https://www.wildflowerjs.com/changelog.html>.** Each entry below links to the full prose description on the website. Breaking changes are kept in full here so they are visible at upgrade time without leaving the package.
 
 
+## [1.5.9] - 2026-11-24
+
+### Added
+- [Development builds warn about four markup mistakes that rendered wrong with no message (WF-509)](https://www.wildflowerjs.com/changelog.html#markup-mistake-warnings)
+- [Development builds report a template that uses itself (WF-412)](https://www.wildflowerjs.com/changelog.html#template-uses-itself-warning)
+
+### Changed
+- [`onPropsChange` runs once after a block of writes, with the final values](https://www.wildflowerjs.com/changelog.html#props-refresh-per-flush)
+- [The typings no longer declare the framework's internal registries](https://www.wildflowerjs.com/changelog.html#typings-internal-registries)
+- [A prop at its default follows the parent once the parent has a value](https://www.wildflowerjs.com/changelog.html#prop-default-follows-parent)
+- [A redirect replaces the history entry the browser arrived on](https://www.wildflowerjs.com/changelog.html#redirect-replaces-entry)
+- [An import of the package is typed, and the default export is the instance](https://www.wildflowerjs.com/changelog.html#typings-default-export-instance)
+
+### Fixed
+- [Custom elements keep their own members in production builds](https://www.wildflowerjs.com/changelog.html#element-properties-production)
+- [A prop fed by a parent's computed over a store updates in production builds](https://www.wildflowerjs.com/changelog.html#store-computed-child-prop-production)
+- [A store no longer keeps a destroyed component in memory](https://www.wildflowerjs.com/changelog.html#destroy-disposes-computeds)
+- [`wildflower.startBatch()` is defined in production builds](https://www.wildflowerjs.com/changelog.html#start-batch-production)
+- [`wildflower.config({ useWfPrefixOnly: true })` takes effect in production builds](https://www.wildflowerjs.com/changelog.html#wf-prefix-option-production)
+- [A prop from a parent's computed has its value on the first render](https://www.wildflowerjs.com/changelog.html#prop-parent-computed-page-load)
+- [A getter or setter on a class instance in state is reactive](https://www.wildflowerjs.com/changelog.html#class-accessor-reactive)
+- [`??`, `?.`, `typeof`, `in`, and `items[index]` work in a binding without parentheses](https://www.wildflowerjs.com/changelog.html#bare-expression-forms)
+- [`data-bind-attr` sets `checked` and `value` as properties on form controls](https://www.wildflowerjs.com/changelog.html#bind-attr-form-control)
+- [A list row writes `false` as `"false"` on a non-boolean attribute](https://www.wildflowerjs.com/changelog.html#list-row-attr-false)
+- [A `null` or `undefined` entry in a list renders an empty row](https://www.wildflowerjs.com/changelog.html#list-null-entries)
+- [`this.listItem` follows the row's item](https://www.wildflowerjs.com/changelog.html#list-item-follows-row)
+- [An item-level computed on a server-rendered row follows component state](https://www.wildflowerjs.com/changelog.html#ssr-row-item-computed)
+- [A blocked navigation leaves the address on the current route](https://www.wildflowerjs.com/changelog.html#blocked-navigation-address)
+- [`navigate()` with `replace: true` adds no history entry in hash mode](https://www.wildflowerjs.com/changelog.html#hash-replace-no-entry)
+- [A form rule's function can read `this` without breaking the component's types](https://www.wildflowerjs.com/changelog.html#rule-function-this-typings)
+- [A list row follows its `data-template-key` field](https://www.wildflowerjs.com/changelog.html#template-key-row-follows-field)
+
 ## [1.5.8] - 2026-11-21
 
 ### Fixed

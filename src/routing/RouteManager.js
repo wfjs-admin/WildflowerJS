@@ -198,6 +198,9 @@ export class RouteManager {
         // Navigation state
         this.isNavigating = false;      // Prevent concurrent navigations
         this._navigationAborted = false; // Abort flag for in-progress navigation
+        // The current entry's place in the history list. Each entry the
+        // router has been on carries the same number in its state (wfPos).
+        this._pos = -1;
 
         // View Transitions state
         this.currentTransition = null;  // Current ViewTransition object (null when not transitioning)
@@ -654,6 +657,10 @@ export class RouteManager {
         // Intercept clicks on internal links for SPA navigation
         this._setupLinkInterception();
 
+        // Number the entry the page loaded on, whether or not its route
+        // can be entered.
+        this._pos = this._entryPos();
+
         // Handle initial route
         const initialLocation = this.urlParser.parse(window.location);
 
@@ -661,6 +668,29 @@ export class RouteManager {
         this._matchAndExecute(initialLocation, NO_PUSH_TO_HISTORY, [], { skipTransition: true });
 
         this.isInitialized = true;
+    }
+
+    /**
+     * The place in the history list of the entry the browser is on. An
+     * entry the router has been on carries its number. One the browser
+     * made (a hash link, a typed hash) is one step past the router's own,
+     * and is numbered here.
+     */
+    _entryPos() {
+        const state = window.history.state;
+        if (state && state.wfPos != null) return state.wfPos;
+        const pos = this._pos + 1;
+        window.history.replaceState({ ...state, wfPos: pos }, '');
+        return pos;
+    }
+
+    /**
+     * Step the history to the entry the view is on, after the browser
+     * moved the address to one the router did not go to.
+     */
+    _stepToCurrent() {
+        const delta = this._pos - this._entryPos();
+        if (delta) window.history.go(delta);
     }
 
     /**
@@ -776,6 +806,9 @@ export class RouteManager {
 
         // Check if already at this location
         if (this.currentRoute && this._isSameLocation(this.currentRoute, location)) {
+            // A redirect back to the route on screen, from an address the
+            // browser had already moved to.
+            if (options._moved) this._stepToCurrent();
             return;
         }
 
@@ -801,7 +834,8 @@ export class RouteManager {
             await this._matchAndExecute(location, !options.replace, visitedPaths, {
                 skipTransition: options.skipTransition,
                 _state: options.state,
-                _replace: options.replace
+                _replace: options.replace,
+                _moved: options._moved
             });
         } finally {
             this.isNavigating = false;
@@ -1032,6 +1066,21 @@ export class RouteManager {
             location.pathname = location.pathname.slice(0, -1);
         }
 
+        // True when the browser moved the address before the router heard
+        // of it: the first load, Back, Forward, a hash link.
+        const moved = transitionOptions._moved || (!pushState && !transitionOptions._replace);
+
+        // Send the visitor on to another path. When the browser is already
+        // on the address being left, the target is written over it, so the
+        // history holds no entry that only sends the visitor on again.
+        const redirect = (path, query) => this.navigate(path, {
+            _visitedPaths: [...visitedPaths, location.pathname],
+            skipTransition: transitionOptions.skipTransition,
+            replace: moved,
+            _moved: moved,
+            ...(query && { query })
+        });
+
         // Find matching route
         let matchedRoute = null;
         let params = {};
@@ -1072,11 +1121,7 @@ export class RouteManager {
                 });
 
                 if (defaultRouteExists) {
-                    const newVisitedPaths = [...visitedPaths, location.pathname];
-                    return this.navigate(this.options.defaultRoute, {
-                        _visitedPaths: newVisitedPaths,
-                        skipTransition: transitionOptions.skipTransition
-                    });
+                    return redirect(this.options.defaultRoute);
                 } else {
                     if (__DEV__) wfWarn('Default route not registered, cannot redirect');
                 }
@@ -1101,14 +1146,8 @@ export class RouteManager {
 
             // Clear isNavigating flag before redirect to prevent infinite loop
             this.isNavigating = false;
-            // Add current path to visited chain and continue redirect
-            const newVisitedPaths = [...visitedPaths, location.pathname];
-            // Preserve query parameters on redirect, and skipTransition if set
-            return this.navigate(redirectPath, {
-                query: location.query,
-                _visitedPaths: newVisitedPaths,
-                skipTransition: transitionOptions.skipTransition
-            });
+            // Preserve query parameters on redirect
+            return redirect(redirectPath, location.query);
         }
 
         // Build route object
@@ -1124,29 +1163,28 @@ export class RouteManager {
 
         const from = this.currentRoute;
 
+        // A blocked navigation stays on the current route. navigate() has
+        // not written the address yet, so there is nothing to undo. Back,
+        // Forward and a hash link moved the address before the router heard
+        // of it: step the history to the entry the view is on.
+        const stay = () => {
+            if (moved && from) this._stepToCurrent();
+        };
+
         // Run beforeLeave guard on current route (if any)
         if (from && from.matched && from.matched.beforeLeave) {
             try {
                 const leaveResult = await from.matched.beforeLeave({ to, from });
                 if (leaveResult === false) {
-                    return;
+                    return stay();
                 }
                 if (typeof leaveResult === 'string') {
                     this.isNavigating = false;
-                    const newVisitedPaths = [...visitedPaths, location.pathname];
-                    return this.navigate(leaveResult, {
-                        _visitedPaths: newVisitedPaths,
-                        skipTransition: transitionOptions.skipTransition
-                    });
+                    return redirect(leaveResult);
                 }
                 if (leaveResult && typeof leaveResult === 'object' && leaveResult.path) {
                     this.isNavigating = false;
-                    const newVisitedPaths = [...visitedPaths, location.pathname];
-                    return this.navigate(leaveResult.path, {
-                        _visitedPaths: newVisitedPaths,
-                        skipTransition: transitionOptions.skipTransition,
-                        ...(leaveResult.query && { query: leaveResult.query })
-                    });
+                    return redirect(leaveResult.path, leaveResult.query);
                 }
             } catch (error) {
                 wfError(WF_ERRORS.ROUTE_GUARD_ERROR, {
@@ -1161,7 +1199,7 @@ export class RouteManager {
         // Dispatch route:beforeChange event (cancelable via preventDefault)
         const shouldProceed = this._dispatchBeforeChange(to, from);
         if (!shouldProceed) {
-            return;
+            return stay();
         }
 
         // Shared guard result processing: false blocks, string redirects.
@@ -1169,24 +1207,18 @@ export class RouteManager {
         const processGuardResult = async (guardPromise, errorContext) => {
             try {
                 const result = await guardPromise;
-                if (result === false) return true;
+                if (result === false) {
+                    stay();
+                    return true;
+                }
                 if (typeof result === 'string') {
                     this.isNavigating = false;
-                    const newVisitedPaths = [...visitedPaths, location.pathname];
-                    await this.navigate(result, {
-                        _visitedPaths: newVisitedPaths,
-                        skipTransition: transitionOptions.skipTransition
-                    });
+                    await redirect(result);
                     return true;
                 }
                 if (result && typeof result === 'object' && result.path) {
                     this.isNavigating = false;
-                    const newVisitedPaths = [...visitedPaths, location.pathname];
-                    await this.navigate(result.path, {
-                        _visitedPaths: newVisitedPaths,
-                        skipTransition: transitionOptions.skipTransition,
-                        ...(result.query && { query: result.query })
-                    });
+                    await redirect(result.path, result.query);
                     return true;
                 }
             } catch (error) {
@@ -1213,6 +1245,12 @@ export class RouteManager {
             )) return;
         }
 
+        // Take the place of the entry the browser is on. For navigate() it
+        // is the entry being left, and the number is already this._pos. For
+        // the first load, Back, Forward and a hash link it is the entry
+        // arrived at, whose address is already right.
+        this._pos = this._entryPos();
+
         // Update browser history or hash
         if (pushState) {
             // Save scroll position before navigation
@@ -1225,7 +1263,8 @@ export class RouteManager {
             const historyState = {
                 path: location.pathname,
                 ...scrollState,
-                ...(transitionOptions._state || {})
+                ...(transitionOptions._state || {}),
+                wfPos: ++this._pos
             };
 
             const url = this.urlParser.buildUrl(location);
@@ -1250,11 +1289,15 @@ export class RouteManager {
             const url = this.urlParser.buildUrl(location);
             const historyState = {
                 path: location.pathname,
-                ...(transitionOptions._state || {})
+                ...(transitionOptions._state || {}),
+                wfPos: this._pos
             };
             if (this.options.mode === 'hash') {
+                // location.replace() writes over the current entry; setting
+                // location.hash would add one. The full address keeps a
+                // <base> element from moving the page.
                 const hashValue = url.startsWith('#') ? url.slice(1) : url;
-                window.location.hash = hashValue;
+                window.location.replace(window.location.href.split('#')[0] + '#' + hashValue);
                 window.history.replaceState(historyState, '');
             } else {
                 window.history.replaceState(historyState, '', url);

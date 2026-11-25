@@ -500,7 +500,8 @@ export const PropsSystemMethods = {
             // isn't a valid JS identifier, treat it as a string literal.
             // This allows: data-prop-title="Custom Title" (literal)
             // While preserving: data-prop-title="cardTitle" (state path)
-            if (resolvedValue === undefined && !PROP_PATH_RE.test(valuePath)) {
+            // A computed: path is never text: with no value yet it is undefined.
+            if (resolvedValue === undefined && !PROP_PATH_RE.test(valuePath) && !valuePath.startsWith('computed:')) {
                 return valuePath;
             }
 
@@ -617,21 +618,20 @@ export const PropsSystemMethods = {
                     }
                 }
 
-                // Only store path for reactive updates if we didn't use default.
-                // With no parent instance the path was never resolved at all
-                // (the parent's definition registers later), so keep it for
-                // _adoptPendingChildren to resolve once the parent exists.
-                if (!usedDefault || !parentInstance)
+                // Keep the path so the prop follows the parent. A prop at its
+                // default is marked: it stays there until the parent has a
+                // value for it (_updateComponentProps), which covers a parent
+                // whose value arrives later and a page-load scan, where the
+                // parent's computeds do not exist yet at this point.
+                if (!instance._propPaths)
                 {
-                    if (!instance._propPaths)
-                    {
-                        instance._propPaths = {};
-                    }
-                    instance._propPaths[propName] = {
-                        path: attrValue,
-                        parentId: parentInstance?.id
-                    };
+                    instance._propPaths = {};
                 }
+                instance._propPaths[propName] = {
+                    path: attrValue,
+                    parentId: parentInstance?.id,
+                    _atDefault: usedDefault
+                };
             }
             else
             {
@@ -839,6 +839,13 @@ export const PropsSystemMethods = {
             if (!parentInstance) continue;
 
             const newValue = this._resolvePropsValue(pathInfo.path, parentInstance, instance.id, instance.element);
+
+            // A prop at its default stays there until the parent has a value.
+            if (pathInfo._atDefault)
+            {
+                if (newValue === undefined) continue;
+                pathInfo._atDefault = false;
+            }
 
             // Skip if the resolved value is undefined/null for a "." prop path
             // This indicates the list item no longer exists at this index

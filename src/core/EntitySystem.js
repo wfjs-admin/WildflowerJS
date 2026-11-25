@@ -6,7 +6,7 @@
 
 import { RAW_TARGET } from '../state/ContextProxy.js';
 import { pathResolver, wfError, WF_ERRORS, PENDING_BINDING, setOwn, isDigits } from '../core/wfUtils.js';
-import { beginBatchScope, endBatchScope, discardScheduled, toRaw as graphToRaw } from '../state/reactive-graph/core.js';
+import { beginBatchScope, endBatchScope, discardScheduled, microtask, toRaw as graphToRaw } from '../state/reactive-graph/core.js';
 import { entityMissed } from '../state/StoreManager.js';
 
 /**
@@ -554,8 +554,21 @@ export const EntitySystemMethods = {
      * sweeps must cascade to children through the same code.
      * @private
      */
-    _refreshChildProps(childInstance, propsChangeInfo) {
-        if (!this._updateComponentProps(childInstance)) return;
+    _refreshChildProps(childInstance, propsChangeInfo, seen) {
+        if (seen === undefined) {
+            if (!this._updateComponentProps(childInstance)) return;
+        } else {
+            // From the flush: resolve what a read has not resolved already,
+            // then go on only when a prop differs from what the child last
+            // saw. A value that changed and came back is no change.
+            if (childInstance._propsStale) this._resolveStaleProps(childInstance);
+            const now = childInstance._propsData;
+            let changed = false;
+            for (const key in now) {
+                if (now[key] !== seen[key]) { changed = true; break; }
+            }
+            if (!changed) return;
+        }
 
         // Props changed - invalidate props-dependent computeds so they
         // recalculate (props access is untracked). Core props reactivity,
@@ -602,6 +615,47 @@ export const EntitySystemMethods = {
             } catch (error) {
                 if (__DEV__) console.error(`[WF] Error in onPropsChange for ${childInstance.name}:`, error);
             }
+        }
+    },
+
+    /**
+     * A write that may have changed a child's props marks them stale. They
+     * are resolved when the child reads them (_resolveStaleProps, from the
+     * props getter), so a read in the same turn gives the new value, and the
+     * child's bindings and onPropsChange follow once, when the turn's updates
+     * are flushed. Resolving evaluates the parent's computed, so resolving on
+     * every write would evaluate it once per write.
+     *
+     * The first mark of a turn keeps a copy of the props as the child last
+     * saw them, which is what the flush compares against.
+     * @private
+     */
+    _markPropsStale(childInstance, propsChangeInfo) {
+        if (!childInstance._propPaths || !childInstance._propsData) return;
+        childInstance._propsStale = true;
+        childInstance._propsStaleInfo = propsChangeInfo;
+        if (childInstance._propsSeen) return;
+        childInstance._propsSeen = Object.assign({}, childInstance._propsData);
+        const queue = this._stalePropsQueue || (this._stalePropsQueue = []);
+        queue.push(childInstance);
+        if (queue.length === 1) microtask(() => this._flushStaleProps());
+    },
+
+    _resolveStaleProps(instance) {
+        instance._propsStale = false;
+        this._updateComponentProps(instance);
+    },
+
+    _flushStaleProps() {
+        const queue = this._stalePropsQueue;
+        if (!queue) return;
+        this._stalePropsQueue = null;
+        for (let i = 0; i < queue.length; i++) {
+            const child = queue[i];
+            const seen = child._propsSeen;
+            child._propsSeen = null;
+            if (!this.componentInstances.has(child.id)) continue;
+            this._refreshChildProps(child, child._propsStaleInfo, seen);
         }
     },
 
@@ -692,7 +746,7 @@ export const EntitySystemMethods = {
             if (dependentInstance.children && dependentInstance.children.length > 0) {
                 const propsChangeInfo = { parentPath: path, newValue, oldValue, viaEntity: entityId };
                 dependentInstance.children.forEach(child => {
-                    this._refreshChildProps(child, propsChangeInfo);
+                    this._markPropsStale(child, propsChangeInfo);
                 });
             }
 
@@ -875,7 +929,7 @@ export const EntitySystemMethods = {
             if (instance.children && instance.children.length > 0) {
                 const propsChangeInfo = { parentPath: path, newValue, oldValue };
                 instance.children.forEach(childInstance => {
-                    this._refreshChildProps(childInstance, propsChangeInfo);
+                    this._markPropsStale(childInstance, propsChangeInfo);
                 });
             }
 

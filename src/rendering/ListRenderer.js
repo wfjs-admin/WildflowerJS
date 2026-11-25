@@ -80,10 +80,10 @@ import { TemplateLookupMethods, rowPathElement } from './TemplateSystem.js';
 import { needsComponentInitSet, storedTemplateCache, storedTemplatesCache } from '../core/DomMetadata.js';
 import { SSRListMethods } from './ssr-list.js';
 import { DIRECT_WRITERS } from '../state/bindingConstants.js';
-import { applyAttrObj, applyStyleProp, applyStyleObj, applyClass, reapplySelectValue } from '../core/BindingWriters.js';
+import { applyAttrObj, applyAttrValue, applyStyleProp, applyStyleObj, applyClass, reapplySelectValue } from '../core/BindingWriters.js';
 import { WF_ERRORS, wfError, isDigits } from '../core/wfUtils.js';
 import { getContextMethod } from '../state/ContextProxy.js';
-import { __wf_str, __wf_txt, HAS_MOVE_BEFORE, wfYield, listTemplateId } from '../core/wfUtils.js';
+import { __wf_str, __wf_txt, HAS_MOVE_BEFORE, wfYield, listTemplateId, NO_ITEM } from '../core/wfUtils.js';
 import { getRowCompileMode, getTextEmitters, applyRowText, shadowCompareRow,
     createListSinkDispatcher, applyRowTextUpdate, applyRowTextByPath, getPureTextSpec } from './RowCompiler.js';
 
@@ -2246,9 +2246,14 @@ export const ListRendererMethods = {
 
         }
 
+        // The data-type an item names through the list's data-template-key
+        // field: '' for an entry with none.
+        const typeOf = (item) => String((item || NO_ITEM)[templateKeyProp] ?? '');
+
         // Map function - creates DOM element for each item
         // Third parameter isBulkCreation: when true, defer effect creation for better performance
         const mapFn = (itemProxy, index, isBulkCreation) => {
+            if (itemProxy == null) itemProxy = NO_ITEM;
             // === POLYMORPHIC TEMPLATE SELECTION ===
             // Select the correct template and compiled metadata for this item
             let itemTemplateContent = templateContent;
@@ -2256,7 +2261,7 @@ export const ListRendererMethods = {
             let itemIsDocFrag = isDocumentFragment;
 
             if (isPolymorphic && templatesByType) {
-                const typeValue = String(itemProxy[templateKeyProp] ?? '');
+                const typeValue = typeOf(itemProxy);
                 const typed = templatesByType.get(typeValue);
                 if (typed) {
                     itemTemplateContent = typed;
@@ -2330,7 +2335,7 @@ export const ListRendererMethods = {
 
             // Store template type for per-item effect updates
             if (isPolymorphic) {
-                itemEl._templateType = String(itemProxy[templateKeyProp] ?? '');
+                itemEl._templateType = typeOf(itemProxy);
             }
 
             // SSR Support: Mark items rendered with configurable templates
@@ -2444,13 +2449,17 @@ export const ListRendererMethods = {
         // other source, context.data, is refreshed only by a render from
         // outside, so for a list over a computed or a store `info.length`
         // and `info.last` stayed at the first render's values.
-        const trackedArrayFn = context
-            ? () => {
-                const arr = arrayFn();
-                context._length = Array.isArray(arr) ? arr.length : 0;
-                return arr;
-            }
-            : arrayFn;
+        //
+        // A row's template follows its item's data-template-key field, so
+        // that field is read here on every item: a write to it runs the
+        // reconcile, where rowFits below has the row made again.
+        const trackedArrayFn = () => {
+            const arr = arrayFn();
+            const length = Array.isArray(arr) ? arr.length : 0;
+            if (context) context._length = length;
+            if (isPolymorphic) for (let i = 0; i < length; i++) typeOf(arr[i]);
+            return arr;
+        };
 
         // Set up mapArray with callbacks
         const disposeMapArray = sm.mapArray(
@@ -2458,6 +2467,9 @@ export const ListRendererMethods = {
             mapFn,
             {
                 key: keyProp,
+                // A row made from one data-type template cannot show an
+                // item that now names another.
+                rowFits: isPolymorphic && ((rowEl, item) => !rowEl || rowEl._templateType === typeOf(item)),
                 // The list's path, for the reconciler's error message.
                 name: listPath,
                 // OPTIMIZATION: bulk create fast path; clone a cached row prototype
@@ -2573,8 +2585,11 @@ export const ListRendererMethods = {
                         || !!(self._processCustomDirectives && self._customDirectives && self._customDirectives.size > 0);
                     for (let i = rowStartIndex; i < rows.length; i++) {
                         const row = rows[i];
-                        const itemProxy = rawNewArray[i];
-                        if (!row || !itemProxy) continue;
+                        if (!row) continue;
+                        // Every entry has a row: a null or undefined one
+                        // binds to the empty stand-in.
+                        let itemProxy = rawNewArray[i];
+                        if (itemProxy == null) itemProxy = NO_ITEM;
 
                         const itemKey = itemProxy[keyProp] !== undefined ? itemProxy[keyProp] : i;
 
@@ -2992,6 +3007,7 @@ export const ListRendererMethods = {
                 // Called when mapArray reuses an element but the item proxy has changed
                 // This happens when array is replaced (e.g., state.items = [...]) with same keys
                 onItemUpdate: (itemEl, newItemProxy, oldItemProxy, index) => {
+                    if (newItemProxy == null) newItemProxy = NO_ITEM;
                     // Update element's item data reference
                     itemEl._itemData = newItemProxy;
                     itemEl._listIndex = index;
@@ -3568,9 +3584,11 @@ export const ListRendererMethods = {
 
         const fragment = document.createDocumentFragment();
         for (let i = startIndex; i < endIndex; i++) {
-            const item = rawData[i];
-            // A primitive list's 0, '' or false is a row like any other.
-            if (item == null) continue;
+            // A primitive list's 0, '' or false is a row like any other, and
+            // so is a null or undefined entry, which binds to the empty
+            // stand-in.
+            let item = rawData[i];
+            if (item == null) item = NO_ITEM;
 
             const row = proto.cloneNode(true);
             if (_lazyEls) {
@@ -4716,13 +4734,7 @@ export const ListRendererMethods = {
         const self = this;
         sm.stampDirectWriter(itemProxy, key, (target) => {
             if (!el.isConnected) return false;
-            const v = target[key];
-            if (v === null || v === undefined || v === false) {
-                el.removeAttribute(attrName);
-            } else {
-                const s = self._sanitizeAttrValue(attrName, v);
-                if (s !== null) el.setAttribute(attrName, String(s));
-            }
+            applyAttrValue(el, attrName, self._sanitizeAttrValue(attrName, target[key]));
             return true;
         });
     },

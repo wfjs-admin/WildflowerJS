@@ -87,10 +87,15 @@ declare namespace WF {
         [pathWithModifier: string]: (newValue: any, oldValue: any) => void;
     }
 
-    /** Cross-field form rule. The key is the user-facing message. */
+    /**
+     * Cross-field form rule. The key is the user-facing message. A function
+     * form runs with the component as `this`; it is declared `any` here so
+     * that a rule reading `this` does not take part in inferring the
+     * component's own type.
+     */
     interface RuleConfig {
-        check: string | (() => boolean);
-        when?: string;
+        check: string | ((this: any) => boolean);
+        when?: string | ((this: any) => boolean);
         message?: string;
         fields?: string[];
     }

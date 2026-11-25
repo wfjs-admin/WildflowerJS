@@ -112,8 +112,9 @@ export default defineConfig({
       headless: true,
     },
 
-    // Runtime per-test auto-skip for list tests (import-agnostic global hooks).
-    setupFiles: [path.resolve(__dirname, 'nano-list-autoskip.js')],
+    // Runtime per-test auto-skip for list tests (import-agnostic global hooks),
+    // and the element property guard every test file runs under.
+    setupFiles: [path.resolve(__dirname, 'nano-list-autoskip.js'), path.resolve(__dirname, 'helpers/expando-guard.js')],
 
     include: ['tests/**/*.test.js', 'tests/**/*.spec.js'],
 

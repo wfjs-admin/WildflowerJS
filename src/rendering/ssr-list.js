@@ -62,9 +62,23 @@ export const SSRListMethods = {
      * row templates are read, or its first server row when the template is
      * elsewhere. A list inside the rows answers for itself, and a component
      * inside them reads its own bindings.
+     *
+     * The component that owns the list is a shared source too. A row binding
+     * that names one of its computeds (an item-level visible(item) that also
+     * reads this.q), or an expression that names one of its state keys,
+     * changes with the component's state, which no write to the list names.
      * @private
      */
-    _ssrRowsReadShared(listEl, firstRow) {
+    _ssrRowsReadShared(listEl, firstRow, instance) {
+        const definition = instance && (this.componentDefinitions.get(instance.name) || instance.definition) || {};
+        const computed = definition.computed || {};
+        const state = definition.state || {};
+        const has = Object.prototype.hasOwnProperty;
+        const readsComponent = (value) => {
+            const expression = this.isExpression(value);
+            return this._extractExpressionVars(value).some((name) =>
+                has.call(computed, name) || (expression && has.call(state, name)));
+        };
         const templates = listEl.querySelectorAll(':scope > template');
         const roots = templates.length ? Array.from(templates, (t) => t.content) : [firstRow];
         const listSel = this._attrSelector('list');
@@ -80,7 +94,7 @@ export const SSRListMethods = {
                 if (owner && root.contains(owner)) continue;
                 for (const type of _ROW_BINDINGS) {
                     const value = this._getAttr(el, type);
-                    if (value && this._ssrEntityNames(value)) return true;
+                    if (value && (this._ssrEntityNames(value) || readsComponent(value))) return true;
                 }
             }
         }
@@ -953,12 +967,13 @@ export const SSRListMethods = {
         }
 
         // Rows whose bindings read a shared source ($store, a plugin, a
-        // query, external()) change through that source, which no write to
-        // this list names. Adopted rows are bound once and have no effect of
-        // their own, so nothing in them followed it. With every server row
-        // matched, the list is taken over at activation: mapArray keeps the
-        // rows as the same nodes, and each row's effect follows the source.
-        if (pairs.length > 0 && !mismatch && this._ssrRowsReadShared(element, pairs[0][0])) {
+        // query, external(), or the owning component's computeds and state)
+        // change through that source, which no write to this list names.
+        // Adopted rows are bound once and have no effect of their own, so
+        // nothing in them follows it. With every server row matched, the list
+        // is taken over at activation: mapArray keeps the rows as the same
+        // nodes, and each row's effect follows the source.
+        if (pairs.length > 0 && !mismatch && this._ssrRowsReadShared(element, pairs[0][0], instance)) {
             let top = context;
             while (top && top.parent && top.parent.type === 'list') top = top.parent;
             ssrTakeoverAtActivation.add(top && top.element ? top.element : element);
@@ -1018,8 +1033,9 @@ export const SSRListMethods = {
     },
 
     /**
-     * Re-resolve props on the components inside one adopted row, now that the
-     * row carries _listIndex/_itemData. Runs the parent-state-change follow-up
+     * Point the components inside one adopted row at the row's item, now that
+     * the row carries _listIndex/_itemData: each one's listItem, then its
+     * props. The props step runs the parent-state-change follow-up
      * (_refreshChildProps): props-dependent computeds are invalidated, the
      * child's render effect re-runs, and onPropsChange fires.
      * @private
@@ -1029,12 +1045,10 @@ export const SSRListMethods = {
         if (nested.length === 0 && !itemEl.dataset.componentId) return;
 
         const propsChangeInfo = { parentPath: listPath, newValue: itemProxy, oldValue: undefined };
-        const refresh = (el) => {
-            const inst = this.componentInstances.get(el.dataset.componentId);
-            if (inst && inst._propPaths) this._refreshChildProps(inst, propsChangeInfo);
-        };
-        if (itemEl.dataset.componentId) refresh(itemEl);
-        nested.forEach(refresh);
+        if (itemEl.dataset.componentId) this._repointRowComponent(itemEl, itemEl.dataset.componentId, propsChangeInfo);
+        for (let i = 0; i < nested.length; i++) {
+            this._repointRowComponent(nested[i], nested[i].dataset.componentId, propsChangeInfo);
+        }
     },
 
     /**

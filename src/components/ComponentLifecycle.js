@@ -637,6 +637,7 @@ export const ComponentLifecycleMethods = {
             children: [],
             context,
             listItem,  // List item data for components rendered inside lists (null if not in a list)
+            _listItemCell: null,  // The cell a tracked read of listItem reads; made on the first read
             _isInitialSetup: true,
             _htmlContextsReady: new Set(),
             _hasRendered: false,
@@ -1848,6 +1849,9 @@ export const ComponentLifecycleMethods = {
         Object.defineProperty(context, 'props', {
             get() {
                 const instance = self.componentInstances.get(instanceId);
+                // Props a write marked stale are resolved on this read, so
+                // the component sees the new value in the same turn.
+                if (instance && instance._propsStale) self._resolveStaleProps(instance);
                 return instance ? instance.props : {};
             },
             enumerable: true,
@@ -1860,7 +1864,18 @@ export const ComponentLifecycleMethods = {
         Object.defineProperty(context, 'listItem', {
             get() {
                 const instance = self.componentInstances.get(instanceId);
-                return instance ? instance.listItem : null;
+                if (!instance) return null;
+                // A row that keeps its element can be given another item (a
+                // same-key replacement), and a server-rendered row gets its
+                // item after its components exist. A computed or an effect
+                // that reads listItem reads this cell too, and the list bumps
+                // it when the row's item changes.
+                if (__FEATURE_LISTS__) {
+                    let cell = instance._listItemCell;
+                    if (cell === null) cell = instance._listItemCell = instance.stateManager.reactive({ n: 0 });
+                    void cell.n;
+                }
+                return instance.listItem;
             },
             enumerable: true,
             configurable: true

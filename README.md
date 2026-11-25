@@ -62,7 +62,7 @@ A page that keeps its code in a separate file loads the framework and that file 
 ```
 
 `wildflowerjs@1` always loads the newest 1.x release.
-Pin an exact version, such as `wildflowerjs@1.5.8`, for production.
+Pin an exact version, such as `wildflowerjs@1.5.9`, for production.
 
 To install it from npm instead:
 

@@ -2,11 +2,12 @@
  * WildflowerJS TypeScript Definitions
  * A lightweight reactive framework with no build step required
  *
- * @version 1.5.8
+ * @version 1.5.9
  * @license MIT
  *
- * The bundles are IIFEs that assign `window.wildflower`; import this file for
- * types only. Surface as of 1.5.1: components, stores, plugins, pools,
+ * The script-tag bundles assign `window.wildflower`. The ESM bundles export
+ * the same instance as `wildflower` and as their default export, and the
+ * class as `WildflowerJS`. Surface: components, stores, plugins, pools,
  * routing (spa/full), data queries (full).
  */
 
@@ -294,11 +295,11 @@ export interface PoolEntityShape<T extends Record<string, any> = Record<string, 
  * The rule's key is the user-facing message.
  */
 export interface RuleConfig {
-  /** Expression string, or a predicate, that must hold */
-  check: string | (() => boolean);
+  /** Expression string, or a predicate run with the component as `this`, that must hold */
+  check: string | ((this: any) => boolean);
 
-  /** Expression string; the rule applies only while it is truthy */
-  when?: string;
+  /** Expression string or predicate; the rule applies only while it is truthy */
+  when?: string | ((this: any) => boolean);
 
   message?: string;
 
@@ -581,8 +582,8 @@ export interface ComponentInstance<TState extends ComponentState = ComponentStat
   /** The component definition */
   definition: ComponentDefinition<TState>;
 
-  /** The reactive state manager */
-  stateManager: ReactiveStateManager;
+  /** Internal. Its members are not part of the public API. */
+  stateManager: object;
 }
 
 // =============================================================================
@@ -1241,105 +1242,6 @@ export interface EventDelegationOptions {
 export type DelegatedEventHandler = (event: Event, element: HTMLElement) => void;
 
 // =============================================================================
-// CONTEXT REGISTRY
-// =============================================================================
-
-/**
- * Context types in the framework
- */
-export type ContextType = 'binding' | 'action' | 'conditional' | 'list' | 'component';
-
-/**
- * Context Registry for managing binding/action/conditional contexts
- */
-export interface ContextRegistry {
-  /**
-   * Register a dependency between contexts
-   */
-  registerDependency(sourceContext: any, targetContext: any, path: string): void;
-
-  /**
-   * Get context by ID
-   */
-  getContextById(id: string): any;
-
-  /**
-   * Get all contexts of a specific type
-   */
-  getContextsByType(type: ContextType): any[];
-
-  /**
-   * Get contexts for a specific component
-   */
-  getContextsForComponent(componentId: string): any[];
-
-  /**
-   * Get context for a specific element
-   */
-  getContextForElement(element: HTMLElement): any | null;
-
-  /**
-   * Remove a context
-   */
-  removeContext(contextId: string): void;
-
-  /**
-   * Garbage collect orphaned contexts
-   */
-  garbageCollect(): void;
-}
-
-// =============================================================================
-// REACTIVE STATE MANAGER
-// =============================================================================
-
-/**
- * Options for creating reactive state
- */
-export interface ReactiveStateOptions {
-  /** Callback when state changes */
-  onStateChange?: (path: string, newValue: any, oldValue: any) => void;
-
-  /** Local storage key for persistence */
-  storageKey?: string | null;
-
-  /** Auto-save to local storage */
-  autoSave?: boolean;
-
-  /** Component reference */
-  component?: { id: string; name: string };
-}
-
-/**
- * Reactive State Manager
- */
-export interface ReactiveStateManager {
-  /**
-   * Create reactive state from initial values
-   * @param initialState - Initial state object
-   */
-  createState<T extends Record<string, any>>(initialState: T): T;
-
-  /**
-   * Get value at path
-   * @param path - Dot-notation path
-   */
-  getValue(path: string): any;
-
-  /**
-   * Set value at path
-   * @param path - Dot-notation path
-   * @param value - Value to set
-   */
-  setValue(path: string, value: any): void;
-
-  /**
-   * Reset state to initial values
-   */
-  reset(): void;
-}
-
-// =============================================================================
 // SSR MANAGER
 // =============================================================================
 
@@ -1373,7 +1275,7 @@ export interface SSRManager {
 /**
  * Main WildflowerJS class
  */
-export default class WildflowerJS {
+export class WildflowerJS {
   /**
    * Create a new WildflowerJS instance
    * @param root - Root element, document, or selector for the app
@@ -1426,17 +1328,8 @@ export default class WildflowerJS {
     cause?: Error | string;
   }) => WildflowerDiagnostic;
 
-  /** Component definitions registry */
-  readonly componentDefinitions: Map<string, ComponentDefinition>;
-
-  /** Component instances registry */
-  readonly componentInstances: Map<string, ComponentInstance>;
-
-  /** Context registry */
-  readonly contextRegistry: ContextRegistry;
-
-  /** Store manager */
-  readonly storeManager: StoreManager;
+  /** Internal. Its members are not part of the public API. */
+  readonly contextRegistry: object;
 
   /** SSR manager (if enabled) */
   readonly ssrManager: SSRManager | null;
@@ -1670,9 +1563,10 @@ export default class WildflowerJS {
   // =========================================================================
 
   /**
-   * Start a batch update (defers DOM updates)
+   * Start a batch update (defers DOM updates). The returned object applies
+   * or cancels the batch; `applyBatch()` and `cancelBatch()` do the same.
    */
-  startBatch(): void;
+  startBatch(): { apply(): void; cancel(): void };
 
   /**
    * Apply batched updates
@@ -1709,23 +1603,6 @@ export default class WildflowerJS {
   // =========================================================================
   // UTILITY METHODS
   // =========================================================================
-
-  /**
-   * Evaluate an expression in a component context
-   * @param expression - Expression string
-   * @param state - State object
-   * @param options - Evaluation options
-   */
-  evaluateExpression(expression: string, state: Record<string, any>, options?: {
-    additionalContext?: Record<string, any>;
-    cachePrefix?: string;
-  }): any;
-
-  /**
-   * Check if a string is an expression (vs simple path)
-   * @param str - String to check
-   */
-  isExpression(str: string): boolean;
 
   /**
    * Manually rescan for item templates in a component
@@ -1840,43 +1717,6 @@ export default class WildflowerJS {
 }
 
 // =============================================================================
-// STORE MANAGER CLASS
-// =============================================================================
-
-/**
- * Store Manager for global state management
- */
-export interface StoreManager {
-  /**
-   * Create a store component
-   * @param name - Store name
-   * @param definition - Store definition
-   */
-  createStoreComponent<TState extends Record<string, any>>(
-    name: string,
-    definition: StoreConfig<TState>
-  ): StoreContext<TState>;
-
-  /**
-   * Get a store component by name
-   * @param name - Store name
-   */
-  getStoreComponentByName(name: string): StoreContext | undefined;
-
-  /**
-   * Check if a store exists
-   * @param name - Store name
-   */
-  hasStore(name: string): boolean;
-
-  /**
-   * Destroy a store
-   * @param name - Store name
-   */
-  destroyStore(name: string): void;
-}
-
-// =============================================================================
 // GLOBAL AUGMENTATION
 // =============================================================================
 
@@ -1895,5 +1735,12 @@ declare global {
 // =============================================================================
 //
 // Every type above is exported inline where it is declared. A trailing
-// `export { ... }` block that re-exported them made every strict consumer
-// (skipLibCheck off) fail with TS2484 on each name; it was removed after 1.5.0.
+// `export { ... }` block re-exporting them would give a strict consumer
+// (skipLibCheck off) TS2484 on each name.
+
+/**
+ * The instance every build creates: the default export of the ESM builds
+ * and the `wildflower` global of the script-tag builds.
+ */
+export const wildflower: WildflowerJS;
+export default wildflower;

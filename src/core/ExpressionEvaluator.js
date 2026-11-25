@@ -34,10 +34,9 @@ const _EMPTY_PATHS = Object.freeze([]);
 // What this regex actually is: a footgun catcher. It catches the obvious
 // mistake of writing `eval(...)`, `Function(...)`, `document`, `window`, or
 // similar directly in a bound expression, and rejects it with a silent
-// compile failure (the binding renders empty) rather than running it. That
-// silence is itself a known gap (2026-09-09 review; a legitimate expression
-// that merely mentions `document` fails with no message) — tracked
-// separately, not fixed by this rename.
+// compile failure (the binding renders empty) rather than running it. A
+// legitimate expression that merely mentions `document` fails the same way,
+// with no message.
 // Exported for use by TemplateSystem, ListExpressionEval, ListRenderer
 export const _EXPR_FOOTGUN_RE = /\beval\s*\(|\bFunction\s*\(|\bimport\s*\(|\[\s*['"]constructor['"]\s*\]|\[\s*['"]__proto__['"]\s*\]|__defineGetter__|__defineSetter__|\bglobalThis\b|\bwindow\b|\bself\b|\bframes\b|\bdocument\b/;
 
@@ -270,15 +269,12 @@ export const ExpressionEvaluatorMethods = {
         const simpleNegation = /^![\w.]+$/.test(str);
         if (simpleNegation) return false;
 
-        // Check for comparison, logical, arithmetic operators
-        // Note: We check for ternary (?:) separately to avoid matching single colons
-        const hasOperators = /[><=!&|+\-*/%]/.test(str);
-        const hasTernary = /\?.*:/.test(str); // Ternary operator pattern
-        // A call (a.toFixed(2), form.isDirty()): as a property path it read
-        // nothing, while the same call next to an operator rendered.
-        const hasCall = str.includes('(');
-        const hasObjectLiteral = str.includes('{');
-
-        return hasOperators || hasTernary || hasCall || hasObjectLiteral;
+        // Anything a property path cannot hold makes it an expression:
+        // - a comparison, logical or arithmetic operator;
+        // - `?` (a ternary, `??`, `?.`);
+        // - `(` (a call such as a.toFixed(2), or grouping) and `{`;
+        // - a bracket with anything but a number in it (arr[idx], obj['x']);
+        // - a space between two tokens (typeof n, 'x' in obj).
+        return /[><=!&|+\-*/%?({]|\[(?!\d+\])|\S\s+\S/.test(str);
     }
 };

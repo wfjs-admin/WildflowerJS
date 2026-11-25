@@ -396,6 +396,7 @@ export class SSRManager {
         // the other lists' server rows are fields of their row item.
         if (ssrData && ssrData.deferred) {
             for (const d of ssrData.deferred) {
+                if (d.rowsOf) { this._dropComputedFields(d, originalDefinition); continue; }
                 if (!d.path.includes('$') && !this.wildflower._declaresListHead(originalDefinition, d.path) &&
                     !this._rowListIsComputed(originalDefinition, d.path)) {
                     pathResolver.set(d.item, d.path, d.rows);
@@ -828,6 +829,7 @@ export class SSRManager {
         }
         const def = instance && (this.wildflower.componentDefinitions.get(instance.name) || instance.definition);
         for (const d of deferred) {
+            if (d.rowsOf) { this._dropComputedFields(d, def); continue; }
             if (!this.wildflower._rowListReadsComponent(instance, d.path) && !this._rowListIsComputed(def, d.path) &&
                 pathResolver.get(d.item, d.path) === undefined) {
                 pathResolver.set(d.item, d.path, d.rows);
@@ -866,6 +868,10 @@ export class SSRManager {
         const itemElements = Array.from(listEl.children).filter(child =>
             child !== template && child.tagName !== 'TEMPLATE'
         );
+        // The first segment of every bound path in these rows, and the names
+        // a row's data-seed gives (see _dropComputedFields).
+        const bound = new Set();
+        const seeded = new Set();
 
         itemElements.forEach(itemEl => {
             const itemState = {};
@@ -890,6 +896,8 @@ export class SSRManager {
                 if (path.startsWith('computed:')) return;
                 if (bindEl.closest(containers) !== listEl) return;
                 pathResolver.set(itemState, path, this._parseValueFromElement(bindEl));
+                const dot = path.indexOf('.');
+                bound.add(dot < 0 ? path : path.slice(0, dot));
             });
 
             // First-level nested lists inside this item → recurse into item state.
@@ -919,12 +927,34 @@ export class SSRManager {
 
             // data-seed on the item root: unrendered item fields (ids, flags).
             const itemSeed = this._readSeedAttribute(itemEl);
-            if (itemSeed) mergeData(itemState, itemSeed);
+            if (itemSeed) {
+                mergeData(itemState, itemSeed);
+                for (const name in itemSeed) seeded.add(name);
+            }
 
             listItems.push(itemState);
         });
 
+        if (bound.size > 0) deferred.push({ rowsOf: listItems, bound, seeded });
         return listItems;
+    }
+
+    /**
+     * A row binding that names a computed of the component, bare, shows a
+     * derived value, which is not a field of the item: with the field on the
+     * item, the row reads it first and the computed never runs again. The row
+     * parse runs before the definition is known, so it writes every bound
+     * value and records the names; the ones that turn out to be computeds are
+     * removed here. A name a row's data-seed gives stays on the list's items:
+     * that is their own data.
+     * @param {Object} d - one record from _parseListElement
+     * @param {Object} definition - the component's definition, if known
+     */
+    _dropComputedFields(d, definition) {
+        for (const head of d.bound) {
+            if (d.seeded.has(head) || !this._rowListIsComputed(definition, head)) continue;
+            for (const item of d.rowsOf) delete item[head];
+        }
     }
 
     /**

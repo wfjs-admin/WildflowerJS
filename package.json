@@ -1,6 +1,6 @@
 {
   "name": "wildflowerjs",
-  "version": "1.5.8",
+  "version": "1.5.9",
   "description": "Lightweight reactive JavaScript framework with no build step and no virtual DOM",
   "type": "module",
   "main": "dist/wildflower.min.js",
@@ -18,15 +18,16 @@
   ],
   "exports": {
     ".": {
+      "types": "./types/wildflowerJS.d.ts",
       "import": "./dist/wildflower.esm.min.js",
       "default": "./dist/wildflower.min.js"
     },
-    "./nano": { "import": "./dist/wildflower.nano.esm.min.js", "default": "./dist/wildflower.nano.min.js" },
-    "./mini-pool": { "import": "./dist/wildflower.mini-pool.esm.min.js", "default": "./dist/wildflower.mini-pool.min.js" },
-    "./mini": { "import": "./dist/wildflower.mini.esm.min.js", "default": "./dist/wildflower.mini.min.js" },
-    "./lite": { "import": "./dist/wildflower.lite.esm.min.js", "default": "./dist/wildflower.lite.min.js" },
-    "./spa": { "import": "./dist/wildflower.spa.esm.min.js", "default": "./dist/wildflower.spa.min.js" },
-    "./full": { "import": "./dist/wildflower.full.esm.min.js", "default": "./dist/wildflower.full.min.js" },
+    "./nano": { "types": "./types/wildflowerJS.d.ts", "import": "./dist/wildflower.nano.esm.min.js", "default": "./dist/wildflower.nano.min.js" },
+    "./mini-pool": { "types": "./types/wildflowerJS.d.ts", "import": "./dist/wildflower.mini-pool.esm.min.js", "default": "./dist/wildflower.mini-pool.min.js" },
+    "./mini": { "types": "./types/wildflowerJS.d.ts", "import": "./dist/wildflower.mini.esm.min.js", "default": "./dist/wildflower.mini.min.js" },
+    "./lite": { "types": "./types/wildflowerJS.d.ts", "import": "./dist/wildflower.lite.esm.min.js", "default": "./dist/wildflower.lite.min.js" },
+    "./spa": { "types": "./types/wildflowerJS.d.ts", "import": "./dist/wildflower.spa.esm.min.js", "default": "./dist/wildflower.spa.min.js" },
+    "./full": { "types": "./types/wildflowerJS.d.ts", "import": "./dist/wildflower.full.esm.min.js", "default": "./dist/wildflower.full.min.js" },
     "./adapters/*": "./adapters/*"
   },
   "module": "dist/wildflower.esm.min.js",

@@ -1476,11 +1476,16 @@ function wrapTree(obj, prefix, notify, computedResolver) {
   if (!isTreeModelled(obj)) return obj;
   const cached = treeProxiesFor(obj).get(obj);
   if (cached) return cached.proxy;
+  // A class instance may have getters and setters. They have to run with the
+  // proxy as `this`: run on the raw object, the fields a getter reads are not
+  // tracked and the fields a setter writes wake nobody.
+  const proto = Object.getPrototypeOf(obj);
+  const isClass = proto !== Object.prototype && proto !== null && !Array.isArray(obj);
 
   const handler = {
-    get(target, key) {
+    get(target, key, receiver) {
       if (key === RAW) return target;
-      const value = target[key];
+      const value = isClass ? Reflect.get(target, key, receiver) : target[key];
       if (typeof value === 'function') {
         // Structural array mutator: return a wrapper that coalesces the per-index
         // onStateChange storm into a single `.length` structural notify (see
@@ -1562,7 +1567,18 @@ function wrapTree(obj, prefix, notify, computedResolver) {
       }
       return value;
     },
-    set(target, key, value) {
+    set(target, key, value, receiver) {
+      // A class setter runs with the proxy as `this`; its own writes go
+      // through this trap and notify there.
+      if (isClass && !hasOwnProp.call(target, key)) {
+        for (let p = proto; p !== null; p = Object.getPrototypeOf(p)) {
+          const d = Object.getOwnPropertyDescriptor(p, key);
+          if (d !== undefined) {
+            if (d.set !== undefined) return Reflect.set(target, key, value, receiver);
+            break;
+          }
+        }
+      }
       // Never store a proxy back into the raw graph: splice/reverse/sort read
       // elements THROUGH the proxy (get returns a wrapped child) and re-store
       // them, which would nest proxies and corrupt path + NODES lookups. Unwrap
@@ -1703,6 +1719,18 @@ function computed(fn) {
   return getter;
 }
 
+// Dispose a computed when its entity is destroyed: unlink it from everything
+// it read, so a source that outlives the entity (a store, a plugin, another
+// component) no longer holds it, and through it the entity and its elements.
+// The getter goes on returning the last value.
+function disposeComputed(getter) {
+  const node = getter && getter.__node;
+  if (!node || (node.flags & F_DISPOSED)) return;
+  node.flags |= F_DISPOSED;
+  cleanupSources(node);
+  node.fn = null;
+}
+
 function effect(fn, opts) {
   const node = new Node(EFFECT, null, fn);
   if (opts && opts.stable) node.flags |= F_STABLE;
@@ -1769,6 +1797,7 @@ export {
   isObserved,
   COMPUTED_MISS,
   computed,
+  disposeComputed,
   effect,
   refresh,
   linkLeaf,

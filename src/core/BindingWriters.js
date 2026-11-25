@@ -190,13 +190,24 @@ export function applyAttrObj(element, object, helpers) {
  */
 export function applyAttrValue(element, prop, value) {
     const isBooleanAttr = BOOLEAN_HTML_ATTRS.has(prop.toLowerCase());
-    if (value == null || (value === false && isBooleanAttr)) {
+    const absent = value == null || (value === false && isBooleanAttr);
+    if (absent) {
         if (element.hasAttribute(prop)) element.removeAttribute(prop);
     } else if (value === true && isBooleanAttr) {
         if (element.getAttribute(prop) !== '') element.setAttribute(prop, '');
     } else {
         const strValue = String(value);
         if (element.getAttribute(prop) !== strValue) element.setAttribute(prop, strValue);
+    }
+    // A form control stops following its `checked` or `value` attribute once
+    // the user has changed it, and a select and a textarea have no `value`
+    // attribute: the property is what the control shows, so it is set too.
+    if (prop === 'checked' || prop === 'value') {
+        const tag = element.localName;
+        if (tag === 'input' || tag === 'select' || tag === 'textarea') {
+            if (prop === 'value') applyModel(element, value);
+            else applyModel(element, !absent, 'checkbox');
+        }
     }
 }
 

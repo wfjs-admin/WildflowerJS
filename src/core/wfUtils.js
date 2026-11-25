@@ -123,6 +123,13 @@ export function __wf_str(v) {
     return v == null ? '' : (typeof v === 'number' ? '' + v : String(v));
 }
 
+/**
+ * What a row binds to when its entry in the array is null or undefined: an
+ * object with no fields, which prints as nothing. The row is made from the
+ * template with every binding empty.
+ */
+export const NO_ITEM = /*#__PURE__*/ Object.freeze(/*#__PURE__*/ Object.create({ toString() { return ''; } }));
+
 export function __wf_txt(el, s) {
     // Fast path: a single text-node child (the common bound-element shape after
     // first render) is mutated in place via its .data, preserving node identity.
